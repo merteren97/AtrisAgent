@@ -137,6 +137,55 @@ function sanitizePayload(value: unknown, allowLoginToken = false): unknown {
   return output;
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+}
+
+/**
+ * AtrisHub intentionally stores managed upload paths as relative URLs (for
+ * example `/uploads/profiles/avatar.jpg`). A browser on atrishub.com resolves
+ * those paths correctly, while a packaged Tauri WebView would otherwise point
+ * them at its own local application origin. Normalize the desktop-facing auth
+ * contract at the gateway boundary so every client receives a fetchable URL.
+ */
+export function normalizeAvatarUrl(value: unknown, hubBaseUrl: string): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== 'string') return null;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  try {
+    const base = new URL(hubBaseUrl);
+    base.pathname = '/';
+    base.search = '';
+    base.hash = '';
+    const resolved = new URL(trimmed, base);
+    const secure = resolved.protocol === 'https:';
+    const localDevelopment = resolved.protocol === 'http:' && isLoopbackHostname(resolved.hostname);
+    if ((!secure && !localDevelopment) || resolved.username || resolved.password) return null;
+    return resolved.toString();
+  } catch {
+    return null;
+  }
+}
+
+function normalizePayloadAvatar(payload: unknown, hubBaseUrl: string): unknown {
+  if (!isRecord(payload) || !isRecord(payload.user) || !Object.prototype.hasOwnProperty.call(payload.user, 'avatarUrl')) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    user: {
+      ...payload.user,
+      avatarUrl: normalizeAvatarUrl(payload.user.avatarUrl, hubBaseUrl),
+    },
+  };
+}
+
 function parseSession(payload: unknown): AtrisSession {
   if (!isRecord(payload) || !isRecord(payload.user) || typeof payload.user.id !== 'string' || !payload.user.id.trim()) {
     throw new HubAuthUnavailableError();
@@ -239,7 +288,7 @@ export class AtrisAuthService {
       }
       if (!response.ok) throw new HubAuthUnavailableError();
 
-      const session = parseSession(payload);
+      const session = normalizePayloadAvatar(parseSession(payload), this.baseUrl) as AtrisSession;
       const now = this.now();
       this.cache.set(tokenHash, {
         session,
@@ -280,9 +329,10 @@ export class AtrisAuthService {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body ?? {}),
     });
+    const sanitized = sanitizePayload(result.payload, result.response.ok);
     return {
       status: result.response.status,
-      body: sanitizePayload(result.payload, result.response.ok),
+      body: normalizePayloadAvatar(sanitized, this.baseUrl),
     };
   }
 
