@@ -15,6 +15,7 @@ interface NativeRuntimeConfig {
 
 const browserOrigin = normalizeApiOrigin(import.meta.env?.VITE_ATRIS_API_URL as string | undefined);
 let bootstrapPromise: Promise<RuntimeBootstrap> | null = null;
+let recoveryPromise: Promise<RuntimeBootstrap> | null = null;
 
 function isLoopbackOrigin(value: string): boolean {
   try {
@@ -58,6 +59,19 @@ export function validateNativeRuntimeConfig(
   };
 }
 
+async function configureNativeRuntime(): Promise<RuntimeBootstrap> {
+  try {
+    // Rust's get_runtime_config is intentionally an ensure operation: if the
+    // packaged gateway child died it restarts it and returns the new port/token.
+    const nativeConfig = await invoke<NativeRuntimeConfig>('get_runtime_config');
+    const validated = validateNativeRuntimeConfig(nativeConfig);
+    configureApiRuntime(validated);
+    return { status: 'ready', mode: 'native', origin: validated.origin };
+  } catch (error) {
+    return { status: 'failed', mode: 'native', error: runtimeBootstrapErrorMessage(error) };
+  }
+}
+
 export function initializeRuntime(): Promise<RuntimeBootstrap> {
   if (bootstrapPromise) return bootstrapPromise;
   const pending: Promise<RuntimeBootstrap> = (async (): Promise<RuntimeBootstrap> => {
@@ -65,15 +79,7 @@ export function initializeRuntime(): Promise<RuntimeBootstrap> {
       configureApiRuntime({ origin: browserOrigin, runtimeToken: null });
       return { status: 'ready', mode: 'browser', origin: browserOrigin };
     }
-
-    try {
-      const nativeConfig = await invoke<NativeRuntimeConfig>('get_runtime_config');
-      const validated = validateNativeRuntimeConfig(nativeConfig);
-      configureApiRuntime(validated);
-      return { status: 'ready', mode: 'native', origin: validated.origin };
-    } catch (error) {
-      return { status: 'failed', mode: 'native', error: runtimeBootstrapErrorMessage(error) };
-    }
+    return configureNativeRuntime();
   })();
   const configured = pending.then((result) => {
     if (result.status === 'failed') bootstrapPromise = null;
@@ -84,4 +90,21 @@ export function initializeRuntime(): Promise<RuntimeBootstrap> {
   });
   bootstrapPromise = configured;
   return configured;
+}
+
+/** Re-resolve the native runtime after a failed health probe. */
+export function recoverRuntimeConnection(): Promise<RuntimeBootstrap> {
+  if (recoveryPromise) return recoveryPromise;
+  if (!isTauriRuntime()) {
+    configureApiRuntime({ origin: browserOrigin, runtimeToken: null });
+    return Promise.resolve({ status: 'ready', mode: 'browser', origin: browserOrigin });
+  }
+
+  recoveryPromise = configureNativeRuntime().then((result) => {
+    if (result.status === 'ready') bootstrapPromise = Promise.resolve(result);
+    return result;
+  }).finally(() => {
+    recoveryPromise = null;
+  });
+  return recoveryPromise;
 }
