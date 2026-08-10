@@ -35,6 +35,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "resources": {
       "target/runtime/": "runtime/"
     },
