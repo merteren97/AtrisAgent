@@ -20,6 +20,7 @@ import { AgentsView } from '@/components/agents/AgentsView';
 import { ProjectsView } from '@/components/projects/ProjectsView';
 import { CommandPalette } from '@/components/search/CommandPalette';
 import { DeveloperConsole } from '@/components/developer/DeveloperConsole';
+import { UpdateManager } from '@/components/update/UpdateManager';
 import { useAccountStore } from '@/stores/account-store';
 import { AuthSessionProvider, useAuthSession } from '@/lib/auth-session';
 import { LoginView } from '@/components/auth/login-view';
@@ -132,14 +133,17 @@ export default function App({ runtime }: { runtime: RuntimeBootstrap }) {
     });
   }, [closeBehavior]);
 
-  if (runtime.status === 'failed') return <RuntimeStartupFailure error={runtime.error} />;
-
   return (
     <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
       <TooltipProvider>
-        <AuthSessionProvider>
-          <WorkspaceApp />
-        </AuthSessionProvider>
+        <UpdateManager />
+        {runtime.status === 'failed' ? (
+          <RuntimeStartupFailure error={runtime.error} />
+        ) : (
+          <AuthSessionProvider>
+            <WorkspaceApp />
+          </AuthSessionProvider>
+        )}
       </TooltipProvider>
     </ThemeProvider>
   );
