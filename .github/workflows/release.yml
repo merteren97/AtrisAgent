@@ -125,6 +125,18 @@ jobs:
       - name: Smoke packaged runtime sidecar
         run: npm run test:runtime-sidecar -w @atris-agent-code/desktop
 
+      - name: Smoke Windows installed-layout runtime
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          $sourceRuntime = (Resolve-Path 'apps/desktop/src-tauri/target/runtime').Path
+          $installedRoot = Join-Path $env:RUNNER_TEMP 'Atris Agent Installed Layout'
+          $installedRuntime = Join-Path $installedRoot 'runtime'
+          Remove-Item $installedRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $installedRuntime -Force | Out-Null
+          Copy-Item -Path (Join-Path $sourceRuntime '*') -Destination $installedRuntime -Recurse -Force
+          npm run test:runtime-sidecar -w @atris-agent-code/desktop -- --runtime-dir "$installedRuntime"
+
       - name: Test Tauri runtime launcher
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --target "${{ matrix.rustTarget }}"
 
