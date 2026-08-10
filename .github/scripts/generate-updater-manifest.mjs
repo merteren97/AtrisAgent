@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 function walk(directory) {
   const entries = [];
@@ -71,7 +72,9 @@ export function generateUpdaterManifest({ directory, repository, tag, publishedA
   };
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
+const currentFile = fileURLToPath(import.meta.url);
+const invokedFile = process.argv[1] ? path.resolve(process.argv[1]) : '';
+if (invokedFile === currentFile) {
   const [directory, repository, tag] = process.argv.slice(2);
   if (!directory || !repository || !tag) {
     console.error('Usage: node generate-updater-manifest.mjs <release-assets-dir> <owner/repo> <vX.Y.Z>');
