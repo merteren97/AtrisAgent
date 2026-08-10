@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { AppShell } from '@/components/layout/app-shell';
 import { Sidebar } from '@/components/layout/sidebar';
@@ -23,6 +24,7 @@ import { useAccountStore } from '@/stores/account-store';
 import { AuthSessionProvider, useAuthSession } from '@/lib/auth-session';
 import { LoginView } from '@/components/auth/login-view';
 import { AccessGate } from '@/components/auth/access-gate';
+import { isTauriRuntime } from '@/lib/secure-storage';
 import { Loader2 } from 'lucide-react';
 import type { RuntimeBootstrap } from '@/lib/runtime-config';
 
@@ -121,6 +123,15 @@ function RuntimeStartupFailure({ error }: { error: string }) {
 }
 
 export default function App({ runtime }: { runtime: RuntimeBootstrap }) {
+  const closeBehavior = useSettingsStore((state) => state.closeBehavior);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void invoke('set_close_behavior', { behavior: closeBehavior }).catch((error) => {
+      console.error('[AtrisAgent] Could not synchronize close behavior with the native shell.', error);
+    });
+  }, [closeBehavior]);
+
   if (runtime.status === 'failed') return <RuntimeStartupFailure error={runtime.error} />;
 
   return (
