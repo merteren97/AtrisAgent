@@ -90,3 +90,13 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /permissions:\s*\n\s*contents:\s*write/, "release publishing requires narrowly-scoped contents write permission");
   assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
 });
+
+test("Tauri packages the complete runtime directory into a stable resource path", () => {
+  const configPath = path.join(repositoryRoot, "apps", "desktop", "src-tauri", "tauri.conf.json");
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.deepEqual(
+    config.bundle?.resources,
+    { "target/runtime/": "runtime/" },
+    "the staged runtime directory must be copied recursively to $RESOURCE/runtime",
+  );
+});
