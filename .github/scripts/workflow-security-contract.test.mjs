@@ -91,11 +91,35 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
 });
 
-test("release publishing requires signed updater artifacts and a stable GitHub manifest", () => {
+test("release publishing requires a complete signed Tauri updater configuration", () => {
   const release = readWorkflow("release.yml");
+  const updaterConfigGenerator = fs.readFileSync(
+    path.join(scriptsDirectory, "create-updater-build-config.mjs"),
+    "utf8",
+  );
+
   assert.match(release, /TAURI_SIGNING_PRIVATE_KEY/, "release builds must require the private updater signing key");
-  assert.match(release, /TAURI_UPDATER_PUBLIC_KEY/, "release builds must embed the matching updater public key");
-  assert.match(release, /createUpdaterArtifacts\\?\"?:true/, "release builds must explicitly enable updater artifact generation");
+  assert.match(release, /TAURI_UPDATER_PUBLIC_KEY/, "release builds must require the matching updater public key");
+  assert.match(
+    release,
+    /create-updater-build-config\.mjs/,
+    "release builds must generate a complete release-only Tauri updater config",
+  );
+  assert.match(
+    release,
+    /--config src-tauri\/tauri\.release\.conf\.json/,
+    "release bundling must consume the generated updater config instead of an incomplete inline override",
+  );
+  assert.match(updaterConfigGenerator, /createUpdaterArtifacts:\s*true/, "updater artifacts must be explicitly enabled");
+  assert.match(updaterConfigGenerator, /plugins:\s*\{/, "release updater config must define Tauri plugins");
+  assert.match(updaterConfigGenerator, /updater:\s*\{/, "release updater config must define plugins.updater");
+  assert.match(updaterConfigGenerator, /pubkey:\s*normalizedPublicKey/, "release updater config must inject the trusted public key");
+  assert.match(updaterConfigGenerator, /endpoints:\s*\[UPDATER_ENDPOINT\]/, "release updater config must pin the stable manifest endpoint");
+  assert.doesNotMatch(
+    updaterConfigGenerator,
+    /TAURI_SIGNING_PRIVATE_KEY/,
+    "the release config generator must never serialize the private signing key",
+  );
   assert.match(release, /generate-updater-manifest\.mjs/, "stable releases must generate the updater manifest");
   assert.match(release, /latest\.json/, "stable releases must publish the static GitHub updater manifest");
   assert.match(release, /\.sig/, "release artifacts must include updater signatures");
