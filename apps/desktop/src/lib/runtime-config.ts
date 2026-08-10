@@ -28,8 +28,13 @@ function isLoopbackOrigin(value: string): boolean {
   }
 }
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) return error.message;
+export function runtimeBootstrapErrorMessage(error: unknown): string {
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+  }
   return 'The local AtrisAgent runtime could not be started.';
 }
 
@@ -67,7 +72,7 @@ export function initializeRuntime(): Promise<RuntimeBootstrap> {
       configureApiRuntime(validated);
       return { status: 'ready', mode: 'native', origin: validated.origin };
     } catch (error) {
-      return { status: 'failed', mode: 'native', error: errorMessage(error) };
+      return { status: 'failed', mode: 'native', error: runtimeBootstrapErrorMessage(error) };
     }
   })();
   const configured = pending.then((result) => {
