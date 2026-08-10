@@ -8,7 +8,7 @@
   "scripts": {
     "start": "tsx src/entry.ts",
     "dev": "tsx src/entry.ts",
-    "test": "npx tsx src/api-gateway.test.ts && npx tsx src/auth.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/entry-auth.test.ts && npx tsx src/runtime-protocol.test.ts && npx tsx src/runtime-lifecycle.test.ts",
+    "test": "npx tsx src/api-gateway.test.ts && npx tsx src/auth.test.ts && npx tsx src/auth-avatar.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/entry-auth.test.ts && npx tsx src/runtime-protocol.test.ts && npx tsx src/runtime-lifecycle.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -28,7 +28,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
-    "@types/cors": "^2.8.17",
+    "@types/cors": "^8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.14",
