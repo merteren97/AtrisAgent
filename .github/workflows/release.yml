@@ -125,6 +125,9 @@ jobs:
       - name: Smoke packaged runtime sidecar
         run: npm run test:runtime-sidecar -w @atris-agent-code/desktop
 
+      - name: Test Tauri runtime launcher
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --target "${{ matrix.rustTarget }}"
+
       - name: Build desktop packages
         run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}"
 

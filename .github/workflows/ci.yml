@@ -57,12 +57,14 @@ jobs:
           - os: windows-latest
             platform: windows-x86_64
             rustTarget: x86_64-pc-windows-msvc
+            smokeBundle: nsis
           - os: ubuntu-22.04
             platform: linux-x86_64
             rustTarget: x86_64-unknown-linux-gnu
+            smokeBundle: deb
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -108,8 +110,14 @@ jobs:
       - name: Smoke packaged runtime sidecar
         run: npm run test:runtime-sidecar -w @atris-agent-code/desktop
 
-      - name: Check Tauri Rust shell
-        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --target "${{ matrix.rustTarget }}"
+      - name: Test Tauri runtime launcher
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --target "${{ matrix.rustTarget }}"
+
+      - name: Check release-mode Tauri runtime launcher
+        run: cargo check --release --manifest-path apps/desktop/src-tauri/Cargo.toml --target "${{ matrix.rustTarget }}"
+
+      - name: Build representative packaged desktop bundle
+        run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.smokeBundle }}"
 
       - name: Typecheck runtime host
         run: npm run typecheck -w @atris-agent-code/runtime-host

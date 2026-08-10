@@ -2,11 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +16,8 @@ use tauri::{AppHandle, Manager};
 pub const READY_PREFIX: &str = "ATRIS_RUNTIME_READY ";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_DIAGNOSTIC_LINES: usize = 24;
+const MAX_DIAGNOSTIC_LINE_CHARS: usize = 512;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +48,8 @@ pub struct RuntimePaths {
     pub gateway: PathBuf,
     pub bridge: PathBuf,
 }
+
+type DiagnosticBuffer = Arc<Mutex<VecDeque<String>>>;
 
 pub struct RuntimeState {
     child: Mutex<Option<Child>>,
@@ -162,7 +167,6 @@ impl RuntimeState {
 
     pub fn shutdown(&self) {
         let config = self.config.lock().ok().and_then(|state| state.clone());
-        #[cfg(windows)]
         if let Some(config) = config.as_ref() {
             request_runtime_shutdown(config);
         }
@@ -189,8 +193,7 @@ impl RuntimeState {
             }
         }
         if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child);
         }
         #[cfg(windows)]
         {
@@ -200,31 +203,22 @@ impl RuntimeState {
 
     #[cfg(not(debug_assertions))]
     fn start_release(&self, app: &AppHandle) -> Result<(), String> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = app;
-            return Err("The packaged AtrisAgent runtime is currently Windows-only.".to_string());
+            return Err(
+                "The packaged AtrisAgent runtime is not supported on this operating system yet."
+                    .to_string(),
+            );
         }
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            use std::os::windows::process::CommandExt;
-
             self.shutdown();
             let resource_dir = app.path().resource_dir().map_err(|error| {
                 format!("Could not resolve packaged runtime resources: {error}")
             })?;
-            let paths = runtime_paths(&resource_dir);
-            for (path, label) in [
-                (&paths.node, "Packaged Node executable"),
-                (&paths.gateway, "Packaged API gateway bundle"),
-                (&paths.bridge, "Packaged control-plane bridge"),
-            ] {
-                if !path.is_file() {
-                    return Err(format!("{label} is missing: {}", path.display()));
-                }
-            }
-
+            let paths = resolve_runtime_paths(&resource_dir)?;
             let data_dir = runtime_data_dir()?;
             fs::create_dir_all(&data_dir)
                 .map_err(|error| format!("Could not create AtrisAgent data directory: {error}"))?;
@@ -242,63 +236,95 @@ impl RuntimeState {
                 .env("ATRIS_AGENT_VERSION", APP_VERSION)
                 .env("NODE_ENV", "production")
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .creation_flags(0x08000000);
+                .stderr(Stdio::piped());
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
 
             let mut child = command.spawn().map_err(|error| {
-                format!("Could not start the packaged AtrisAgent runtime: {error}")
+                format!(
+                    "Could not start the packaged AtrisAgent runtime from {}: {error}",
+                    paths.node.display()
+                )
             })?;
-            let job = match create_process_job(&child) {
-                Ok(job) => job,
-                Err(error) => {
+
+            #[cfg(windows)]
+            {
+                let job = match create_process_job(&child) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        terminate_child(&mut child);
+                        return Err(error);
+                    }
+                };
+                if let Ok(mut job_state) = self.job.lock() {
+                    *job_state = job;
+                } else {
                     terminate_child(&mut child);
-                    return Err(error);
+                    return Err("Could not retain the packaged runtime job state.".to_string());
+                }
+            }
+
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    terminate_child(&mut child);
+                    return Err("Packaged runtime stdout was not available.".to_string());
                 }
             };
-            if let Ok(mut job_state) = self.job.lock() {
-                *job_state = Some(job);
-            } else {
-                terminate_child(&mut child);
-                return Err("Could not retain the packaged runtime job state.".to_string());
-            }
-            let stdout = child
-                .stdout
+            let diagnostics = child
+                .stderr
                 .take()
-                .ok_or_else(|| "Packaged runtime stdout was not available.".to_string())?;
-            if let Some(stderr) = child.stderr.take() {
-                drain_stream(stderr);
-            }
+                .map(capture_diagnostics)
+                .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
 
             let receiver = wait_for_ready_line(stdout);
             let ready_line = match receiver.recv_timeout(READY_TIMEOUT) {
                 Ok(Ok(line)) => line,
                 Ok(Err(error)) => {
                     terminate_child(&mut child);
-                    return Err(error);
+                    return Err(startup_error_with_diagnostics(
+                        &error,
+                        &diagnostics,
+                        &runtime_token,
+                    ));
                 }
                 Err(_) => {
                     terminate_child(&mut child);
-                    return Err("The packaged AtrisAgent runtime did not become ready before the startup timeout.".to_string());
+                    return Err(startup_error_with_diagnostics(
+                        "The packaged AtrisAgent runtime did not become ready before the startup timeout.",
+                        &diagnostics,
+                        &runtime_token,
+                    ));
                 }
             };
             let ready = match parse_ready_line(&ready_line) {
                 Ok(ready) => ready,
                 Err(error) => {
                     terminate_child(&mut child);
-                    return Err(error);
+                    return Err(startup_error_with_diagnostics(
+                        &error,
+                        &diagnostics,
+                        &runtime_token,
+                    ));
                 }
             };
-            if child
-                .try_wait()
-                .map_err(|error| {
-                    format!("Could not inspect the packaged runtime process: {error}")
-                })?
-                .is_some()
-            {
-                return Err(
-                    "The packaged AtrisAgent runtime exited immediately after becoming ready."
-                        .to_string(),
-                );
+            match child.try_wait().map_err(|error| {
+                format!("Could not inspect the packaged runtime process: {error}")
+            })? {
+                Some(status) => {
+                    return Err(startup_error_with_diagnostics(
+                        &format!(
+                            "The packaged AtrisAgent runtime exited immediately after becoming ready ({status})."
+                        ),
+                        &diagnostics,
+                        &runtime_token,
+                    ));
+                }
+                None => {}
             }
 
             if let Ok(mut child_state) = self.child.lock() {
@@ -331,6 +357,58 @@ pub fn runtime_paths(resource_dir: &Path) -> RuntimePaths {
         bridge: runtime_dir.join("control-plane-bridge.mjs"),
         runtime_dir,
     }
+}
+
+fn runtime_paths_complete(paths: &RuntimePaths) -> bool {
+    paths.node.is_file() && paths.gateway.is_file() && paths.bridge.is_file()
+}
+
+fn missing_runtime_resources(paths: &RuntimePaths) -> Vec<String> {
+    [
+        (&paths.node, "Node executable"),
+        (&paths.gateway, "API gateway bundle"),
+        (&paths.bridge, "control-plane bridge"),
+    ]
+    .into_iter()
+    .filter_map(|(path, label)| {
+        (!path.is_file()).then(|| format!("{label}: {}", path.display()))
+    })
+    .collect()
+}
+
+fn local_target_root(resource_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(resource_dir);
+    for _ in 0..=3 {
+        let directory = current?;
+        if directory.file_name().and_then(|value| value.to_str()) == Some("target") {
+            return Some(directory.to_path_buf());
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+pub fn resolve_runtime_paths(resource_dir: &Path) -> Result<RuntimePaths, String> {
+    let primary = runtime_paths(resource_dir);
+    if runtime_paths_complete(&primary) {
+        return Ok(primary);
+    }
+
+    // `tauri build` places the raw executable under target/.../release while
+    // beforeBuildCommand stages the runtime under target/runtime. Installed
+    // bundles still resolve through the primary Tauri resource directory.
+    if let Some(target_root) = local_target_root(resource_dir) {
+        let local_build = runtime_paths(&target_root);
+        if runtime_paths_complete(&local_build) {
+            return Ok(local_build);
+        }
+    }
+
+    let missing = missing_runtime_resources(&primary).join("; ");
+    Err(format!(
+        "Packaged runtime resources are incomplete under {}. Missing: {missing}",
+        primary.runtime_dir.display()
+    ))
 }
 
 pub fn parse_ready_line(line: &str) -> Result<ReadyInfo, String> {
@@ -440,13 +518,72 @@ where
     receiver
 }
 
-fn drain_stream<R>(mut stream: R)
+fn capture_diagnostics<R>(stderr: R) -> DiagnosticBuffer
 where
     R: Read + Send + 'static,
 {
+    let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
+    let writer = diagnostics.clone();
     thread::spawn(move || {
-        let _ = io::copy(&mut stream, &mut io::sink());
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let compact = line.trim();
+            if compact.is_empty() {
+                continue;
+            }
+            let bounded: String = compact.chars().take(MAX_DIAGNOSTIC_LINE_CHARS).collect();
+            if let Ok(mut buffer) = writer.lock() {
+                if buffer.len() >= MAX_DIAGNOSTIC_LINES {
+                    buffer.pop_front();
+                }
+                buffer.push_back(bounded);
+            }
+        }
     });
+    diagnostics
+}
+
+fn sanitize_diagnostic_line(line: &str, runtime_token: &str) -> String {
+    let line = line.replace(runtime_token, "[runtime-token-redacted]");
+    let normalized = line.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "password=",
+        "password:",
+        "api_key=",
+        "apikey=",
+        "secret=",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return "[sensitive runtime diagnostic redacted]".to_string();
+    }
+    line
+}
+
+fn startup_error_with_diagnostics(
+    base: &str,
+    diagnostics: &DiagnosticBuffer,
+    runtime_token: &str,
+) -> String {
+    // Give the stderr reader a brief chance to consume a final line after an
+    // early child-process exit without extending the normal startup timeout.
+    thread::sleep(Duration::from_millis(20));
+    let lines = diagnostics
+        .lock()
+        .ok()
+        .map(|buffer| {
+            buffer
+                .iter()
+                .map(|line| sanitize_diagnostic_line(line, runtime_token))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if lines.is_empty() {
+        return base.to_string();
+    }
+    format!("{base} Runtime diagnostic: {}", lines.join(" | "))
 }
 
 fn terminate_child(child: &mut Child) {
@@ -472,13 +609,27 @@ impl Drop for JobHandle {
 }
 
 #[cfg(windows)]
-fn create_process_job(child: &Child) -> Result<JobHandle, String> {
+fn create_process_job(child: &Child) -> Result<Option<JobHandle>, String> {
     use std::{mem, os::windows::io::AsRawHandle, ptr};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
+
+    let process_handle = child.as_raw_handle() as _;
+    let mut already_in_job = 0;
+    let inspected = unsafe { IsProcessInJob(process_handle, ptr::null_mut(), &mut already_in_job) };
+    if inspected == 0 {
+        return Err("Could not inspect the packaged runtime job membership.".to_string());
+    }
+    if already_in_job != 0 {
+        // Some shells, IDEs and enterprise launchers already place descendants
+        // in a Windows job. The gateway also has a parent-PID watchdog, so a
+        // nested assignment is unnecessary and may be rejected by Windows.
+        return Ok(None);
+    }
+
     let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     if job.is_null() {
         return Err("Could not create the packaged runtime job object.".to_string());
@@ -497,15 +648,14 @@ fn create_process_job(child: &Child) -> Result<JobHandle, String> {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         return Err("Could not configure the packaged runtime job object.".to_string());
     }
-    let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) != 0 };
+    let assigned = unsafe { AssignProcessToJobObject(job, process_handle) != 0 };
     if !assigned {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         return Err("Could not attach the packaged runtime to its job object.".to_string());
     }
-    Ok(JobHandle(job))
+    Ok(Some(JobHandle(job)))
 }
 
-#[cfg(windows)]
 fn request_runtime_shutdown(config: &RuntimeConfig) {
     let Some(token) = config.runtime_token.as_deref() else {
         return;
@@ -550,9 +700,22 @@ fn runtime_data_dir() -> Result<PathBuf, String> {
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn runtime_data_dir() -> Result<PathBuf, String> {
-    Err("The packaged AtrisAgent runtime is currently Windows-only.".to_string())
+    if let Some(configured) = std::env::var_os("ATRIS_AGENT_DATA_DIR") {
+        return validate_explicit_data_dir(Some(Path::new(&configured)))
+            .map(|path| path.expect("configured data dir was present"));
+    }
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    select_unix_runtime_data_dir(home.as_deref(), xdg_data_home.as_deref())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn runtime_data_dir() -> Result<PathBuf, String> {
+    Err("The packaged AtrisAgent runtime data directory is not supported on this operating system yet.".to_string())
 }
 
 fn select_runtime_data_dir(local_app_data: &Path, legacy_app_data: Option<&Path>) -> PathBuf {
@@ -568,6 +731,19 @@ fn select_runtime_data_dir(local_app_data: &Path, legacy_app_data: Option<&Path>
     local_dir
 }
 
+fn select_unix_runtime_data_dir(
+    home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(xdg_data_home) = xdg_data_home.filter(|path| path.is_absolute()) {
+        return Ok(xdg_data_home.join("AtrisAgent"));
+    }
+    let home = home
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "HOME is not available for the AtrisAgent runtime.".to_string())?;
+    Ok(home.join(".local").join("share").join("AtrisAgent"))
+}
+
 fn validate_explicit_data_dir(path: Option<&Path>) -> Result<Option<PathBuf>, String> {
     let Some(path) = path else {
         return Ok(None);
@@ -578,7 +754,6 @@ fn validate_explicit_data_dir(path: Option<&Path>) -> Result<Option<PathBuf>, St
     Ok(Some(path.to_path_buf()))
 }
 
-#[cfg(windows)]
 fn random_runtime_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes)
@@ -589,13 +764,26 @@ fn random_runtime_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_semver, parse_ready_line, runtime_paths, select_runtime_data_dir,
+        is_semver, parse_ready_line, resolve_runtime_paths, runtime_paths,
+        sanitize_diagnostic_line, select_runtime_data_dir, select_unix_runtime_data_dir,
         validate_explicit_data_dir, READY_PREFIX,
     };
     use std::{
         fs,
         path::{Path, PathBuf},
     };
+
+    fn create_runtime_files(root: &Path) {
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime directory");
+        fs::write(
+            runtime.join(if cfg!(windows) { "node.exe" } else { "node" }),
+            b"node",
+        )
+        .expect("node runtime");
+        fs::write(runtime.join("gateway.cjs"), b"gateway").expect("gateway");
+        fs::write(runtime.join("control-plane-bridge.mjs"), b"bridge").expect("bridge");
+    }
 
     #[test]
     fn parses_only_loopback_ready_payloads() {
@@ -639,6 +827,49 @@ mod tests {
     }
 
     #[test]
+    fn resolves_installed_resources_before_local_build_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "atris-runtime-resource-test-{}-primary",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        create_runtime_files(&root);
+        let resolved = resolve_runtime_paths(&root).expect("installed runtime resources");
+        assert_eq!(resolved.runtime_dir, root.join("runtime"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_raw_tauri_release_from_target_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "atris-runtime-resource-test-{}-raw",
+            std::process::id()
+        ));
+        let target = root.join("target");
+        let raw_release = target.join("x86_64-test-target").join("release");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&raw_release).expect("raw release directory");
+        create_runtime_files(&target);
+        let resolved = resolve_runtime_paths(&raw_release).expect("raw build runtime fallback");
+        assert_eq!(resolved.runtime_dir, target.join("runtime"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_incomplete_packaged_resources_with_actionable_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "atris-runtime-resource-test-{}-missing",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("resource directory");
+        let error = resolve_runtime_paths(&root).expect_err("incomplete resources must fail");
+        assert!(error.contains("Packaged runtime resources are incomplete"));
+        assert!(error.contains("gateway.cjs"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn prefers_existing_local_db_then_legacy_db_then_local_default() {
         let root =
             std::env::temp_dir().join(format!("atris-runtime-data-test-{}", std::process::id()));
@@ -665,6 +896,22 @@ mod tests {
     }
 
     #[test]
+    fn selects_xdg_or_home_linux_data_directory() {
+        let root = std::env::temp_dir().join("atris-linux-data-test");
+        let xdg = root.join("xdg");
+        let home = root.join("home");
+        assert_eq!(
+            select_unix_runtime_data_dir(Some(&home), Some(&xdg)).expect("xdg path"),
+            xdg.join("AtrisAgent")
+        );
+        assert_eq!(
+            select_unix_runtime_data_dir(Some(&home), None).expect("home path"),
+            home.join(".local").join("share").join("AtrisAgent")
+        );
+        assert!(select_unix_runtime_data_dir(None, None).is_err());
+    }
+
+    #[test]
     fn accepts_only_non_empty_absolute_explicit_data_dirs() {
         let absolute = std::env::temp_dir().join("atris-agent-explicit-data");
         assert_eq!(
@@ -674,5 +921,18 @@ mod tests {
         assert!(validate_explicit_data_dir(Some(Path::new("relative-data"))).is_err());
         assert!(validate_explicit_data_dir(Some(Path::new(""))).is_err());
         assert_eq!(validate_explicit_data_dir(None).expect("unset path"), None);
+    }
+
+    #[test]
+    fn runtime_diagnostics_redact_transport_and_secret_values() {
+        let token = "runtime-token-value";
+        assert_eq!(
+            sanitize_diagnostic_line("failed runtime-token-value", token),
+            "failed [runtime-token-redacted]"
+        );
+        assert_eq!(
+            sanitize_diagnostic_line("password=do-not-print", token),
+            "[sensitive runtime diagnostic redacted]"
+        );
     }
 }
