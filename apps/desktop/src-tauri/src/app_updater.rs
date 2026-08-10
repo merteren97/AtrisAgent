@@ -78,10 +78,13 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 #[tauri::command]
-pub fn get_update_runtime_info() -> UpdateRuntimeInfo {
+pub fn get_update_runtime_info(app: AppHandle) -> UpdateRuntimeInfo {
     UpdateRuntimeInfo {
         configured: updater_public_key().is_some(),
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The Tauri package version is the updater's source of truth. Release
+        // builds rewrite this surface before packaging, so the UI always shows
+        // the exact installed version instead of the repository's dev version.
+        current_version: app.package_info().version.to_string(),
         endpoint: UPDATE_ENDPOINT,
     }
 }
