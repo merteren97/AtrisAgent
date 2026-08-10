@@ -46,6 +46,9 @@ Thumbs.db
 .atris-baseline/
 .atris-worktrees/
 
+# Release-only Tauri config generated from GitHub Actions updater settings.
+apps/desktop/src-tauri/tauri.release.conf.json
+
 # Local developer state and legacy checkout artifacts. Keep canonical tracked docs visible.
 .mertcode/
 .npm-cache/

@@ -46,7 +46,7 @@ jobs:
         run: npm run typecheck -w @atris-agent-code/landing && npm run build:landing
 
       - name: Validate release and workflow security contracts
-        run: node --test .github/scripts/workflow-security-contract.test.mjs .github/scripts/generate-updater-manifest.test.mjs
+        run: node --test .github/scripts/workflow-security-contract.test.mjs .github/scripts/generate-updater-manifest.test.mjs .github/scripts/create-updater-build-config.test.mjs
 
   native-runtime-regression:
     name: Native runtime regression (${{ matrix.platform }})

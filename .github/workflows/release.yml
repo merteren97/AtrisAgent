@@ -129,6 +129,24 @@ jobs:
           if (tauri !== expected) throw new Error(`tauri version ${tauri} != ${expected}`);
           NODE
 
+      - name: Create release-only updater bundler config
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/create-updater-build-config.mjs apps/desktop/src-tauri/tauri.release.conf.json
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const config = JSON.parse(fs.readFileSync('apps/desktop/src-tauri/tauri.release.conf.json', 'utf8'));
+          if (config.bundle?.createUpdaterArtifacts !== true) throw new Error('Updater artifacts are not enabled.');
+          if (!config.plugins?.updater?.pubkey) throw new Error('Updater public key is missing from the Tauri release config.');
+          if (!Array.isArray(config.plugins?.updater?.endpoints) || config.plugins.updater.endpoints.length !== 1) {
+            throw new Error('Updater endpoint is missing from the Tauri release config.');
+          }
+          console.log('Release-only Tauri updater configuration validated.');
+          NODE
+
       - name: Stage packaged runtime sidecar
         run: npm run build:runtime-sidecar -w @atris-agent-code/desktop
 
@@ -155,7 +173,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
-        run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}" --config '{"bundle":{"createUpdaterArtifacts":true}}'
+        run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}" --config src-tauri/tauri.release.conf.json
 
       - name: Upload release artifacts
         # v7 (reviewed immutable commit)
