@@ -72,3 +72,21 @@ test("CodeQL skips private repositories until code scanning is enabled", () => {
     "codeql.yml must run only after the repository is public",
   );
 });
+
+test("release publishing stays owner-controlled and requires both desktop platforms", () => {
+  const release = readWorkflow("release.yml");
+
+  assert.match(release, /workflow_dispatch:/, "release.yml must remain an explicit manual release workflow");
+  assert.doesNotMatch(release, /push:\s*\n\s*tags:/, "release.yml must not publish automatically from a pushed tag");
+  assert.match(release, /github\.repository == 'merteren97\/AtrisAgent'/, "release.yml must be repository-scoped");
+  assert.match(release, /github\.actor == 'merteren97'/, "release.yml must be owner-triggered");
+  assert.match(release, /github\.triggering_actor == 'merteren97'/, "release.yml must reject reruns by another actor");
+  assert.match(release, /github\.ref == 'refs\/heads\/main'/, "release.yml must publish only from main");
+  assert.match(release, /windows-latest/, "release.yml must build the Windows desktop package");
+  assert.match(release, /ubuntu-22\.04/, "release.yml must build the Linux desktop package on the supported baseline");
+  assert.match(release, /bundles:\s*nsis,msi/, "release.yml must publish NSIS and MSI bundles");
+  assert.match(release, /bundles:\s*appimage,deb/, "release.yml must publish AppImage and Debian bundles");
+  assert.match(release, /needs:\s*build/, "release publishing must wait for every platform build");
+  assert.match(release, /permissions:\s*\n\s*contents:\s*write/, "release publishing requires narrowly-scoped contents write permission");
+  assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
+});
