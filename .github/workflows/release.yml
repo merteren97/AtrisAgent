@@ -1,54 +1,55 @@
-name: AtrisAgentCode Desktop Staging
+name: Release AtrisAgent Desktop
+run-name: Release AtrisAgent ${{ inputs.release_version }}
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      version:
-        description: Release version, for example v0.2.0
+      release_version:
+        description: "Enter only v0.2.1-1 (prerelease) or v0.2.1 (stable)"
         required: true
         type: string
-      ref:
-        description: Branch or commit to build
+      prerelease:
+        description: "Mark as prerelease"
         required: true
-        default: main
-        type: string
+        default: true
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: atris-agent-code-release-${{ github.ref }}
+  group: atris-agent-release-${{ inputs.release_version }}
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  RELEASE_TAG: ${{ inputs.release_version }}
+  MANUAL_PRERELEASE: ${{ inputs.prerelease }}
 
-# This workflow intentionally uploads unsigned staging artifacts only. They must
-# not be promoted as a release: the packaged API gateway/runtime audit and Tauri
-# updater signing/public-key decision are still blocking follow-ups.
 jobs:
   build:
-    name: Build ${{ matrix.platform }} staging artifacts
+    if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            platform: windows-x86_64
+            releaseTarget: windows-x86_64
+            rustTarget: x86_64-pc-windows-msvc
             bundles: nsis,msi
+          - os: ubuntu-22.04
+            releaseTarget: linux-x86_64
+            rustTarget: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
-      - name: Checkout exact repository ref
+      - name: Checkout exact main revision
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -61,19 +62,62 @@ jobs:
       - name: Setup Rust
         # stable ref verified 2026-08-09 (reviewed immutable commit)
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: ${{ matrix.rustTarget }}
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Restore Rust build cache
+        # v2.9.2 (reviewed immutable commit)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: "./apps/desktop/src-tauri -> target"
+          shared-key: release-${{ matrix.releaseTarget }}
+          cache-on-failure: true
 
-      - name: Apply release version surfaces
-        shell: bash
-        run: node .github/scripts/apply-release-version.mjs "${RELEASE_TAG}"
-
-      - name: Verify source version
+      - name: Install Linux desktop dependencies
+        if: startsWith(matrix.os, 'ubuntu')
         shell: bash
         run: |
           set -euo pipefail
-          node -e 'const p=require("./package.json"); const v=process.env.RELEASE_TAG.replace(/^v/i, ""); if(p.version!==v) throw new Error(`root version ${p.version} != ${v}`);'
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libsecret-1-dev \
+            libxdo-dev \
+            libxkbcommon-dev
+
+      - name: Install dependencies
+        run: npm ci --include=dev --include=optional --prefer-offline --no-audit --no-fund
+
+      - name: Validate requested release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "Unsupported release tag: $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Apply release version surfaces
+        shell: bash
+        run: node .github/scripts/apply-release-version.mjs "$RELEASE_TAG"
+
+      - name: Verify source version surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const expected = process.env.RELEASE_TAG.replace(/^v/i, '');
+          const root = require('./package.json').version;
+          const desktop = require('./apps/desktop/package.json').version;
+          const tauri = JSON.parse(fs.readFileSync('./apps/desktop/src-tauri/tauri.conf.json', 'utf8')).version;
+          if (root !== expected) throw new Error(`root version ${root} != ${expected}`);
+          if (desktop !== expected) throw new Error(`desktop version ${desktop} != ${expected}`);
+          if (tauri !== expected) throw new Error(`tauri version ${tauri} != ${expected}`);
+          NODE
 
       - name: Stage packaged runtime sidecar
         run: npm run build:runtime-sidecar -w @atris-agent-code/desktop
@@ -81,16 +125,79 @@ jobs:
       - name: Smoke packaged runtime sidecar
         run: npm run test:runtime-sidecar -w @atris-agent-code/desktop
 
-      - name: Build unsigned Tauri staging bundle
-        run: npm run tauri:build -w @atris-agent-code/desktop -- --bundles "${{ matrix.bundles }}"
+      - name: Build desktop packages
+        run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}"
 
-      - name: Upload staging artifacts for review only
-        # v4.6.2 (reviewed immutable commit)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - name: Upload release artifacts
+        # v7 (reviewed immutable commit)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: atris-agent-code-staging-${{ matrix.platform }}-${{ env.RELEASE_TAG }}
+          name: atris-agent-${{ matrix.releaseTarget }}-${{ env.RELEASE_TAG }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
+          compression-level: 0
           path: |
-            apps/desktop/src-tauri/target/release/bundle/**/*.exe
-            apps/desktop/src-tauri/target/release/bundle/**/*.msi
+            apps/desktop/src-tauri/target/**/release/bundle/**/*.exe
+            apps/desktop/src-tauri/target/**/release/bundle/**/*.msi
+            apps/desktop/src-tauri/target/**/release/bundle/**/*.AppImage
+            apps/desktop/src-tauri/target/**/release/bundle/**/*.deb
+            apps/desktop/src-tauri/target/**/release/bundle/**/*.sig
+
+  publish:
+    if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified build artifacts
+        # v8 (reviewed immutable commit)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Require Windows and Linux release packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$(find release-assets -type f \( -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
+          test -n "$(find release-assets -type f -iname '*.AppImage' -print -quit)"
+          test -n "$(find release-assets -type f -iname '*.deb' -print -quit)"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLAGS=()
+          if [[ "$MANUAL_PRERELEASE" == "true" || ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            FLAGS+=(--prerelease)
+          fi
+
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "AtrisAgent $RELEASE_TAG" \
+              --generate-notes \
+              "${FLAGS[@]}"
+          fi
+
+          mapfile -d '' RELEASE_ASSETS < <(find release-assets -type f -print0)
+          test "${#RELEASE_ASSETS[@]}" -gt 0
+          gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          grep -Eiq '\.(exe|msi)$' <<< "$ASSETS"
+          grep -Eiq '\.AppImage$' <<< "$ASSETS"
+          grep -Eiq '\.deb$' <<< "$ASSETS"
