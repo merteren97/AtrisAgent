@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
-import { useSettingsStore, type CloseBehavior } from '@/stores/settings-store';
+import { useSettingsStore, type CloseBehavior, type UpdateBehavior } from '@/stores/settings-store';
+import { useUpdateStore } from '@/stores/update-store';
 import { useLanguageStore } from '@/stores/language-store';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -7,7 +8,7 @@ import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { ThemeToggle } from '@/components/theme-toggle';
 import { ExecutionPolicyEditor } from './ExecutionPolicyEditor';
-import { Braces, KeyRound, Minimize2, MonitorCog, Power, ShieldCheck, Terminal } from 'lucide-react';
+import { Bell, Braces, Download, KeyRound, Loader2, Minimize2, MonitorCog, Power, RefreshCw, Rocket, ShieldCheck, Terminal } from 'lucide-react';
 
 const closeBehaviorOptions: Array<{
   value: CloseBehavior;
@@ -29,6 +30,39 @@ const closeBehaviorOptions: Array<{
   },
 ];
 
+const updateBehaviorOptions: Array<{
+  value: UpdateBehavior;
+  title: string;
+  description: string;
+  icon: typeof Bell;
+}> = [
+  {
+    value: 'notify',
+    title: 'Notify before installing',
+    description: 'Check GitHub Releases when AtrisAgent starts and let you decide when to download and install a new version.',
+    icon: Bell,
+  },
+  {
+    value: 'automatic',
+    title: 'Install automatically',
+    description: 'Check on startup and automatically download, verify and install a newer signed release when one is available.',
+    icon: Rocket,
+  },
+];
+
+function updateStatusLabel(status: ReturnType<typeof useUpdateStore.getState>['status']): string {
+  switch (status) {
+    case 'checking': return 'Checking…';
+    case 'available': return 'Update available';
+    case 'up-to-date': return 'Up to date';
+    case 'downloading': return 'Downloading…';
+    case 'installing': return 'Installing…';
+    case 'installed': return 'Installed';
+    case 'error': return 'Update error';
+    default: return 'Ready';
+  }
+}
+
 export function SettingsView() {
   const {
     telemetryOptIn,
@@ -40,8 +74,17 @@ export function SettingsView() {
     setTrustMode,
     closeBehavior,
     setCloseBehavior,
+    updateBehavior,
+    setUpdateBehavior,
   } = useSettingsStore();
   const { language, setLanguage } = useLanguageStore();
+  const updateRuntime = useUpdateStore((state) => state.runtime);
+  const updateStatus = useUpdateStore((state) => state.status);
+  const availableUpdate = useUpdateStore((state) => state.availableUpdate);
+  const updateError = useUpdateStore((state) => state.error);
+  const checkForUpdates = useUpdateStore((state) => state.checkForUpdates);
+  const installAvailableUpdate = useUpdateStore((state) => state.installAvailableUpdate);
+  const updateBusy = updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing';
 
   return (
     <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden bg-background p-4 sm:p-6">
@@ -49,7 +92,7 @@ export function SettingsView() {
         <header className="border-b border-border pb-5">
           <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-[0.18em] text-primary"><MonitorCog className="h-4 w-4" /> Application settings</div>
           <h1 className="text-2xl font-semibold tracking-tight">AtrisAgent preferences</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Control local privacy, application behavior, approval posture and role-specific runtime routing. Runtime accounts remain managed through verified CLI flows.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Control local privacy, application behavior, updates, approval posture and role-specific runtime routing. Runtime accounts remain managed through verified CLI flows.</p>
         </header>
 
         <Card>
@@ -91,6 +134,74 @@ export function SettingsView() {
                 </button>
               );
             })}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2 text-base"><RefreshCw className="h-4 w-4 text-primary" /> Application updates</CardTitle>
+                <CardDescription className="mt-1">Signed releases are checked from the official AtrisAgent GitHub Releases channel.</CardDescription>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="secondary">v{updateRuntime?.currentVersion || '—'}</Badge>
+                <Badge variant={updateStatus === 'error' ? 'destructive' : 'outline'}>{updateStatusLabel(updateStatus)}</Badge>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              {updateBehaviorOptions.map((option) => {
+                const Icon = option.icon;
+                const active = updateBehavior === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setUpdateBehavior(option.value)}
+                    className={`rounded-xl border p-4 text-left transition-colors ${active ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/30'}`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${active ? 'border-primary/30 bg-primary/10 text-primary' : 'border-border bg-muted/30 text-muted-foreground'}`}>
+                          <Icon className="h-4 w-4" aria-hidden="true" />
+                        </span>
+                        <span className="text-sm font-semibold">{option.title}</span>
+                      </div>
+                      {active && <Badge>Active</Badge>}
+                    </div>
+                    <p className="mt-3 text-xs leading-relaxed text-muted-foreground">{option.description}</p>
+                  </button>
+                );
+              })}
+            </div>
+
+            <SettingRow
+              title="Update channel"
+              description={updateRuntime?.configured
+                ? `Stable GitHub Releases · current ${updateRuntime.currentVersion}${availableUpdate ? ` · available ${availableUpdate.version}` : ''}`
+                : 'Updater signing is not configured in this development build. Signed release builds enable this automatically.'}
+            >
+              <div className="flex items-center gap-2">
+                <Button variant="outline" disabled={updateBusy || !updateRuntime?.configured} onClick={() => void checkForUpdates(true)}>
+                  {updateStatus === 'checking' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                  Check now
+                </Button>
+                {availableUpdate && updateStatus === 'available' ? (
+                  <Button onClick={() => void installAvailableUpdate()}>
+                    <Download className="mr-2 h-4 w-4" />Update to {availableUpdate.version}
+                  </Button>
+                ) : null}
+              </div>
+            </SettingRow>
+
+            {updateError ? (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-xs leading-relaxed text-destructive">
+                {updateError}
+              </div>
+            ) : null}
           </CardContent>
         </Card>
 
