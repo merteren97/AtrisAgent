@@ -5,6 +5,7 @@ export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' 
 export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate';
 export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' | 'checks' | 'artifacts' | 'activity';
 export type CloseBehavior = 'quit' | 'tray';
+export type UpdateBehavior = 'notify' | 'automatic';
 
 interface SettingsState {
   hasSeenOnboarding: boolean;
@@ -19,6 +20,7 @@ interface SettingsState {
   teamTemplate: string;
   trustMode: TrustMode;
   closeBehavior: CloseBehavior;
+  updateBehavior: UpdateBehavior;
   automationSettings: {
     fileWrite: boolean;
     gitCommit: boolean;
@@ -41,6 +43,7 @@ interface SettingsState {
   setTeamTemplate: (template: string) => void;
   setTrustMode: (mode: TrustMode) => void;
   setCloseBehavior: (behavior: CloseBehavior) => void;
+  setUpdateBehavior: (behavior: UpdateBehavior) => void;
   setAutomationSettings: (settings: Partial<SettingsState['automationSettings']>) => void;
   toggleSidebar: () => void;
   setSidebarWidth: (width: number) => void;
@@ -66,6 +69,7 @@ export const useSettingsStore = create<SettingsState>()(
       teamTemplate: 'default-core-dev-team',
       trustMode: 'Balanced',
       closeBehavior: 'quit',
+      updateBehavior: 'notify',
       automationSettings: {
         fileWrite: true,
         gitCommit: false,
@@ -88,6 +92,7 @@ export const useSettingsStore = create<SettingsState>()(
       setTeamTemplate: (template) => set({ teamTemplate: template }),
       setTrustMode: (mode) => set({ trustMode: mode }),
       setCloseBehavior: (behavior) => set({ closeBehavior: behavior }),
+      setUpdateBehavior: (behavior) => set({ updateBehavior: behavior }),
       setAutomationSettings: (settings) =>
         set((state) => ({ automationSettings: { ...state.automationSettings, ...settings } })),
       toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
@@ -108,7 +113,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 5,
+      version: 6,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
         return {
@@ -117,6 +122,7 @@ export const useSettingsStore = create<SettingsState>()(
           reasoningLevel: (state.reasoningLevel || 'medium').toLowerCase(),
           teamTemplate: state.teamTemplate === 'Core Dev Team' || !state.teamTemplate ? 'default-core-dev-team' : state.teamTemplate,
           closeBehavior: state.closeBehavior === 'tray' ? 'tray' : 'quit',
+          updateBehavior: state.updateBehavior === 'automatic' ? 'automatic' : 'notify',
           inspectorTab: state.inspectorTab || 'agents',
           inspectorExpanded: false,
           // Direct role selection is now an advanced capability; normal missions always

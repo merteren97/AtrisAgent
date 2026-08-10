@@ -91,6 +91,16 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
 });
 
+test("release publishing requires signed updater artifacts and a stable GitHub manifest", () => {
+  const release = readWorkflow("release.yml");
+  assert.match(release, /TAURI_SIGNING_PRIVATE_KEY/, "release builds must require the private updater signing key");
+  assert.match(release, /TAURI_UPDATER_PUBLIC_KEY/, "release builds must embed the matching updater public key");
+  assert.match(release, /createUpdaterArtifacts\\?\"?:true/, "release builds must explicitly enable updater artifact generation");
+  assert.match(release, /generate-updater-manifest\.mjs/, "stable releases must generate the updater manifest");
+  assert.match(release, /latest\.json/, "stable releases must publish the static GitHub updater manifest");
+  assert.match(release, /\.sig/, "release artifacts must include updater signatures");
+});
+
 test("Windows runtime checks include an installed-style path with spaces", () => {
   for (const workflow of ["ci.yml", "release.yml"]) {
     const source = readWorkflow(workflow);

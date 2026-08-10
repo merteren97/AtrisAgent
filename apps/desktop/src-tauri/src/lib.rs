@@ -4,11 +4,13 @@ use std::{fs, path::Path, process::Command};
 use tauri::{AppHandle, Manager, State};
 
 use app_lifecycle::{set_close_behavior, CloseBehaviorState};
+use app_updater::{check_for_updates, get_update_runtime_info, install_update};
 
 const KEYRING_SERVICE: &str = "com.atris.agent";
 const SESSION_TOKEN_KEY: &str = "session:atris-token";
 
 mod app_lifecycle;
+mod app_updater;
 mod runtime;
 #[cfg(windows)]
 mod session_store;
@@ -323,6 +325,7 @@ pub fn run() {
         .on_window_event(app_lifecycle::handle_window_event)
         .setup(|app| {
             app_lifecycle::setup(app)?;
+            app_updater::setup(app)?;
             let state = app.state::<runtime::RuntimeState>();
             if let Err(error) = state.start(&app.handle()) {
                 state.shutdown();
@@ -338,6 +341,9 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             set_close_behavior,
+            get_update_runtime_info,
+            check_for_updates,
+            install_update,
             get_runtime_config,
             store_local_secret,
             read_local_secret,

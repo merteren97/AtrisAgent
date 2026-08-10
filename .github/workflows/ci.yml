@@ -45,8 +45,8 @@ jobs:
         # typecheck and static export/build-site contract instead of rerunning tests.
         run: npm run typecheck -w @atris-agent-code/landing && npm run build:landing
 
-      - name: Validate workflow security contracts
-        run: node --test .github/scripts/workflow-security-contract.test.mjs
+      - name: Validate release and workflow security contracts
+        run: node --test .github/scripts/workflow-security-contract.test.mjs .github/scripts/generate-updater-manifest.test.mjs
 
   native-runtime-regression:
     name: Native runtime regression (${{ matrix.platform }})
