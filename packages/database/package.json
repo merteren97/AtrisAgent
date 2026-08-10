@@ -1,0 +1,19 @@
+{
+  "name": "@atris-agent-code/database",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@atris-agent-code/domain": "*",
+    "drizzle-orm": "0.45.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

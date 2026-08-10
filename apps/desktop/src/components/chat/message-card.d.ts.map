@@ -1,0 +1,1 @@
+{"version":3,"file":"message-card.d.ts","sourceRoot":"","sources":["message-card.tsx"],"names":[],"mappings":"AAEA,UAAU,gBAAgB;IACxB,IAAI,EAAE,MAAM,GAAG,cAAc,CAAC;IAC9B,OAAO,EAAE,MAAM,CAAC;IAChB,SAAS,EAAE,MAAM,CAAC;CACnB;AAED,wBAAgB,WAAW,CAAC,EAAE,IAAI,EAAE,OAAO,EAAE,SAAS,EAAE,EAAE,gBAAgB,+BAyBzE"}

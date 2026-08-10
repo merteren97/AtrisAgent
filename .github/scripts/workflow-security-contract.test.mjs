@@ -1,0 +1,74 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(scriptsDirectory, "../..");
+const workflowDirectory = path.join(repositoryRoot, ".github", "workflows");
+
+function readWorkflow(name) {
+  return fs.readFileSync(path.join(workflowDirectory, name), "utf8");
+}
+
+test("all third-party workflow actions use reviewed immutable refs", () => {
+  const files = fs.readdirSync(workflowDirectory).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
+  assert.ok(files.length > 0, "At least one workflow must be present.");
+
+  for (const file of files) {
+    const source = readWorkflow(file);
+    const lines = source.split(/\r?\n/);
+    for (const [index, line] of lines.entries()) {
+      const match = line.match(/^\s*uses:\s*([^\s#]+)(?:\s+#\s*(.*))?$/);
+      if (!match) continue;
+      const [, reference, comment] = match;
+      assert.match(reference, /^[^@\s]+@[0-9a-f]{40}$/, `${file} contains an unpinned action: ${reference}`);
+      const previousComment = lines
+        .slice(0, index)
+        .reverse()
+        .find((previousLine) => previousLine.trim().length > 0);
+      assert.ok(
+        (comment && comment.trim().length > 0) || /^\s*#\s*\S/.test(previousComment || ""),
+        `${file} must document the reviewed action version: ${reference}`,
+      );
+    }
+  }
+});
+
+test("public source repository contains no active production deployment", () => {
+  const forbiddenPaths = [
+    path.join(workflowDirectory, "deploy.yml"),
+    path.join(repositoryRoot, "infra", "nginx", "agent.atrishub.com.conf.example"),
+    path.join(repositoryRoot, "infra", "pm2", "atris-agent-code-public.ecosystem.config.cjs"),
+    path.join(repositoryRoot, "infra", "scripts", "deploy-agent-public.sh"),
+  ];
+
+  for (const forbiddenPath of forbiddenPaths) {
+    assert.equal(fs.existsSync(forbiddenPath), false, `private production operation remains public: ${forbiddenPath}`);
+  }
+
+  const workflows = fs.readdirSync(workflowDirectory).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
+  for (const workflow of workflows) {
+    const source = readWorkflow(workflow);
+    assert.doesNotMatch(source, /appleboy\/ssh-action/, `${workflow} must not open a production SSH boundary`);
+    assert.doesNotMatch(source, /SSH_PRIVATE_KEY/, `${workflow} must not request a production SSH key`);
+    assert.doesNotMatch(source, /\/var\/www\//, `${workflow} must not expose a production checkout path`);
+  }
+
+  const readiness = fs.readFileSync(path.join(repositoryRoot, "docs", "PUBLIC_REPOSITORY_READINESS.md"), "utf8");
+  assert.match(
+    readiness,
+    /separate private operations boundary/,
+    "public readiness docs must preserve the private operations boundary without naming its repository",
+  );
+});
+
+test("CodeQL skips private repositories until code scanning is enabled", () => {
+  const codeql = readWorkflow("codeql.yml");
+  assert.match(
+    codeql,
+    /if:\s*github\.event\.repository\.visibility\s*==\s*'public'/,
+    "codeql.yml must run only after the repository is public",
+  );
+});

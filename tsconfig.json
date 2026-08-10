@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "files": [],
+  "references": [
+    { "path": "packages/domain" },
+    { "path": "packages/event-schema" },
+    { "path": "packages/event-bus" },
+    { "path": "packages/database" },
+    { "path": "services/workspace-manager" },
+    { "path": "services/policy-engine" },
+    { "path": "services/orchestration-core" },
+    { "path": "services/coordination-mcp" },
+    { "path": "services/runtime-host" },
+    { "path": "services/merge-coordinator" },
+    { "path": "services/api-gateway" }
+  ]
+}

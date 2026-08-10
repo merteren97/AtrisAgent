@@ -1,0 +1,48 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "30 2 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze JavaScript and TypeScript
+    # Code scanning uploads require the repository security feature. Keep the
+    # workflow ready for the public toggle while making private PRs pass
+    # without a settings-dependent failure.
+    if: github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript]
+
+    steps:
+      - name: Checkout
+        # v4.4.0 (reviewed immutable commit)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Initialize CodeQL
+        # v3.37.4 (reviewed immutable commit)
+        uses: github/codeql-action/init@dfbc6164313353db46c80e2fcfd38820bd2c3c46
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: Analyze
+        # v3.37.4 (reviewed immutable commit)
+        uses: github/codeql-action/analyze@dfbc6164313353db46c80e2fcfd38820bd2c3c46
+        with:
+          category: "/language:${{ matrix.language }}"

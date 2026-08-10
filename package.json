@@ -1,0 +1,29 @@
+{
+  "name": "atris-agent-code",
+  "version": "0.2.0",
+  "private": true,
+  "packageManager": "npm@10.0.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @atris-agent-code/desktop",
+    "dev:landing": "npm run dev -w @atris-agent-code/landing",
+    "api-gateway:dev": "npm run dev -w @atris-agent-code/api-gateway",
+    "build": "npm run build -w @atris-agent-code/desktop",
+    "build:landing": "npm run build -w @atris-agent-code/public-server",
+    "start:landing": "node infra/scripts/start-agent-landing.mjs",
+    "typecheck": "npx tsc -b --pretty false && npm run typecheck -w @atris-agent-code/desktop",
+    "test": "npm run test --workspaces --if-present",
+    "test:landing": "npm run test -w @atris-agent-code/public-server",
+    "check": "npm run typecheck && npm test && npm run build",
+    "tauri:dev": "npm run tauri:dev -w @atris-agent-code/desktop",
+    "tauri:build": "npm run tauri:build -w @atris-agent-code/desktop",
+    "tauri:build:windows": "npm run tauri:build:windows -w @atris-agent-code/desktop",
+    "dev:all": "node scripts/dev-stack.mjs",
+    "clean": "node scripts/clean-generated.mjs",
+    "preflight": "node scripts/preflight.mjs"
+  }
+}

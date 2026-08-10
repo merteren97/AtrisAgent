@@ -1,0 +1,38 @@
+{
+  "name": "@atris-agent-code/api-gateway",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/entry.ts",
+    "dev": "tsx src/entry.ts",
+    "test": "npx tsx src/api-gateway.test.ts && npx tsx src/auth.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/entry-auth.test.ts && npx tsx src/runtime-protocol.test.ts && npx tsx src/runtime-lifecycle.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@atris-agent-code/database": "*",
+    "@atris-agent-code/domain": "*",
+    "@atris-agent-code/event-bus": "*",
+    "@atris-agent-code/event-schema": "*",
+    "@atris-agent-code/orchestration-core": "*",
+    "@atris-agent-code/runtime-host": "*",
+    "@atris-agent-code/workspace-manager": "*",
+    "@atris-agent-code/merge-coordinator": "*",
+    "better-sqlite3": "^11.8.1",
+    "cors": "^2.8.5",
+    "drizzle-orm": "0.45.2",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.23.7",
+    "typescript": "^5.8.0"
+  }
+}

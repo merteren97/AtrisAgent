@@ -1,0 +1,28 @@
+{
+  "name": "@atris-agent-code/public-server",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build:site": "npm run build -w @atris-agent-code/landing && node scripts/build-site.mjs",
+    "build": "npm run build:site && tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx src/test-release-proxy.ts && tsx src/test-server.ts",
+    "test:release-proxy": "tsx src/test-release-proxy.ts",
+    "test:server": "tsx src/test-server.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.22.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.5",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.7",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@atris-agent-code/event-bus",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@atris-agent-code/event-schema": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

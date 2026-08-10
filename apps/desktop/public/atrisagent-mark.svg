@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="118 91 307 307" role="img" aria-labelledby="title desc">
+  <title id="title">AtrisAgent</title>
+  <desc id="desc">AtrisAgent mark combining an upward Atris arrow with a connected agent network.</desc>
+  <path d="M316 100 201 164 239 184 132 379H195L240 295 316 164Z" fill="#1B4D78"/>
+  <path fill="#20BFAF" fill-rule="evenodd" d="M321 199 414 384 269 290 321 199ZM321 244 381 354 302 295 321 244Z"/>
+  <circle cx="321" cy="214" r="14" fill="#20BFAF"/>
+  <path d="M224 329 272 292 326 324 316 341 276 309 239 342Z" fill="#1B4D78"/>
+  <circle cx="274" cy="292" r="13" fill="#1B4D78"/>
+</svg>

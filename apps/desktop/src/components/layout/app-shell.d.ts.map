@@ -1,0 +1,1 @@
+{"version":3,"file":"app-shell.d.ts","sourceRoot":"","sources":["app-shell.tsx"],"names":[],"mappings":"AAAA,OAAO,EAAE,SAAS,EAAE,MAAM,OAAO,CAAC;AAElC,UAAU,aAAa;IACrB,OAAO,EAAE,SAAS,CAAC;IACnB,IAAI,EAAE,SAAS,CAAC;IAChB,SAAS,EAAE,SAAS,CAAC;CACtB;AAED,wBAAgB,QAAQ,CAAC,EAAE,OAAO,EAAE,IAAI,EAAE,SAAS,EAAE,EAAE,aAAa,+BAQnE"}
