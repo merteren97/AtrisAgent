@@ -766,7 +766,7 @@ mod tests {
     use super::{
         is_semver, parse_ready_line, resolve_runtime_paths, runtime_paths,
         sanitize_diagnostic_line, select_runtime_data_dir, select_unix_runtime_data_dir,
-        validate_explicit_data_dir, READY_PREFIX,
+        validate_explicit_data_dir, APP_VERSION, READY_PREFIX,
     };
     use std::{
         fs,
@@ -785,26 +785,36 @@ mod tests {
         fs::write(runtime.join("control-plane-bridge.mjs"), b"bridge").expect("bridge");
     }
 
+    fn ready_payload(origin: &str, pid: u32, version: &str) -> String {
+        format!(
+            "{READY_PREFIX}{{\"origin\":\"{origin}\",\"pid\":{pid},\"version\":\"{version}\"}}"
+        )
+    }
+
     #[test]
     fn parses_only_loopback_ready_payloads() {
-        let ready = parse_ready_line(&format!(
-            "{READY_PREFIX}{{\"origin\":\"http://127.0.0.1:43127\",\"pid\":42,\"version\":\"0.2.0\"}}\n"
+        let ready = parse_ready_line(&ready_payload(
+            "http://127.0.0.1:43127",
+            42,
+            APP_VERSION,
         ))
         .expect("valid ready payload");
         assert_eq!(ready.origin, "http://127.0.0.1:43127");
         assert_eq!(ready.pid, 42);
+        assert_eq!(ready.version, APP_VERSION);
     }
 
     #[test]
     fn rejects_non_loopback_or_malformed_payloads() {
-        for line in [
-            "ATRIS_RUNTIME_READY {\"origin\":\"http://localhost:43127\",\"pid\":42,\"version\":\"0.2.0\"}",
-            "ATRIS_RUNTIME_READY {\"origin\":\"http://127.0.0.1:0\",\"pid\":42,\"version\":\"0.2.0\"}",
-            "ATRIS_RUNTIME_READY {\"origin\":\"http://127.0.0.1:43127\",\"pid\":0,\"version\":\"0.2\"}",
-            "ATRIS_RUNTIME_READY {\"origin\":\"http://127.0.0.1:43127\",\"pid\":42,\"version\":\"99.0.0\"}",
-            "not a ready line",
-        ] {
-            assert!(parse_ready_line(line).is_err(), "unexpectedly accepted: {line}");
+        let invalid_lines = [
+            ready_payload("http://localhost:43127", 42, APP_VERSION),
+            ready_payload("http://127.0.0.1:0", 42, APP_VERSION),
+            ready_payload("http://127.0.0.1:43127", 0, "0.2"),
+            ready_payload("http://127.0.0.1:43127", 42, "99.0.0"),
+            "not a ready line".to_string(),
+        ];
+        for line in invalid_lines {
+            assert!(parse_ready_line(&line).is_err(), "unexpectedly accepted: {line}");
         }
     }
 
