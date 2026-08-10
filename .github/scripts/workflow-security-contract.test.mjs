@@ -91,6 +91,27 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
 });
 
+test("Windows runtime checks include an installed-style path with spaces", () => {
+  for (const workflow of ["ci.yml", "release.yml"]) {
+    const source = readWorkflow(workflow);
+    assert.match(
+      source,
+      /Smoke Windows installed-layout runtime/,
+      `${workflow} must exercise the packaged runtime outside the checkout layout`,
+    );
+    assert.match(
+      source,
+      /Atris Agent Installed Layout/,
+      `${workflow} must exercise Windows process arguments with an installed-style path containing spaces`,
+    );
+    assert.match(
+      source,
+      /--runtime-dir \"\$installedRuntime\"/,
+      `${workflow} must pass the copied installed runtime to the sidecar smoke test`,
+    );
+  }
+});
+
 test("Tauri packages the complete runtime directory into a stable resource path", () => {
   const configPath = path.join(repositoryRoot, "apps", "desktop", "src-tauri", "tauri.conf.json");
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
