@@ -3,9 +3,12 @@ use serde::Serialize;
 use std::{fs, path::Path, process::Command};
 use tauri::{AppHandle, Manager, State};
 
+use app_lifecycle::{set_close_behavior, CloseBehaviorState};
+
 const KEYRING_SERVICE: &str = "com.atris.agent";
 const SESSION_TOKEN_KEY: &str = "session:atris-token";
 
+mod app_lifecycle;
 mod runtime;
 #[cfg(windows)]
 mod session_store;
@@ -294,9 +297,11 @@ fn window_toggle_maximize(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn window_close(app: tauri::AppHandle) -> Result<(), String> {
-    app.exit(0);
-    Ok(())
+fn window_close(
+    app: tauri::AppHandle,
+    state: State<'_, CloseBehaviorState>,
+) -> Result<(), String> {
+    app_lifecycle::close_main_window(&app, state.inner())
 }
 
 #[tauri::command]
@@ -311,10 +316,13 @@ fn get_runtime_config(
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(runtime::RuntimeState::default())
+        .manage(CloseBehaviorState::default())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .on_window_event(app_lifecycle::handle_window_event)
         .setup(|app| {
+            app_lifecycle::setup(app)?;
             let state = app.state::<runtime::RuntimeState>();
             if let Err(error) = state.start(&app.handle()) {
                 state.shutdown();
@@ -329,6 +337,7 @@ pub fn run() {
             window_minimize,
             window_toggle_maximize,
             window_close,
+            set_close_behavior,
             get_runtime_config,
             store_local_secret,
             read_local_secret,

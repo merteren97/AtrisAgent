@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { useSettingsStore } from '@/stores/settings-store';
+import { useSettingsStore, type CloseBehavior } from '@/stores/settings-store';
 import { useLanguageStore } from '@/stores/language-store';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -7,7 +7,27 @@ import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { ThemeToggle } from '@/components/theme-toggle';
 import { ExecutionPolicyEditor } from './ExecutionPolicyEditor';
-import { Braces, KeyRound, MonitorCog, ShieldCheck, Terminal } from 'lucide-react';
+import { Braces, KeyRound, Minimize2, MonitorCog, Power, ShieldCheck, Terminal } from 'lucide-react';
+
+const closeBehaviorOptions: Array<{
+  value: CloseBehavior;
+  title: string;
+  description: string;
+  icon: typeof Power;
+}> = [
+  {
+    value: 'quit',
+    title: 'Quit AtrisAgent',
+    description: 'Close the desktop app and stop its local runtime completely.',
+    icon: Power,
+  },
+  {
+    value: 'tray',
+    title: 'Minimize to tray',
+    description: 'Hide the window while keeping AtrisAgent and active local work running. Use the tray menu to reopen or quit.',
+    icon: Minimize2,
+  },
+];
 
 export function SettingsView() {
   const {
@@ -18,6 +38,8 @@ export function SettingsView() {
     setActiveView,
     trustMode,
     setTrustMode,
+    closeBehavior,
+    setCloseBehavior,
   } = useSettingsStore();
   const { language, setLanguage } = useLanguageStore();
 
@@ -27,7 +49,7 @@ export function SettingsView() {
         <header className="border-b border-border pb-5">
           <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-[0.18em] text-primary"><MonitorCog className="h-4 w-4" /> Application settings</div>
           <h1 className="text-2xl font-semibold tracking-tight">AtrisAgent preferences</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Control local privacy, approval posture and role-specific runtime routing. Runtime accounts remain managed through verified CLI flows.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Control local privacy, application behavior, approval posture and role-specific runtime routing. Runtime accounts remain managed through verified CLI flows.</p>
         </header>
 
         <Card>
@@ -36,6 +58,39 @@ export function SettingsView() {
             <SettingRow title="Anonymous diagnostics" description="Allow non-secret crash and performance diagnostics. Prompts, source files and credentials are excluded."><Switch checked={telemetryOptIn} onCheckedChange={setTelemetryOptIn} /></SettingRow>
             <SettingRow title="Theme" description="Use the system, light or dark appearance."><ThemeToggle /></SettingRow>
             <SettingRow title="Interface language" description="Language affects the desktop UI, not agent prompts or repository files."><select value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'tr')} className="h-9 min-w-28 rounded-md border border-input bg-background px-3 text-sm"><option value="en">English</option><option value="tr">Türkçe</option></select></SettingRow>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base"><Power className="h-4 w-4 text-primary" /> Window & background behavior</CardTitle>
+            <CardDescription>Choose what AtrisAgent should do when you close its main window.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3 sm:grid-cols-2">
+            {closeBehaviorOptions.map((option) => {
+              const Icon = option.icon;
+              const active = closeBehavior === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => setCloseBehavior(option.value)}
+                  className={`rounded-xl border p-4 text-left transition-colors ${active ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/30'}`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${active ? 'border-primary/30 bg-primary/10 text-primary' : 'border-border bg-muted/30 text-muted-foreground'}`}>
+                        <Icon className="h-4 w-4" aria-hidden="true" />
+                      </span>
+                      <span className="text-sm font-semibold">{option.title}</span>
+                    </div>
+                    {active && <Badge>Active</Badge>}
+                  </div>
+                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">{option.description}</p>
+                </button>
+              );
+            })}
           </CardContent>
         </Card>
 
