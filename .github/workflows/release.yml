@@ -155,7 +155,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
-        run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}"
+        run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}" --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
       - name: Upload release artifacts
         # v7 (reviewed immutable commit)
