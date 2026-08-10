@@ -49,6 +49,71 @@ pub struct RuntimePaths {
     pub bridge: PathBuf,
 }
 
+#[cfg(windows)]
+fn external_process_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    use std::{
+        ffi::OsString,
+        path::{Component, Prefix},
+    };
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix_component)) = components.next() else {
+        return Ok(path.to_path_buf());
+    };
+
+    let mut normalized = match prefix_component.kind() {
+        Prefix::VerbatimDisk(drive) => {
+            let mut root = OsString::new();
+            root.push((drive as char).to_string());
+            root.push(":\\");
+            PathBuf::from(root)
+        }
+        Prefix::VerbatimUNC(server, share) => {
+            let mut root = OsString::from(r"\\");
+            root.push(server);
+            root.push(r"\");
+            root.push(share);
+            root.push(r"\");
+            PathBuf::from(root)
+        }
+        Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            return Err(format!(
+                "{label} uses an unsupported Windows device/verbatim path: {}",
+                path.display()
+            ));
+        }
+        _ => return Ok(path.to_path_buf()),
+    };
+
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(format!(
+            "{label} uses a malformed Windows verbatim path: {}",
+            path.display()
+        ));
+    }
+
+    for component in components {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => normalized.push(".."),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "{label} uses an unsupported Windows path shape: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
+#[cfg(not(windows))]
+fn external_process_path(path: &Path, _label: &str) -> Result<PathBuf, String> {
+    Ok(path.to_path_buf())
+}
+
 type DiagnosticBuffer = Arc<Mutex<VecDeque<String>>>;
 
 pub struct RuntimeState {
@@ -222,19 +287,37 @@ impl RuntimeState {
             let data_dir = runtime_data_dir()?;
             fs::create_dir_all(&data_dir)
                 .map_err(|error| format!("Could not create AtrisAgent data directory: {error}"))?;
+
+            // Tauri/Windows filesystem APIs can surface verbatim paths such as
+            // `\\?\C:\...`. Rust can work with those paths, but Node's entrypoint
+            // resolver treats that namespace form inconsistently. Normalize only
+            // at the external-process boundary so installed resources remain fully
+            // addressable while the embedded Node process receives standard paths.
+            let node_path = external_process_path(&paths.node, "Packaged Node executable")?;
+            let gateway_path = external_process_path(&paths.gateway, "Packaged gateway bundle")?;
+            let bridge_path = external_process_path(&paths.bridge, "Packaged control-plane bridge")?;
+            let data_dir = external_process_path(&data_dir, "AtrisAgent data directory")?;
+
             let runtime_token = random_runtime_token()?;
             let parent_pid = std::process::id().to_string();
-            let mut command = Command::new(&paths.node);
+            let mut command = Command::new(&node_path);
             command
-                .arg(&paths.gateway)
+                .arg(&gateway_path)
                 .current_dir(&data_dir)
                 .env("PORT", "0")
+                .env("ATRIS_RUNTIME_MODE", "packaged")
                 .env("ATRIS_RUNTIME_TOKEN", &runtime_token)
                 .env("ATRIS_PARENT_PID", &parent_pid)
                 .env("ATRIS_AGENT_DATA_DIR", &data_dir)
-                .env("ATRIS_CONTROL_PLANE_BRIDGE_PATH", &paths.bridge)
+                .env("ATRIS_CONTROL_PLANE_BRIDGE_PATH", &bridge_path)
                 .env("ATRIS_AGENT_VERSION", APP_VERSION)
                 .env("NODE_ENV", "production")
+                // This Node runtime belongs to AtrisAgent. User/system Node
+                // injection flags must not be able to replace its entrypoint or
+                // alter module lookup before the local security boundary starts.
+                .env_remove("NODE_OPTIONS")
+                .env_remove("NODE_PATH")
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
@@ -247,7 +330,7 @@ impl RuntimeState {
             let mut child = command.spawn().map_err(|error| {
                 format!(
                     "Could not start the packaged AtrisAgent runtime from {}: {error}",
-                    paths.node.display()
+                    node_path.display()
                 )
             })?;
 
@@ -768,6 +851,8 @@ mod tests {
         sanitize_diagnostic_line, select_runtime_data_dir, select_unix_runtime_data_dir,
         validate_explicit_data_dir, APP_VERSION, READY_PREFIX,
     };
+    #[cfg(windows)]
+    use super::external_process_path;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -825,6 +910,36 @@ mod tests {
         assert!(!is_semver("1.2"));
         assert!(!is_semver("1.2.3+"));
         assert!(!is_semver("01.2.3"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_windows_verbatim_paths_before_launching_node() {
+        let drive = external_process_path(
+            Path::new(r"\\?\C:\Program Files\AtrisAgent\runtime\gateway.cjs"),
+            "gateway",
+        )
+        .expect("verbatim drive path");
+        assert_eq!(
+            drive,
+            PathBuf::from(r"C:\Program Files\AtrisAgent\runtime\gateway.cjs")
+        );
+
+        let unc = external_process_path(
+            Path::new(r"\\?\UNC\server\share\AtrisAgent\runtime\gateway.cjs"),
+            "gateway",
+        )
+        .expect("verbatim UNC path");
+        assert_eq!(
+            unc,
+            PathBuf::from(r"\\server\share\AtrisAgent\runtime\gateway.cjs")
+        );
+
+        let normal = PathBuf::from(r"C:\AtrisAgent\runtime\gateway.cjs");
+        assert_eq!(
+            external_process_path(&normal, "gateway").expect("normal path"),
+            normal
+        );
     }
 
     #[test]
