@@ -22,6 +22,7 @@ import type {
 } from '@atris-agent-code/domain';
 import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
 import { parseAntigravityStreamLine } from './antigravity-stream';
+import { resolveAntigravityPrintTimeout } from '../antigravity-run-policy';
 import {
   appendControlPlaneInstructions,
   controlPlaneEnv,
@@ -53,6 +54,10 @@ interface DocumentedModel {
   entitlement?: string;
 }
 
+type PendingTerminalOutcome =
+  | { kind: 'completed'; result: string }
+  | { kind: 'failed'; error: string; exitCode?: number | null };
+
 const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'];
 const MAX_STDERR_CHARS = 8_000;
 
@@ -74,6 +79,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
   private terminalSessions = new Set<string>();
+  private pendingTerminalBySession = new Map<string, PendingTerminalOutcome>();
   private lastOutputBySession = new Map<string, string>();
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
@@ -380,7 +386,16 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const overlay = createAntigravityMcpOverlay(controlPlane, sessionId, workspaceCwd);
     const cwd = overlay?.cwd || workspaceCwd;
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
-    const args = ['--print', prompt, '--output-format', 'stream-json', '--sandbox'];
+    const printTimeout = resolveAntigravityPrintTimeout(options.env?.ATRIS_ANTIGRAVITY_PRINT_TIMEOUT);
+    const args = [
+      '--print',
+      prompt,
+      '--output-format',
+      'stream-json',
+      '--sandbox',
+      '--print-timeout',
+      printTimeout,
+    ];
     if (overlay) args.push(...overlay.extraArgs);
     if (options.model && options.model !== 'antigravity-active-route' && capabilities.modelSelection) args.push('--model', options.model);
     if (options.reasoningLevel && capabilities.reasoningControl) args.push('--effort', options.reasoningLevel);
@@ -409,6 +424,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.activeSessions.set(sessionId, session);
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
     this.terminalSessions.delete(sessionId);
+    this.pendingTerminalBySession.delete(sessionId);
     this.lastOutputBySession.delete(sessionId);
     this.stderrBuffers.delete(sessionId);
     this.registerProcess(sessionId, child);
@@ -437,23 +453,37 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       this.stderrBuffers.set(sessionId, next.slice(-MAX_STDERR_CHARS));
     });
     child.on('error', (error) => {
-      if (!this.terminalSessions.has(sessionId)) {
-        this.terminalSessions.add(sessionId);
-        this.emitFailure(sessionId, error.message);
-      }
+      this.recordTerminalOutcome(sessionId, {
+        kind: 'failed',
+        error: redactSecrets(error.message),
+      });
     });
     child.on('close', (code) => {
-      if (buffer.trim()) this.handleStreamLine(sessionId, buffer);
-      const terminalReported = this.terminalSessions.has(sessionId);
-      const stderr = this.stderrBuffers.get(sessionId)?.trim();
-      if (!terminalReported) {
-        this.terminalSessions.add(sessionId);
+      if (buffer.trim()) {
+        this.handleStreamLine(sessionId, buffer);
+        buffer = '';
+      }
+
+      if (!this.terminalSessions.has(sessionId)) {
+        const stderr = this.stderrBuffers.get(sessionId)?.trim();
         const detail = stderr ? `\n${stderr}` : '';
         const reason = code === 0
           ? `Antigravity exited cleanly before reporting a terminal result.${detail}`
           : `Antigravity exited with code ${code}.${detail}`;
-        this.emitFailure(sessionId, reason, code);
+        this.recordTerminalOutcome(sessionId, {
+          kind: 'failed',
+          error: redactSecrets(reason),
+          exitCode: code,
+        });
       }
+
+      const context = this.sessionContext.get(sessionId);
+      const outcome = this.pendingTerminalBySession.get(sessionId);
+
+      // Tear the native process and its session-scoped MCP grant down before the
+      // terminal task event reaches Orchestrator. task_failed can immediately retry
+      // and task_completed can immediately schedule a dependent role; neither may
+      // overlap the previous Antigravity process/overlay.
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
@@ -462,7 +492,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       this.sessionContext.delete(sessionId);
       this.stderrBuffers.delete(sessionId);
       this.lastOutputBySession.delete(sessionId);
+      this.pendingTerminalBySession.delete(sessionId);
       this.terminalSessions.delete(sessionId);
+
+      if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
     });
     return session;
   }
@@ -518,29 +551,57 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     }
     if (parsed.kind === 'result') {
       if (this.terminalSessions.has(sessionId)) return;
-      this.terminalSessions.add(sessionId);
       if (!parsed.success) {
-        this.emitFailure(sessionId, parsed.error || `Antigravity task failed${parsed.status ? ` (${parsed.status})` : ''}`);
+        this.recordTerminalOutcome(sessionId, {
+          kind: 'failed',
+          error: redactSecrets(parsed.error || `Antigravity task failed${parsed.status ? ` (${parsed.status})` : ''}`),
+        });
         return;
       }
       if (parsed.content && parsed.content !== this.lastOutputBySession.get(sessionId)) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: parsed.content, timestamp });
       }
+      this.recordTerminalOutcome(sessionId, {
+        kind: 'completed',
+        result: parsed.content || 'Antigravity task completed',
+      });
+    }
+  }
+
+  private recordTerminalOutcome(sessionId: string, outcome: PendingTerminalOutcome): void {
+    if (this.terminalSessions.has(sessionId)) return;
+    this.terminalSessions.add(sessionId);
+    this.pendingTerminalBySession.set(sessionId, outcome);
+  }
+
+  private emitTerminalOutcome(
+    sessionId: string,
+    context: { missionId: string; taskId: string },
+    outcome: PendingTerminalOutcome,
+  ): void {
+    const timestamp = new Date().toISOString();
+    if (outcome.kind === 'completed') {
       this.emitEvent({
         id: crypto.randomUUID(),
         type: 'task_completed',
         missionId: context.missionId,
         taskId: context.taskId,
         agentInstanceId: sessionId,
-        result: parsed.content || 'Antigravity task completed',
+        result: outcome.result,
         timestamp,
       });
+      return;
     }
-  }
 
-  private emitFailure(sessionId: string, error: string, exitCode?: number | null): void {
-    const context = this.sessionContext.get(sessionId);
-    if (!context) return;
-    this.emitEvent({ id: crypto.randomUUID(), type: 'task_failed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, error: redactSecrets(error), exitCode, timestamp: new Date().toISOString() });
+    this.emitEvent({
+      id: crypto.randomUUID(),
+      type: 'task_failed',
+      missionId: context.missionId,
+      taskId: context.taskId,
+      agentInstanceId: sessionId,
+      error: outcome.error,
+      exitCode: outcome.exitCode,
+      timestamp,
+    });
   }
 }
