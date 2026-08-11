@@ -34,6 +34,10 @@ function shortAgent(agentId?: string): string {
   return agentId ? agentId.slice(0, 8) : 'agent';
 }
 
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
 export function handleIncomingEvent(eventData: any): void {
   if (!eventData?.type) return;
   const missions = useMissionStore.getState();
@@ -61,9 +65,26 @@ export function handleIncomingEvent(eventData: any): void {
       append(eventData, `Task ready: ${eventData.title || eventData.taskId}`, { agentRole: eventData.assignedRole || 'orchestrator' });
       break;
 
-    case 'task_assigned':
+    case 'task_assigned': {
       append(eventData, `Task assigned to ${eventData.role}: ${eventData.taskId}`, { agentRole: eventData.role });
+      const assignedAgentId = optionalString(eventData.agentInstanceId);
+      if (eventData.taskId) missions.patchTask(eventData.taskId, {
+        status: 'running',
+        assignedRole: optionalString(eventData.role),
+        ...(assignedAgentId ? { assignedAgentId } : {}),
+      });
       break;
+    }
+
+    case 'task_claimed': {
+      append(eventData, `Task claimed by ${shortAgent(eventData.agentInstanceId)}.`, { agentRole: eventData.role || 'agent' });
+      const assignedAgentId = optionalString(eventData.agentInstanceId);
+      if (eventData.taskId) missions.patchTask(eventData.taskId, {
+        status: 'running',
+        ...(assignedAgentId ? { assignedAgentId } : {}),
+      });
+      break;
+    }
 
     case 'task_split':
       append(eventData, `Task split into ${eventData.childTaskIds?.length || 0} focused tasks: ${eventData.reason || ''}`, { agentRole: 'orchestrator' });
@@ -96,7 +117,7 @@ export function handleIncomingEvent(eventData: any): void {
       });
       break;
 
-    case 'agent_started':
+    case 'agent_started': {
       append(eventData, `${eventData.displayName || eventData.role || 'Agent'} started with ${eventData.model || 'runtime-selected model'}.`, { agentRole: eventData.role });
       agents.upsertAgent({
         id: eventData.agentInstanceId,
@@ -113,7 +134,13 @@ export function handleIncomingEvent(eventData: any): void {
         startedAt: eventData.timestamp,
         lastActivityAt: eventData.timestamp,
       });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, {
+        status: 'running',
+        assignedRole: optionalString(eventData.role),
+        assignedAgentId: optionalString(eventData.agentInstanceId),
+      });
       break;
+    }
 
     case 'agent_progressed':
       append(eventData, eventData.progress || 'Agent progress updated.', { agentRole: eventData.role || 'agent' });
@@ -123,6 +150,7 @@ export function handleIncomingEvent(eventData: any): void {
         progress: typeof eventData.percentage === 'number' ? eventData.percentage : undefined,
         lastActivityAt: eventData.timestamp,
       });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'running' });
       break;
 
     case 'agent_waiting':
@@ -137,6 +165,7 @@ export function handleIncomingEvent(eventData: any): void {
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         status: 'running', statusMessage: eventData.reason || 'Resumed', lastActivityAt: eventData.timestamp,
       });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'running' });
       break;
 
     case 'agent_completed':
@@ -250,6 +279,7 @@ export function handleIncomingEvent(eventData: any): void {
 
     case 'task_completed':
       append(eventData, `Task completed: ${eventData.taskId}`, { agentRole: eventData.agentRole || 'builder' });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'done' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, { status: 'completed', progress: 100, lastActivityAt: eventData.timestamp });
       void missions.fetchMissionState(eventData.missionId);
       break;
@@ -257,6 +287,7 @@ export function handleIncomingEvent(eventData: any): void {
     case 'task_failed':
     case 'agent_error':
       append(eventData, `Execution failed: ${eventData.error || 'Unknown runtime error'}`, { agentRole: eventData.agentRole || 'builder' });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'failed' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         status: 'failed', statusMessage: eventData.error || 'Execution failed', completedAt: eventData.timestamp, lastActivityAt: eventData.timestamp,
       });
