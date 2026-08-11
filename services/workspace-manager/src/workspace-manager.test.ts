@@ -26,6 +26,11 @@ async function runTests() {
     const runGit = (cwd: string, args: string[]) => {
       execFileSync('git', args, { cwd, windowsHide: true, stdio: 'ignore' });
     };
+    const commitAll = (cwd: string, message: string) => {
+      runGit(cwd, ['-c', 'user.name=AtrisAgent Test', '-c', 'user.email=atrisagent-test@example.invalid', 'add', '-A']);
+      runGit(cwd, ['-c', 'user.name=AtrisAgent Test', '-c', 'user.email=atrisagent-test@example.invalid', 'commit', '--quiet', '-m', message]);
+    };
+
     const wsPath = path.join(tmpDir, 'test-app');
     fs.mkdirSync(wsPath, { recursive: true });
     fs.writeFileSync(path.join(wsPath, 'index.ts'), 'console.log("hello world");');
@@ -68,6 +73,48 @@ async function runTests() {
     runGit(realRepo, ['worktree', 'add', '--detach', linkedWorktree, 'HEAD']);
     assert(fs.lstatSync(path.join(linkedWorktree, '.git')).isFile(), 'Linked worktree uses a .git file');
     assert(await worktreeManager.isGitRepository(linkedWorktree), 'Linked worktree is detected by Git probing');
+
+    // A workspace can be a project container rather than a repository itself.
+    // Builder isolation must select the task's nested repository instead of
+    // synchronously mirroring every sibling project in the parent folder.
+    const projectContainer = path.join(tmpDir, 'project-container');
+    const atrisTrackerRepo = path.join(projectContainer, 'AtrisTracker');
+    const siblingRepo = path.join(projectContainer, 'OtherProject');
+    for (const repo of [atrisTrackerRepo, siblingRepo]) {
+      fs.mkdirSync(repo, { recursive: true });
+      runGit(repo, ['init', '--quiet']);
+    }
+    fs.writeFileSync(path.join(atrisTrackerRepo, 'tracker.ts'), 'export const tracker = 1;\n');
+    fs.writeFileSync(path.join(siblingRepo, 'sibling.ts'), 'export const sibling = 1;\n');
+    commitAll(atrisTrackerRepo, 'tracker initial');
+    commitAll(siblingRepo, 'sibling initial');
+
+    const isolation = await worktreeManager.resolveIsolationBase(
+      projectContainer,
+      'Task 2: Build & Implement AtrisTracker usage collection',
+    );
+    assert(isolation.kind === 'nested-git', 'Project-container workspace resolves a nested Git repository');
+    assert(path.resolve(isolation.path) === path.resolve(atrisTrackerRepo), 'Task hint selects AtrisTracker instead of a sibling repository');
+
+    const nestedBuilderPath = path.join(projectContainer, '.atris-worktrees', 'mission-nested', 'task-builder');
+    const nestedBuilderWorktree = await worktreeManager.createWorktree(
+      projectContainer,
+      'atris/mission-nested/task-builder',
+      nestedBuilderPath,
+      'HEAD',
+      'Build and verify AtrisTracker usage collection',
+    );
+    assert(await worktreeManager.isGitRepository(nestedBuilderWorktree), 'Builder receives a linked Git worktree for the nested project');
+    assert(fs.existsSync(path.join(nestedBuilderWorktree, 'tracker.ts')), 'Nested Builder worktree contains AtrisTracker source');
+    assert(!fs.existsSync(path.join(nestedBuilderWorktree, 'sibling.ts')), 'Nested Builder worktree does not mirror sibling projects');
+
+    fs.writeFileSync(path.join(nestedBuilderWorktree, 'tracker.ts'), 'export const tracker = 2;\n');
+    const nestedMerge = await worktreeManager.merge(nestedBuilderWorktree, undefined, projectContainer);
+    assert(nestedMerge.success, 'Nested Builder worktree merges into its owning repository');
+    assert(fs.readFileSync(path.join(atrisTrackerRepo, 'tracker.ts'), 'utf8').includes('tracker = 2'), 'Nested merge updates AtrisTracker source');
+    assert(fs.readFileSync(path.join(siblingRepo, 'sibling.ts'), 'utf8').includes('sibling = 1'), 'Nested merge leaves sibling repository untouched');
+    await worktreeManager.removeWorktree(nestedBuilderWorktree, true, projectContainer);
+    assert(!fs.existsSync(nestedBuilderWorktree), 'Nested Builder worktree is cleaned up through its owning repository');
 
     const mirrorSource = path.join(tmpDir, 'mirror-source');
     const mirrorTarget = path.join(tmpDir, 'mirror-target');
