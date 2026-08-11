@@ -2,10 +2,60 @@ import { useEffect, useMemo, useRef } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { MessageCard } from './message-card';
 import { EventCard } from './event-card';
-import { useMissionStore } from '@/stores/mission-store';
+import { ActivityGroup } from './activity-group';
+import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAgentStore } from '@/stores/agent-store';
 import { Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
+
+const COMPACT_ACTIVITY_EVENTS = new Set([
+  'task_created',
+  'task_assigned',
+  'task_claimed',
+  'agent_spawned',
+  'agent_started',
+  'agent_progressed',
+  'agent_waiting',
+  'agent_resumed',
+  'agent_message_read',
+  'agent_context_attached',
+  'agent_context_compacted',
+  'agent_thought',
+  'agent_tool_call',
+  'tool_call_started',
+  'tool_call_completed',
+]);
+
+type TimelineRenderRow =
+  | { kind: 'item'; item: TimelineItem }
+  | { kind: 'activity'; id: string; items: TimelineItem[] };
+
+function buildTimelineRows(timeline: TimelineItem[]): TimelineRenderRow[] {
+  const rows: TimelineRenderRow[] = [];
+  let activity: TimelineItem[] = [];
+
+  const flushActivity = () => {
+    if (activity.length === 0) return;
+    if (activity.length === 1) {
+      rows.push({ kind: 'item', item: activity[0] });
+    } else {
+      rows.push({ kind: 'activity', id: `activity-${activity[0].id}-${activity[activity.length - 1].id}`, items: activity });
+    }
+    activity = [];
+  };
+
+  for (const item of timeline) {
+    const compact = item.type === 'event' && Boolean(item.eventType && COMPACT_ACTIVITY_EVENTS.has(item.eventType));
+    if (compact) {
+      activity.push(item);
+      continue;
+    }
+    flushActivity();
+    rows.push({ kind: 'item', item });
+  }
+  flushActivity();
+  return rows;
+}
 
 export function ChatTimeline() {
   const timeline = useMissionStore((state) => state.timeline);
@@ -26,6 +76,7 @@ export function ChatTimeline() {
     () => activeMissionId ? agents.filter((agent) => agent.missionId === activeMissionId) : [],
     [activeMissionId, agents],
   );
+  const timelineRows = useMemo(() => buildTimelineRows(timeline), [timeline]);
   const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
   const completedTasks = activeTasks.filter((task) => task.status === 'completed' || task.status === 'done').length;
 
@@ -129,8 +180,13 @@ export function ChatTimeline() {
 
   return (
     <ScrollArea className="min-h-0 flex-1">
-      <div className="mx-auto min-w-0 max-w-3xl space-y-4 px-4 py-6">
-        {timeline.length === 0 ? emptyState : timeline.map((item) => {
+      <div className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+        {timeline.length === 0 ? emptyState : timelineRows.map((row) => {
+          if (row.kind === 'activity') {
+            return <ActivityGroup key={row.id} items={row.items} />;
+          }
+
+          const item = row.item;
           if (item.type === 'user_message') {
             return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} />;
           }
