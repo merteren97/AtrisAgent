@@ -167,11 +167,45 @@ export class WorktreeManager {
   }
 
   /**
-   * Resolve the source repository that owns a linked Git worktree. This keeps
-   * cleanup/apply operations correct when the selected AtrisAgent workspace is
-   * a non-Git parent directory.
+   * Resolve the source repository that owns a linked Git worktree. Git may
+   * report the common directory either as an absolute path or relative to its
+   * internal worktree metadata, so use the absolute rev-parse form first and a
+   * porcelain worktree-list fallback rather than guessing from the task path.
    */
   private async resolveGitOwner(worktreePath: string): Promise<string | undefined> {
+    const ownerFromCommonDir = (rawValue: string): string | undefined => {
+      const raw = rawValue.trim();
+      if (!raw) return undefined;
+      const commonDir = path.normalize(raw);
+      if (path.basename(commonDir).toLowerCase() !== '.git') return undefined;
+      const owner = path.dirname(commonDir);
+      return fs.existsSync(owner) ? owner : undefined;
+    };
+
+    try {
+      const { stdout } = await git(['rev-parse', '--path-format=absolute', '--git-common-dir'], worktreePath);
+      const owner = ownerFromCommonDir(stdout);
+      if (owner) return owner;
+    } catch {
+      // Older Git builds may not support --path-format. Continue with fallbacks.
+    }
+
+    try {
+      const { stdout } = await git(['worktree', 'list', '--porcelain'], worktreePath);
+      const normalizedCurrent = path.resolve(worktreePath);
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!line.startsWith('worktree ')) continue;
+        const candidate = path.resolve(line.slice('worktree '.length).trim());
+        if (candidate === normalizedCurrent) continue;
+        const metadata = path.join(candidate, '.git');
+        if (fs.existsSync(metadata) && fs.statSync(metadata).isDirectory() && await this.isGitRepository(candidate)) {
+          return candidate;
+        }
+      }
+    } catch {
+      // Fall through to the legacy common-dir form below.
+    }
+
     try {
       const { stdout } = await git(['rev-parse', '--git-common-dir'], worktreePath);
       const rawCommonDir = stdout.trim();
@@ -181,7 +215,7 @@ export class WorktreeManager {
         : path.resolve(worktreePath, rawCommonDir);
       if (path.basename(commonDir).toLowerCase() === '.git') return path.dirname(commonDir);
     } catch {
-      // Fall through to the caller-provided workspace root.
+      // Caller will use its explicit fallback only when Git owner discovery fails.
     }
     return undefined;
   }
