@@ -60,6 +60,8 @@ type PendingTerminalOutcome =
 
 const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'];
 const MAX_STDERR_CHARS = 8_000;
+const TERMINAL_EXIT_GRACE_MS = 750;
+const TERMINAL_FORCE_KILL_MS = 3_000;
 
 // This list is a documented fallback only. Live account/runtime evidence always wins.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
@@ -348,7 +350,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
 
   async sendInput(sessionId: string, input: AgentInput): Promise<void> {
     const child = this.activeProcesses.get(sessionId);
-    if (!child?.stdin || child.killed) throw new Error(`Antigravity session ${sessionId} is not interactive.`);
+    if (!child?.stdin || child.killed || child.stdin.destroyed || child.stdin.writableEnded) throw new Error(`Antigravity session ${sessionId} is not interactive.`);
     child.stdin.write(`${input.content}\n`);
   }
 
@@ -410,7 +412,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
           ...options.env,
           ...controlPlaneEnv(controlPlane),
         },
-        stdio: ['pipe', 'pipe', 'pipe'],
+        // Background print mode is a one-shot invocation: the complete prompt is
+        // supplied through --print, so stdin must start closed instead of keeping
+        // the CLI/MCP process graph alive while AtrisAgent waits for `result`.
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) {
       overlay?.cleanup();
@@ -572,6 +577,33 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     if (this.terminalSessions.has(sessionId)) return;
     this.terminalSessions.add(sessionId);
     this.pendingTerminalBySession.set(sessionId, outcome);
+    this.requestTerminalProcessShutdown(sessionId);
+  }
+
+  private requestTerminalProcessShutdown(sessionId: string): void {
+    const child = this.activeProcesses.get(sessionId);
+    if (!child) return;
+
+    // `agy --print` is a one-shot process. Once its authoritative terminal
+    // `result` event arrives, keeping stdin open or a lingering MCP/background
+    // worker alive must not hold the mission DAG in Running forever.
+    if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) {
+      child.stdin.end();
+    }
+
+    const terminate = setTimeout(() => {
+      const active = this.activeProcesses.get(sessionId);
+      if (!active || active.exitCode !== null || active.signalCode !== null) return;
+      active.kill('SIGTERM');
+
+      const forceKill = setTimeout(() => {
+        const stillActive = this.activeProcesses.get(sessionId);
+        if (!stillActive || stillActive.exitCode !== null || stillActive.signalCode !== null) return;
+        stillActive.kill('SIGKILL');
+      }, TERMINAL_FORCE_KILL_MS);
+      forceKill.unref?.();
+    }, TERMINAL_EXIT_GRACE_MS);
+    terminate.unref?.();
   }
 
   private emitTerminalOutcome(
