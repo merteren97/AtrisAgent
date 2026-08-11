@@ -62,6 +62,7 @@ const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'research
 const MAX_STDERR_CHARS = 8_000;
 const TERMINAL_EXIT_GRACE_MS = 750;
 const TERMINAL_FORCE_KILL_MS = 3_000;
+const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
 
 // This list is a documented fallback only. Live account/runtime evidence always wins.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
@@ -446,6 +447,49 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     });
 
     let buffer = '';
+    let finalized = false;
+    let exitFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const flushBufferedOutput = () => {
+      if (!buffer.trim()) return;
+      this.handleStreamLine(sessionId, buffer);
+      buffer = '';
+    };
+
+    const finalizeNativeSession = (code: number | null, signal: NodeJS.Signals | null = null) => {
+      if (finalized) return;
+      finalized = true;
+      if (exitFinalizeTimer) clearTimeout(exitFinalizeTimer);
+      flushBufferedOutput();
+      this.recordProcessTerminationOutcome(sessionId, code, signal);
+
+      const context = this.sessionContext.get(sessionId);
+      const outcome = this.pendingTerminalBySession.get(sessionId);
+
+      // Native process termination, not stdio stream closure, is the ownership
+      // boundary for a one-shot Antigravity run. A descendant MCP bridge may share
+      // stdout/stderr and keep Node's `close` event pending after `exit` has fired.
+      this.unregisterProcess(sessionId);
+      session.endedAt = new Date().toISOString();
+      this.activeSessions.delete(sessionId);
+      overlay?.cleanup();
+      revokeControlPlaneAgent(sessionId);
+      this.sessionContext.delete(sessionId);
+      this.stderrBuffers.delete(sessionId);
+      this.lastOutputBySession.delete(sessionId);
+      this.pendingTerminalBySession.delete(sessionId);
+      this.terminalSessions.delete(sessionId);
+
+      // Stop waiting on inherited/shared stdio handles after the parent runtime
+      // has exited. The control-plane grant is already revoked above.
+      child.stdout?.removeAllListeners('data');
+      child.stderr?.removeAllListeners('data');
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+
+      if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
+    };
+
     child.stdout?.on('data', (chunk: Buffer) => {
       buffer += chunk.toString('utf8');
       const lines = buffer.split(/\r?\n/);
@@ -463,44 +507,15 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         error: redactSecrets(error.message),
       });
     });
-    child.on('close', (code) => {
-      if (buffer.trim()) {
-        this.handleStreamLine(sessionId, buffer);
-        buffer = '';
-      }
-
-      if (!this.terminalSessions.has(sessionId)) {
-        const stderr = this.stderrBuffers.get(sessionId)?.trim();
-        const detail = stderr ? `\n${stderr}` : '';
-        const reason = code === 0
-          ? `Antigravity exited cleanly before reporting a terminal result.${detail}`
-          : `Antigravity exited with code ${code}.${detail}`;
-        this.recordTerminalOutcome(sessionId, {
-          kind: 'failed',
-          error: redactSecrets(reason),
-          exitCode: code,
-        });
-      }
-
-      const context = this.sessionContext.get(sessionId);
-      const outcome = this.pendingTerminalBySession.get(sessionId);
-
-      // Tear the native process and its session-scoped MCP grant down before the
-      // terminal task event reaches Orchestrator. task_failed can immediately retry
-      // and task_completed can immediately schedule a dependent role; neither may
-      // overlap the previous Antigravity process/overlay.
-      this.unregisterProcess(sessionId);
-      session.endedAt = new Date().toISOString();
-      this.activeSessions.delete(sessionId);
-      overlay?.cleanup();
-      revokeControlPlaneAgent(sessionId);
-      this.sessionContext.delete(sessionId);
-      this.stderrBuffers.delete(sessionId);
-      this.lastOutputBySession.delete(sessionId);
-      this.pendingTerminalBySession.delete(sessionId);
-      this.terminalSessions.delete(sessionId);
-
-      if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
+    child.on('exit', (code, signal) => {
+      // `exit` proves the Antigravity parent process is gone, but a final stdout
+      // chunk may still be in flight. Give the stream a short bounded drain window;
+      // `close` will finalize sooner when all stdio handles close normally.
+      exitFinalizeTimer = setTimeout(() => finalizeNativeSession(code, signal), PROCESS_EXIT_STREAM_DRAIN_MS);
+      exitFinalizeTimer.unref?.();
+    });
+    child.on('close', (code, signal) => {
+      finalizeNativeSession(code, signal);
     });
     return session;
   }
@@ -573,16 +588,45 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     }
   }
 
-  private recordTerminalOutcome(sessionId: string, outcome: PendingTerminalOutcome): void {
+  private recordProcessTerminationOutcome(
+    sessionId: string,
+    code: number | null,
+    signal: NodeJS.Signals | null = null,
+  ): void {
+    if (this.terminalSessions.has(sessionId)) return;
+
+    const stderr = this.stderrBuffers.get(sessionId)?.trim();
+    const detail = stderr ? `\n${stderr}` : '';
+    if (code === 0) {
+      const result = this.lastOutputBySession.get(sessionId)?.trim() || 'Antigravity task completed';
+      this.recordTerminalOutcome(sessionId, { kind: 'completed', result }, false);
+      return;
+    }
+
+    const reason = signal
+      ? `Antigravity terminated by signal ${signal}.${detail}`
+      : `Antigravity exited with code ${code}.${detail}`;
+    this.recordTerminalOutcome(sessionId, {
+      kind: 'failed',
+      error: redactSecrets(reason),
+      exitCode: code,
+    }, false);
+  }
+
+  private recordTerminalOutcome(
+    sessionId: string,
+    outcome: PendingTerminalOutcome,
+    requestShutdown = true,
+  ): void {
     if (this.terminalSessions.has(sessionId)) return;
     this.terminalSessions.add(sessionId);
     this.pendingTerminalBySession.set(sessionId, outcome);
-    this.requestTerminalProcessShutdown(sessionId);
+    if (requestShutdown) this.requestTerminalProcessShutdown(sessionId);
   }
 
   private requestTerminalProcessShutdown(sessionId: string): void {
     const child = this.activeProcesses.get(sessionId);
-    if (!child) return;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
 
     // `agy --print` is a one-shot process. Once its authoritative terminal
     // `result` event arrives, keeping stdin open or a lingering MCP/background
