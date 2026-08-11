@@ -196,23 +196,70 @@ async function runTests() {
     emittedEvents.length = 0;
     const antigravityAdapter = new AntigravityAdapter(eventBus);
     const antigravityContext = { missionId: 'm-1', taskId: 't-2' };
+    let failedStdinEnded = false;
     (antigravityAdapter as any).sessionContext.set('test-session-2', antigravityContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-2', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { failedStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
     const antigravityLines = [
       JSON.stringify({ type: 'step_update', step_type: 'thought', text: 'Planning execution strategy' }),
       JSON.stringify({ type: 'step_update', step_type: 'tool', tool_name: 'RunBuild', args: { command: 'npm run build' } }),
       JSON.stringify({ type: 'step_update', step_type: 'progress', text: 'Build is running' }),
-      JSON.stringify({ type: 'result', success: false, error: 'Antigravity quota limit hit' }),
+      JSON.stringify({ type: 'step_update', step_type: 'agent_response', state: 'DONE', text: 'Intermediate agent response' }),
     ];
     for (const line of antigravityLines) (antigravityAdapter as any).handleStreamLine('test-session-2', line);
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-2'), 'Antigravity agent_response DONE remains a non-terminal step because more tool work can follow');
+
+    (antigravityAdapter as any).handleStreamLine('test-session-2', JSON.stringify({ type: 'result', success: false, error: 'Antigravity quota limit hit' }));
     const antigravityTypesBeforeClose = emittedEvents.map((e) => e.type);
     const pendingOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-2');
     assert(antigravityTypesBeforeClose.includes('agent_thought'), 'AntigravityAdapter normalizes thought steps into agent_thought');
     assert(antigravityTypesBeforeClose.includes('agent_tool_call'), 'AntigravityAdapter normalizes tool steps into agent_tool_call');
     assert(antigravityTypesBeforeClose.includes('text_delta'), 'AntigravityAdapter normalizes progress text into text_delta');
+    assert(failedStdinEnded, 'AntigravityAdapter closes print-mode stdin as soon as a terminal result is received');
     assert(!antigravityTypesBeforeClose.includes('task_failed') && pendingOutcome?.kind === 'failed', 'AntigravityAdapter defers terminal failure until native session cleanup');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-2');
 
     (antigravityAdapter as any).emitTerminalOutcome('test-session-2', antigravityContext, pendingOutcome);
     assert(emittedEvents.some((event) => event.type === 'task_failed'), 'AntigravityAdapter emits task_failed after close-phase cleanup');
+
+    emittedEvents.length = 0;
+    const successContext = { missionId: 'm-2', taskId: 'research-task' };
+    let successStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-3', successContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-3', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { successStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-3', JSON.stringify({
+      type: 'result',
+      success: true,
+      status: 'SUCCESS',
+      response: 'Research complete',
+    }));
+    const successPendingOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-3');
+    assert(successStdinEnded, 'AntigravityAdapter starts native shutdown after a successful terminal result');
+    assert(successPendingOutcome?.kind === 'completed', 'AntigravityAdapter records a successful terminal result for close-phase handoff');
+    assert(!emittedEvents.some((event) => event.type === 'task_completed'), 'AntigravityAdapter still waits for native cleanup before publishing task_completed');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-3');
+
+    (antigravityAdapter as any).emitTerminalOutcome('test-session-3', successContext, successPendingOutcome);
+    assert(emittedEvents.some((event) => event.type === 'task_completed'), 'AntigravityAdapter publishes task_completed after native cleanup so Orchestrator can schedule the next DAG task');
   }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);
