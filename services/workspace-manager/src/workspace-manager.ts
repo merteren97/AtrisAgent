@@ -398,7 +398,7 @@ export class WorkspaceManager {
   /**
    * Create an isolated git worktree for a task (branch: atris/mission-<missionId>/task-<taskId>).
    */
-  async createWorktreeForTask(taskId: string, baseBranch: string = 'main', candidateSuffix?: string): Promise<string> {
+  async createWorktreeForTask(taskId: string, baseBranch: string = 'HEAD', candidateSuffix?: string): Promise<string> {
     const task = await this.getTask(taskId);
     if (!task) {
       throw new Error(`Task with ID "${taskId}" not found`);
@@ -422,12 +422,14 @@ export class WorkspaceManager {
       : `task-${taskId}`;
 
     const worktreeDir = path.join(basePath, '.atris-worktrees', `mission-${task.missionId}`, worktreeSubDir);
+    const projectHint = `${task.title}\n${task.description || ''}`;
 
     const createdPath = await this.worktreeManager.createWorktree(
       basePath,
       branchName,
       worktreeDir,
-      baseBranch
+      baseBranch,
+      projectHint,
     );
 
     const now = new Date().toISOString();
