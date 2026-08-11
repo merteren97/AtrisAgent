@@ -73,7 +73,7 @@ export class WorkspaceManager {
 
   constructor(
     private db: AtrisDatabase,
-    private eventBus?: LocalEventBus
+    _eventBus?: LocalEventBus
   ) {}
 
   getWorktreeManager(): WorktreeManager {
@@ -117,7 +117,11 @@ export class WorkspaceManager {
     return await this.db.select().from(workspaces);
   }
 
-  /** Create a new mission record under a workspace. */
+  /**
+   * Create a mission record only. Runtime lifecycle events are emitted by the
+   * Orchestrator when execution actually transitions into Running; persistence
+   * must not impersonate that transition or every mission gets two starts.
+   */
   async createMission(input: CreateMissionInput): Promise<MissionSelect> {
     const now = new Date().toISOString();
     const newMission: MissionInsert = {
@@ -136,17 +140,6 @@ export class WorkspaceManager {
     await this.db.insert(missions).values(newMission);
     const result = await this.getMission(newMission.id);
     if (!result) throw new Error(`Failed to retrieve newly created mission "${newMission.id}"`);
-
-    if (this.eventBus) {
-      this.eventBus.emit({
-        id: crypto.randomUUID(),
-        type: 'mission_started',
-        missionId: result.id,
-        workspaceId: result.workspaceId,
-        title: result.title,
-        timestamp: now,
-      });
-    }
     return result;
   }
 
