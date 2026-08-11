@@ -79,6 +79,7 @@ interface MissionState {
   updateMissionStatus: (id: string, status: MissionStatus) => void;
   addTimelineItem: (item: TimelineItem) => void;
   setTasks: (tasks: TaskItem[]) => void;
+  patchTask: (taskId: string, patch: Partial<TaskItem>) => void;
   pauseMission: (id: string) => Promise<void>;
   stopMission: (id: string) => Promise<void>;
   retryMission: (id: string) => Promise<void>;
@@ -153,6 +154,51 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
       || (event.type?.includes('verification') || event.type?.includes('review') ? 'reviewer' : event.type?.includes('check') ? 'qa' : undefined),
     metadata: event,
   };
+}
+
+function streamIdentity(item: TimelineItem): string {
+  const agentInstanceId = typeof item.metadata?.agentInstanceId === 'string' ? item.metadata.agentInstanceId : '';
+  return `${agentInstanceId}|${item.agentRole || ''}`;
+}
+
+function canCoalesceTextDelta(previous: TimelineItem | undefined, next: TimelineItem): previous is TimelineItem {
+  return Boolean(
+    previous
+    && previous.type === 'orchestrator_message'
+    && previous.eventType === 'text_delta'
+    && next.type === 'orchestrator_message'
+    && next.eventType === 'text_delta'
+    && streamIdentity(previous) === streamIdentity(next),
+  );
+}
+
+function mergeTextDelta(previous: TimelineItem, next: TimelineItem): TimelineItem {
+  const previousText = previous.content || '';
+  const nextText = next.content || '';
+  if (!nextText || nextText === previousText || previousText.startsWith(nextText)) return previous;
+  if (nextText.startsWith(previousText)) {
+    return { ...previous, content: nextText, timestamp: next.timestamp, metadata: next.metadata };
+  }
+  const separator = previousText.endsWith('\n') || nextText.startsWith('\n') ? '' : '\n\n';
+  return {
+    ...previous,
+    content: `${previousText}${separator}${nextText}`,
+    timestamp: next.timestamp,
+    metadata: { ...previous.metadata, ...next.metadata },
+  };
+}
+
+function coalesceTimeline(items: TimelineItem[]): TimelineItem[] {
+  const result: TimelineItem[] = [];
+  for (const item of items) {
+    const previous = result[result.length - 1];
+    if (canCoalesceTextDelta(previous, item)) {
+      result[result.length - 1] = mergeTextDelta(previous, item);
+    } else {
+      result.push(item);
+    }
+  }
+  return result;
 }
 
 export const useMissionStore = create<MissionState>((set, get) => ({
@@ -231,7 +277,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         return {
           missions,
           activeTasks: state.tasks || [],
-          timeline: restoredTimeline,
+          timeline: coalesceTimeline(restoredTimeline),
           hydratedMissionId: missionId,
         };
       });
@@ -297,6 +343,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         activeTasks: data.tasks || [],
         loading: false,
       }));
+
+      // Mission start can emit assignment/start events before the POST response is
+      // returned. Re-read persisted state immediately so Task 1 and its agent are
+      // never left at the plan-time snapshot shown by the response payload.
+      await get().fetchMissionState(data.missionId);
     } catch (error: any) {
       const errorCard: TimelineItem = {
         id: crypto.randomUUID(),
@@ -361,10 +412,18 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     missions: state.missions.map((mission) => mission.id === id ? { ...mission, status } : mission),
   })),
 
-  addTimelineItem: (item) => set((state) => state.timeline.some((entry) => entry.id === item.id)
-    ? state
-    : { timeline: [...state.timeline, item] }),
+  addTimelineItem: (item) => set((state) => {
+    if (state.timeline.some((entry) => entry.id === item.id)) return state;
+    const previous = state.timeline[state.timeline.length - 1];
+    if (canCoalesceTextDelta(previous, item)) {
+      return { timeline: [...state.timeline.slice(0, -1), mergeTextDelta(previous, item)] };
+    }
+    return { timeline: [...state.timeline, item] };
+  }),
   setTasks: (tasks) => set({ activeTasks: tasks }),
+  patchTask: (taskId, patch) => set((state) => ({
+    activeTasks: state.activeTasks.map((task) => task.id === taskId ? { ...task, ...patch } : task),
+  })),
 
   pauseMission: async () => {
     set({ error: 'Pause/resume is not exposed until every configured runtime supports safe resumable cancellation. Use Stop to cancel the current mission.' });
