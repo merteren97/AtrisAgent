@@ -412,7 +412,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
           ...options.env,
           ...controlPlaneEnv(controlPlane),
         },
-        stdio: ['pipe', 'pipe', 'pipe'],
+        // Background print mode is a one-shot invocation: the complete prompt is
+        // supplied through --print, so stdin must start closed instead of keeping
+        // the CLI/MCP process graph alive while AtrisAgent waits for `result`.
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) {
       overlay?.cleanup();
