@@ -5,9 +5,16 @@ import path from 'path';
 import { isGeneratedWorkspaceDirectory, isGitWorktree } from './git-utils';
 
 const execFileAsync = promisify(execFile);
+const GIT_COMMAND_TIMEOUT_MS = 45_000;
 
 async function git(args: string[], cwd: string): Promise<{ stdout: string; stderr: string }> {
-  const result = await execFileAsync('git', args, { cwd, windowsHide: true, maxBuffer: 20 * 1024 * 1024 });
+  const result = await execFileAsync('git', args, {
+    cwd,
+    windowsHide: true,
+    maxBuffer: 20 * 1024 * 1024,
+    timeout: GIT_COMMAND_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  });
   return { stdout: String(result.stdout || ''), stderr: String(result.stderr || '') };
 }
 
@@ -40,6 +47,11 @@ export interface ChangedFile {
   status: 'added' | 'modified' | 'deleted' | 'renamed' | 'unknown';
 }
 
+export interface IsolationBase {
+  path: string;
+  kind: 'workspace-git' | 'nested-git' | 'mirror';
+}
+
 const DEFAULT_IGNORED_DIRS = new Set([
   'node_modules',
   '.git',
@@ -55,23 +67,18 @@ function shouldIgnoreEntry(name: string, ignoreList: Set<string>): boolean {
   return ignoreList.has(name) || isGeneratedWorkspaceDirectory(name);
 }
 
-function copyDirRecursive(src: string, dest: string, ignoreList: Set<string> = DEFAULT_IGNORED_DIRS) {
-  if (!fs.existsSync(dest)) {
-    fs.mkdirSync(dest, { recursive: true });
-  }
-
-  const entries = fs.readdirSync(src, { withFileTypes: true });
+async function copyDirRecursive(src: string, dest: string, ignoreList: Set<string> = DEFAULT_IGNORED_DIRS): Promise<void> {
+  await fs.promises.mkdir(dest, { recursive: true });
+  const entries = await fs.promises.readdir(src, { withFileTypes: true });
   for (const entry of entries) {
-    if (shouldIgnoreEntry(entry.name, ignoreList)) {
-      continue;
-    }
+    if (shouldIgnoreEntry(entry.name, ignoreList)) continue;
     const srcPath = path.join(src, entry.name);
     const destPath = path.join(dest, entry.name);
 
     if (entry.isDirectory()) {
-      copyDirRecursive(srcPath, destPath, ignoreList);
+      await copyDirRecursive(srcPath, destPath, ignoreList);
     } else if (entry.isFile()) {
-      fs.copyFileSync(srcPath, destPath);
+      await fs.promises.copyFile(srcPath, destPath);
     }
   }
 }
@@ -94,6 +101,10 @@ function getAllFilesRelative(dir: string, baseDir: string = dir, ignoreList: Set
   return files;
 }
 
+function normalizeProjectHint(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
 export class WorktreeManager {
   /**
    * Check if the directory is a Git repository.
@@ -103,13 +114,94 @@ export class WorktreeManager {
   }
 
   /**
+   * Resolve the actual project that owns Builder isolation.
+   *
+   * AtrisAgent workspaces may intentionally be project containers (for example
+   * a parent directory containing AtrisTracker plus other repositories). A
+   * Builder should isolate the intended child repository instead of mirroring
+   * the complete parent folder twice before the runtime can even start.
+   */
+  async resolveIsolationBase(workspacePath: string, projectHint = ''): Promise<IsolationBase> {
+    if (await this.isGitRepository(workspacePath)) {
+      return { path: workspacePath, kind: 'workspace-git' };
+    }
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(workspacePath, { withFileTypes: true });
+    } catch {
+      return { path: workspacePath, kind: 'mirror' };
+    }
+
+    const repositories: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || shouldIgnoreEntry(entry.name, DEFAULT_IGNORED_DIRS)) continue;
+      const candidate = path.join(workspacePath, entry.name);
+      if (await this.isGitRepository(candidate)) repositories.push(candidate);
+    }
+
+    if (repositories.length === 1) {
+      return { path: repositories[0], kind: 'nested-git' };
+    }
+
+    if (repositories.length > 1 && projectHint.trim()) {
+      const normalizedHint = normalizeProjectHint(projectHint);
+      const ranked = repositories
+        .map((candidate) => {
+          const projectName = path.basename(candidate);
+          const normalizedName = normalizeProjectHint(projectName);
+          return {
+            candidate,
+            score: normalizedName && normalizedHint.includes(normalizedName) ? normalizedName.length : 0,
+          };
+        })
+        .filter((item) => item.score > 0)
+        .sort((left, right) => right.score - left.score);
+
+      if (ranked.length > 0 && (ranked.length === 1 || ranked[0].score > ranked[1].score)) {
+        return { path: ranked[0].candidate, kind: 'nested-git' };
+      }
+    }
+
+    return { path: workspacePath, kind: 'mirror' };
+  }
+
+  /**
+   * Resolve the source repository that owns a linked Git worktree. This keeps
+   * cleanup/apply operations correct when the selected AtrisAgent workspace is
+   * a non-Git parent directory.
+   */
+  private async resolveGitOwner(worktreePath: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await git(['rev-parse', '--git-common-dir'], worktreePath);
+      const rawCommonDir = stdout.trim();
+      if (!rawCommonDir) return undefined;
+      const commonDir = path.isAbsolute(rawCommonDir)
+        ? path.normalize(rawCommonDir)
+        : path.resolve(worktreePath, rawCommonDir);
+      if (path.basename(commonDir).toLowerCase() === '.git') return path.dirname(commonDir);
+    } catch {
+      // Fall through to the caller-provided workspace root.
+    }
+    return undefined;
+  }
+
+  async resolveMergeBasePath(worktreePath: string, fallbackBasePath: string): Promise<string> {
+    if (await this.isGitRepository(worktreePath)) {
+      return (await this.resolveGitOwner(worktreePath)) || fallbackBasePath;
+    }
+    return fallbackBasePath;
+  }
+
+  /**
    * Create an isolated git worktree or non-git mirror for a task.
    */
   async createWorktree(
     basePath: string,
     branchName: string,
     worktreePath?: string,
-    baseBranch: string = 'main'
+    baseBranch: string = 'HEAD',
+    projectHint: string = '',
   ): Promise<string> {
     const targetPath =
       worktreePath ||
@@ -121,16 +213,21 @@ export class WorktreeManager {
     }
 
     if (fs.existsSync(targetPath)) {
-      return targetPath;
+      if (await this.isGitRepository(targetPath) || fs.existsSync(path.join(targetPath, '.atris-baseline'))) {
+        return targetPath;
+      }
+      fs.rmSync(targetPath, { recursive: true, force: true });
     }
 
-    const isGit = await this.isGitRepository(basePath);
+    const isolationBase = await this.resolveIsolationBase(basePath, projectHint);
+    const sourcePath = isolationBase.path;
+    const isGit = isolationBase.kind !== 'mirror';
 
     if (isGit) {
-      ensureAtrisGitExcludes(basePath);
+      ensureAtrisGitExcludes(sourcePath);
       let branchExists = false;
       try {
-        await git(['rev-parse', '--verify', branchName], basePath);
+        await git(['rev-parse', '--verify', branchName], sourcePath);
         branchExists = true;
       } catch {
         branchExists = false;
@@ -138,25 +235,34 @@ export class WorktreeManager {
 
       try {
         if (branchExists) {
-          await git(['worktree', 'add', targetPath, branchName], basePath);
+          await git(['worktree', 'add', targetPath, branchName], sourcePath);
         } else {
-          await git(['worktree', 'add', '-b', branchName, targetPath, baseBranch], basePath);
+          await git(['worktree', 'add', '-b', branchName, targetPath, baseBranch], sourcePath);
         }
       } catch (err: any) {
         if (!branchExists && baseBranch !== 'HEAD') {
-          await git(['worktree', 'add', '-b', branchName, targetPath, 'HEAD'], basePath);
+          await git(['worktree', 'add', '-b', branchName, targetPath, 'HEAD'], sourcePath);
         } else {
-          throw err;
+          throw new Error(
+            `Could not create Builder worktree from ${sourcePath}: ${err?.stderr || err?.message || 'git worktree add failed'}`,
+            { cause: err },
+          );
         }
       }
     } else {
-      // Non-Git Managed Mirror
-      fs.mkdirSync(targetPath, { recursive: true });
-      copyDirRecursive(basePath, targetPath);
+      // Truly non-Git/cross-project workspaces still use a managed mirror. Keep
+      // the copy asynchronous so preparation cannot monopolize the API event loop.
+      try {
+        fs.mkdirSync(targetPath, { recursive: true });
+        await copyDirRecursive(basePath, targetPath);
 
-      // Save a baseline snapshot inside targetPath for diff tracking
-      const baselinePath = path.join(targetPath, '.atris-baseline');
-      copyDirRecursive(basePath, baselinePath);
+        const baselinePath = path.join(targetPath, '.atris-baseline');
+        await copyDirRecursive(basePath, baselinePath);
+      } catch (error) {
+        fs.rmSync(targetPath, { recursive: true, force: true });
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Could not create an isolated mirror for ${basePath}: ${message}`, { cause: error });
+      }
     }
 
     return targetPath;
@@ -166,8 +272,13 @@ export class WorktreeManager {
    * Remove a worktree directory and prune git worktrees if git.
    */
   async removeWorktree(worktreePath: string, force: boolean = true, basePath?: string): Promise<void> {
-    const cwd = basePath || (fs.existsSync(worktreePath) ? worktreePath : process.cwd());
-    const isGit = await this.isGitRepository(cwd);
+    const worktreeIsGit = fs.existsSync(worktreePath) && await this.isGitRepository(worktreePath);
+    let cwd = basePath || (fs.existsSync(worktreePath) ? worktreePath : process.cwd());
+    if (worktreeIsGit) {
+      const owner = await this.resolveGitOwner(worktreePath);
+      if (owner) cwd = owner;
+    }
+    const isGit = worktreeIsGit || await this.isGitRepository(cwd);
 
     if (isGit) {
       try {
@@ -183,10 +294,8 @@ export class WorktreeManager {
       } catch {
         // Ignore prune errors
       }
-    } else {
-      if (fs.existsSync(worktreePath)) {
-        fs.rmSync(worktreePath, { recursive: true, force: true });
-      }
+    } else if (fs.existsSync(worktreePath)) {
+      fs.rmSync(worktreePath, { recursive: true, force: true });
     }
   }
 
@@ -225,38 +334,38 @@ export class WorktreeManager {
       } catch {
         return [];
       }
-    } else {
-      // Non-Git comparison against .atris-baseline
-      const baselineDir = path.join(worktreePath, '.atris-baseline');
-      if (!fs.existsSync(baselineDir)) {
-        return [];
-      }
-
-      const baselineFiles = new Set(getAllFilesRelative(baselineDir));
-      const currentFiles = new Set(getAllFilesRelative(worktreePath, worktreePath, new Set([...DEFAULT_IGNORED_DIRS, '.atris-baseline'])));
-
-      const changed: ChangedFile[] = [];
-
-      for (const file of currentFiles) {
-        if (!baselineFiles.has(file)) {
-          changed.push({ path: file, status: 'added' });
-        } else {
-          const baseBuf = fs.readFileSync(path.join(baselineDir, file));
-          const currBuf = fs.readFileSync(path.join(worktreePath, file));
-          if (!baseBuf.equals(currBuf)) {
-            changed.push({ path: file, status: 'modified' });
-          }
-        }
-      }
-
-      for (const file of baselineFiles) {
-        if (!currentFiles.has(file)) {
-          changed.push({ path: file, status: 'deleted' });
-        }
-      }
-
-      return changed;
     }
+
+    // Non-Git comparison against .atris-baseline
+    const baselineDir = path.join(worktreePath, '.atris-baseline');
+    if (!fs.existsSync(baselineDir)) {
+      return [];
+    }
+
+    const baselineFiles = new Set(getAllFilesRelative(baselineDir));
+    const currentFiles = new Set(getAllFilesRelative(worktreePath, worktreePath, new Set([...DEFAULT_IGNORED_DIRS, '.atris-baseline'])));
+
+    const changed: ChangedFile[] = [];
+
+    for (const file of currentFiles) {
+      if (!baselineFiles.has(file)) {
+        changed.push({ path: file, status: 'added' });
+      } else {
+        const baseBuf = fs.readFileSync(path.join(baselineDir, file));
+        const currBuf = fs.readFileSync(path.join(worktreePath, file));
+        if (!baseBuf.equals(currBuf)) {
+          changed.push({ path: file, status: 'modified' });
+        }
+      }
+    }
+
+    for (const file of baselineFiles) {
+      if (!currentFiles.has(file)) {
+        changed.push({ path: file, status: 'deleted' });
+      }
+    }
+
+    return changed;
   }
 
   /**
@@ -283,46 +392,46 @@ export class WorktreeManager {
       } catch {
         return '';
       }
-    } else {
-      // Non-Git line-by-line diff generation
-      const changedFiles = await this.getChangedFiles(worktreePath);
-      const baselineDir = path.join(worktreePath, '.atris-baseline');
-      let diffText = '';
+    }
 
-      for (const cf of changedFiles) {
-        const filePath = cf.path;
-        const worktreeFile = path.join(worktreePath, filePath);
-        const baselineFile = path.join(baselineDir, filePath);
+    // Non-Git line-by-line diff generation
+    const changedFiles = await this.getChangedFiles(worktreePath);
+    const baselineDir = path.join(worktreePath, '.atris-baseline');
+    let diffText = '';
 
-        diffText += `--- a/${filePath}\n+++ b/${filePath}\n`;
+    for (const cf of changedFiles) {
+      const filePath = cf.path;
+      const worktreeFile = path.join(worktreePath, filePath);
+      const baselineFile = path.join(baselineDir, filePath);
 
-        const oldContent = fs.existsSync(baselineFile) ? fs.readFileSync(baselineFile, 'utf-8').split('\n') : [];
-        const newContent = fs.existsSync(worktreeFile) ? fs.readFileSync(worktreeFile, 'utf-8').split('\n') : [];
+      diffText += `--- a/${filePath}\n+++ b/${filePath}\n`;
 
-        if (cf.status === 'added') {
-          for (const line of newContent) {
-            diffText += `+${line}\n`;
-          }
-        } else if (cf.status === 'deleted') {
-          for (const line of oldContent) {
+      const oldContent = fs.existsSync(baselineFile) ? fs.readFileSync(baselineFile, 'utf-8').split('\n') : [];
+      const newContent = fs.existsSync(worktreeFile) ? fs.readFileSync(worktreeFile, 'utf-8').split('\n') : [];
+
+      if (cf.status === 'added') {
+        for (const line of newContent) {
+          diffText += `+${line}\n`;
+        }
+      } else if (cf.status === 'deleted') {
+        for (const line of oldContent) {
+          diffText += `-${line}\n`;
+        }
+      } else if (cf.status === 'modified') {
+        for (const line of oldContent) {
+          if (!newContent.includes(line)) {
             diffText += `-${line}\n`;
           }
-        } else if (cf.status === 'modified') {
-          for (const line of oldContent) {
-            if (!newContent.includes(line)) {
-              diffText += `-${line}\n`;
-            }
-          }
-          for (const line of newContent) {
-            if (!oldContent.includes(line)) {
-              diffText += `+${line}\n`;
-            }
+        }
+        for (const line of newContent) {
+          if (!oldContent.includes(line)) {
+            diffText += `+${line}\n`;
           }
         }
       }
-
-      return diffText;
     }
+
+    return diffText;
   }
 
   /**
@@ -330,11 +439,15 @@ export class WorktreeManager {
    */
   async merge(
     worktreePath: string,
-    targetBranch: string = 'main',
-    basePath?: string
+    targetBranch?: string,
+    basePath?: string,
   ): Promise<{ success: boolean; output: string }> {
-    const rootPath = basePath || path.dirname(path.dirname(worktreePath));
-    const isGit = await this.isGitRepository(rootPath);
+    let rootPath = basePath || path.dirname(path.dirname(worktreePath));
+    const worktreeIsGit = await this.isGitRepository(worktreePath);
+    if (worktreeIsGit) {
+      rootPath = (await this.resolveGitOwner(worktreePath)) || rootPath;
+    }
+    const isGit = worktreeIsGit || await this.isGitRepository(rootPath);
 
     if (isGit) {
       if (fs.existsSync(worktreePath)) {
@@ -344,8 +457,8 @@ export class WorktreeManager {
           if (status.trim().length > 0) {
             await git(['-c', 'user.name=AtrisAgent', '-c', 'user.email=local@atrisagent', 'commit', '-m', 'atris: auto-commit worktree changes before merge'], worktreePath);
           }
-        } catch (e) {
-          // Ignore
+        } catch {
+          // Merge below returns the actionable failure when auto-commit was insufficient.
         }
       }
 
@@ -363,8 +476,9 @@ export class WorktreeManager {
 
       try {
         const { stdout: currentBranch } = await git(['rev-parse', '--abbrev-ref', 'HEAD'], rootPath);
-        if (currentBranch.trim() !== targetBranch) {
-          return { success: false, output: `Workspace is on branch "${currentBranch.trim()}"; expected target branch "${targetBranch}".` };
+        const current = currentBranch.trim();
+        if (targetBranch && current !== targetBranch) {
+          return { success: false, output: `Workspace is on branch "${current}"; expected target branch "${targetBranch}".` };
         }
         const { stdout: rawRootStatus } = await git(['status', '--porcelain'], rootPath);
         const rootStatus = filterAtrisManagedStatus(rawRootStatus);
@@ -379,30 +493,30 @@ export class WorktreeManager {
           output: err?.stderr || err?.message || 'Git merge failed',
         };
       }
-    } else {
-      // Non-Git merge: Copy changed files from worktree back to rootPath
-      try {
-        const changedFiles = await this.getChangedFiles(worktreePath);
-        for (const cf of changedFiles) {
-          const srcFile = path.join(worktreePath, cf.path);
-          const destFile = path.join(rootPath, cf.path);
+    }
 
-          if (cf.status === 'deleted') {
-            if (fs.existsSync(destFile)) {
-              fs.unlinkSync(destFile);
-            }
-          } else {
-            const destDir = path.dirname(destFile);
-            if (!fs.existsSync(destDir)) {
-              fs.mkdirSync(destDir, { recursive: true });
-            }
-            fs.copyFileSync(srcFile, destFile);
+    // Non-Git merge: Copy changed files from worktree back to rootPath
+    try {
+      const changedFiles = await this.getChangedFiles(worktreePath);
+      for (const cf of changedFiles) {
+        const srcFile = path.join(worktreePath, cf.path);
+        const destFile = path.join(rootPath, cf.path);
+
+        if (cf.status === 'deleted') {
+          if (fs.existsSync(destFile)) {
+            fs.unlinkSync(destFile);
           }
+        } else {
+          const destDir = path.dirname(destFile);
+          if (!fs.existsSync(destDir)) {
+            fs.mkdirSync(destDir, { recursive: true });
+          }
+          fs.copyFileSync(srcFile, destFile);
         }
-        return { success: true, output: `Merged ${changedFiles.length} files to non-git workspace ${rootPath}` };
-      } catch (err: any) {
-        return { success: false, output: err?.message || 'Non-git merge failed' };
       }
+      return { success: true, output: `Merged ${changedFiles.length} files to non-git workspace ${rootPath}` };
+    } catch (err: any) {
+      return { success: false, output: err?.message || 'Non-git merge failed' };
     }
   }
 }
