@@ -46,10 +46,29 @@ function joinStreamText(previous: string, next: string): string {
   return `${previous} ${next}`;
 }
 
+function isDuplicateTerminalDiagnostic(items: TimelineItem[], index: number): boolean {
+  const item = items[index];
+  if (item.eventType !== 'agent_error') return false;
+
+  const taskId = metadataString(item, 'taskId');
+  const error = metadataString(item, 'error');
+  if (!taskId || !error) return false;
+
+  // RuntimeHost may attach an agent-level diagnostic while propagating the same
+  // task_failed event. Keep that diagnostic in the Activity inspector for deep
+  // telemetry, but show one authoritative failure in the conversational timeline.
+  return items.slice(index + 1, index + 4).some((candidate) => (
+    candidate.eventType === 'task_failed'
+    && metadataString(candidate, 'taskId') === taskId
+    && metadataString(candidate, 'error') === error
+  ));
+}
+
 function prepareTimeline(items: TimelineItem[]): RenderEntry[] {
+  const conversationalItems = items.filter((_, index) => !isDuplicateTerminalDiagnostic(items, index));
   const coalesced: TimelineItem[] = [];
 
-  for (const item of items) {
+  for (const item of conversationalItems) {
     const previous = coalesced[coalesced.length - 1];
     const canMerge = item.type === 'orchestrator_message'
       && previous?.type === 'orchestrator_message'
