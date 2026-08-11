@@ -79,6 +79,7 @@ interface MissionState {
   updateMissionStatus: (id: string, status: MissionStatus) => void;
   addTimelineItem: (item: TimelineItem) => void;
   setTasks: (tasks: TaskItem[]) => void;
+  patchTask: (id: string, updates: Partial<TaskItem>) => void;
   pauseMission: (id: string) => Promise<void>;
   stopMission: (id: string) => Promise<void>;
   retryMission: (id: string) => Promise<void>;
@@ -107,6 +108,7 @@ function eventLabel(event: Record<string, any>): string {
     case 'plan_revised': return `Plan revised: ${event.reason || 'Execution evidence changed the plan.'}`;
     case 'task_created': return `Task ready: ${event.title || event.taskId}`;
     case 'task_assigned': return `Task assigned to ${event.role}: ${event.taskId}`;
+    case 'task_claimed': return `Execution context prepared for ${event.taskId}.`;
     case 'task_split': return `Task split into ${event.childTaskIds?.length || 0} focused tasks: ${event.reason || ''}`;
     case 'task_merged': return `Tasks merged into ${event.mergedTaskId}: ${event.reason || ''}`;
     case 'agent_spawned': return `${event.displayName || event.role || 'Agent'} spawned: ${event.spawnReason || 'Specialized work required.'}`;
@@ -134,7 +136,8 @@ function eventLabel(event: Record<string, any>): string {
     case 'check_completed': return `${event.checkName || 'Check'}: ${event.passed ? 'passed' : 'failed'} — ${event.summary || ''}`;
     case 'changes_applied': return `Changes applied. ${event.filesChanged || 0} files changed.`;
     case 'task_completed': return `Task completed: ${event.taskId}`;
-    case 'task_failed': case 'agent_error': return `Execution failed: ${event.error || 'Unknown runtime error'}`;
+    case 'task_failed': return `Execution failed: ${event.error || 'Unknown runtime error'}`;
+    case 'agent_error': return `Runtime diagnostic: ${event.error || 'Unknown runtime diagnostic'}`;
     case 'mission_completed': return event.summary || 'Mission completed.';
     case 'mission_failed': return `Mission failed: ${event.reason || 'Unknown error'}`;
     default: return `Event: ${event.type}`;
@@ -228,10 +231,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           : current.missions;
 
         if (current.activeMissionId !== missionId) return { missions };
+        const restoredIds = new Set(restoredTimeline.map((item) => item.id));
+        const liveOnlyItems = current.timeline.filter((item) => !restoredIds.has(item.id) && item.id !== `request-${missionId}`);
         return {
           missions,
           activeTasks: state.tasks || [],
-          timeline: restoredTimeline,
+          timeline: [...restoredTimeline, ...liveOnlyItems],
           hydratedMissionId: missionId,
         };
       });
@@ -297,6 +302,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         activeTasks: data.tasks || [],
         loading: false,
       }));
+
+      // The runtime starts asynchronously from task_created events. Re-read the
+      // persisted mission immediately so the first task cannot remain on the
+      // plan-time snapshot while its agent is already preparing or running.
+      void get().fetchMissionState(data.missionId);
     } catch (error: any) {
       const errorCard: TimelineItem = {
         id: crypto.randomUUID(),
@@ -365,6 +375,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     ? state
     : { timeline: [...state.timeline, item] }),
   setTasks: (tasks) => set({ activeTasks: tasks }),
+  patchTask: (id, updates) => set((state) => ({
+    activeTasks: state.activeTasks.map((task) => task.id === id ? { ...task, ...updates } : task),
+  })),
 
   pauseMission: async () => {
     set({ error: 'Pause/resume is not exposed until every configured runtime supports safe resumable cancellation. Use Stop to cancel the current mission.' });
