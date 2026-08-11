@@ -39,11 +39,12 @@ export class MergeCoordinator {
   }
 
   /**
-   * Apply changes from the task's worktree back to the main branch with conflict detection and checkpoint rollback support.
+   * Apply changes from the task's worktree back to its actual source repository
+   * with conflict detection and checkpoint rollback support.
    */
   async applyWorktree(
     taskId: string,
-    targetBranch: string = 'main'
+    targetBranch?: string,
   ): Promise<MergeResult> {
     const task = await this.workspaceManager.getTask(taskId);
     if (!task) {
@@ -55,25 +56,29 @@ export class MergeCoordinator {
     }
 
     const mission = await this.workspaceManager.getMission(task.missionId);
-    let basePath = process.cwd();
+    let workspacePath = process.cwd();
     if (mission?.workspaceId) {
       const ws = await this.workspaceManager.getWorkspace(mission.workspaceId);
       if (ws?.path) {
-        basePath = ws.path;
+        workspacePath = ws.path;
       }
     }
 
-    // Step 1: Save pre-merge checkpoint
+    const worktreeManager = this.workspaceManager.getWorktreeManager();
+    const mergeBasePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, workspacePath);
+
+    // Step 1: Save pre-merge checkpoint at the repository that actually owns the
+    // Builder worktree, not at a non-Git parent project container.
     const checkpointManager = (this.workspaceManager as any).getCheckpointManager();
     const checkpointId = await checkpointManager.createCheckpoint(
-      basePath,
+      mergeBasePath,
       `pre-merge-task-${taskId}`,
       { missionId: task.missionId, isRollbackTarget: true }
     );
 
-    // Step 2: Attempt merge
-    const worktreeManager = this.workspaceManager.getWorktreeManager();
-    const mergeOutput = await worktreeManager.merge(task.worktreeId, targetBranch, basePath);
+    // Step 2: Attempt merge. Omitting targetBranch means "the source repository's
+    // currently checked out branch", so repositories are not forced to use main.
+    const mergeOutput = await worktreeManager.merge(task.worktreeId, targetBranch, mergeBasePath);
 
     // Step 3: Conflict & NeedsRebase detection
     const isConflict =
@@ -83,13 +88,13 @@ export class MergeCoordinator {
         mergeOutput.output.includes('conflict'));
 
     if (isConflict) {
-      // Abort git merge if in progress
       try {
-        await execAsync('git merge --abort', { cwd: basePath });
+        await execAsync('git merge --abort', { cwd: mergeBasePath });
       } catch {
         // Ignore if git merge abort fails or wasn't git
       }
 
+      const targetLabel = targetBranch || 'current workspace branch';
       return {
         success: false,
         status: 'NeedsRebase',
@@ -97,9 +102,9 @@ export class MergeCoordinator {
         checkpointId,
         rebaseRequest: {
           taskId,
-          targetBranch,
+          targetBranch: targetLabel,
           conflictMessage: mergeOutput.output,
-          instructions: `Merge conflict detected on task "${taskId}". Rebase worktree branch onto "${targetBranch}" and resolve conflicts before re-submitting.`,
+          instructions: `Merge conflict detected on task "${taskId}". Rebase the Builder worktree onto the ${targetLabel} and resolve conflicts before re-submitting.`,
         },
       };
     }
