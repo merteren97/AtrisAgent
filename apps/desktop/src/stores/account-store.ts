@@ -53,6 +53,7 @@ interface AccountState {
   loading: boolean;
   serviceOnline: boolean;
   error: string | null;
+  setServiceOnline: (online: boolean, error?: string | null) => void;
   fetchAccounts: () => Promise<void>;
   discoverModels: () => void;
   discoverLocalClis: () => Promise<void>;
@@ -126,6 +127,11 @@ function mapModels(models: ModelDescriptor[], accounts: AccountProfile[]): Disco
   });
 }
 
+function rejectionMessage(result: PromiseSettledResult<unknown>): string | undefined {
+  if (result.status !== 'rejected') return undefined;
+  return result.reason instanceof Error ? result.reason.message : String(result.reason || 'Unknown error');
+}
+
 export const useAccountStore = create<AccountState>()(persist((set, get) => ({
   accounts: [],
   runtimes: [],
@@ -134,16 +140,39 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
   serviceOnline: false,
   error: null,
 
+  setServiceOnline: (online, error = null) => set({ serviceOnline: online, error: error ?? (online ? null : get().error) }),
+
   fetchAccounts: async () => {
     set({ loading: true, error: null });
     try {
+      // Gateway liveness and catalog freshness are different concerns. Once
+      // health succeeds, an individual discovery endpoint may degrade without
+      // claiming the entire local service is offline.
       await checkApiHealth();
-      const [accounts, runtimes, models] = await Promise.all([
+      const [accountsResult, runtimesResult, modelsResult] = await Promise.allSettled([
         apiRequest<AccountProfile[]>('/accounts'),
         apiRequest<RuntimeStatus[]>('/runtimes'),
         apiRequest<ModelDescriptor[]>('/models'),
       ]);
-      set({ accounts, runtimes, discoveredModels: mapModels(models, accounts), serviceOnline: true, loading: false });
+      const current = get();
+      const accounts = accountsResult.status === 'fulfilled' ? accountsResult.value : current.accounts;
+      const runtimes = runtimesResult.status === 'fulfilled' ? runtimesResult.value : current.runtimes;
+      const discoveredModels = modelsResult.status === 'fulfilled'
+        ? mapModels(modelsResult.value, accounts)
+        : current.discoveredModels;
+      const endpointErrors = [accountsResult, runtimesResult, modelsResult]
+        .map(rejectionMessage)
+        .filter((value): value is string => Boolean(value));
+      set({
+        accounts,
+        runtimes,
+        discoveredModels,
+        serviceOnline: true,
+        loading: false,
+        error: endpointErrors.length
+          ? `Local service is online, but some runtime data could not be refreshed. Showing cached data. ${endpointErrors[0]}`
+          : null,
+      });
     } catch (error: any) {
       set({
         serviceOnline: false,
@@ -159,7 +188,7 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
       const runtimes = await apiRequest<RuntimeStatus[]>('/runtimes/discover', { method: 'POST' });
       set({ runtimes, serviceOnline: true, loading: false });
     } catch (error: any) {
-      set({ error: error?.message || 'Runtime discovery failed.', serviceOnline: false, loading: false });
+      set({ error: error?.message || 'Runtime discovery failed.', loading: false });
       throw error;
     }
   },
@@ -245,7 +274,7 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
       }
       const accounts = await apiRequest<AccountProfile[]>('/accounts');
       const models = await apiRequest<ModelDescriptor[]>('/models');
-      set({ accounts, discoveredModels: mapModels(models, accounts), error: null });
+      set({ accounts, discoveredModels: mapModels(models, accounts), serviceOnline: true, error: null });
     } catch (error: any) {
       set({ error: error?.message || 'Model catalog refresh failed.' });
       throw error;

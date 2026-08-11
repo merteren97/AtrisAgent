@@ -1,11 +1,11 @@
-import { useEffect, useMemo } from 'react';
-import { 
-  BarChart, 
-  Bar, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
+import { useMemo } from 'react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
   ResponsiveContainer,
   LineChart,
   Line
@@ -19,41 +19,36 @@ import { useAccountStore } from '@/stores/account-store';
 import { Badge } from '@/components/ui/badge';
 
 export function AnalyticsDashboard() {
-  const { missions, activeTasks, fetchMissions } = useMissionStore();
-  const { workspaces, fetchWorkspaces } = useWorkspaceStore();
-  const { accounts, fetchAccounts } = useAccountStore();
-
-  useEffect(() => {
-    fetchMissions();
-    fetchWorkspaces();
-    fetchAccounts();
-  }, [fetchMissions, fetchWorkspaces, fetchAccounts]);
+  // Dashboard navigation is a pure projection of already-hydrated app state.
+  // Core runtime refresh/recovery is owned by WorkspaceApp so mounting this view
+  // cannot fan out duplicate requests or clear navigation on a transient failure.
+  const { missions, activeTasks } = useMissionStore();
+  const { workspaces } = useWorkspaceStore();
+  const { accounts } = useAccountStore();
 
   const totalMissions = missions.length;
   const completedMissions = missions.filter(m => m.status === 'completed').length;
   const runningMissions = missions.filter(m => m.status === 'running').length;
-  
+
   const activeWorkspaces = workspaces.length;
   const connectedAccounts = accounts.filter(a => a.authStatus === 'connected').length;
-  
+
   const totalTasks = activeTasks.length;
-  const completedTasks = activeTasks.filter(t => t.status === 'completed').length;
+  const completedTasks = activeTasks.filter(t => t.status === 'completed' || t.status === 'done').length;
   const taskCompletionRate = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
 
   const activityData = useMemo(() => {
     const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     const data = days.map(day => ({ name: day, tasks: 0 }));
-    // To make it look like "Real Data" computed from mission task counts:
     missions.forEach((m) => {
       const date = new Date(m.createdAt || Date.now());
       const dayIndex = date.getDay();
       data[dayIndex].tasks += 1;
     });
     return data;
-  }, [missions, activeTasks]);
+  }, [missions]);
 
   const tokenData = useMemo(() => {
-    // Dynamically calculated token consumption charts from mission task counts
     return [
       { name: 'Week 1', tokens: totalMissions * 1500 },
       { name: 'Week 2', tokens: totalMissions * 2200 },
@@ -78,7 +73,7 @@ export function AnalyticsDashboard() {
           <h2 className="text-3xl font-bold tracking-tight">Analytics Dashboard</h2>
           <p className="text-muted-foreground">Real-time overview of agent activities and resources.</p>
         </div>
-        
+
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">

@@ -8,7 +8,9 @@ import { ChatTimeline } from '@/components/chat/chat-timeline';
 import { ChatComposer } from '@/components/composer/chat-composer';
 import { OnboardingModal } from '@/components/onboarding/OnboardingModal';
 import { InspectorPanel } from '@/components/inspector/inspector-panel';
-import { initEventListener } from '@/lib/event-listener';
+import { initEventListener, reconnectEventListener } from '@/lib/event-listener';
+import { checkApiHealth } from '@/lib/api-client';
+import { recoverRuntimeConnection } from '@/lib/runtime-config';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useMissionStore } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
@@ -28,6 +30,8 @@ import { AccessGate } from '@/components/auth/access-gate';
 import { isTauriRuntime } from '@/lib/secure-storage';
 import { Loader2 } from 'lucide-react';
 import type { RuntimeBootstrap } from '@/lib/runtime-config';
+
+const RUNTIME_HEALTH_INTERVAL_MS = 8_000;
 
 function AuthLoadingView() {
   return (
@@ -57,6 +61,58 @@ function WorkspaceApp() {
     })();
     return disposeEvents;
   }, [fetchWorkspaces, fetchMissions, shellState, session.token]);
+
+  useEffect(() => {
+    if (shellState !== 'workspace') return undefined;
+    let disposed = false;
+    let timer: number | null = null;
+    let probing = false;
+
+    const schedule = () => {
+      if (!disposed) timer = window.setTimeout(() => void probe(), RUNTIME_HEALTH_INTERVAL_MS);
+    };
+
+    const restoreClientState = async () => {
+      await fetchWorkspaces();
+      if (disposed) return;
+      const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
+      await Promise.allSettled([
+        fetchMissions(workspaceId || undefined),
+        useAccountStore.getState().fetchAccounts(),
+      ]);
+    };
+
+    const probe = async () => {
+      if (disposed || probing) return;
+      probing = true;
+      try {
+        await checkApiHealth();
+        if (!disposed) useAccountStore.getState().setServiceOnline(true);
+      } catch (healthError) {
+        if (!disposed) useAccountStore.getState().setServiceOnline(false, healthError instanceof Error ? healthError.message : 'Local service health check failed.');
+        try {
+          const recovered = await recoverRuntimeConnection();
+          if (disposed || recovered.status !== 'ready') return;
+          await checkApiHealth();
+          if (disposed) return;
+          useAccountStore.getState().setServiceOnline(true);
+          reconnectEventListener();
+          await restoreClientState();
+        } catch (recoveryError) {
+          if (!disposed) useAccountStore.getState().setServiceOnline(false, recoveryError instanceof Error ? recoveryError.message : 'Local runtime recovery failed.');
+        }
+      } finally {
+        probing = false;
+        schedule();
+      }
+    };
+
+    schedule();
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [fetchMissions, fetchWorkspaces, shellState, session.token]);
 
   if (shellState === 'checking') return <AuthLoadingView />;
   if (shellState === 'signed-out') return <LoginView error={error} isLoading={isLoggingIn} onLogin={login} />;

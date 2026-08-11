@@ -52,11 +52,12 @@ export const useWorkspaceStore = create<WorkspaceState>()(
             loading: false,
           });
         } catch (error: any) {
+          // A temporary gateway restart must never make a user's projects appear
+          // deleted. Keep the last known navigation state and surface a degraded
+          // status until the runtime supervisor reconnects and refreshes it.
           set({
-            workspaces: [],
-            activeWorkspaceId: null,
             loading: false,
-            error: error?.message || 'Could not load workspaces from the local service.',
+            error: error?.message || 'Could not refresh workspaces from the local service. Showing the last known workspace list.',
           });
         }
       },

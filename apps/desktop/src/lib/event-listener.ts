@@ -360,6 +360,17 @@ async function connectSse(): Promise<void> {
   }
 }
 
+/** Force the active listener onto the latest runtime origin/token after recovery. */
+export function reconnectEventListener(): void {
+  if (!transportActive) return;
+  markTransportGap();
+  streamAbortController?.abort();
+  streamAbortController = null;
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  void connectSse();
+}
+
 /** Uses fetch streaming so the bearer header never appears in a URL. */
 export function initEventListener(): () => void {
   transportActive = true;

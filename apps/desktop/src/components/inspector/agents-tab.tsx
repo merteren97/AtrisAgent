@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from 'react';
 import {
+  Activity,
   Ban,
   Bot,
   Brain,
@@ -31,7 +32,7 @@ function roleIcon(role: string) {
   if (value.includes('builder')) return <Hammer className="h-3.5 w-3.5 text-blue-400" />;
   if (value.includes('reviewer')) return <Eye className="h-3.5 w-3.5 text-amber-400" />;
   if (value.includes('researcher')) return <Search className="h-3.5 w-3.5 text-emerald-400" />;
-  if (value.includes('qa')) return <Shield className="h-3.5 w-3.5 text-cyan-400" />;
+  if (value.includes('qa')) return <Shield className="h-3 w-3 text-cyan-400" />;
   return <Bot className="h-3.5 w-3.5" />;
 }
 
@@ -133,7 +134,7 @@ function AgentTreeRow({
 }
 
 export function AgentsTab() {
-  const { activeMissionId, activeTasks, missions } = useMissionStore();
+  const { activeMissionId, activeTasks, missions, timeline } = useMissionStore();
   const agents = useAgentStore((state) => state.agents);
   const selectedAgentId = useAgentStore((state) => state.selectedAgentId);
   const setSelectedAgent = useAgentStore((state) => state.setSelectedAgent);
@@ -165,6 +166,13 @@ export function AgentsTab() {
       || activeTasks.find((task) => task.assignedAgentId === selectedAgent.id)
     : undefined;
   const selectedDisplayStatus = selectedAgent ? effectiveAgentStatus(selectedAgent, missionCancelled) : undefined;
+  const selectedActivity = useMemo(() => {
+    if (!selectedAgent) return [];
+    return timeline.filter((item) => {
+      const metadata = item.metadata as Record<string, unknown> | undefined;
+      return metadata?.agentInstanceId === selectedAgent.id;
+    }).slice(-16);
+  }, [selectedAgent, timeline]);
   const runningCount = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
   const waitingCount = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'waiting').length;
 
@@ -248,6 +256,27 @@ export function AgentsTab() {
                   {selectedAgent.workspaceMode && <Badge variant="outline" className="h-5 max-w-full px-1.5 text-[8px]"><GitBranch className="mr-1 h-2.5 w-2.5 shrink-0" /><span className="truncate">{selectedAgent.workspaceMode.replaceAll('_', ' ')}</span></Badge>}
                   {selectedAgent.unreadMessages ? <Badge variant="outline" className="h-5 px-1.5 text-[8px]"><MessageSquare className="mr-1 h-2.5 w-2.5" />{selectedAgent.unreadMessages} unread</Badge> : null}
                 </div>
+              </div>
+
+              <div className="mt-3 border-t border-border/60 pt-2.5">
+                <div className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                  <Activity className="h-2.5 w-2.5" />Live activity
+                </div>
+                {selectedActivity.length ? (
+                  <div className="mt-2 max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                    {selectedActivity.map((item) => (
+                      <div key={item.id} className="rounded-md border border-border/60 bg-background/55 px-2 py-1.5">
+                        <div className="flex items-center gap-2 text-[8px] text-muted-foreground">
+                          <span className="font-mono uppercase text-primary/90">{item.eventType || item.type}</span>
+                          <span className="ml-auto">{item.timestamp}</span>
+                        </div>
+                        <p className="mt-0.5 whitespace-pre-wrap break-words text-[9px] leading-relaxed text-foreground/85">{item.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-1.5 text-[9px] leading-relaxed text-muted-foreground">No runtime activity has been reported for this agent yet. If the process stalls or exits, its terminal state will now be surfaced instead of remaining silently Running.</p>
+                )}
               </div>
             </section>
           )}

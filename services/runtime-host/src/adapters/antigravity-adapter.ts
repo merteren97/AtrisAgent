@@ -21,6 +21,7 @@ import type {
   AgentRole,
 } from '@atris-agent-code/domain';
 import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
+import { parseAntigravityStreamLine } from './antigravity-stream';
 import {
   appendControlPlaneInstructions,
   controlPlaneEnv,
@@ -53,6 +54,7 @@ interface DocumentedModel {
 }
 
 const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'];
+const MAX_STDERR_CHARS = 8_000;
 
 // This list is a documented fallback only. Live account/runtime evidence always wins.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
@@ -71,6 +73,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
 
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
+  private terminalSessions = new Set<string>();
+  private lastOutputBySession = new Map<string, string>();
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
   constructor(eventBus?: LocalEventBus) {
@@ -404,8 +408,21 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     // exists. This prevents a Windows spawn ENOENT from creating ghost agents.
     this.activeSessions.set(sessionId, session);
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
+    this.terminalSessions.delete(sessionId);
+    this.lastOutputBySession.delete(sessionId);
+    this.stderrBuffers.delete(sessionId);
     this.registerProcess(sessionId, child);
-    this.emitEvent({ id: crypto.randomUUID(), type: 'agent_started', missionId: options.missionId, agentInstanceId: sessionId, role: String(options.role || 'builder'), model: options.model || 'Antigravity active model', timestamp: new Date().toISOString() });
+    this.emitEvent({
+      id: crypto.randomUUID(),
+      type: 'agent_started',
+      missionId: options.missionId,
+      agentInstanceId: sessionId,
+      role: String(options.role || 'builder'),
+      model: options.model || 'Antigravity active model',
+      taskId: options.taskId,
+      workspaceMode: options.isolated ? 'isolated_worktree' : options.role === 'orchestrator' ? 'shared' : 'read_only',
+      timestamp: new Date().toISOString(),
+    });
 
     let buffer = '';
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -415,19 +432,37 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       for (const line of lines) this.handleStreamLine(sessionId, line);
     });
     child.stderr?.on('data', (chunk: Buffer) => {
-      const error = redactSecrets(chunk.toString('utf8'));
-      if (error.trim()) this.emitAgentError(sessionId, error);
+      const previous = this.stderrBuffers.get(sessionId) || '';
+      const next = `${previous}${redactSecrets(chunk.toString('utf8'))}`;
+      this.stderrBuffers.set(sessionId, next.slice(-MAX_STDERR_CHARS));
     });
-    child.on('error', (error) => this.emitFailure(sessionId, error.message));
+    child.on('error', (error) => {
+      if (!this.terminalSessions.has(sessionId)) {
+        this.terminalSessions.add(sessionId);
+        this.emitFailure(sessionId, error.message);
+      }
+    });
     child.on('close', (code) => {
       if (buffer.trim()) this.handleStreamLine(sessionId, buffer);
+      const terminalReported = this.terminalSessions.has(sessionId);
+      const stderr = this.stderrBuffers.get(sessionId)?.trim();
+      if (!terminalReported) {
+        this.terminalSessions.add(sessionId);
+        const detail = stderr ? `\n${stderr}` : '';
+        const reason = code === 0
+          ? `Antigravity exited cleanly before reporting a terminal result.${detail}`
+          : `Antigravity exited with code ${code}.${detail}`;
+        this.emitFailure(sessionId, reason, code);
+      }
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
       overlay?.cleanup();
       revokeControlPlaneAgent(sessionId);
-      if (code !== 0) this.emitFailure(sessionId, `Antigravity exited with code ${code}`, code);
       this.sessionContext.delete(sessionId);
+      this.stderrBuffers.delete(sessionId);
+      this.lastOutputBySession.delete(sessionId);
+      this.terminalSessions.delete(sessionId);
     });
     return session;
   }
@@ -435,36 +470,72 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private handleStreamLine(sessionId: string, line: string): void {
     const context = this.sessionContext.get(sessionId);
     if (!context || !line.trim()) return;
-    let event: any;
-    try { event = JSON.parse(line); } catch { return; }
+    const parsed = parseAntigravityStreamLine(line);
     const timestamp = new Date().toISOString();
-    if (event.type === 'init') {
-      const session = this.activeSessions.get(sessionId);
-      if (session) session.runtimeSessionId = event.conversation_id || event.session_id || '';
-      return;
-    }
-    if (event.type === 'step_update') {
-      const stepType = event.step_type || event.step?.type || 'progress';
-      const content = event.text || event.message || event.summary || event.step?.summary || '';
-      if (/thought|reason|plan/.test(stepType) && content) this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: content, timestamp });
-      else if (/tool|command|shell|subagent/.test(stepType)) this.emitEvent({ id: crypto.randomUUID(), type: 'agent_tool_call', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, toolName: event.tool_name || stepType, args: event.args || event.input || {}, timestamp });
-      else if (content) this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content, timestamp });
-      return;
-    }
-    if (event.type === 'result') {
-      if (event.error || event.success === false) this.emitFailure(sessionId, event.error?.message || event.error || 'Antigravity task failed');
-      else {
-        const content = event.text || event.result || event.output;
-        if (content) this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: typeof content === 'string' ? content : JSON.stringify(content), timestamp });
-        this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: 'Antigravity task completed', timestamp });
-      }
-    }
-  }
 
-  private emitAgentError(sessionId: string, error: string): void {
-    const context = this.sessionContext.get(sessionId);
-    if (!context) return;
-    this.emitEvent({ id: crypto.randomUUID(), type: 'agent_error', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, error: redactSecrets(error), timestamp: new Date().toISOString() });
+    if (parsed.kind === 'malformed') {
+      return;
+    }
+    if (parsed.kind === 'unknown') {
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'agent_progressed',
+        missionId: context.missionId,
+        taskId: context.taskId,
+        agentInstanceId: sessionId,
+        progress: `Antigravity event: ${parsed.eventName || 'unknown'}`,
+        timestamp,
+      });
+      return;
+    }
+    if (parsed.kind === 'init') {
+      const session = this.activeSessions.get(sessionId);
+      if (session && parsed.conversationId) session.runtimeSessionId = parsed.conversationId;
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'agent_progressed',
+        missionId: context.missionId,
+        taskId: context.taskId,
+        agentInstanceId: sessionId,
+        progress: 'Antigravity session initialized',
+        timestamp,
+      });
+      return;
+    }
+    if (parsed.kind === 'step') {
+      const stepType = parsed.stepType.toLowerCase();
+      if (/thought|reason|plan/.test(stepType) && parsed.content) {
+        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: parsed.content, timestamp });
+      } else if (/tool|command|shell|subagent/.test(stepType)) {
+        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_tool_call', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, toolName: parsed.toolName || parsed.stepType, args: parsed.args || {}, timestamp });
+      } else if (parsed.content) {
+        this.lastOutputBySession.set(sessionId, parsed.content);
+        this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: parsed.content, timestamp });
+      } else if (parsed.state) {
+        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, progress: `${parsed.stepType}: ${parsed.state}`, timestamp });
+      }
+      return;
+    }
+    if (parsed.kind === 'result') {
+      if (this.terminalSessions.has(sessionId)) return;
+      this.terminalSessions.add(sessionId);
+      if (!parsed.success) {
+        this.emitFailure(sessionId, parsed.error || `Antigravity task failed${parsed.status ? ` (${parsed.status})` : ''}`);
+        return;
+      }
+      if (parsed.content && parsed.content !== this.lastOutputBySession.get(sessionId)) {
+        this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: parsed.content, timestamp });
+      }
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'task_completed',
+        missionId: context.missionId,
+        taskId: context.taskId,
+        agentInstanceId: sessionId,
+        result: parsed.content || 'Antigravity task completed',
+        timestamp,
+      });
+    }
   }
 
   private emitFailure(sessionId: string, error: string, exitCode?: number | null): void {

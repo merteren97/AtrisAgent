@@ -12,6 +12,12 @@ import { Card } from '@/components/ui/card';
 import { X, Activity, Terminal, Settings2, Network, Cpu, CheckCircle2, ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
+const RUNTIME_EVENT_TYPES = new Set([
+  'agent_spawned', 'agent_started', 'agent_progressed', 'agent_waiting', 'agent_resumed',
+  'agent_completed', 'agent_error', 'agent_thought', 'agent_tool_call', 'text_delta',
+  'tool_call_started', 'tool_call_completed', 'task_completed', 'task_failed', 'file_changed',
+]);
+
 export function DeveloperConsole() {
   const { devMode, toggleDevMode } = useSettingsStore();
   const { timeline } = useMissionStore();
@@ -26,14 +32,13 @@ export function DeveloperConsole() {
     !filter || e.content.toLowerCase().includes(filter.toLowerCase()) ||
     (e.eventType || '').toLowerCase().includes(filter.toLowerCase())
   );
-
-  const mcpEvents = timeline.filter(e => 
+  const runtimeEvents = timeline.filter((event) => RUNTIME_EVENT_TYPES.has(event.eventType || ''));
+  const mcpEvents = timeline.filter(e =>
     e.eventType?.includes('tool') || e.eventType?.includes('mcp') || (e.metadata && 'toolName' in e.metadata)
   );
 
   return (
     <div className="h-[300px] border-t border-border bg-card flex flex-col shrink-0 shadow-2xl z-40 select-none">
-      {/* Header */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-border bg-muted/30">
         <div className="flex items-center gap-2">
           <Terminal className="w-3.5 h-3.5 text-primary" />
@@ -48,12 +53,11 @@ export function DeveloperConsole() {
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col overflow-hidden">
         <TabsList className="h-7 px-2 justify-start bg-transparent border-b border-border rounded-none gap-1">
           <TabsTrigger value="events" className="text-[11px] h-6 px-2.5 cursor-pointer"><Activity className="w-3 h-3 mr-1 text-primary" />Raw Events ({timeline.length})</TabsTrigger>
-          <TabsTrigger value="process" className="text-[11px] h-6 px-2.5 cursor-pointer"><Terminal className="w-3 h-3 mr-1 text-blue-400" />Process Logs (stdout/stderr)</TabsTrigger>
+          <TabsTrigger value="process" className="text-[11px] h-6 px-2.5 cursor-pointer"><Terminal className="w-3 h-3 mr-1 text-blue-400" />Runtime Stream ({runtimeEvents.length})</TabsTrigger>
           <TabsTrigger value="mcp" className="text-[11px] h-6 px-2.5 cursor-pointer"><Network className="w-3 h-3 mr-1 text-indigo-400" />MCP Calls ({mcpEvents.length})</TabsTrigger>
           <TabsTrigger value="environment" className="text-[11px] h-6 px-2.5 cursor-pointer"><Settings2 className="w-3 h-3 mr-1 text-emerald-400" />Environment & Diagnostics</TabsTrigger>
         </TabsList>
 
-        {/* Events tab content */}
         <TabsContent value="events" className="flex-1 overflow-hidden flex flex-col m-0 p-0">
           <div className="px-2 py-1 border-b border-border bg-muted/10">
             <Input placeholder="Filter raw event log stream..." value={filter} onChange={e => setFilter(e.target.value)}
@@ -71,36 +75,40 @@ export function DeveloperConsole() {
                     event.eventType === 'mission_failed' && 'border-destructive text-destructive',
                   )}>{event.eventType || event.type}</Badge>
                   <span className="text-foreground/80 truncate flex-1">{event.content}</span>
-                  {event.agentRole && (
-                    <Badge variant="secondary" className="text-[8px] py-0 h-3 px-1">{event.agentRole}</Badge>
-                  )}
+                  {event.agentRole && <Badge variant="secondary" className="text-[8px] py-0 h-3 px-1">{event.agentRole}</Badge>}
                 </div>
               ))}
-              {filteredEvents.length === 0 && (
-                <div className="text-muted-foreground text-center py-6 text-xs font-mono">No raw events emitted yet</div>
-              )}
+              {filteredEvents.length === 0 && <div className="text-muted-foreground text-center py-6 text-xs font-mono">No raw events emitted yet</div>}
             </div>
           </ScrollArea>
         </TabsContent>
 
-        {/* Process stdout/stderr tab */}
         <TabsContent value="process" className="flex-1 m-0 p-0">
           <ScrollArea className="h-full">
             <div className="p-3 font-mono text-[11px] space-y-2">
-              <div className="text-muted-foreground text-xs font-sans mb-2">Captured CLI child process streams (stdout/stderr JSONL):</div>
+              <div className="text-muted-foreground text-xs font-sans mb-2">
+                Parsed runtime/agent events observed from the authenticated local event stream. This view does not claim to be raw child-process stdout/stderr.
+              </div>
               <div className="bg-zinc-950 p-3 rounded-lg border border-white/10 text-zinc-300 space-y-1.5 leading-relaxed">
-                <div className={serviceOnline ? 'text-emerald-400' : 'text-rose-400'}>[SYSTEM] Local API {serviceOnline ? `reachable at ${getApiOrigin()}` : 'is not reachable'}</div>
-                {timeline.map((e, idx) => (
-                  <div key={idx} className="text-zinc-400 font-mono">
-                    <span className="text-zinc-600">[{e.timestamp}]</span> <span className="text-zinc-200">{e.content}</span>
-                  </div>
-                ))}
+                <div className={serviceOnline ? 'text-emerald-400' : 'text-rose-400'}>[SYSTEM] Local API {serviceOnline ? `reachable at ${getApiOrigin()}` : `unreachable at ${getApiOrigin()} · recovery supervisor active`}</div>
+                {runtimeEvents.map((event) => {
+                  const metadata = event.metadata as Record<string, unknown> | undefined;
+                  const agentId = typeof metadata?.agentInstanceId === 'string' ? metadata.agentInstanceId.slice(0, 8) : '--------';
+                  return (
+                    <div key={event.id} className="text-zinc-400 font-mono">
+                      <span className="text-zinc-600">[{event.timestamp}]</span>{' '}
+                      <span className="text-indigo-300">[{(event.eventType || event.type).toUpperCase()}]</span>{' '}
+                      <span className="text-zinc-500">[{agentId}]</span>{' '}
+                      <span className="text-zinc-200 whitespace-pre-wrap break-words">{event.content}</span>
+                    </div>
+                  );
+                })}
+                {runtimeEvents.length === 0 && <div className="text-zinc-500">No runtime events observed for the active mission yet.</div>}
               </div>
             </div>
           </ScrollArea>
         </TabsContent>
 
-        {/* MCP Calls tab */}
         <TabsContent value="mcp" className="flex-1 m-0 p-0">
           <ScrollArea className="h-full">
             <div className="p-3 font-mono text-[11px] space-y-2">
@@ -125,46 +133,24 @@ export function DeveloperConsole() {
           </ScrollArea>
         </TabsContent>
 
-        {/* Environment tab & Runtime diagnostic card */}
         <TabsContent value="environment" className="flex-1 m-0 p-0">
           <ScrollArea className="h-full">
             <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4 font-sans text-xs">
-              {/* Diagnostic Card */}
               <Card className="p-3 bg-muted/20 border-border space-y-2">
-                <div className="flex items-center gap-2 text-primary font-semibold">
-                  <Cpu className="w-4 h-4" />
-                  Runtime Diagnostic Card
-                </div>
+                <div className="flex items-center gap-2 text-primary font-semibold"><Cpu className="w-4 h-4" />Runtime Diagnostic Card</div>
                 <div className="space-y-1 font-mono text-[11px]">
-                  <div className="flex justify-between border-b border-border/40 pb-1">
-                    <span className="text-muted-foreground">Tauri Framework:</span>
-                    <span className="text-foreground font-semibold">Tauri 2 desktop shell</span>
-                  </div>
+                  <div className="flex justify-between border-b border-border/40 pb-1"><span className="text-muted-foreground">Tauri Framework:</span><span className="text-foreground font-semibold">Tauri 2 desktop shell</span></div>
                   <div className="flex justify-between border-b border-border/40 pb-1">
                     <span className="text-muted-foreground">Local API Gateway:</span>
-                    <span className={cn('font-semibold flex items-center gap-1', serviceOnline ? 'text-emerald-500' : 'text-rose-400')}>
-                      <CheckCircle2 className="w-3 h-3" /> {serviceOnline ? getApiOrigin() : 'Offline'}
-                    </span>
+                    <span className={cn('font-semibold flex items-center gap-1', serviceOnline ? 'text-emerald-500' : 'text-rose-400')}><CheckCircle2 className="w-3 h-3" /> {serviceOnline ? getApiOrigin() : `Offline · ${getApiOrigin()}`}</span>
                   </div>
-                  <div className="flex justify-between border-b border-border/40 pb-1">
-                    <span className="text-muted-foreground">SQLite Storage:</span>
-                    <span className="text-foreground font-semibold">%APPDATA%/AtrisAgent/atris.db</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">Security Policy:</span>
-                    <span className="text-indigo-400 font-semibold flex items-center gap-1">
-                      <ShieldCheck className="w-3 h-3" /> Path Traversal Active
-                    </span>
-                  </div>
+                  <div className="flex justify-between border-b border-border/40 pb-1"><span className="text-muted-foreground">SQLite Storage:</span><span className="text-foreground font-semibold">%APPDATA%/AtrisAgent/atris.db</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Security Policy:</span><span className="text-indigo-400 font-semibold flex items-center gap-1"><ShieldCheck className="w-3 h-3" /> Path Traversal Active</span></div>
                 </div>
               </Card>
 
-              {/* Runtimes Summary */}
               <Card className="p-3 bg-muted/20 border-border space-y-2">
-                <div className="flex items-center gap-2 text-foreground font-semibold">
-                  <Terminal className="w-4 h-4 text-blue-500" />
-                  Detected CLI Runtimes
-                </div>
+                <div className="flex items-center gap-2 text-foreground font-semibold"><Terminal className="w-4 h-4 text-blue-500" />Detected CLI Runtimes</div>
                 <div className="space-y-1.5 font-mono text-[11px]">
                   {runtimes.map((runtime) => (
                     <div key={runtime.runtimeType} className="flex items-center justify-between p-1 rounded bg-background/50 border border-border/40">
