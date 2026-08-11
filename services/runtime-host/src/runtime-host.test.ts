@@ -195,7 +195,8 @@ async function runTests() {
 
     emittedEvents.length = 0;
     const antigravityAdapter = new AntigravityAdapter(eventBus);
-    (antigravityAdapter as any).sessionContext.set('test-session-2', { missionId: 'm-1', taskId: 't-2' });
+    const antigravityContext = { missionId: 'm-1', taskId: 't-2' };
+    (antigravityAdapter as any).sessionContext.set('test-session-2', antigravityContext);
     const antigravityLines = [
       JSON.stringify({ type: 'step_update', step_type: 'thought', text: 'Planning execution strategy' }),
       JSON.stringify({ type: 'step_update', step_type: 'tool', tool_name: 'RunBuild', args: { command: 'npm run build' } }),
@@ -203,11 +204,15 @@ async function runTests() {
       JSON.stringify({ type: 'result', success: false, error: 'Antigravity quota limit hit' }),
     ];
     for (const line of antigravityLines) (antigravityAdapter as any).handleStreamLine('test-session-2', line);
-    const antigravityTypes = emittedEvents.map((e) => e.type);
-    assert(antigravityTypes.includes('agent_thought'), 'AntigravityAdapter normalizes thought steps into agent_thought');
-    assert(antigravityTypes.includes('agent_tool_call'), 'AntigravityAdapter normalizes tool steps into agent_tool_call');
-    assert(antigravityTypes.includes('text_delta'), 'AntigravityAdapter normalizes progress text into text_delta');
-    assert(antigravityTypes.includes('task_failed'), 'AntigravityAdapter normalizes terminal error results into task_failed');
+    const antigravityTypesBeforeClose = emittedEvents.map((e) => e.type);
+    const pendingOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-2');
+    assert(antigravityTypesBeforeClose.includes('agent_thought'), 'AntigravityAdapter normalizes thought steps into agent_thought');
+    assert(antigravityTypesBeforeClose.includes('agent_tool_call'), 'AntigravityAdapter normalizes tool steps into agent_tool_call');
+    assert(antigravityTypesBeforeClose.includes('text_delta'), 'AntigravityAdapter normalizes progress text into text_delta');
+    assert(!antigravityTypesBeforeClose.includes('task_failed') && pendingOutcome?.kind === 'failed', 'AntigravityAdapter defers terminal failure until native session cleanup');
+
+    (antigravityAdapter as any).emitTerminalOutcome('test-session-2', antigravityContext, pendingOutcome);
+    assert(emittedEvents.some((event) => event.type === 'task_failed'), 'AntigravityAdapter emits task_failed after close-phase cleanup');
   }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);

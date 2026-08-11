@@ -232,7 +232,14 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
         if (current.activeMissionId !== missionId) return { missions };
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
-        const liveOnlyItems = current.timeline.filter((item) => !restoredIds.has(item.id) && item.id !== `request-${missionId}`);
+        // The canonical user request is synthesized from the persisted mission.
+        // Never append the optimistic local composer card after hydration, or a
+        // reconcile triggered by task failure/retry moves the same message to the
+        // bottom of the conversation as a duplicate.
+        const liveOnlyItems = current.timeline.filter((item) => (
+          item.type !== 'user_message'
+          && !restoredIds.has(item.id)
+        ));
         return {
           missions,
           activeTasks: state.tasks || [],
