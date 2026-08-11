@@ -260,6 +260,26 @@ async function runTests() {
 
     (antigravityAdapter as any).emitTerminalOutcome('test-session-3', successContext, successPendingOutcome);
     assert(emittedEvents.some((event) => event.type === 'task_completed'), 'AntigravityAdapter publishes task_completed after native cleanup so Orchestrator can schedule the next DAG task');
+
+    emittedEvents.length = 0;
+    const cleanExitContext = { missionId: 'm-3', taskId: 'research-clean-exit' };
+    (antigravityAdapter as any).sessionContext.set('test-session-4', cleanExitContext);
+    (antigravityAdapter as any).handleStreamLine('test-session-4', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final research report without a result envelope',
+    }));
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-4'), 'Antigravity final agent_response alone is not treated as terminal while the process is still alive');
+
+    (antigravityAdapter as any).recordProcessTerminationOutcome('test-session-4', 0, null);
+    const cleanExitOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-4');
+    assert(cleanExitOutcome?.kind === 'completed', 'Antigravity clean native exit becomes a successful task outcome even when stream-json omits result');
+    assert(cleanExitOutcome?.result === 'Final research report without a result envelope', 'Antigravity clean-exit completion preserves the latest agent response as task result');
+    assert(!emittedEvents.some((event) => event.type === 'task_completed'), 'Clean process exit still defers task_completed until runtime cleanup finishes');
+
+    (antigravityAdapter as any).emitTerminalOutcome('test-session-4', cleanExitContext, cleanExitOutcome);
+    assert(emittedEvents.some((event) => event.type === 'task_completed' && (event as any).taskId === 'research-clean-exit'), 'Clean Antigravity exit publishes task_completed so the mission DAG can dispatch Task 2');
   }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);
