@@ -12,6 +12,8 @@ function statusIcon(status: EffectiveTaskStatus) {
   switch (status) {
     case 'completed':
       return <CheckCircle2 className="h-4 w-4 text-success" />;
+    case 'preparing':
+      return <CircleDashed className="h-4 w-4 animate-pulse text-amber-400" />;
     case 'running':
       return <Loader2 className="h-4 w-4 animate-spin text-primary" />;
     case 'failed':
@@ -27,6 +29,8 @@ function statusColor(status: EffectiveTaskStatus) {
   switch (status) {
     case 'completed':
       return 'border-success/20 bg-success/10 text-success';
+    case 'preparing':
+      return 'border-amber-500/20 bg-amber-500/10 text-amber-400';
     case 'running':
       return 'border-primary/20 bg-primary/10 text-primary';
     case 'failed':
@@ -41,6 +45,7 @@ function statusColor(status: EffectiveTaskStatus) {
 function statusLabel(status: EffectiveTaskStatus) {
   switch (status) {
     case 'completed': return 'Completed';
+    case 'preparing': return 'Preparing';
     case 'running': return 'Running';
     case 'failed': return 'Failed';
     case 'cancelled': return 'Cancelled';
@@ -145,13 +150,14 @@ export function PlanTab() {
           ) : viewMode === 'list' ? (
             <div className="relative space-y-3 before:absolute before:bottom-2 before:left-[11px] before:top-2 before:w-px before:bg-border">
               {activeTasks.map((task) => {
-                const displayStatus = effectiveTaskStatus(task.status, activeMission.status);
+                const displayStatus = effectiveTaskStatus(task.status, activeMission.status, task.assignedAgentId);
                 return (
                   <div key={task.id} className="relative flex min-w-0 items-start gap-3">
                     <div
                       className={cn(
                         'z-10 mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border-2 bg-background',
                         displayStatus === 'running' ? 'border-primary' :
+                        displayStatus === 'preparing' ? 'border-amber-500/70' :
                         displayStatus === 'completed' ? 'border-success' :
                         displayStatus === 'failed' ? 'border-destructive' :
                         displayStatus === 'cancelled' ? 'border-muted-foreground/50' :
@@ -165,6 +171,7 @@ export function PlanTab() {
                       className={cn(
                         'min-w-0 flex-1 cursor-pointer space-y-2 p-3 transition-colors hover:bg-muted/30',
                         displayStatus === 'running' && 'border-primary/50 bg-primary/5',
+                        displayStatus === 'preparing' && 'border-amber-500/25 bg-amber-500/[0.035]',
                         displayStatus === 'cancelled' && 'bg-muted/[0.12]',
                       )}
                       onClick={() => setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }))}
@@ -194,6 +201,9 @@ export function PlanTab() {
                           <span className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
                             {task.assignedRole}
                           </span>
+                          {displayStatus === 'preparing' && (
+                            <span className="text-[10px] text-muted-foreground">Preparing route and isolated execution context…</span>
+                          )}
                         </div>
                       )}
                     </Card>
@@ -204,7 +214,7 @@ export function PlanTab() {
           ) : (
             <div className="relative flex flex-col items-center py-2">
               {activeTasks.map((task, index) => {
-                const displayStatus = effectiveTaskStatus(task.status, activeMission.status);
+                const displayStatus = effectiveTaskStatus(task.status, activeMission.status, task.assignedAgentId);
                 return (
                   <div key={task.id} className="relative flex w-full max-w-2xl flex-col items-center">
                     {index > 0 && (
@@ -215,6 +225,7 @@ export function PlanTab() {
                     <Card className={cn(
                       'relative z-10 w-full min-w-0 p-4 transition-all',
                       displayStatus === 'running' && 'border-primary shadow-[0_0_15px_rgba(var(--primary),0.2)]',
+                      displayStatus === 'preparing' && 'border-amber-500/30 bg-amber-500/[0.03]',
                       displayStatus === 'completed' && 'border-success/50',
                       displayStatus === 'failed' && 'border-destructive/50',
                       displayStatus === 'cancelled' && 'border-border bg-muted/[0.12]',
@@ -223,6 +234,7 @@ export function PlanTab() {
                         <div className={cn(
                           'flex h-8 w-8 shrink-0 items-center justify-center rounded-full border',
                           displayStatus === 'running' ? 'border-primary text-primary' :
+                          displayStatus === 'preparing' ? 'border-amber-500/40 bg-amber-500/10 text-amber-400' :
                           displayStatus === 'completed' ? 'border-success bg-success/10 text-success' :
                           displayStatus === 'failed' ? 'border-destructive bg-destructive/10 text-destructive' :
                           displayStatus === 'cancelled' ? 'border-border bg-muted text-muted-foreground' :
