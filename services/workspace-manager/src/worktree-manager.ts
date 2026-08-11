@@ -107,19 +107,10 @@ function normalizeProjectHint(value: string): string {
 }
 
 export class WorktreeManager {
-  /** Check if the directory is a valid Git repository or linked worktree. */
   async isGitRepository(dirPath: string): Promise<boolean> {
     return isGitWorktree(dirPath);
   }
 
-  /**
-   * Resolve the real project root inside an AtrisAgent workspace.
-   *
-   * A workspace may intentionally be a parent container holding several projects.
-   * We never mirror that whole parent when it already contains Git projects: one
-   * child is selected automatically, while multiple children require an explicit
-   * project-name match from the task hint.
-   */
   async resolveIsolationBase(workspacePath: string, projectHint = ''): Promise<IsolationBase> {
     if (await this.isGitRepository(workspacePath)) {
       return { path: workspacePath, kind: 'workspace-git' };
@@ -170,7 +161,6 @@ export class WorktreeManager {
     );
   }
 
-  /** Resolve the source repository that owns a linked Git worktree. */
   private async resolveGitOwner(worktreePath: string): Promise<string | undefined> {
     try {
       const { stdout } = await git(['rev-parse', '--git-common-dir'], worktreePath);
@@ -186,7 +176,6 @@ export class WorktreeManager {
     return undefined;
   }
 
-  /** Resolve where a Builder result must be applied, even when its mission workspace is a parent folder. */
   async resolveMergeBasePath(worktreePath: string, fallbackBasePath: string): Promise<string> {
     if (fs.existsSync(worktreePath) && await this.isGitRepository(worktreePath)) {
       return (await this.resolveGitOwner(worktreePath)) || fallbackBasePath;
@@ -194,7 +183,6 @@ export class WorktreeManager {
     return fallbackBasePath;
   }
 
-  /** Create an isolated Git worktree or a non-Git mirror for a task. */
   async createWorktree(
     basePath: string,
     branchName: string,
@@ -237,8 +225,6 @@ export class WorktreeManager {
       return targetPath;
     }
 
-    // Truly non-Git workspaces retain mirror support, but file IO is asynchronous
-    // so Builder preparation does not freeze the API/event loop.
     try {
       await fs.promises.mkdir(targetPath, { recursive: true });
       await copyDirRecursive(sourcePath, targetPath);
@@ -252,7 +238,6 @@ export class WorktreeManager {
     }
   }
 
-  /** Remove a worktree directory and prune Git worktrees if necessary. */
   async removeWorktree(worktreePath: string, force: boolean = true, basePath?: string): Promise<void> {
     const worktreeIsGit = fs.existsSync(worktreePath) && await this.isGitRepository(worktreePath);
     let cwd = basePath || (fs.existsSync(worktreePath) ? worktreePath : process.cwd());
@@ -275,7 +260,6 @@ export class WorktreeManager {
     }
   }
 
-  /** Get list of changed files in a worktree. */
   async getChangedFiles(worktreePath: string): Promise<ChangedFile[]> {
     if (!fs.existsSync(worktreePath)) return [];
     const isGit = await this.isGitRepository(worktreePath);
@@ -319,7 +303,6 @@ export class WorktreeManager {
     return changed;
   }
 
-  /** Get unified diff of worktree compared to HEAD or a target branch. */
   async getDiff(worktreePath: string, targetBranch?: string): Promise<string> {
     if (!fs.existsSync(worktreePath)) return '';
     const isGit = await this.isGitRepository(worktreePath);
@@ -358,7 +341,6 @@ export class WorktreeManager {
     return diffText;
   }
 
-  /** Merge a task worktree to its owning repository or non-Git source path. */
   async merge(
     worktreePath: string,
     targetBranch?: string,
@@ -402,7 +384,11 @@ export class WorktreeManager {
         if (rootStatus.trim()) {
           return { success: false, output: 'Main workspace has uncommitted changes. Commit, stash, or discard them before applying an agent worktree.' };
         }
-        const { stdout } = await git(['merge', '--no-ff', branchName, '-m', `Merge task worktree ${branchName}`], rootPath);
+        const { stdout } = await git([
+          '-c', 'user.name=AtrisAgent',
+          '-c', 'user.email=local@atrisagent',
+          'merge', '--no-ff', branchName, '-m', `Merge task worktree ${branchName}`,
+        ], rootPath);
         return { success: true, output: stdout };
       } catch (error: any) {
         return { success: false, output: error?.stderr || error?.message || 'Git merge failed' };
