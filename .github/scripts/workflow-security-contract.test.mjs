@@ -89,6 +89,13 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /needs:\s*build/, "release publishing must wait for every platform build");
   assert.match(release, /permissions:\s*\n\s*contents:\s*write/, "release publishing requires narrowly-scoped contents write permission");
   assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
+
+  const normalizationSteps = release.match(/- name: Validate and normalize requested release tag/g) || [];
+  assert.equal(normalizationSteps.length, 2, "build and publish jobs must both normalize the manual release tag");
+  assert.match(release, /\^\[vV\]\[0-9\]\+/, "release validation must accept either v or V as the version prefix");
+  assert.match(release, /normalized_tag="v\$\{RELEASE_TAG:1\}"/, "release tags must be canonicalized to a lowercase v prefix");
+  assert.match(release, /echo "RELEASE_TAG=\$normalized_tag" >> "\$GITHUB_ENV"/, "canonical release tags must flow to later build and publish steps");
+  assert.match(release, /group:\s*atris-agent-release\s*$/m, "only one release workflow may execute at a time regardless of input casing");
 });
 
 test("release publishing requires a complete signed Tauri updater configuration", () => {

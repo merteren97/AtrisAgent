@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Enter only v0.2.1-1 (prerelease) or v0.2.1 (stable)"
+        description: "Enter v0.2.1-1 (prerelease) or v0.2.1 (stable); v/V prefix is accepted"
         required: true
         type: string
       prerelease:
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: atris-agent-release-${{ inputs.release_version }}
+  group: atris-agent-release
   cancel-in-progress: false
 
 env:
@@ -45,6 +45,19 @@ jobs:
     timeout-minutes: 50
 
     steps:
+      - name: Validate and normalize requested release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "Unsupported release tag: $RELEASE_TAG"
+            echo "Use v0.2.8 (stable) or v0.2.8-1 (prerelease). The V prefix is case-insensitive."
+            exit 1
+          fi
+          normalized_tag="v${RELEASE_TAG:1}"
+          echo "RELEASE_TAG=$normalized_tag" >> "$GITHUB_ENV"
+          echo "Using canonical release tag: $normalized_tag"
+
       - name: Checkout exact main revision
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -90,15 +103,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --include=dev --include=optional --prefer-offline --no-audit --no-fund
-
-      - name: Validate requested release tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
-            echo "Unsupported release tag: $RELEASE_TAG"
-            exit 1
-          fi
 
       - name: Require updater signing configuration
         env:
@@ -199,6 +203,18 @@ jobs:
       contents: write
 
     steps:
+      - name: Validate and normalize requested release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "Unsupported release tag: $RELEASE_TAG"
+            exit 1
+          fi
+          normalized_tag="v${RELEASE_TAG:1}"
+          echo "RELEASE_TAG=$normalized_tag" >> "$GITHUB_ENV"
+          echo "Using canonical release tag: $normalized_tag"
+
       - name: Checkout release manifest generator
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
