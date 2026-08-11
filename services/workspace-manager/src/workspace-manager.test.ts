@@ -26,6 +26,11 @@ async function runTests() {
     const runGit = (cwd: string, args: string[]) => {
       execFileSync('git', args, { cwd, windowsHide: true, stdio: 'ignore' });
     };
+    const commitAll = (cwd: string, message: string) => {
+      runGit(cwd, ['add', '-A']);
+      runGit(cwd, ['-c', 'user.name=AtrisAgent Test', '-c', 'user.email=atrisagent-test@example.invalid', 'commit', '--quiet', '-m', message]);
+    };
+
     const wsPath = path.join(tmpDir, 'test-app');
     fs.mkdirSync(wsPath, { recursive: true });
     fs.writeFileSync(path.join(wsPath, 'index.ts'), 'console.log("hello world");');
@@ -62,8 +67,7 @@ async function runTests() {
     assert(await worktreeManager.isGitRepository(nestedRepo), 'Nested initialized repository is detected at its own root');
 
     fs.writeFileSync(path.join(realRepo, 'README.md'), 'linked worktree probe');
-    runGit(realRepo, ['-c', 'user.name=AtrisAgent Test', '-c', 'user.email=atrisagent-test@example.invalid', 'add', 'README.md']);
-    runGit(realRepo, ['-c', 'user.name=AtrisAgent Test', '-c', 'user.email=atrisagent-test@example.invalid', 'commit', '--quiet', '-m', 'initial']);
+    commitAll(realRepo, 'initial');
     const linkedWorktree = path.join(tmpDir, 'linked-worktree');
     runGit(realRepo, ['worktree', 'add', '--detach', linkedWorktree, 'HEAD']);
     assert(fs.lstatSync(path.join(linkedWorktree, '.git')).isFile(), 'Linked worktree uses a .git file');
@@ -150,11 +154,7 @@ async function runTests() {
     const validCheckpointDb = {
       select: () => ({
         from: () => ({
-          where: async () => [{
-            id: 'valid-git-checkpoint',
-            snapshotPath: null,
-            gitRef: validGitRef,
-          }],
+          where: async () => [{ id: 'valid-git-checkpoint', snapshotPath: null, gitRef: validGitRef }],
         }),
       }),
     } as unknown as NonNullable<Parameters<typeof checkpointManager.restoreCheckpoint>[2]>['db'];
@@ -190,9 +190,58 @@ async function runTests() {
     const mergeResult = await worktreeManager.merge(wtPath, 'main', wsPath);
     assert(mergeResult.success === true, 'Non-git merge succeeds');
     assert(fs.existsSync(path.join(wsPath, 'newfile.ts')), 'Merged newfile.ts copied to main workspace');
-
     await worktreeManager.removeWorktree(wtPath, true, wsPath);
     assert(!fs.existsSync(wtPath), 'Worktree cleaned up successfully');
+
+    // Parent-workspace regression: this mirrors the real AtrisTracker workflow.
+    const projectContainer = path.join(tmpDir, 'project-container');
+    const atrisTracker = path.join(projectContainer, 'AtrisTracker');
+    const siblingProject = path.join(projectContainer, 'OtherProject');
+    fs.mkdirSync(atrisTracker, { recursive: true });
+    fs.mkdirSync(siblingProject, { recursive: true });
+    runGit(atrisTracker, ['init', '--quiet']);
+    runGit(siblingProject, ['init', '--quiet']);
+    fs.writeFileSync(path.join(atrisTracker, 'tracker.ts'), 'export const usage = "old";\n');
+    fs.writeFileSync(path.join(siblingProject, 'sibling.ts'), 'export const untouched = true;\n');
+    commitAll(atrisTracker, 'AtrisTracker baseline');
+    commitAll(siblingProject, 'Sibling baseline');
+
+    const resolvedProject = await worktreeManager.resolveIsolationBase(
+      projectContainer,
+      'Analyze AtrisTracker usage collection and implement the fix',
+    );
+    assert(resolvedProject.kind === 'nested-git', 'Parent workspace resolves a nested Git project instead of mirroring the whole container');
+    assert(path.resolve(resolvedProject.path) === path.resolve(atrisTracker), 'Task project hint deterministically selects AtrisTracker');
+
+    let ambiguousError = '';
+    try {
+      await worktreeManager.resolveIsolationBase(projectContainer, 'Implement a generic feature');
+    } catch (error) {
+      ambiguousError = error instanceof Error ? error.message : String(error);
+    }
+    assert(ambiguousError.includes('multiple Git projects'), 'Multiple child repositories fail safely when the task does not identify a project');
+
+    const nestedTaskWorktree = await worktreeManager.createWorktree(
+      projectContainer,
+      'atris/mission-parent/task-builder',
+      undefined,
+      'HEAD',
+      'Implement the AtrisTracker usage fix',
+    );
+    assert(await worktreeManager.isGitRepository(nestedTaskWorktree), 'Builder receives a linked Git worktree for the selected nested project');
+    assert(!fs.existsSync(path.join(projectContainer, '.atris-baseline')), 'Parent project container is never copied into a fallback baseline');
+
+    fs.writeFileSync(path.join(nestedTaskWorktree, 'tracker.ts'), 'export const usage = "fixed";\n');
+    const mergeBase = await worktreeManager.resolveMergeBasePath(nestedTaskWorktree, projectContainer);
+    assert(path.resolve(mergeBase) === path.resolve(atrisTracker), 'Nested Builder worktree resolves its actual source repository for apply');
+
+    const nestedMerge = await worktreeManager.merge(nestedTaskWorktree, undefined, projectContainer);
+    assert(nestedMerge.success, 'Nested Builder result merges back to the owning project');
+    assert(fs.readFileSync(path.join(atrisTracker, 'tracker.ts'), 'utf8').includes('fixed'), 'AtrisTracker receives the Builder change');
+    assert(fs.readFileSync(path.join(siblingProject, 'sibling.ts'), 'utf8').includes('untouched'), 'Sibling project remains untouched by Builder apply');
+
+    await worktreeManager.removeWorktree(nestedTaskWorktree, true, projectContainer);
+    assert(!fs.existsSync(nestedTaskWorktree), 'Nested linked worktree is cleaned up from its owning repository');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

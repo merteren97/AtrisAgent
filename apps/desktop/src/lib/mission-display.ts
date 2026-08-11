@@ -1,6 +1,6 @@
 import type { MissionStatus } from '@/stores/mission-store';
 
-export type EffectiveTaskStatus = 'completed' | 'running' | 'failed' | 'cancelled' | 'planned';
+export type EffectiveTaskStatus = 'completed' | 'preparing' | 'running' | 'failed' | 'cancelled' | 'planned';
 
 const ACTIVE_MISSION_STATUSES = new Set<MissionStatus>([
   'planning',
@@ -18,11 +18,16 @@ export function isMissionCancelled(status: MissionStatus): boolean {
   return status === 'cancelled';
 }
 
-export function effectiveTaskStatus(taskStatus: string, missionStatus: MissionStatus): EffectiveTaskStatus {
-  if (taskStatus === 'completed' || taskStatus === 'done') return 'completed';
-  if (taskStatus === 'failed' || taskStatus === 'blocked') return 'failed';
+export function effectiveTaskStatus(
+  taskStatus: string,
+  missionStatus: MissionStatus,
+  assignedAgentId?: string | null,
+): EffectiveTaskStatus {
+  if (taskStatus === 'completed' || taskStatus === 'done' || taskStatus === 'verified' || taskStatus === 'applied') return 'completed';
+  if (taskStatus === 'failed' || taskStatus === 'blocked' || taskStatus === 'rejected') return 'failed';
   if (missionStatus === 'cancelled') return 'cancelled';
-  if (taskStatus === 'running') return 'running';
+  if (taskStatus === 'running') return assignedAgentId ? 'running' : 'preparing';
+  if (taskStatus === 'ready' || taskStatus === 'claimed' || taskStatus === 'revision_requested' || taskStatus === 'review') return 'preparing';
   return 'planned';
 }
 

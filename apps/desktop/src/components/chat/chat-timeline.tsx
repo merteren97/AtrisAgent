@@ -2,10 +2,99 @@ import { useEffect, useMemo, useRef } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { MessageCard } from './message-card';
 import { EventCard } from './event-card';
-import { useMissionStore } from '@/stores/mission-store';
+import { ActivityGroup } from './activity-group';
+import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAgentStore } from '@/stores/agent-store';
 import { Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
+
+const COMPACT_EVENT_TYPES = new Set([
+  'task_created',
+  'task_assigned',
+  'task_claimed',
+  'agent_spawned',
+  'agent_started',
+  'agent_progressed',
+  'agent_thought',
+  'agent_context_attached',
+  'agent_context_compacted',
+  'agent_message_read',
+  'agent_tool_call',
+  'tool_call_started',
+  'tool_call_completed',
+]);
+
+type RenderEntry =
+  | { kind: 'item'; item: TimelineItem }
+  | { kind: 'activity'; items: TimelineItem[] };
+
+function metadataString(item: TimelineItem, key: string): string | undefined {
+  const value = item.metadata?.[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function streamIdentity(item: TimelineItem): string {
+  return metadataString(item, 'agentInstanceId') || item.agentRole || 'orchestrator';
+}
+
+function joinStreamText(previous: string, next: string): string {
+  if (!previous) return next;
+  if (!next) return previous;
+  if (/\s$/.test(previous) || /^\s/.test(next)) return `${previous}${next}`;
+  if (/^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|>|---)/.test(next)) return `${previous}\n\n${next}`;
+  if (/[.!?;:)]$/.test(previous)) return `${previous}\n\n${next}`;
+  return `${previous} ${next}`;
+}
+
+function prepareTimeline(items: TimelineItem[]): RenderEntry[] {
+  const coalesced: TimelineItem[] = [];
+
+  for (const item of items) {
+    const previous = coalesced[coalesced.length - 1];
+    const canMerge = item.type === 'orchestrator_message'
+      && previous?.type === 'orchestrator_message'
+      && streamIdentity(previous) === streamIdentity(item)
+      && previous.eventType === 'text_delta'
+      && item.eventType === 'text_delta';
+
+    if (canMerge) {
+      coalesced[coalesced.length - 1] = {
+        ...previous,
+        content: joinStreamText(previous.content, item.content),
+        timestamp: item.timestamp || previous.timestamp,
+        metadata: { ...previous.metadata, ...item.metadata, coalescedEventCount: Number(previous.metadata?.coalescedEventCount || 1) + 1 },
+      };
+    } else {
+      coalesced.push(item);
+    }
+  }
+
+  const result: RenderEntry[] = [];
+  let activity: TimelineItem[] = [];
+
+  const flush = () => {
+    if (activity.length === 0) return;
+    if (activity.length === 1) result.push({ kind: 'item', item: activity[0] });
+    else result.push({ kind: 'activity', items: activity });
+    activity = [];
+  };
+
+  for (const item of coalesced) {
+    const isCompact = item.type === 'event' && COMPACT_EVENT_TYPES.has(item.eventType || '');
+    if (!isCompact) {
+      flush();
+      result.push({ kind: 'item', item });
+      continue;
+    }
+
+    const previousRole = activity[0]?.agentRole || 'agent';
+    const nextRole = item.agentRole || 'agent';
+    if (activity.length > 0 && previousRole !== nextRole) flush();
+    activity.push(item);
+  }
+  flush();
+  return result;
+}
 
 export function ChatTimeline() {
   const timeline = useMissionStore((state) => state.timeline);
@@ -28,6 +117,7 @@ export function ChatTimeline() {
   );
   const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
   const completedTasks = activeTasks.filter((task) => task.status === 'completed' || task.status === 'done').length;
+  const renderTimeline = useMemo(() => prepareTimeline(timeline), [timeline]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -129,8 +219,12 @@ export function ChatTimeline() {
 
   return (
     <ScrollArea className="min-h-0 flex-1">
-      <div className="mx-auto min-w-0 max-w-3xl space-y-4 px-4 py-6">
-        {timeline.length === 0 ? emptyState : timeline.map((item) => {
+      <div className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+        {timeline.length === 0 ? emptyState : renderTimeline.map((entry, index) => {
+          if (entry.kind === 'activity') {
+            return <ActivityGroup key={`activity-${entry.items[0]?.id || index}`} items={entry.items} />;
+          }
+          const item = entry.item;
           if (item.type === 'user_message') {
             return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} />;
           }

@@ -1,14 +1,14 @@
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
-import type { ReviewPack, CheckResult } from '@atris-agent-code/domain';
+import type { ReviewPack } from '@atris-agent-code/domain';
 import { ReviewPackGenerator, type GenerateReviewPackOptions } from './review-pack-generator';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export interface RebaseRequest {
   taskId: string;
-  targetBranch: string;
+  targetBranch?: string;
   conflictMessage: string;
   instructions: string;
 }
@@ -28,9 +28,6 @@ export class MergeCoordinator {
     this.generator = new ReviewPackGenerator(workspaceManager);
   }
 
-  /**
-   * Generate a unified diff review pack for the task's worktree.
-   */
   async generateReviewPack(
     taskId: string,
     options?: GenerateReviewPackOptions
@@ -39,57 +36,49 @@ export class MergeCoordinator {
   }
 
   /**
-   * Apply changes from the task's worktree back to the main branch with conflict detection and checkpoint rollback support.
+   * Apply a Builder worktree back to the repository that actually owns it.
+   * A mission workspace may be only a parent project container, so checkpointing
+   * and merge operations must resolve the linked worktree's Git owner first.
    */
   async applyWorktree(
     taskId: string,
-    targetBranch: string = 'main'
+    targetBranch?: string,
   ): Promise<MergeResult> {
     const task = await this.workspaceManager.getTask(taskId);
-    if (!task) {
-      throw new Error(`Task with ID "${taskId}" not found`);
-    }
-
-    if (!task.worktreeId) {
-      throw new Error(`Task "${taskId}" does not have an active worktree`);
-    }
+    if (!task) throw new Error(`Task with ID "${taskId}" not found`);
+    if (!task.worktreeId) throw new Error(`Task "${taskId}" does not have an active worktree`);
 
     const mission = await this.workspaceManager.getMission(task.missionId);
     let basePath = process.cwd();
     if (mission?.workspaceId) {
-      const ws = await this.workspaceManager.getWorkspace(mission.workspaceId);
-      if (ws?.path) {
-        basePath = ws.path;
-      }
+      const workspace = await this.workspaceManager.getWorkspace(mission.workspaceId);
+      if (workspace?.path) basePath = workspace.path;
     }
 
-    // Step 1: Save pre-merge checkpoint
-    const checkpointManager = (this.workspaceManager as any).getCheckpointManager();
+    const worktreeManager = this.workspaceManager.getWorktreeManager();
+    basePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, basePath);
+
+    const checkpointManager = this.workspaceManager.getCheckpointManager();
     const checkpointId = await checkpointManager.createCheckpoint(
       basePath,
       `pre-merge-task-${taskId}`,
-      { missionId: task.missionId, isRollbackTarget: true }
+      { missionId: task.missionId, isRollbackTarget: true },
     );
 
-    // Step 2: Attempt merge
-    const worktreeManager = this.workspaceManager.getWorktreeManager();
     const mergeOutput = await worktreeManager.merge(task.worktreeId, targetBranch, basePath);
-
-    // Step 3: Conflict & NeedsRebase detection
-    const isConflict =
-      !mergeOutput.success &&
-      (mergeOutput.output.includes('CONFLICT') ||
-        mergeOutput.output.includes('Automatic merge failed') ||
-        mergeOutput.output.includes('conflict'));
+    const isConflict = !mergeOutput.success && (
+      mergeOutput.output.includes('CONFLICT')
+      || mergeOutput.output.includes('Automatic merge failed')
+      || mergeOutput.output.toLowerCase().includes('conflict')
+    );
 
     if (isConflict) {
-      // Abort git merge if in progress
       try {
-        await execAsync('git merge --abort', { cwd: basePath });
+        await execFileAsync('git', ['merge', '--abort'], { cwd: basePath, windowsHide: true });
       } catch {
-        // Ignore if git merge abort fails or wasn't git
+        // There may be no in-progress merge to abort.
       }
-
+      const branchLabel = targetBranch || 'the current workspace branch';
       return {
         success: false,
         status: 'NeedsRebase',
@@ -99,33 +88,20 @@ export class MergeCoordinator {
           taskId,
           targetBranch,
           conflictMessage: mergeOutput.output,
-          instructions: `Merge conflict detected on task "${taskId}". Rebase worktree branch onto "${targetBranch}" and resolve conflicts before re-submitting.`,
+          instructions: `Merge conflict detected on task "${taskId}". Rebase the worktree branch onto ${branchLabel} and resolve conflicts before re-submitting.`,
         },
       };
     }
 
     if (!mergeOutput.success) {
-      return {
-        success: false,
-        status: 'Failed',
-        output: mergeOutput.output,
-        checkpointId,
-      };
+      return { success: false, status: 'Failed', output: mergeOutput.output, checkpointId };
     }
 
-    return {
-      success: true,
-      status: 'Merged',
-      output: mergeOutput.output,
-      checkpointId,
-    };
+    return { success: true, status: 'Merged', output: mergeOutput.output, checkpointId };
   }
 
-  /**
-   * Rollback workspace state to a pre-merge checkpoint.
-   */
   async rollback(checkpointId: string, workspacePath: string): Promise<void> {
-    const checkpointManager = (this.workspaceManager as any).getCheckpointManager();
+    const checkpointManager = this.workspaceManager.getCheckpointManager();
     await checkpointManager.restoreCheckpoint(checkpointId, workspacePath);
   }
 }

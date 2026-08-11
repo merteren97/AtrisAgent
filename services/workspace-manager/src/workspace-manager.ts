@@ -84,9 +84,7 @@ export class WorkspaceManager {
     return this.checkpointManager;
   }
 
-  /**
-   * Create a new workspace record.
-   */
+  /** Create a new workspace record. */
   async createWorkspace(input: CreateWorkspaceInput): Promise<WorkspaceSelect> {
     const now = new Date().toISOString();
     const newWorkspace: WorkspaceInsert = {
@@ -101,40 +99,25 @@ export class WorkspaceManager {
     };
 
     await this.db.insert(workspaces).values(newWorkspace);
-
     const result = await this.getWorkspace(newWorkspace.id);
-    if (!result) {
-      throw new Error(`Failed to retrieve newly created workspace "${newWorkspace.id}"`);
-    }
+    if (!result) throw new Error(`Failed to retrieve newly created workspace "${newWorkspace.id}"`);
     return result;
   }
 
-  /**
-   * Get workspace by ID. Boundary callers may provide a repeated route parameter;
-   * only the first scalar identifier is accepted by the persistence layer.
-   */
+  /** Get workspace by ID. */
   async getWorkspace(id: string | string[]): Promise<WorkspaceSelect | null> {
     const workspaceId = Array.isArray(id) ? id[0] : id;
     if (!workspaceId) return null;
-
-    const rows = await this.db
-      .select()
-      .from(workspaces)
-      .where(eq(workspaces.id, workspaceId));
-
+    const rows = await this.db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
     return rows[0] ?? null;
   }
 
-  /**
-   * List all workspaces.
-   */
+  /** List all workspaces. */
   async listWorkspaces(): Promise<WorkspaceSelect[]> {
     return await this.db.select().from(workspaces);
   }
 
-  /**
-   * Create a new mission record under a workspace.
-   */
+  /** Create a new mission record under a workspace. */
   async createMission(input: CreateMissionInput): Promise<MissionSelect> {
     const now = new Date().toISOString();
     const newMission: MissionInsert = {
@@ -151,11 +134,8 @@ export class WorkspaceManager {
     };
 
     await this.db.insert(missions).values(newMission);
-
     const result = await this.getMission(newMission.id);
-    if (!result) {
-      throw new Error(`Failed to retrieve newly created mission "${newMission.id}"`);
-    }
+    if (!result) throw new Error(`Failed to retrieve newly created mission "${newMission.id}"`);
 
     if (this.eventBus) {
       this.eventBus.emit({
@@ -167,52 +147,27 @@ export class WorkspaceManager {
         timestamp: now,
       });
     }
-
     return result;
   }
 
-  /**
-   * Get mission by ID.
-   */
+  /** Get mission by ID. */
   async getMission(id: string): Promise<MissionSelect | null> {
-    const rows = await this.db
-      .select()
-      .from(missions)
-      .where(eq(missions.id, id));
-
+    const rows = await this.db.select().from(missions).where(eq(missions.id, id));
     return rows[0] ?? null;
   }
 
-  /**
-   * Update mission fields by ID.
-   */
+  /** Update mission fields by ID. */
   async updateMission(id: string, updates: Partial<MissionInsert>): Promise<MissionSelect> {
     const now = new Date().toISOString();
-    await this.db
-      .update(missions)
-      .set({
-        ...updates,
-        updatedAt: now,
-      })
-      .where(eq(missions.id, id));
-
+    await this.db.update(missions).set({ ...updates, updatedAt: now }).where(eq(missions.id, id));
     const updated = await this.getMission(id);
-    if (!updated) {
-      throw new Error(`Failed to retrieve updated mission "${id}"`);
-    }
+    if (!updated) throw new Error(`Failed to retrieve updated mission "${id}"`);
     return updated;
   }
 
-  /**
-   * List missions, optionally filtered by workspaceId.
-   */
+  /** List missions, optionally filtered by workspaceId. */
   async listMissions(workspaceId?: string): Promise<MissionSelect[]> {
-    if (workspaceId) {
-      return await this.db
-        .select()
-        .from(missions)
-        .where(eq(missions.workspaceId, workspaceId));
-    }
+    if (workspaceId) return await this.db.select().from(missions).where(eq(missions.workspaceId, workspaceId));
     return await this.db.select().from(missions);
   }
 
@@ -268,11 +223,7 @@ export class WorkspaceManager {
     }));
   }
 
-  /**
-   * Resolve route policy with deterministic precedence:
-   * mission override > workspace override > team template > scheduler.
-   * Explicit chat directives are applied one layer above this in RuntimeHost.
-   */
+  /** Resolve route policy with deterministic precedence: mission > workspace > team > scheduler. */
   async resolveRoleExecutionPolicy(missionId: string, role: AgentRole): Promise<EffectiveRoutingPreference | undefined> {
     const mission = await this.getMission(missionId);
     if (!mission) return undefined;
@@ -301,7 +252,6 @@ export class WorkspaceManager {
       };
     }
 
-    // Compatibility path for templates saved before execution_policies existed.
     if (mission.teamTemplateId) {
       const legacyRows = await this.db.select().from(teamRoles).where(and(
         eq(teamRoles.templateId, mission.teamTemplateId),
@@ -318,13 +268,10 @@ export class WorkspaceManager {
         };
       }
     }
-
     return undefined;
   }
 
-  /**
-   * Create a new task record under a mission.
-   */
+  /** Create a new task record under a mission. */
   async createTask(input: CreateTaskInput): Promise<TaskSelect> {
     const now = new Date().toISOString();
     const newTask: TaskInsert = {
@@ -345,97 +292,70 @@ export class WorkspaceManager {
     };
 
     await this.db.insert(tasks).values(newTask);
-
     const result = await this.getTask(newTask.id);
-    if (!result) {
-      throw new Error(`Failed to retrieve newly created task "${newTask.id}"`);
-    }
+    if (!result) throw new Error(`Failed to retrieve newly created task "${newTask.id}"`);
     return result;
   }
 
-  /**
-   * Get task by ID.
-   */
+  /** Get task by ID. */
   async getTask(id: string): Promise<TaskSelect | null> {
-    const rows = await this.db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, id));
-
+    const rows = await this.db.select().from(tasks).where(eq(tasks.id, id));
     return rows[0] ?? null;
   }
 
-  /**
-   * List all tasks for a specific mission.
-   */
+  /** List all tasks for a mission. */
   async listTasks(missionId: string): Promise<TaskSelect[]> {
-    return await this.db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.missionId, missionId));
+    return await this.db.select().from(tasks).where(eq(tasks.missionId, missionId));
   }
 
-  /**
-   * Update task fields by ID.
-   */
+  /** Update task fields by ID. */
   async updateTask(id: string, updates: Partial<TaskInsert>): Promise<TaskSelect> {
     const now = new Date().toISOString();
-    await this.db
-      .update(tasks)
-      .set({
-        ...updates,
-        updatedAt: now,
-      })
-      .where(eq(tasks.id, id));
-
+    await this.db.update(tasks).set({ ...updates, updatedAt: now }).where(eq(tasks.id, id));
     const updated = await this.getTask(id);
-    if (!updated) {
-      throw new Error(`Failed to retrieve updated task "${id}"`);
-    }
+    if (!updated) throw new Error(`Failed to retrieve updated task "${id}"`);
     return updated;
   }
 
   /**
-   * Create an isolated git worktree for a task (branch: atris/mission-<missionId>/task-<taskId>).
+   * Create a project-aware isolated worktree for a task.
+   * Parent workspaces can contain several repositories; task title/description is
+   * used only as a deterministic project hint, never as a shell command.
    */
-  async createWorktreeForTask(taskId: string, baseBranch: string = 'main', candidateSuffix?: string): Promise<string> {
+  async createWorktreeForTask(taskId: string, baseBranch: string = 'HEAD', candidateSuffix?: string): Promise<string> {
     const task = await this.getTask(taskId);
-    if (!task) {
-      throw new Error(`Task with ID "${taskId}" not found`);
-    }
+    if (!task) throw new Error(`Task with ID "${taskId}" not found`);
 
     const mission = await this.getMission(task.missionId);
-    let basePath = process.cwd();
+    let workspacePath = process.cwd();
     if (mission?.workspaceId) {
-      const ws = await this.getWorkspace(mission.workspaceId);
-      if (ws?.path) {
-        basePath = ws.path;
-      }
+      const workspace = await this.getWorkspace(mission.workspaceId);
+      if (workspace?.path) workspacePath = workspace.path;
     }
 
+    const projectHint = `${task.title}\n${task.description}`;
+    const isolationBase = await this.worktreeManager.resolveIsolationBase(workspacePath, projectHint);
+    const projectBasePath = isolationBase.path;
     const branchName = candidateSuffix
       ? `atris/mission-${task.missionId}/task-${taskId}-${candidateSuffix}`
       : `atris/mission-${task.missionId}/task-${taskId}`;
-
-    const worktreeSubDir = candidateSuffix
-      ? `task-${taskId}-${candidateSuffix}`
-      : `task-${taskId}`;
-
-    const worktreeDir = path.join(basePath, '.atris-worktrees', `mission-${task.missionId}`, worktreeSubDir);
+    const worktreeSubDir = candidateSuffix ? `task-${taskId}-${candidateSuffix}` : `task-${taskId}`;
+    const worktreeDir = path.join(projectBasePath, '.atris-worktrees', `mission-${task.missionId}`, worktreeSubDir);
 
     const createdPath = await this.worktreeManager.createWorktree(
-      basePath,
+      projectBasePath,
       branchName,
       worktreeDir,
-      baseBranch
+      baseBranch,
+      projectHint,
     );
 
     const now = new Date().toISOString();
     const worktreeRecord: WorktreeInsert = {
       id: crypto.randomUUID(),
       missionId: task.missionId,
-      taskId: taskId,
-      branchName: branchName,
+      taskId,
+      branchName,
       path: createdPath,
       status: 'active',
       createdAt: now,
@@ -444,27 +364,20 @@ export class WorkspaceManager {
     try {
       await this.db.insert(worktrees).values(worktreeRecord);
     } catch {
-      // Ignore unique constraint error if recorded already
+      // A resumed/revision attempt may already have a persisted worktree row.
     }
 
     await this.updateTask(taskId, { worktreeId: createdPath });
-
     return createdPath;
   }
 
-  /**
-   * Remove worktree for task.
-   */
+  /** Remove worktree for task. */
   async removeWorktreeForTask(taskId: string): Promise<void> {
     const task = await this.getTask(taskId);
     if (!task || !task.worktreeId) return;
 
     await this.worktreeManager.removeWorktree(task.worktreeId);
     await this.updateTask(taskId, { worktreeId: null });
-
-    await this.db
-      .update(worktrees)
-      .set({ status: 'abandoned' })
-      .where(eq(worktrees.taskId, taskId));
+    await this.db.update(worktrees).set({ status: 'abandoned' }).where(eq(worktrees.taskId, taskId));
   }
 }
