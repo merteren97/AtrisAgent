@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 
 export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts';
 export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate';
-export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' | 'checks' | 'artifacts' | 'activity';
+export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' | 'checks' | 'memory' | 'artifacts' | 'activity';
 export type CloseBehavior = 'quit' | 'tray';
 export type UpdateBehavior = 'notify' | 'automatic';
 
@@ -113,9 +113,10 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 6,
+      version: 7,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
+        const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
         return {
           ...state,
           selectedModel: state.selectedModel?.includes(':') ? state.selectedModel : '',
@@ -123,7 +124,7 @@ export const useSettingsStore = create<SettingsState>()(
           teamTemplate: state.teamTemplate === 'Core Dev Team' || !state.teamTemplate ? 'default-core-dev-team' : state.teamTemplate,
           closeBehavior: state.closeBehavior === 'tray' ? 'tray' : 'quit',
           updateBehavior: state.updateBehavior === 'automatic' ? 'automatic' : 'notify',
-          inspectorTab: state.inspectorTab || 'agents',
+          inspectorTab: validInspectorTabs.includes(state.inspectorTab as InspectorTab) ? state.inspectorTab : 'agents',
           inspectorExpanded: false,
           // Direct role selection is now an advanced capability; normal missions always
           // enter through the orchestrator and @mentions can still target specialists.
