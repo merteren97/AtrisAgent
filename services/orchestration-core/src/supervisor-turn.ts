@@ -133,7 +133,7 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- clarify: ask only the minimum blocking question(s); create no workers and no plan.',
     '- delegate: read-only investigation/research/validation. Use 1-3 independent Researchers in parallel when the work naturally splits.',
     '- execute: source changes are requested. Research is optional. Use at most 2 parallel Builders and only for genuinely independent implementation lanes. Every Builder lane must be reviewable and testable.',
-    '- plan_only: the user explicitly asks to create/show a plan without beginning execution.',
+    '- plan_only: the user explicitly asks to create/show a plan without beginning execution; include the intended review/QA path but do not start it.',
     '',
     'Capacity policy: at most 3 Researchers, 2 Builders, 2 Reviewers, 2 QA workers; no more than 4 dependency-free workers may start concurrently.',
     '',
@@ -238,7 +238,7 @@ export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTa
     delegations = delegations.filter((item) => item.role !== 'builder');
   }
 
-  if (decision.action === 'execute') {
+  if (decision.action === 'execute' || decision.action === 'plan_only') {
     const builders = delegations.filter((item) => item.role === 'builder');
     const nonQuality = delegations.filter((item) => item.role !== 'reviewer' && item.role !== 'qa');
     delegations = [...nonQuality];
