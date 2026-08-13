@@ -44,6 +44,17 @@ export function handleIncomingEvent(eventData: any): void {
   const agents = useAgentStore.getState();
 
   switch (eventData.type) {
+    case 'user_message': {
+      const content = String(eventData.content || '').trim();
+      if (!content) break;
+      // Continuation is optimistic in the composer, while the backend also
+      // persists/broadcasts the canonical user turn. Avoid a temporary duplicate;
+      // the next hydration replaces the optimistic card with this persisted event.
+      const alreadyVisible = missions.timeline.some((item) => item.type === 'user_message' && item.content.trim() === content);
+      if (!alreadyVisible) append(eventData, content, { type: 'user_message' });
+      break;
+    }
+
     case 'mission_started':
       append(eventData, `Mission started: ${eventData.title || eventData.missionId}`, { agentRole: 'orchestrator' });
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'running');
@@ -64,7 +75,11 @@ export function handleIncomingEvent(eventData: any): void {
     case 'task_created': {
       const role = optionalString(eventData.assignedRole) || 'orchestrator';
       append(eventData, `Task ready: ${eventData.title || eventData.taskId}`, { agentRole: role });
-      if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'ready', assignedRole: optionalString(eventData.assignedRole) });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, {
+        status: 'ready',
+        assignedRole: optionalString(eventData.assignedRole),
+        ...(optionalString(eventData.agentInstanceId) ? { assignedAgentId: optionalString(eventData.agentInstanceId) } : {}),
+      });
       break;
     }
 
