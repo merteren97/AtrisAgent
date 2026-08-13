@@ -6,7 +6,7 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "test": "npx tsx src/orchestrator.test.ts && npx tsx src/orchestration-reliability.test.ts && npx tsx src/orchestrator-v2.test.ts && npx tsx src/orchestrator-v2-phase2.test.ts",
+    "test": "npx tsx src/orchestrator.test.ts && npx tsx src/orchestration-reliability.test.ts && npx tsx src/orchestrator-v2.test.ts && npx tsx src/orchestrator-v2-phase2.test.ts && npx tsx src/supervisor-turn.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
