@@ -17,7 +17,8 @@ export {
   graphDistanceScore,
   rankMemoryNodes,
 } from './memory-retrieval';
-export { ProjectMemoryService } from './project-memory';
+export { ProjectMemoryServiceV2 as ProjectMemoryService, ProjectMemoryServiceV2 } from './project-memory-v2';
+export { ProjectMemoryService as BaseProjectMemoryService } from './project-memory';
 export type {
   RawSqliteConnection,
   RawSqliteStatement,
