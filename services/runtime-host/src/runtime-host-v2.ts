@@ -1,8 +1,10 @@
 import {
   LocalEventBus,
   registerSupervisorTurnRunner,
+  unregisterSupervisorTurnRunner,
   type SupervisorTurnRuntimeRequest,
   type SupervisorTurnRunner,
+  type Unsubscribe,
 } from '@atris-agent-code/event-bus';
 import type {
   CanonicalReasoning,
@@ -70,9 +72,8 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   }
 
   override async stopAll(): Promise<void> {
-    if (this.supervisorRunner === this.supervisorRunner) {
-      registerSupervisorTurnRunner(null);
-    }
+    unregisterSupervisorTurnRunner(this.supervisorRunner);
+    this.supervisorRouting.clear();
     await super.stopAll();
   }
 
@@ -159,27 +160,38 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     let streamedText = '';
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribeDelta: Unsubscribe = () => undefined;
+    let unsubscribeCompleted: Unsubscribe = () => undefined;
+    let unsubscribeFailed: Unsubscribe = () => undefined;
+
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = undefined;
+      unsubscribeDelta();
+      unsubscribeCompleted();
+      unsubscribeFailed();
+      unsubscribeDelta = () => undefined;
+      unsubscribeCompleted = () => undefined;
+      unsubscribeFailed = () => undefined;
+    };
 
     const resultPromise = new Promise<string>((resolve, reject) => {
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
-        if (timeout) clearTimeout(timeout);
-        unsubscribeDelta();
-        unsubscribeCompleted();
-        unsubscribeFailed();
+        cleanup();
         callback();
       };
-      const unsubscribeDelta = turnBus.on('text_delta', (event) => {
+      unsubscribeDelta = turnBus.on('text_delta', (event) => {
         if (event.agentInstanceId !== sessionId) return;
         streamedText += event.content || '';
       });
-      const unsubscribeCompleted = turnBus.on('task_completed', (event) => {
+      unsubscribeCompleted = turnBus.on('task_completed', (event) => {
         if (event.taskId !== syntheticTaskId) return;
         const output = String(event.result || streamedText || '').trim();
         finish(() => resolve(output));
       });
-      const unsubscribeFailed = turnBus.on('task_failed', (event) => {
+      unsubscribeFailed = turnBus.on('task_failed', (event) => {
         if (event.taskId !== syntheticTaskId) return;
         finish(() => reject(new Error(event.error || 'Supervisor runtime failed.')));
       });
@@ -189,21 +201,28 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     });
 
     try {
-      await adapter.spawnAgent({
-        sessionId,
-        taskId: syntheticTaskId,
-        missionId: syntheticMissionId,
-        prompt: request.prompt,
-        role: 'orchestrator',
-        model: route.model?.runtimeModelId,
-        reasoningLevel: route.reasoningLevel,
-        profileId: route.profile?.id,
-        isolated: false,
-        cwd: request.workspacePath || this.v2WorkspacePath,
-        enableCoordinationMcp: false,
-      });
+      try {
+        await adapter.spawnAgent({
+          sessionId,
+          taskId: syntheticTaskId,
+          missionId: syntheticMissionId,
+          prompt: request.prompt,
+          role: 'orchestrator',
+          model: route.model?.runtimeModelId,
+          reasoningLevel: route.reasoningLevel,
+          profileId: route.profile?.id,
+          isolated: false,
+          cwd: request.workspacePath || this.v2WorkspacePath,
+          enableCoordinationMcp: false,
+        });
+      } catch (error) {
+        settled = true;
+        cleanup();
+        throw error;
+      }
       return await resultPromise;
     } finally {
+      cleanup();
       await adapter.shutdown().catch(() => undefined);
     }
   }
