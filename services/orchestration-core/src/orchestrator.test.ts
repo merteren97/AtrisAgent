@@ -252,9 +252,15 @@ async function runTests() {
     const spawnedEvents: any[] = [];
     const createdEvents: TaskCreated[] = [];
 
-    eventBus.on('task_assigned', (event: any) => assignedEvents.push(event));
-    eventBus.on('agent_spawned', (event: any) => spawnedEvents.push(event));
-    eventBus.on('task_created', (event: TaskCreated) => createdEvents.push(event));
+    eventBus.on('task_assigned', (event: any) => {
+      assignedEvents.push(event);
+    });
+    eventBus.on('agent_spawned', (event: any) => {
+      spawnedEvents.push(event);
+    });
+    eventBus.on('task_created', (event: TaskCreated) => {
+      createdEvents.push(event);
+    });
 
     const missionId = 'mission-correlated-agent';
     const result = await orchestrator.startMission(missionId, 'Investigate a routing issue');
@@ -277,8 +283,12 @@ async function runTests() {
     const userTurns: any[] = [];
     const planRevisions: any[] = [];
 
-    eventBus.on('user_message', (event: any) => userTurns.push(event));
-    eventBus.on('plan_revised', (event: any) => planRevisions.push(event));
+    eventBus.on('user_message', (event: any) => {
+      userTurns.push(event);
+    });
+    eventBus.on('plan_revised', (event: any) => {
+      planRevisions.push(event);
+    });
 
     const missionId = 'mission-persistent-conversation';
     const first = await orchestrator.startMission(missionId, 'Analyze the repository');
