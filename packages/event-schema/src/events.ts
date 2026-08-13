@@ -4,6 +4,13 @@ export interface BaseEvent {
   timestamp: string;
 }
 
+export interface UserMessage extends BaseEvent {
+  type: 'user_message';
+  content: string;
+  planId?: string | null;
+  previousPlanId?: string | null;
+}
+
 export interface MissionStarted extends BaseEvent {
   type: 'mission_started';
   title: string;
@@ -316,6 +323,7 @@ export interface AgentError extends BaseEvent {
 }
 
 export type AgentEvent =
+  | UserMessage
   | MissionStarted
   | PlanGenerated
   | PlanRevised
