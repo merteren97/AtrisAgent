@@ -26,11 +26,13 @@ export interface Mission {
   checkpointId?: string;
   taskCount?: number;
   description?: string;
+  planId?: string | null;
 }
 
 export interface TaskItem {
   id: string;
   missionId: string;
+  planId?: string;
   title: string;
   description: string;
   status: string;
@@ -72,6 +74,7 @@ interface MissionState {
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
+  continueMission: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
   deleteMission: (id: string) => Promise<boolean>;
   addMission: (mission: Mission) => void;
   setActiveMission: (id: string) => void;
@@ -89,6 +92,8 @@ interface MissionState {
   setComposerInput: (input: string) => void;
 }
 
+const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+
 function toExecutionMode(options?: StartMissionOptions): string {
   if (options?.executionMode) return options.executionMode;
   if (options?.trustMode === 'Review Driven') return 'review_driven';
@@ -103,6 +108,7 @@ function nowLabel(): string {
 
 function eventLabel(event: Record<string, any>): string {
   switch (event.type) {
+    case 'user_message': return event.content || '';
     case 'mission_started': return `Mission started: ${event.title || event.missionId}`;
     case 'plan_generated': return event.summary || `Generated ${event.taskCount || 0} tasks.`;
     case 'plan_revised': return `Plan revised: ${event.reason || 'Execution evidence changed the plan.'}`;
@@ -148,13 +154,35 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
   const date = event.timestamp ? new Date(event.timestamp) : new Date();
   return {
     id: event.id || crypto.randomUUID(),
-    type: event.type === 'text_delta' || event.type === 'mission_completed' ? 'orchestrator_message' : 'event',
+    type: event.type === 'user_message'
+      ? 'user_message'
+      : event.type === 'text_delta' || event.type === 'mission_completed'
+        ? 'orchestrator_message'
+        : 'event',
     content: eventLabel(event),
     timestamp: Number.isNaN(date.getTime()) ? nowLabel() : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     eventType: event.type,
-    agentRole: event.role || event.agentRole
-      || (event.type?.includes('verification') || event.type?.includes('review') ? 'reviewer' : event.type?.includes('check') ? 'qa' : undefined),
+    agentRole: event.type === 'user_message'
+      ? undefined
+      : event.role || event.agentRole
+        || (event.type?.includes('verification') || event.type?.includes('review') ? 'reviewer' : event.type?.includes('check') ? 'qa' : undefined),
     metadata: event,
+  };
+}
+
+function requestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions): Record<string, unknown> {
+  return {
+    request,
+    title: request,
+    workspaceId,
+    modelCatalogId: options?.model || undefined,
+    reasoningLevel: options?.reasoningLevel || undefined,
+    teamTemplate: options?.teamTemplate,
+    trustMode: options?.trustMode,
+    executionMode: toExecutionMode(options),
+    targetRole: options?.targetRole,
+    routeRole: options?.routeRole,
+    command: options?.command,
   };
 }
 
@@ -232,17 +260,18 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
         if (current.activeMissionId !== missionId) return { missions };
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
-        // The canonical user request is synthesized from the persisted mission.
-        // Never append the optimistic local composer card after hydration, or a
-        // reconcile triggered by task failure/retry moves the same message to the
-        // bottom of the conversation as a duplicate.
+        // User turns after the first message are persisted as user_message events.
+        // Hydration therefore replaces optimistic composer cards with canonical
+        // persisted events instead of appending duplicate user messages.
         const liveOnlyItems = current.timeline.filter((item) => (
           item.type !== 'user_message'
           && !restoredIds.has(item.id)
         ));
+        const activePlanId = state.mission?.planId;
+        const activeTasks = (state.tasks || []).filter((task) => !activePlanId || !task.planId || task.planId === activePlanId);
         return {
           missions,
-          activeTasks: state.tasks || [],
+          activeTasks,
           timeline: [...restoredTimeline, ...liveOnlyItems],
           hydratedMissionId: missionId,
         };
@@ -276,19 +305,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const data = await apiRequest<{ missionId: string; planId: string; tasks: TaskItem[]; status?: MissionStatus }>('/missions/start', {
         method: 'POST',
-        body: JSON.stringify({
-          request: trimmed,
-          title: trimmed,
-          workspaceId,
-          modelCatalogId: options?.model || undefined,
-          reasoningLevel: options?.reasoningLevel || undefined,
-          teamTemplate: options?.teamTemplate,
-          trustMode: options?.trustMode,
-          executionMode: toExecutionMode(options),
-          targetRole: options?.targetRole,
-          routeRole: options?.routeRole,
-          command: options?.command,
-        }),
+        body: JSON.stringify(requestBody(trimmed, workspaceId, options)),
       });
 
       const newMission: Mission = {
@@ -299,6 +316,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         status: data.status || 'running',
         createdAt: new Date().toISOString(),
         taskCount: data.tasks?.length || 0,
+        planId: data.planId,
       };
 
       useAgentStore.getState().clearMissionAgents(data.missionId);
@@ -327,6 +345,75 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         timeline: [...state.timeline, errorCard],
         loading: false,
         error: error?.message || 'Mission start failed.',
+      }));
+    }
+  },
+
+  continueMission: async (missionId, request, options) => {
+    const trimmed = request.trim();
+    if (!trimmed) return;
+    const mission = get().missions.find((item) => item.id === missionId);
+    if (!mission) {
+      set({ error: 'The selected conversation no longer exists.' });
+      return;
+    }
+    if (!TERMINAL_CONVERSATION_STATUSES.has(mission.status)) {
+      set({ error: 'Wait for the current mission turn to finish or stop it before sending a new request in this conversation.' });
+      return;
+    }
+
+    const userMessage: TimelineItem = {
+      id: crypto.randomUUID(),
+      type: 'user_message',
+      content: trimmed,
+      timestamp: nowLabel(),
+      metadata: {
+        targetRole: options?.targetRole,
+        routeRole: options?.routeRole,
+        command: options?.command,
+        modelCatalogId: options?.model,
+        reasoningLevel: options?.reasoningLevel,
+      },
+    };
+
+    set((state) => ({
+      loading: true,
+      error: null,
+      activeTasks: [],
+      timeline: [...state.timeline, userMessage],
+      missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'planning' } : item),
+    }));
+
+    try {
+      const data = await apiRequest<{ missionId: string; planId: string; tasks: TaskItem[] }>(`/missions/${missionId}/start`, {
+        method: 'POST',
+        body: JSON.stringify(requestBody(trimmed, mission.workspaceId, options)),
+      });
+
+      set((state) => ({
+        loading: false,
+        activeMissionId: missionId,
+        hydratedMissionId: null,
+        activeTasks: data.tasks || [],
+        missions: state.missions.map((item) => item.id === missionId
+          ? { ...item, status: 'running', planId: data.planId, taskCount: data.tasks?.length || 0 }
+          : item),
+      }));
+      await get().fetchMissionState(missionId);
+    } catch (error: any) {
+      const errorCard: TimelineItem = {
+        id: crypto.randomUUID(),
+        type: 'event',
+        content: `Conversation turn could not start: ${error?.message || 'The local AtrisAgent service is unavailable.'}`,
+        timestamp: nowLabel(),
+        eventType: 'mission_failed',
+        agentRole: 'orchestrator',
+      };
+      set((state) => ({
+        timeline: [...state.timeline, errorCard],
+        missions: state.missions.map((item) => item.id === missionId ? mission : item),
+        loading: false,
+        error: error?.message || 'Conversation continuation failed.',
       }));
     }
   },
