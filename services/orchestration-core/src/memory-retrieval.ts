@@ -52,15 +52,15 @@ export function rankMemoryNodes(params: {
 }): MemoryRetrievalHit[] {
   const now = params.now || new Date();
   const allowedTypes = params.query.nodeTypes ? new Set(params.query.nodeTypes) : null;
-  const allowedStatuses = params.query.statuses
+  const allowedStatuses: Set<MemoryNode['status']> = params.query.statuses
     ? new Set(params.query.statuses)
-    : new Set(['active', 'stale', 'disputed'] as const);
+    : new Set<MemoryNode['status']>(['active', 'stale', 'disputed']);
 
   const hits = params.nodes
     .filter((node) => node.projectId === params.query.projectId)
     .filter((node) => !allowedTypes || allowedTypes.has(node.type))
     .filter((node) => params.query.includeArchived || node.status !== 'archived')
-    .filter((node) => allowedStatuses.has(node.status as 'active' | 'stale' | 'disputed'))
+    .filter((node) => allowedStatuses.has(node.status))
     .map((node): MemoryRetrievalHit => {
       const lexicalScore = lexicalMemoryScore(node, params.query.text);
       const graphScore = graphDistanceScore(params.graphDistances?.get(node.id));
