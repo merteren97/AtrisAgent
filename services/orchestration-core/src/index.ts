@@ -1,4 +1,5 @@
-export { OrchestratorV2 as Orchestrator, OrchestratorV2 } from './orchestrator-v2';
+export { OrchestratorV3 as Orchestrator, OrchestratorV3 } from './orchestrator-v3';
+export { OrchestratorV2 } from './orchestrator-v2';
 export { Orchestrator as LegacyOrchestrator, validateAndRepairPlan, StructuredPlanJSONSchema } from './orchestrator';
 export type { OrchestratorConfig, StructuredPlan, StructuredTaskPlan } from './orchestrator';
 export { MissionController } from './controllers/mission-controller';
