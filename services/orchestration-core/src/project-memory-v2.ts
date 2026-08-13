@@ -6,6 +6,7 @@ import {
   type AtrisDatabase,
   type ProjectSelect,
 } from '@atris-agent-code/database';
+import type { AgentEvent } from '@atris-agent-code/event-schema';
 import {
   ProjectMemoryService,
   type ProjectMemoryOverview,
@@ -23,6 +24,23 @@ function resolveRawSqlite(db: AtrisDatabase, explicit?: RawSqliteConnection): Ra
   return candidate as RawSqliteConnection;
 }
 
+function redactMemoryValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value
+      .replace(/Authorization:\s*(?:Bearer|Basic)\s+[^\s"'\r\n]+/gi, 'Authorization: [REDACTED]')
+      .replace(/\b(?:sk-|ghp_|gho_|xox[baprs]-)[A-Za-z0-9_.-]{12,}\b/g, '[REDACTED_SECRET]')
+      .replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*["']?[^\s"']{8,}["']?/gi, '$1=[REDACTED]');
+  }
+  if (Array.isArray(value)) return value.map(redactMemoryValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .map(([key, item]) => [key, redactMemoryValue(item)]),
+    );
+  }
+  return value;
+}
+
 /**
  * Lifecycle-aware memory service used by the application runtime.
  *
@@ -37,6 +55,11 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
     sqlite?: RawSqliteConnection,
   ) {
     super(lifecycleDb, resolveRawSqlite(lifecycleDb, sqlite));
+  }
+
+  override async ingestEvent(event: AgentEvent): Promise<void> {
+    const redacted = redactMemoryValue(event) as AgentEvent;
+    await super.ingestEvent(redacted);
   }
 
   override async resolveProjectForMission(missionId: string): Promise<ProjectSelect | null> {
