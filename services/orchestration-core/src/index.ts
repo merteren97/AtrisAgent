@@ -17,3 +17,11 @@ export {
   graphDistanceScore,
   rankMemoryNodes,
 } from './memory-retrieval';
+export { ProjectMemoryService } from './project-memory';
+export type {
+  RawSqliteConnection,
+  RawSqliteStatement,
+  ProjectMemoryOverview,
+  ProjectMemorySnapshot,
+  ManualMemoryInput,
+} from './project-memory';
