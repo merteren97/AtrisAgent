@@ -51,6 +51,10 @@ export function configureRuntimeControlPlaneBridge(config?: RuntimeControlPlaneB
 }
 
 export function prepareControlPlaneSession(options: SpawnAgentOptions, agentInstanceId: string): PreparedControlPlaneSession | undefined {
+  // Supervisor decision/synthesis turns deliberately run outside the mission task
+  // control plane. This prevents a synthetic Orchestrator decision session from
+  // receiving worker-spawn tools or a grant bound to a non-existent task.
+  if (options.enableCoordinationMcp === false) return undefined;
   if (!bridgeConfig) return undefined;
   const grant = bridgeConfig.issueGrant({
     agentInstanceId,
