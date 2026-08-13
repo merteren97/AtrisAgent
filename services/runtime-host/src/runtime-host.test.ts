@@ -216,7 +216,8 @@ async function runTests() {
       JSON.stringify({ type: 'step_update', step_type: 'agent_response', state: 'DONE', text: 'Intermediate agent response' }),
     ];
     for (const line of antigravityLines) (antigravityAdapter as any).handleStreamLine('test-session-2', line);
-    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-2'), 'Antigravity agent_response DONE remains a non-terminal step because more tool work can follow');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-2'), 'Antigravity agent_response DONE remains non-terminal during the quiet grace window');
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-2'), 'Antigravity DONE response arms a bounded fallback instead of completing immediately');
 
     (antigravityAdapter as any).handleStreamLine('test-session-2', JSON.stringify({ type: 'result', success: false, error: 'Antigravity quota limit hit' }));
     const antigravityTypesBeforeClose = emittedEvents.map((e) => e.type);
@@ -224,6 +225,7 @@ async function runTests() {
     assert(antigravityTypesBeforeClose.includes('agent_thought'), 'AntigravityAdapter normalizes thought steps into agent_thought');
     assert(antigravityTypesBeforeClose.includes('agent_tool_call'), 'AntigravityAdapter normalizes tool steps into agent_tool_call');
     assert(antigravityTypesBeforeClose.includes('text_delta'), 'AntigravityAdapter normalizes progress text into text_delta');
+    assert(!(antigravityAdapter as any).softTerminalTimers.has('test-session-2'), 'Authoritative result cancels the soft completion fallback');
     assert(failedStdinEnded, 'AntigravityAdapter closes print-mode stdin as soon as a terminal result is received');
     assert(!antigravityTypesBeforeClose.includes('task_failed') && pendingOutcome?.kind === 'failed', 'AntigravityAdapter defers terminal failure until native session cleanup');
     (antigravityAdapter as any).activeProcesses.delete('test-session-2');
@@ -270,16 +272,74 @@ async function runTests() {
       state: 'DONE',
       text: 'Final research report without a result envelope',
     }));
-    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-4'), 'Antigravity final agent_response alone is not treated as terminal while the process is still alive');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-4'), 'Antigravity final agent_response is not promoted before the quiet grace expires');
 
     (antigravityAdapter as any).recordProcessTerminationOutcome('test-session-4', 0, null);
     const cleanExitOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-4');
     assert(cleanExitOutcome?.kind === 'completed', 'Antigravity clean native exit becomes a successful task outcome even when stream-json omits result');
     assert(cleanExitOutcome?.result === 'Final research report without a result envelope', 'Antigravity clean-exit completion preserves the latest agent response as task result');
+    assert(!(antigravityAdapter as any).softTerminalTimers.has('test-session-4'), 'Native exit cancels the pending soft completion timer');
     assert(!emittedEvents.some((event) => event.type === 'task_completed'), 'Clean process exit still defers task_completed until runtime cleanup finishes');
 
     (antigravityAdapter as any).emitTerminalOutcome('test-session-4', cleanExitContext, cleanExitOutcome);
     assert(emittedEvents.some((event) => event.type === 'task_completed' && (event as any).taskId === 'research-clean-exit'), 'Clean Antigravity exit publishes task_completed so the mission DAG can dispatch Task 2');
+
+    emittedEvents.length = 0;
+    const quietContext = { missionId: 'm-4', taskId: 'research-stuck-after-final-response' };
+    let quietStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-5', quietContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-5', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { quietStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-5', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Quiet final research report',
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-5'), 'A final Antigravity response arms the missing-result watchdog');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-5', 'Quiet final research report');
+    const quietOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-5');
+    assert(quietOutcome?.kind === 'completed', 'Quiet final response is promoted when agy omits terminal result and stays alive');
+    assert(quietOutcome?.result === 'Quiet final research report', 'Soft completion preserves the visible final agent response');
+    assert(quietStdinEnded, 'Soft completion starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-5');
+    (antigravityAdapter as any).emitTerminalOutcome('test-session-5', quietContext, quietOutcome);
+    assert(emittedEvents.some((event) => event.type === 'task_completed' && (event as any).taskId === 'research-stuck-after-final-response'), 'Missing-result fallback ultimately publishes task_completed for Task 2 scheduling');
+
+    const followOnContext = { missionId: 'm-5', taskId: 'research-follow-on-tool' };
+    (antigravityAdapter as any).sessionContext.set('test-session-6', followOnContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-6', {
+      stdin: { destroyed: false, writableEnded: false, end() { this.writableEnded = true; } },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-6', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Interim answer before another tool',
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-6'), 'Interim DONE response initially creates a soft candidate');
+    (antigravityAdapter as any).handleStreamLine('test-session-6', JSON.stringify({
+      type: 'step_update',
+      step_type: 'tool',
+      tool_name: 'InspectFile',
+      args: { path: 'src/index.ts' },
+    }));
+    assert(!(antigravityAdapter as any).softTerminalTimers.has('test-session-6'), 'A subsequent Antigravity step cancels the soft completion candidate');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-6'), 'Follow-on tool activity cannot be prematurely completed by an earlier DONE response');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-6');
   }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);
