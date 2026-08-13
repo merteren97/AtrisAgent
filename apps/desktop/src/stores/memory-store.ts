@@ -173,9 +173,7 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
       set((state) => ({
         snapshot,
         selectedProjectId: snapshot.project.id,
-        selectedNodeId: state.selectedNodeId && snapshot.nodes.some((node) => node.id === state.selectedNodeId)
-          ? state.selectedNodeId
-          : null,
+        selectedNodeId: state.selectedNodeId && snapshot.nodes.some((node) => node.id === state.selectedNodeId) ? state.selectedNodeId : null,
         projects: upsertProject(state.projects, snapshot),
         loading: false,
       }));
@@ -193,9 +191,7 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
       set((state) => ({
         snapshot,
         selectedProjectId: projectId,
-        selectedNodeId: state.selectedNodeId && snapshot.nodes.some((node) => node.id === state.selectedNodeId)
-          ? state.selectedNodeId
-          : null,
+        selectedNodeId: state.selectedNodeId && snapshot.nodes.some((node) => node.id === state.selectedNodeId) ? state.selectedNodeId : null,
         projects: upsertProject(state.projects, snapshot),
         loading: false,
       }));
@@ -222,6 +218,7 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
       const params = new URLSearchParams({ q: text, limit: '80' });
       if (types.length) params.set('types', types.join(','));
       if (statuses.length) params.set('statuses', statuses.join(','));
+      if (get().snapshot?.project.status === 'archived') params.set('includeArchived', 'true');
       const searchHits = await apiRequest<MemorySearchHit[]>(`/memory/projects/${projectId}/search?${params}`);
       set({ searchHits, error: null });
     } catch (error: any) {
@@ -234,10 +231,7 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
     if (!projectId) return null;
     set({ mutating: true, error: null });
     try {
-      const node = await apiRequest<MemoryNode>(`/memory/projects/${projectId}/nodes`, {
-        method: 'POST',
-        body: JSON.stringify(input),
-      });
+      const node = await apiRequest<MemoryNode>(`/memory/projects/${projectId}/nodes`, { method: 'POST', body: JSON.stringify(input) });
       await get().loadProject(projectId);
       set({ mutating: false, selectedNodeId: node.id });
       return node;
@@ -250,15 +244,9 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
   updateMemory: async (nodeId, updates) => {
     set({ mutating: true, error: null });
     try {
-      const node = await apiRequest<MemoryNode>(`/memory/nodes/${nodeId}`, {
-        method: 'PATCH',
-        body: JSON.stringify(updates),
-      });
+      const node = await apiRequest<MemoryNode>(`/memory/nodes/${nodeId}`, { method: 'PATCH', body: JSON.stringify(updates) });
       set((state) => ({
-        snapshot: state.snapshot ? {
-          ...state.snapshot,
-          nodes: state.snapshot.nodes.map((item) => item.id === node.id ? node : item),
-        } : null,
+        snapshot: state.snapshot ? { ...state.snapshot, nodes: state.snapshot.nodes.map((item) => item.id === node.id ? node : item) } : null,
         mutating: false,
       }));
       return node;
