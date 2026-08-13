@@ -24,6 +24,11 @@ import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
 import { parseAntigravityStreamLine } from './antigravity-stream';
 import { resolveAntigravityPrintTimeout } from '../antigravity-run-policy';
 import {
+  parseAntigravityModelsOutput,
+  resolveAntigravityModelRoute,
+  type AntigravityCliModelFamily,
+} from '../antigravity-model-catalog';
+import {
   appendControlPlaneInstructions,
   controlPlaneEnv,
   createAntigravityMcpOverlay,
@@ -64,15 +69,17 @@ const TERMINAL_EXIT_GRACE_MS = 750;
 const TERMINAL_FORCE_KILL_MS = 3_000;
 const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
 const FINAL_RESPONSE_QUIET_GRACE_MS = 2_500;
+const TERMINAL_RELEASE_GRACE_MS = TERMINAL_EXIT_GRACE_MS + TERMINAL_FORCE_KILL_MS + 500;
 
-// This list is a documented fallback only. Live account/runtime evidence always wins.
+// Last-resort fallback only. `agy models` is authoritative when the installed CLI exposes it.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
-  { slug: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Available on supported Antigravity plans' },
-  { slug: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', provider: 'google', efforts: ['low', 'high'], entitlement: 'Available on supported Antigravity plans' },
-  { slug: 'gemini-3-flash', name: 'Gemini 3 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Available on supported Antigravity plans' },
-  { slug: 'claude-sonnet-4.6-thinking', name: 'Claude Sonnet 4.6 (thinking)', provider: 'anthropic', efforts: ['high'], entitlement: 'Google AI Ultra / plan dependent' },
-  { slug: 'claude-opus-4.6-thinking', name: 'Claude Opus 4.6 (thinking)', provider: 'anthropic', efforts: ['high'], entitlement: 'Google AI Ultra / plan dependent' },
-  { slug: 'gpt-oss-120b', name: 'GPT-OSS-120b', provider: 'local', efforts: ['medium'], entitlement: 'Google AI Ultra / plan dependent' },
+  { slug: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', provider: 'google', efforts: ['low', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', provider: 'anthropic', efforts: ['high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6', provider: 'anthropic', efforts: ['high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gpt-oss-120b', name: 'GPT-OSS 120B', provider: 'local', efforts: ['medium'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
 ];
 
 export class AntigravityAdapter extends BaseRuntimeAdapter {
@@ -83,9 +90,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
   private terminalSessions = new Set<string>();
+  private publishedTerminalSessions = new Set<string>();
   private pendingTerminalBySession = new Map<string, PendingTerminalOutcome>();
   private lastOutputBySession = new Map<string, string>();
   private softTerminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private terminalReleaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private liveModelFamilies: AntigravityCliModelFamily[] = [];
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
   constructor(eventBus?: LocalEventBus) {
@@ -251,17 +261,83 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     child.kill('SIGTERM');
     this.lastVerification = undefined;
+    this.liveModelFamilies = [];
+  }
+
+  private async discoverLiveModelFamilies(executable: string): Promise<AntigravityCliModelFamily[]> {
+    try {
+      const result = await runCommand(executable, ['models'], { timeoutMs: 12_000, cwd: os.homedir() });
+      const families = parseAntigravityModelsOutput(result.stdout);
+      if (families.length) this.liveModelFamilies = families;
+      return families;
+    } catch (error) {
+      console.warn('[AntigravityAdapter] Live `agy models` discovery failed; using fallback catalog.', error);
+      return [];
+    }
+  }
+
+  private activeFamily(families: AntigravityCliModelFamily[], activeModel?: string): AntigravityCliModelFamily | undefined {
+    if (!activeModel) return undefined;
+    const target = this.normalizeModelId(activeModel);
+    return families.find((family) => [family.id, family.displayName, family.defaultRoute, ...Object.values(family.routes)]
+      .filter((value): value is string => Boolean(value))
+      .some((value) => this.normalizeModelId(value) === target));
   }
 
   async discoverModels(profileId = 'default'): Promise<ModelDescriptor[]> {
     if ((await this.verifyAuthentication()) !== 'connected') return [];
+    const install = await this.discoverInstallation();
+    if (!install.installed || !install.path) return [];
     const capabilities = await this.probeCapabilities();
     const activeModel = this.lastVerification?.activeModel;
-    const models: ModelDescriptor[] = [];
+    const liveFamilies = await this.discoverLiveModelFamilies(install.path);
+    const activeFamily = this.activeFamily(liveFamilies, activeModel);
 
-    // Print-mode result metadata is not guaranteed to include a model identifier.
-    // Even in that case the authenticated, sticky model selected in Antigravity is a
-    // valid route; expose it explicitly instead of leaving the profile with 0 models.
+    if (liveFamilies.length) {
+      const models = liveFamilies.map<ModelDescriptor>((family) => ({
+        catalogId: `${this.id}:${profileId}:${family.id}`,
+        runtimeId: this.runtimeType,
+        accountProfileId: profileId,
+        providerId: family.provider,
+        runtimeModelId: family.id,
+        displayName: family.displayName,
+        description: 'Live model family reported by the installed `agy models` command.',
+        supportedRoles: ALL_ROLES,
+        supportedReasoning: capabilities.reasoningControl ? family.efforts : [],
+        defaultReasoning: capabilities.reasoningControl ? family.defaultReasoning : undefined,
+        inputModalities: ['text', 'image'],
+        availability: 'available',
+        source: 'discovered',
+        routeLabel: 'Antigravity CLI · live catalog',
+        isDefault: activeFamily?.id === family.id,
+        entitlement: 'Available to the connected Antigravity account',
+        discoveredAt: new Date().toISOString(),
+      }));
+
+      if (!activeFamily) {
+        models.unshift({
+          catalogId: `${this.id}:${profileId}:antigravity-active-route`,
+          runtimeId: this.runtimeType,
+          accountProfileId: profileId,
+          providerId: activeModel ? this.providerFor(activeModel) : 'google',
+          runtimeModelId: 'antigravity-active-route',
+          displayName: activeModel ? this.displayName(activeModel) : 'Antigravity Active Model',
+          description: 'Uses the sticky model currently selected inside Antigravity when the CLI does not expose its active route in result metadata.',
+          supportedRoles: ALL_ROLES,
+          supportedReasoning: capabilities.reasoningControl ? ['low', 'medium', 'high'] : [],
+          inputModalities: ['text', 'image'],
+          availability: 'available',
+          source: 'discovered',
+          routeLabel: 'Antigravity CLI · active route',
+          isDefault: true,
+          warning: activeModel ? undefined : 'The exact active model was not reported by print mode; choose a live catalog model for a deterministic route.',
+          discoveredAt: new Date().toISOString(),
+        });
+      }
+      return models;
+    }
+
+    const models: ModelDescriptor[] = [];
     const activeRouteId = activeModel || 'antigravity-active-route';
     models.push({
       catalogId: `${this.id}:${profileId}:${activeRouteId}`,
@@ -270,9 +346,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       providerId: activeModel ? this.providerFor(activeModel) : 'google',
       runtimeModelId: activeRouteId,
       displayName: activeModel ? this.displayName(activeModel) : 'Antigravity Active Model',
-      description: activeModel
-        ? 'Active model reported by the authenticated Antigravity print-mode session.'
-        : 'The sticky model currently selected inside Antigravity. The CLI did not expose its exact identifier in result metadata.',
+      description: 'The sticky model currently selected inside Antigravity. Live model discovery was unavailable.',
       supportedRoles: ALL_ROLES,
       supportedReasoning: capabilities.reasoningControl ? ['low', 'medium', 'high'] : [],
       inputModalities: ['text', 'image'],
@@ -280,7 +354,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       source: 'discovered',
       routeLabel: 'Antigravity CLI · active route',
       isDefault: true,
-      warning: activeModel ? undefined : 'Use /model inside Antigravity to change this sticky route; AtrisAgent will use the active selection.',
+      warning: 'Live `agy models` discovery failed. Refresh routes after confirming the CLI is reachable.',
       discoveredAt: new Date().toISOString(),
     });
 
@@ -293,17 +367,15 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         providerId: model.provider,
         runtimeModelId: model.slug,
         displayName: model.name,
-        description: 'Documented Antigravity model. Availability remains plan-dependent until the installed CLI proves the route.',
+        description: 'Fallback Antigravity model metadata. Refresh routes to replace this with the installed CLI catalog.',
         supportedRoles: ALL_ROLES,
         supportedReasoning: capabilities.reasoningControl ? model.efforts : [],
         inputModalities: ['text', 'image'],
         availability: capabilities.modelSelection ? 'unknown' : 'unavailable',
         source: 'documented',
-        routeLabel: 'Antigravity CLI',
+        routeLabel: 'Antigravity CLI · fallback',
         entitlement: model.entitlement,
-        warning: capabilities.modelSelection
-          ? 'Account entitlement is verified when the run starts.'
-          : 'This CLI build does not expose a --model flag. Select the model with /model in Antigravity; AtrisAgent can use only the active route.',
+        warning: 'This entry is a fallback because live `agy models` discovery did not return a catalog.',
         discoveredAt: new Date().toISOString(),
       });
     }
@@ -377,6 +449,16 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     throw new Error('Antigravity print-mode permission decisions are controlled by its persisted permissions policy; interactive approval bridging is not available yet.');
   }
 
+  private async resolveRequestedModelRoute(executable: string, model: string, reasoning?: string): Promise<string> {
+    if (model === 'antigravity-active-route') return model;
+    let families = this.liveModelFamilies;
+    if (!families.length || !families.some((family) => family.id === model || Object.values(family.routes).includes(model))) {
+      const discovered = await this.discoverLiveModelFamilies(executable);
+      if (discovered.length) families = discovered;
+    }
+    return resolveAntigravityModelRoute(families, model, reasoning);
+  }
+
   async spawnAgent(options: SpawnAgentOptions): Promise<AgentSession> {
     const capabilities = await this.probeCapabilities();
     if (!capabilities.structuredEventStreaming) {
@@ -392,6 +474,9 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const cwd = overlay?.cwd || workspaceCwd;
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
     const printTimeout = resolveAntigravityPrintTimeout(options.env?.ATRIS_ANTIGRAVITY_PRINT_TIMEOUT);
+    const modelRoute = options.model && capabilities.modelSelection
+      ? await this.resolveRequestedModelRoute(install.path, options.model, options.reasoningLevel)
+      : options.model;
     const args = [
       '--print',
       prompt,
@@ -402,8 +487,9 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       printTimeout,
     ];
     if (overlay) args.push(...overlay.extraArgs);
-    if (options.model && options.model !== 'antigravity-active-route' && capabilities.modelSelection) args.push('--model', options.model);
-    if (options.reasoningLevel && capabilities.reasoningControl) args.push('--effort', options.reasoningLevel);
+    if (modelRoute && modelRoute !== 'antigravity-active-route' && capabilities.modelSelection) args.push('--model', modelRoute);
+    const routeEncodesReasoning = Boolean(modelRoute && /-(?:minimal|low|medium|high|xhigh|max)$/i.test(modelRoute));
+    if (options.reasoningLevel && capabilities.reasoningControl && !routeEncodesReasoning) args.push('--effort', options.reasoningLevel);
 
     const session: AgentSession = { id: sessionId, agentInstanceId: sessionId, runtimeSessionId: '', startedAt: new Date().toISOString(), endedAt: null };
     let child;
@@ -415,9 +501,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
           ...options.env,
           ...controlPlaneEnv(controlPlane),
         },
-        // Background print mode is a one-shot invocation: the complete prompt is
-        // supplied through --print, so stdin must start closed instead of keeping
-        // the CLI/MCP process graph alive while AtrisAgent waits for `result`.
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) {
@@ -427,13 +510,13 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       throw new Error(`Antigravity process launch failed: ${message}`, { cause: error });
     }
 
-    // A session is not visible to the UI until the OS confirms the CLI process
-    // exists. This prevents a Windows spawn ENOENT from creating ghost agents.
     this.activeSessions.set(sessionId, session);
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
     this.terminalSessions.delete(sessionId);
+    this.publishedTerminalSessions.delete(sessionId);
     this.pendingTerminalBySession.delete(sessionId);
     this.clearSoftTerminalCandidate(sessionId);
+    this.clearTerminalRelease(sessionId);
     this.lastOutputBySession.delete(sessionId);
     this.stderrBuffers.delete(sessionId);
     this.registerProcess(sessionId, child);
@@ -443,7 +526,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       missionId: options.missionId,
       agentInstanceId: sessionId,
       role: String(options.role || 'builder'),
-      model: options.model || 'Antigravity active model',
+      model: modelRoute || options.model || 'Antigravity active model',
       taskId: options.taskId,
       workspaceMode: options.isolated ? 'isolated_worktree' : options.role === 'orchestrator' ? 'shared' : 'read_only',
       timestamp: new Date().toISOString(),
@@ -464,15 +547,13 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       finalized = true;
       if (exitFinalizeTimer) clearTimeout(exitFinalizeTimer);
       this.clearSoftTerminalCandidate(sessionId);
+      this.clearTerminalRelease(sessionId);
       flushBufferedOutput();
       this.recordProcessTerminationOutcome(sessionId, code, signal);
 
       const context = this.sessionContext.get(sessionId);
       const outcome = this.pendingTerminalBySession.get(sessionId);
 
-      // Native process termination, not stdio stream closure, is the ownership
-      // boundary for a one-shot Antigravity run. A descendant MCP bridge may share
-      // stdout/stderr and keep Node's `close` event pending after `exit` has fired.
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
@@ -484,14 +565,13 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       this.pendingTerminalBySession.delete(sessionId);
       this.terminalSessions.delete(sessionId);
 
-      // Stop waiting on inherited/shared stdio handles after the parent runtime
-      // has exited. The control-plane grant is already revoked above.
       child.stdout?.removeAllListeners('data');
       child.stderr?.removeAllListeners('data');
       child.stdout?.destroy();
       child.stderr?.destroy();
 
       if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
+      this.publishedTerminalSessions.delete(sessionId);
     };
 
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -512,9 +592,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       });
     });
     child.on('exit', (code, signal) => {
-      // `exit` proves the Antigravity parent process is gone, but a final stdout
-      // chunk may still be in flight. Give the stream a short bounded drain window;
-      // `close` will finalize sooner when all stdio handles close normally.
       exitFinalizeTimer = setTimeout(() => finalizeNativeSession(code, signal), PROCESS_EXIT_STREAM_DRAIN_MS);
       exitFinalizeTimer.unref?.();
     });
@@ -530,9 +607,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const parsed = parseAntigravityStreamLine(line);
     const timestamp = new Date().toISOString();
 
-    if (parsed.kind === 'malformed') {
-      return;
-    }
+    if (parsed.kind === 'malformed') return;
     if (parsed.kind === 'unknown') {
       this.emitEvent({
         id: crypto.randomUUID(),
@@ -576,10 +651,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, progress: `${parsed.stepType}: ${parsed.state}`, timestamp });
       }
 
-      // agy 1.1.8 documents a terminal `result` event, but real Windows
-      // subprocess runs can occasionally stop after a final agent_response/DONE
-      // while the parent process remains alive. Treat DONE as a soft candidate,
-      // not an immediate terminal event: any subsequent step cancels this timer.
       if (isFinalResponseCandidate) {
         const candidateResult = parsed.content || this.lastOutputBySession.get(sessionId) || 'Antigravity task completed';
         this.scheduleSoftTerminalCandidate(sessionId, candidateResult);
@@ -597,11 +668,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         return;
       }
       if (parsed.content && parsed.content !== this.lastOutputBySession.get(sessionId)) {
+        this.lastOutputBySession.set(sessionId, parsed.content);
         this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: parsed.content, timestamp });
       }
       this.recordTerminalOutcome(sessionId, {
         kind: 'completed',
-        result: parsed.content || 'Antigravity task completed',
+        result: parsed.content || this.lastOutputBySession.get(sessionId) || 'Antigravity task completed',
       });
     }
   }
@@ -610,6 +682,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const timer = this.softTerminalTimers.get(sessionId);
     if (timer) clearTimeout(timer);
     this.softTerminalTimers.delete(sessionId);
+  }
+
+  private clearTerminalRelease(sessionId: string): void {
+    const timer = this.terminalReleaseTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    this.terminalReleaseTimers.delete(sessionId);
   }
 
   private scheduleSoftTerminalCandidate(sessionId: string, result: string): void {
@@ -667,19 +745,29 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.clearSoftTerminalCandidate(sessionId);
     this.terminalSessions.add(sessionId);
     this.pendingTerminalBySession.set(sessionId, outcome);
-    if (requestShutdown) this.requestTerminalProcessShutdown(sessionId);
+    if (requestShutdown) {
+      this.requestTerminalProcessShutdown(sessionId);
+      this.scheduleTerminalRelease(sessionId);
+    }
+  }
+
+  private scheduleTerminalRelease(sessionId: string): void {
+    this.clearTerminalRelease(sessionId);
+    const timer = setTimeout(() => {
+      this.terminalReleaseTimers.delete(sessionId);
+      const context = this.sessionContext.get(sessionId);
+      const outcome = this.pendingTerminalBySession.get(sessionId);
+      if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
+    }, TERMINAL_RELEASE_GRACE_MS);
+    timer.unref?.();
+    this.terminalReleaseTimers.set(sessionId, timer);
   }
 
   private requestTerminalProcessShutdown(sessionId: string): void {
     const child = this.activeProcesses.get(sessionId);
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
 
-    // `agy --print` is a one-shot process. Once its authoritative terminal
-    // `result` event arrives, keeping stdin open or a lingering MCP/background
-    // worker alive must not hold the mission DAG in Running forever.
-    if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) {
-      child.stdin.end();
-    }
+    if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
 
     const terminate = setTimeout(() => {
       const active = this.activeProcesses.get(sessionId);
@@ -701,6 +789,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     context: { missionId: string; taskId: string },
     outcome: PendingTerminalOutcome,
   ): void {
+    if (this.publishedTerminalSessions.has(sessionId)) return;
+    this.publishedTerminalSessions.add(sessionId);
     const timestamp = new Date().toISOString();
     if (outcome.kind === 'completed') {
       this.emitEvent({
