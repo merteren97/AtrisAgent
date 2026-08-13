@@ -1,0 +1,22 @@
+{
+  "name": "@atris-agent-code/runtime-host",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "npx tsx src/runtime-host.test.ts && npx tsx src/runtime-utils.test.ts && npx tsx src/scheduler-policy.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/supervisor-runtime.test.ts && npx tsx src/antigravity-stream.test.ts && npx tsx src/antigravity-run-policy.test.ts && npx tsx src/antigravity-model-catalog.test.ts",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@atris-agent-code/domain": "*",
+    "@atris-agent-code/event-bus": "*",
+    "@atris-agent-code/event-schema": "*",
+    "@atris-agent-code/workspace-manager": "*"
+  }
+}
