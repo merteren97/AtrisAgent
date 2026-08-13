@@ -2,10 +2,7 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '@atris-agent-code/database';
 import type { AtrisDatabase } from '@atris-agent-code/database';
-import {
-  ProjectMemoryService,
-  type RawSqliteConnection,
-} from '@atris-agent-code/orchestration-core';
+import { ProjectMemoryService } from '@atris-agent-code/orchestration-core';
 
 async function runTests() {
   let passed = 0;
@@ -66,7 +63,9 @@ async function runTests() {
     );
   `);
   const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
-  const service = new ProjectMemoryService(db, sqlite as unknown as RawSqliteConnection);
+  // Match production construction: ProjectMemoryService discovers the underlying
+  // better-sqlite3 client from the Drizzle database wrapper itself.
+  const service = new ProjectMemoryService(db);
   const now = new Date().toISOString();
   const workspacePath = process.platform === 'win32' ? 'C:\\Projects\\MemoryDemo' : '/tmp/MemoryDemo';
 
