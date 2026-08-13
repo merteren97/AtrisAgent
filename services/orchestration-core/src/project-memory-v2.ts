@@ -12,6 +12,17 @@ import {
   type RawSqliteConnection,
 } from './project-memory';
 
+function resolveRawSqlite(db: AtrisDatabase, explicit?: RawSqliteConnection): RawSqliteConnection {
+  if (explicit) return explicit;
+  const candidate = (db as any).$client
+    || (db as any).session?.client
+    || (db as any)._?.session?.client;
+  if (!candidate || typeof candidate.exec !== 'function' || typeof candidate.prepare !== 'function') {
+    throw new Error('Project memory requires the local better-sqlite3 client exposed by the Atris database runtime.');
+  }
+  return candidate as RawSqliteConnection;
+}
+
 /**
  * Lifecycle-aware memory service used by the application runtime.
  *
@@ -23,9 +34,9 @@ import {
 export class ProjectMemoryServiceV2 extends ProjectMemoryService {
   constructor(
     private readonly lifecycleDb: AtrisDatabase,
-    sqlite: RawSqliteConnection,
+    sqlite?: RawSqliteConnection,
   ) {
-    super(lifecycleDb, sqlite);
+    super(lifecycleDb, resolveRawSqlite(lifecycleDb, sqlite));
   }
 
   override async resolveProjectForMission(missionId: string): Promise<ProjectSelect | null> {
