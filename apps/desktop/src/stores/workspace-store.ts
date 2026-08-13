@@ -24,7 +24,7 @@ interface WorkspaceState {
   addWorkspace: (workspace: Workspace) => void;
   setActiveWorkspace: (id: string) => void;
   rememberMission: (workspaceId: string, missionId: string) => void;
-  removeWorkspace: (id: string) => Promise<void>;
+  removeWorkspace: (id: string) => Promise<boolean>;
   clearError: () => void;
 }
 
@@ -111,8 +111,10 @@ export const useWorkspaceStore = create<WorkspaceState>()(
               loading: false,
             };
           });
+          return true;
         } catch (error: any) {
           set({ loading: false, error: error?.message || 'Workspace removal failed.' });
+          return false;
         }
       },
     }),

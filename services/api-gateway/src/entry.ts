@@ -3,6 +3,7 @@ import { configureRuntimeControlPlaneBridge } from '@atris-agent-code/runtime-ho
 import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator } from './index';
 import { ControlPlaneGrantRegistry } from './control-plane-grants';
 import { installControlPlaneRoutes } from './control-plane-router';
+import { installProjectMemoryRoutes } from './project-memory-routes';
 import {
   emitRuntimeReady,
   gatewayOrigin,
@@ -29,6 +30,14 @@ installControlPlaneRoutes(app, {
   workspaceManager,
   grants,
 });
+
+const projectMemory = orchestrator.getProjectMemoryService();
+if (projectMemory) {
+  installProjectMemoryRoutes(app, {
+    memory: projectMemory,
+    workspaceManager,
+  });
+}
 
 function configureBridgeForListeningServer(): string | undefined {
   const address = server.address();

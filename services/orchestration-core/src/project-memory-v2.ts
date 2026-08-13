@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import {
   missionEvents,
   missions,
+  projects,
   projectWorkspaceLinks,
   workspaces,
   type AtrisDatabase,
@@ -54,12 +55,15 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
   private readonly attachmentPromises = new Map<string, Promise<ProjectSelect | null>>();
   private readonly backfillPromises = new Map<string, Promise<void>>();
   private readonly backfilledWorkspaceIds = new Set<string>();
+  private readonly lifecycleSqlite: RawSqliteConnection;
 
   constructor(
     private readonly lifecycleDb: AtrisDatabase,
     sqlite?: RawSqliteConnection,
   ) {
-    super(lifecycleDb, resolveRawSqlite(lifecycleDb, sqlite));
+    const rawSqlite = resolveRawSqlite(lifecycleDb, sqlite);
+    super(lifecycleDb, rawSqlite);
+    this.lifecycleSqlite = rawSqlite;
   }
 
   override async ingestEvent(event: AgentEvent): Promise<void> {
@@ -106,6 +110,25 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
   override async getOverview(projectId: string): Promise<ProjectMemoryOverview> {
     await this.reconcileProjectAttachments(projectId);
     return super.getOverview(projectId);
+  }
+
+  /**
+   * Permanently removes a detached/archived project memory space. Active project
+   * attachments are protected so a user cannot accidentally erase memory that is
+   * still powering an open workspace.
+   */
+  async deleteProjectMemory(projectId: string): Promise<void> {
+    const overview = await this.getOverview(projectId);
+    if (overview.activeWorkspaceIds.length > 0) {
+      throw new Error('Project memory is still attached to an active workspace. Remove the workspace first or keep the memory as a detached backup.');
+    }
+
+    try {
+      this.lifecycleSqlite.prepare('DELETE FROM memory_nodes_fts WHERE project_id = ?').run(projectId);
+    } catch {
+      // FTS is optional and may not exist on this SQLite build.
+    }
+    await this.lifecycleDb.delete(projects).where(eq(projects.id, projectId));
   }
 
   private async ensureWorkspaceBackfill(workspaceId: string): Promise<void> {
