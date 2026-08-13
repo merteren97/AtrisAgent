@@ -179,17 +179,12 @@ export function createAntigravityMcpOverlay(
       [ATRIS_MCP_SERVER_NAME]: {
         command: process.execPath,
         args: [session.bridgeScriptPath],
-        env: {
-          ATRIS_CONTROL_PLANE_URL: session.endpoint,
-          ATRIS_CONTROL_PLANE_TOKEN: session.token,
-          ...(session.runtimeToken ? { ATRIS_RUNTIME_TOKEN: session.runtimeToken } : {}),
-        },
       },
     },
   }, null, 2), 'utf8');
   return {
     cwd: root,
-    extraArgs: [],
+    extraArgs: ['--add-dir', workspacePath],
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   };
 }
