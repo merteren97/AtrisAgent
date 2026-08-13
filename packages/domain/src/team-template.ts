@@ -7,6 +7,10 @@ export interface TeamTemplate {
   name: string;
   description: string;
   roles: TeamRole[];
+  /** Optional v2 scheduler policy. Legacy templates remain valid without it. */
+  workerPools?: WorkerPoolPolicy[];
+  /** Global concurrent worker ceiling for this template. The Orchestrator is not counted as a worker. */
+  maxParallelAgents?: number;
   isDefault: boolean;
   createdAt: string;
 }
@@ -25,4 +29,18 @@ export interface TeamRole {
   preferredReasoning?: CanonicalReasoning;
   defaultCapabilities: string[];
   accessLevel: 'read' | 'write' | 'tests_and_build' | 'orchestration';
+}
+
+export interface WorkerPoolPolicy {
+  role: Exclude<AgentRole, 'orchestrator'>;
+  /** Zero keeps the worker type fully demand-driven. */
+  minInstances: number;
+  /** Maximum live instances of this role within one conversation turn. */
+  maxInstances: number;
+  /** Optional tighter limit for simultaneously running workers of this role. */
+  maxParallel?: number;
+  /** Keep independent work parallel when true; dependencies still serialize execution. */
+  preferParallel?: boolean;
+  /** Optional capabilities that justify spawning an additional specialist of the same role. */
+  splitCapabilities?: string[];
 }
