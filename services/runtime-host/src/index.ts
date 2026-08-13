@@ -1,4 +1,5 @@
-export { RuntimeHostV2 as RuntimeHost, RuntimeHostV2 } from './runtime-host-v2';
+export { RuntimeHostV3 as RuntimeHost, RuntimeHostV3 } from './runtime-host-v3';
+export { RuntimeHostV2 } from './runtime-host-v2';
 export { RuntimeHost as LegacyRuntimeHost } from './runtime-host';
 export type { RuntimeHostConfig, MissionRoutingPreference } from './runtime-host';
 export { BaseRuntimeAdapter } from './adapters/base-adapter';
