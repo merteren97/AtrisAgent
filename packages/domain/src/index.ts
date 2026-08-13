@@ -19,3 +19,4 @@ export * from './usage';
 export * from './notification';
 export * from './worker-request';
 export * from './review-pack';
+export * from './memory';
