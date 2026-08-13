@@ -7,6 +7,13 @@ import type { StructuredTaskPlan } from './orchestrator';
 
 const ACTIONS = new Set<OrchestratorTurnAction>(['respond', 'clarify', 'delegate', 'execute', 'plan_only']);
 const WORKER_ROLES = new Set<OrchestratorDelegation['role']>(['researcher', 'builder', 'reviewer', 'qa']);
+const ROLE_LIMITS: Record<OrchestratorDelegation['role'], number> = {
+  researcher: 3,
+  builder: 2,
+  reviewer: 2,
+  qa: 2,
+};
+const MAX_INITIAL_PARALLEL_DELEGATIONS = 4;
 
 export interface SupervisorTurnContext {
   turnId: string;
@@ -39,6 +46,7 @@ function extractJsonObject(raw: string): Record<string, unknown> | null {
 function normalizeDelegations(value: unknown): OrchestratorDelegation[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
+  const roleCounts = new Map<OrchestratorDelegation['role'], number>();
   const result: OrchestratorDelegation[] = [];
   for (let index = 0; index < value.length && result.length < 12; index += 1) {
     const item = value[index];
@@ -46,6 +54,9 @@ function normalizeDelegations(value: unknown): OrchestratorDelegation[] {
     const record = item as Record<string, unknown>;
     const role = String(record.role || '').toLowerCase() as OrchestratorDelegation['role'];
     if (!WORKER_ROLES.has(role)) continue;
+    const currentRoleCount = roleCounts.get(role) || 0;
+    if (currentRoleCount >= ROLE_LIMITS[role]) continue;
+
     let id = String(record.id || `${role}-${index + 1}`).trim();
     if (!id || seen.has(id)) id = `${role}-${index + 1}-${crypto.randomUUID().slice(0, 6)}`;
     seen.add(id);
@@ -65,12 +76,32 @@ function normalizeDelegations(value: unknown): OrchestratorDelegation[] {
       dependsOnDelegationIds,
       preferredParallelGroup: typeof record.preferredParallelGroup === 'string' ? record.preferredParallelGroup : undefined,
     });
+    roleCounts.set(role, currentRoleCount + 1);
   }
+
   const validIds = new Set(result.map((item) => item.id));
-  return result.map((item) => ({
+  const normalized = result.map((item) => ({
     ...item,
     dependsOnDelegationIds: (item.dependsOnDelegationIds || []).filter((id) => id !== item.id && validIds.has(id)),
   }));
+
+  // The Phase 1 pool has a global parallel ceiling of four. The legacy execution
+  // engine dispatches every zero-dependency root immediately, so encode only the
+  // overflow capacity as a scheduler dependency until the V2 allocator fully owns
+  // initial dispatch. Semantic dependencies from the model are preserved.
+  const initialRoots: string[] = [];
+  let overflowIndex = 0;
+  return normalized.map((item) => {
+    const dependencies = item.dependsOnDelegationIds || [];
+    if (dependencies.length > 0) return item;
+    if (initialRoots.length < MAX_INITIAL_PARALLEL_DELEGATIONS) {
+      initialRoots.push(item.id);
+      return item;
+    }
+    const capacityGate = initialRoots[overflowIndex % initialRoots.length];
+    overflowIndex += 1;
+    return { ...item, dependsOnDelegationIds: [capacityGate] };
+  });
 }
 
 export function parseSupervisorDecision(raw: string, turnId: string): OrchestratorDecision | null {
@@ -101,8 +132,10 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- respond: answer directly from the supplied conversation/project context; create no workers and no plan.',
     '- clarify: ask only the minimum blocking question(s); create no workers and no plan.',
     '- delegate: read-only investigation/research/validation. Use 1-3 independent Researchers in parallel when the work naturally splits.',
-    '- execute: source changes are requested. Research is optional. Builders may be parallel only for genuinely independent implementation lanes. Every Builder lane must be reviewable and testable.',
+    '- execute: source changes are requested. Research is optional. Use at most 2 parallel Builders and only for genuinely independent implementation lanes. Every Builder lane must be reviewable and testable.',
     '- plan_only: the user explicitly asks to create/show a plan without beginning execution.',
+    '',
+    'Capacity policy: at most 3 Researchers, 2 Builders, 2 Reviewers, 2 QA workers; no more than 4 dependency-free workers may start concurrently.',
     '',
     'Important behavior:',
     '- Interpret short follow-ups such as "devam edelim", "2. yöntemi uygula", "öncekini boşver" from conversation context instead of treating them as new isolated requests.',
