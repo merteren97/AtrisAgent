@@ -50,6 +50,8 @@ function redactMemoryValue(value: unknown): unknown {
  * been removed. This keeps the rollout migration-free for users.
  */
 export class ProjectMemoryServiceV2 extends ProjectMemoryService {
+  private readonly attachmentPromises = new Map<string, Promise<ProjectSelect | null>>();
+
   constructor(
     private readonly lifecycleDb: AtrisDatabase,
     sqlite?: RawSqliteConnection,
@@ -70,7 +72,23 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
     if (!mission) return null;
     const workspace = (await this.lifecycleDb.select().from(workspaces).where(eq(workspaces.id, mission.workspaceId)))[0];
     if (!workspace) return null;
-    return (await this.attachWorkspace(workspace)).project;
+
+    const inFlight = this.attachmentPromises.get(workspace.id);
+    if (inFlight) return inFlight;
+
+    const attachment = (async () => {
+      const resolvedDuringWait = await super.resolveProjectForMission(missionId);
+      if (resolvedDuringWait) return resolvedDuringWait;
+      return (await this.attachWorkspace(workspace)).project;
+    })();
+    this.attachmentPromises.set(workspace.id, attachment);
+    try {
+      return await attachment;
+    } finally {
+      if (this.attachmentPromises.get(workspace.id) === attachment) {
+        this.attachmentPromises.delete(workspace.id);
+      }
+    }
   }
 
   override async getOverview(projectId: string): Promise<ProjectMemoryOverview> {
