@@ -63,6 +63,7 @@ const MAX_STDERR_CHARS = 8_000;
 const TERMINAL_EXIT_GRACE_MS = 750;
 const TERMINAL_FORCE_KILL_MS = 3_000;
 const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
+const FINAL_RESPONSE_QUIET_GRACE_MS = 2_500;
 
 // This list is a documented fallback only. Live account/runtime evidence always wins.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
@@ -84,6 +85,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private terminalSessions = new Set<string>();
   private pendingTerminalBySession = new Map<string, PendingTerminalOutcome>();
   private lastOutputBySession = new Map<string, string>();
+  private softTerminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
   constructor(eventBus?: LocalEventBus) {
@@ -431,6 +433,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
     this.terminalSessions.delete(sessionId);
     this.pendingTerminalBySession.delete(sessionId);
+    this.clearSoftTerminalCandidate(sessionId);
     this.lastOutputBySession.delete(sessionId);
     this.stderrBuffers.delete(sessionId);
     this.registerProcess(sessionId, child);
@@ -460,6 +463,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       if (finalized) return;
       finalized = true;
       if (exitFinalizeTimer) clearTimeout(exitFinalizeTimer);
+      this.clearSoftTerminalCandidate(sessionId);
       flushBufferedOutput();
       this.recordProcessTerminationOutcome(sessionId, code, signal);
 
@@ -542,6 +546,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'init') {
+      this.clearSoftTerminalCandidate(sessionId);
       const session = this.activeSessions.get(sessionId);
       if (session && parsed.conversationId) session.runtimeSessionId = parsed.conversationId;
       this.emitEvent({
@@ -556,7 +561,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'step') {
+      this.clearSoftTerminalCandidate(sessionId);
       const stepType = parsed.stepType.toLowerCase();
+      const isFinalResponseCandidate = /(?:^|[_-])(?:agent|final)[_-]?response(?:$|[_-])/.test(stepType)
+        && /^(?:done|completed|success|succeeded)$/i.test(parsed.state || '');
       if (/thought|reason|plan/.test(stepType) && parsed.content) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: parsed.content, timestamp });
       } else if (/tool|command|shell|subagent/.test(stepType)) {
@@ -567,9 +575,19 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       } else if (parsed.state) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, progress: `${parsed.stepType}: ${parsed.state}`, timestamp });
       }
+
+      // agy 1.1.8 documents a terminal `result` event, but real Windows
+      // subprocess runs can occasionally stop after a final agent_response/DONE
+      // while the parent process remains alive. Treat DONE as a soft candidate,
+      // not an immediate terminal event: any subsequent step cancels this timer.
+      if (isFinalResponseCandidate) {
+        const candidateResult = parsed.content || this.lastOutputBySession.get(sessionId) || 'Antigravity task completed';
+        this.scheduleSoftTerminalCandidate(sessionId, candidateResult);
+      }
       return;
     }
     if (parsed.kind === 'result') {
+      this.clearSoftTerminalCandidate(sessionId);
       if (this.terminalSessions.has(sessionId)) return;
       if (!parsed.success) {
         this.recordTerminalOutcome(sessionId, {
@@ -586,6 +604,33 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         result: parsed.content || 'Antigravity task completed',
       });
     }
+  }
+
+  private clearSoftTerminalCandidate(sessionId: string): void {
+    const timer = this.softTerminalTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    this.softTerminalTimers.delete(sessionId);
+  }
+
+  private scheduleSoftTerminalCandidate(sessionId: string, result: string): void {
+    this.clearSoftTerminalCandidate(sessionId);
+    const timer = setTimeout(() => {
+      this.promoteSoftTerminalCandidate(sessionId, result);
+    }, FINAL_RESPONSE_QUIET_GRACE_MS);
+    timer.unref?.();
+    this.softTerminalTimers.set(sessionId, timer);
+  }
+
+  private promoteSoftTerminalCandidate(sessionId: string, result: string): void {
+    this.clearSoftTerminalCandidate(sessionId);
+    if (this.terminalSessions.has(sessionId) || !this.sessionContext.has(sessionId)) return;
+    const child = this.activeProcesses.get(sessionId);
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+
+    this.recordTerminalOutcome(sessionId, {
+      kind: 'completed',
+      result: result.trim() || this.lastOutputBySession.get(sessionId)?.trim() || 'Antigravity task completed',
+    });
   }
 
   private recordProcessTerminationOutcome(
@@ -619,6 +664,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     requestShutdown = true,
   ): void {
     if (this.terminalSessions.has(sessionId)) return;
+    this.clearSoftTerminalCandidate(sessionId);
     this.terminalSessions.add(sessionId);
     this.pendingTerminalBySession.set(sessionId, outcome);
     if (requestShutdown) this.requestTerminalProcessShutdown(sessionId);
