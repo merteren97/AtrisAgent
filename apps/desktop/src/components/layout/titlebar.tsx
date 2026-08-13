@@ -114,51 +114,54 @@ export function Titlebar() {
       <div
         id="atris-titlebar-drag-region"
         data-tauri-drag-region
-        className="atris-drag-region flex h-full min-w-0 flex-1 items-center gap-2.5 px-4"
+        className="atris-drag-region flex h-full min-w-0 flex-1 items-center gap-2.5 overflow-hidden px-4"
         onMouseDown={handleDragFallback}
       >
-        <h1 data-tauri-drag-region className="pointer-events-none max-w-[400px] truncate text-sm font-semibold">
-          {activeMission?.title || (activeWorkspace ? 'New chat' : 'AtrisAgent')}
-        </h1>
-        {activeMission ? (
-          <Badge data-tauri-drag-region variant={activeMission.status === 'running' ? 'success' : 'secondary'} className="pointer-events-none text-[10px] uppercase">
-            {activeMission.status}
-          </Badge>
-        ) : activeWorkspace ? (
-          <Badge data-tauri-drag-region variant="secondary" className="pointer-events-none border-primary/20 bg-primary/[0.06] text-[9px] uppercase tracking-wide text-primary">
-            {activeWorkspace.name}
-          </Badge>
-        ) : null}
-        {feedback && <span data-tauri-drag-region className="pointer-events-none ml-2 max-w-[560px] truncate text-xs text-destructive">{feedback}</span>}
+        <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+          <h1 data-tauri-drag-region className="pointer-events-none min-w-0 truncate text-sm font-semibold">
+            {activeMission?.title || (activeWorkspace ? 'New chat' : 'AtrisAgent')}
+          </h1>
+          {activeMission ? (
+            <Badge data-tauri-drag-region variant={activeMission.status === 'running' ? 'success' : 'secondary'} className="pointer-events-none shrink-0 text-[10px] uppercase">
+              {activeMission.status}
+            </Badge>
+          ) : activeWorkspace ? (
+            <Badge data-tauri-drag-region variant="secondary" className="pointer-events-none shrink-0 border-primary/20 bg-primary/[0.06] text-[9px] uppercase tracking-wide text-primary">
+              {activeWorkspace.name}
+            </Badge>
+          ) : null}
+        </div>
+        {feedback && <span data-tauri-drag-region className="pointer-events-none max-w-[260px] shrink truncate text-xs text-destructive">{feedback}</span>}
       </div>
 
-      <div data-no-drag className="atris-no-drag flex h-full shrink-0 items-center gap-1 pr-1">
+      <div data-no-drag className="atris-no-drag relative z-10 flex h-full shrink-0 items-center gap-1 bg-background pr-1">
         <Button
           variant="ghost"
           size="icon"
-          className={`h-7 w-7 ${!activeMission && activeWorkspace ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
+          className={`h-7 w-7 shrink-0 ${!activeMission && activeWorkspace ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
           onClick={handleNewChat}
           disabled={!activeWorkspace}
           title={activeWorkspace ? `New chat in ${activeWorkspace.name} (Ctrl+N)` : 'Open a project before starting a chat'}
+          aria-label={activeWorkspace ? `New chat in ${activeWorkspace.name}` : 'New chat'}
         >
           <SquarePen className="h-3.5 w-3.5" />
         </Button>
         <div className="mx-0.5 h-5 w-px bg-border" />
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handlePlayPause} disabled={!activeMission} title={activeMission?.status === 'running' ? t('Pause') : t('Play')}>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={handlePlayPause} disabled={!activeMission} title={activeMission?.status === 'running' ? t('Pause') : t('Play')}>
           {activeMission?.status === 'running' ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
         </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => activeMission && void stopMission(activeMission.id)} disabled={!activeMission || activeMission.status === 'cancelled'} title={t('Stop')}>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => activeMission && void stopMission(activeMission.id)} disabled={!activeMission || activeMission.status === 'cancelled'} title={t('Stop')}>
           <Square className="h-3.5 w-3.5" />
         </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => activeMission && void retryMission(activeMission.id)} disabled={!activeMission} title={t('Retry')}>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => activeMission && void retryMission(activeMission.id)} disabled={!activeMission} title={t('Retry')}>
           <RotateCcw className="h-3.5 w-3.5" />
         </Button>
         <div className="mx-1 h-5 w-px bg-border" />
         <UsageMeter />
-        <Button variant="ghost" size="sm" className={`h-7 gap-1.5 text-xs ${devMode ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`} onClick={handleDevModeToggle}>
+        <Button variant="ghost" size="sm" className={`h-7 shrink-0 gap-1.5 text-xs ${devMode ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`} onClick={handleDevModeToggle}>
           <Cpu className="h-3.5 w-3.5" />{t('Developer Mode')}
         </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => console.log('More options clicked')}>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => console.log('More options clicked')}>
           <MoreHorizontal className="h-3.5 w-3.5" />
         </Button>
         <div className="mx-1 h-5 w-px bg-border" />
@@ -166,7 +169,7 @@ export function Titlebar() {
           data-no-drag
           variant="ghost"
           size="icon"
-          className="h-9 w-10 rounded-none"
+          className="h-9 w-10 shrink-0 rounded-none"
           onClick={() => void runWindowAction('minimize').catch((error) => reportWindowError('minimize', error))}
           title="Minimize"
         >
@@ -176,7 +179,7 @@ export function Titlebar() {
           data-no-drag
           variant="ghost"
           size="icon"
-          className="h-9 w-10 rounded-none"
+          className="h-9 w-10 shrink-0 rounded-none"
           onClick={() => void runWindowAction('maximize').catch((error) => reportWindowError('maximize', error))}
           title="Maximize or restore"
         >
@@ -186,7 +189,7 @@ export function Titlebar() {
           data-no-drag
           variant="ghost"
           size="icon"
-          className="h-9 w-10 rounded-none hover:bg-destructive hover:text-destructive-foreground"
+          className="h-9 w-10 shrink-0 rounded-none hover:bg-destructive hover:text-destructive-foreground"
           onClick={() => void runWindowAction('close').catch((error) => reportWindowError('close', error))}
           title="Close AtrisAgent"
         >

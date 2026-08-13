@@ -318,6 +318,7 @@ export class Orchestrator {
     taskId: string;
     title: string;
     assignedRole?: string | null;
+    agentInstanceId?: string;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
     this.emitEvent({
@@ -327,6 +328,7 @@ export class Orchestrator {
       taskId: params.taskId,
       title: params.title,
       assignedRole: params.assignedRole ?? null,
+      agentInstanceId: params.agentInstanceId,
       timestamp: new Date().toISOString(),
     });
   }
@@ -461,6 +463,10 @@ export class Orchestrator {
     return undefined;
   }
 
+  private tasksForPlan(tasks: TaskSelect[], planId?: string | null): TaskSelect[] {
+    return planId ? tasks.filter((task) => task.planId === planId) : tasks;
+  }
+
   /**
    * Generate structured plan and repair if invalid.
    */
@@ -479,6 +485,10 @@ export class Orchestrator {
   /**
    * Primary entry point: Start a mission following Notion plan Section 20 state machine transitions:
    * Draft -> Planning -> AwaitingPlanApproval -> Running -> ...
+   *
+   * A mission is also the persistent chat/conversation boundary. When the same
+   * mission is started again after a terminal turn, a new planId is created and
+   * all execution decisions are scoped to that plan instead of reusing old tasks.
    */
   async startMission(
     missionId: string,
@@ -498,8 +508,9 @@ export class Orchestrator {
   }> {
     const now = new Date().toISOString();
     let currentExecutionMode = this.config.executionMode ?? 'balanced';
+    let previousPlanId: string | null = null;
 
-    // 1. STATE: Draft -> Planning
+    // 1. STATE: Draft/Terminal -> Planning
     if (this.workspaceManager) {
       const existingMission = await this.workspaceManager.getMission(missionId);
       if (!existingMission) {
@@ -513,23 +524,36 @@ export class Orchestrator {
           status: 'planning',
         });
       } else {
+        previousPlanId = existingMission.planId ?? null;
         currentExecutionMode = (existingMission.executionMode as ExecutionMode) || currentExecutionMode;
-        await this.workspaceManager.updateMission(missionId, { status: 'planning' });
+        await this.workspaceManager.updateMission(missionId, { status: 'planning', completedAt: null });
       }
     } else {
-      this.inMemoryMissions.set(missionId, {
-        id: missionId,
-        workspaceId: this.config.workspacePath || 'default-workspace',
-        title: request,
-        description: `Mission started for request: ${request}`,
-        status: 'planning',
-        teamTemplateId: this.config.teamTemplateId ?? 'default-team',
-        planId: null,
-        executionMode: currentExecutionMode,
-        createdAt: now,
-        updatedAt: now,
-        completedAt: null,
-      });
+      const existingMission = this.inMemoryMissions.get(missionId);
+      if (existingMission) {
+        previousPlanId = existingMission.planId ?? null;
+        currentExecutionMode = (existingMission.executionMode as ExecutionMode) || currentExecutionMode;
+        this.inMemoryMissions.set(missionId, {
+          ...existingMission,
+          status: 'planning',
+          completedAt: null,
+          updatedAt: now,
+        });
+      } else {
+        this.inMemoryMissions.set(missionId, {
+          id: missionId,
+          workspaceId: this.config.workspacePath || 'default-workspace',
+          title: request,
+          description: `Mission started for request: ${request}`,
+          status: 'planning',
+          teamTemplateId: this.config.teamTemplateId ?? 'default-team',
+          planId: null,
+          executionMode: currentExecutionMode,
+          createdAt: now,
+          updatedAt: now,
+          completedAt: null,
+        });
+      }
     }
 
     // 2. Generate Structured Plan & DAG with schema repair
@@ -588,6 +612,18 @@ export class Orchestrator {
     } else {
       const m = this.inMemoryMissions.get(missionId);
       if (m) this.inMemoryMissions.set(missionId, { ...m, planId });
+    }
+
+    if (previousPlanId) {
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'user_message',
+        missionId,
+        content: request,
+        planId,
+        previousPlanId,
+        timestamp: new Date().toISOString(),
+      });
     }
 
     const createdTasks: TaskSelect[] = [];
@@ -669,13 +705,25 @@ export class Orchestrator {
       }
     }
 
-    // 3. Emit Plan Generated event
+    // 3. Emit Plan Generated/Revised events
     this.emitPlanGenerated({
       missionId,
       planId,
       taskCount: createdTasks.length,
       summary: `Generated ${createdTasks.length}-step structured DAG plan for "${request}"`,
     });
+    if (previousPlanId) {
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'plan_revised',
+        missionId,
+        planId,
+        previousPlanId,
+        reason: 'New user turn received in the existing conversation. A fresh execution plan was created without mixing prior-turn tasks.',
+        changedTaskIds: createdTasks.map((task) => task.id),
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     // 4. Policy Engine check for Plan Approval
     const policyEngine = new PolicyEngine(currentExecutionMode as any);
@@ -719,11 +767,13 @@ export class Orchestrator {
       }
     }
 
-    this.emitMissionStarted({
-      missionId,
-      workspaceId: this.config.workspacePath || 'default-workspace',
-      title: request,
-    });
+    if (!previousPlanId) {
+      this.emitMissionStarted({
+        missionId,
+        workspaceId: this.config.workspacePath || 'default-workspace',
+        title: request,
+      });
+    }
 
     // Start first ready task(s)
     if (createdTasks.length > 0) {
@@ -745,7 +795,9 @@ export class Orchestrator {
   }
 
   /**
-   * Assign task to agent role and emit task events.
+   * Assign task to agent role and emit task events. The agent instance id is
+   * allocated before runtime startup so route/worktree/spawn failures are tied to
+   * the correct attempt and the UI can show a real preparing subagent immediately.
    */
   async assignTask(taskId: string, agentRole?: AgentRole): Promise<TaskSelect> {
     let task: TaskSelect | null = this.inMemoryTasks.get(taskId) ?? null;
@@ -756,11 +808,13 @@ export class Orchestrator {
     }
 
     const roleToAssign = agentRole ?? task?.assignedRole ?? 'builder';
+    const agentInstanceId = crypto.randomUUID();
 
     if (this.workspaceManager && task) {
       task = await this.workspaceManager.updateTask(taskId, {
         status: 'running',
         assignedRole: roleToAssign,
+        assignedAgentId: agentInstanceId,
       });
       this.inMemoryTasks.set(taskId, task);
     } else if (task) {
@@ -768,6 +822,7 @@ export class Orchestrator {
         ...task,
         status: 'running',
         assignedRole: roleToAssign,
+        assignedAgentId: agentInstanceId,
         updatedAt: new Date().toISOString(),
       };
       this.inMemoryTasks.set(taskId, task);
@@ -775,11 +830,26 @@ export class Orchestrator {
 
     const missionId = task?.missionId ?? this.config.missionId ?? '';
     const title = task?.title ?? `Task ${taskId}`;
+    const displayRole = roleToAssign.charAt(0).toUpperCase() + roleToAssign.slice(1);
 
     this.emitTaskAssigned({
       missionId,
       taskId,
       role: roleToAssign,
+      agentInstanceId,
+    });
+
+    this.emitEvent({
+      id: crypto.randomUUID(),
+      type: 'agent_spawned',
+      missionId,
+      agentInstanceId,
+      role: roleToAssign,
+      displayName: `${displayRole} Agent`,
+      spawnReason: `Orchestrator scheduled task: ${title}`,
+      taskId,
+      workspaceMode: roleToAssign === 'builder' ? 'isolated_worktree' : roleToAssign === 'orchestrator' ? 'shared' : 'read_only',
+      timestamp: new Date().toISOString(),
     });
 
     this.emitTaskCreated({
@@ -787,6 +857,7 @@ export class Orchestrator {
       taskId,
       title,
       assignedRole: roleToAssign,
+      agentInstanceId,
     });
 
     if (task) return task;
@@ -800,7 +871,7 @@ export class Orchestrator {
       description: '',
       status: 'running',
       priority: 'medium',
-      assignedAgentId: null,
+      assignedAgentId: agentInstanceId,
       assignedRole: roleToAssign,
       requiredCapabilities: [],
       dependsOn: [],
@@ -847,8 +918,9 @@ export class Orchestrator {
     const now = new Date().toISOString();
 
     // 1. Mark task completed
+    let completedTask: TaskSelect | null = null;
     if (this.workspaceManager) {
-      await this.workspaceManager.updateTask(taskId, {
+      completedTask = await this.workspaceManager.updateTask(taskId, {
         status: 'done',
         completedAt: now,
       });
@@ -856,20 +928,27 @@ export class Orchestrator {
 
     const cachedTask = this.inMemoryTasks.get(taskId);
     if (cachedTask) {
-      this.inMemoryTasks.set(taskId, {
+      const updatedTask = {
         ...cachedTask,
-        status: 'done',
+        status: 'done' as const,
         completedAt: now,
         updatedAt: now,
-      });
+      };
+      this.inMemoryTasks.set(taskId, updatedTask);
+      if (!completedTask) completedTask = updatedTask;
     }
 
-    // 2. Fetch all tasks for mission
+    // 2. Fetch only tasks from the completed task's plan/turn. Historical tasks
+    // stay persisted for the conversation but must never be scheduled or applied again.
+    const activePlanId = completedTask?.planId || null;
     let allTasks: TaskSelect[] = [];
     if (this.workspaceManager) {
-      allTasks = await this.workspaceManager.listTasks(missionId);
+      allTasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), activePlanId);
     } else {
-      allTasks = Array.from(this.inMemoryTasks.values()).filter((t) => t.missionId === missionId);
+      allTasks = this.tasksForPlan(
+        Array.from(this.inMemoryTasks.values()).filter((t) => t.missionId === missionId),
+        activePlanId,
+      );
     }
 
     if (allTasks.length === 0) {
@@ -1145,7 +1224,7 @@ export class Orchestrator {
       this.inMemoryMissions.set(missionId, { ...cachedMission, status: 'revising', updatedAt: now });
     }
 
-    // Re-assign task to the same Builder session/role
+    // Re-assign task to the same Builder role with a fresh correlated runtime attempt id.
     await this.assignTask(taskId, task?.assignedRole ?? 'builder');
   }
 
@@ -1176,7 +1255,7 @@ export class Orchestrator {
     }
 
     if (approvalType === 'plan') {
-      const tasks = await this.workspaceManager.listTasks(missionId);
+      const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission?.planId);
       await this.workspaceManager.updateMission(missionId, { status: 'running' });
       const ready = tasks.filter((task) => {
         if (task.status !== 'planned' && task.status !== 'ready') return false;
@@ -1193,7 +1272,7 @@ export class Orchestrator {
       if (!this.applyTaskChanges) {
         throw new Error('No deterministic apply coordinator is configured.');
       }
-      const tasks = await this.workspaceManager.listTasks(missionId);
+      const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission?.planId);
       const incomplete = tasks.filter((task) => task.status !== 'done');
       if (incomplete.length > 0) {
         throw new Error('Changes cannot be applied while mission tasks are incomplete.');
@@ -1243,7 +1322,7 @@ export class Orchestrator {
     if (!mission) throw new Error(`Mission '${missionId}' was not found.`);
     if (TERMINAL_MISSION_STATUSES.has(String(mission.status))) throw new Error(`Mission '${missionId}' is already ${mission.status}.`);
     if (mission.executionMode !== 'candidate') throw new Error('Candidate selection is only valid for missions in Candidate mode.');
-    const tasks = await this.workspaceManager.listTasks(missionId);
+    const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission.planId);
     const candidates = tasks.filter((task) => task.assignedRole === 'builder' && task.title.includes('(Candidate'));
     if (candidates.length < 2) throw new Error('This mission does not contain multiple Builder candidates.');
     const selected = candidates.find((task) => task.id === selectedTaskId);
@@ -1267,7 +1346,7 @@ export class Orchestrator {
       timestamp: new Date().toISOString(),
     });
 
-    const refreshed = await this.workspaceManager.listTasks(missionId);
+    const refreshed = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission.planId);
     const nextTasks = refreshed.filter((task) => {
       if (task.status !== 'planned' && task.status !== 'ready') return false;
       return ((task.dependsOn as string[]) || []).every((dependencyId) => {
@@ -1286,6 +1365,9 @@ export class Orchestrator {
       const mission = this.workspaceManager
         ? await this.workspaceManager.getMission(missionId)
         : this.inMemoryMissions.get(missionId);
+      if (mission && task?.planId && mission.planId && task.planId !== mission.planId) {
+        throw new Error(`Task '${taskId}' belongs to a previous conversation turn and cannot be retried as part of the active plan.`);
+      }
       if (mission && (mission.status === 'completed' || mission.status === 'cancelled')) {
         throw new Error(`Mission '${missionId}' is ${mission.status}; its tasks cannot be retried.`);
       }
@@ -1309,7 +1391,7 @@ export class Orchestrator {
       if (dbTasks.length > 0) tasksList = dbTasks;
     }
 
-    return { mission, tasks: tasksList };
+    return { mission, tasks: this.tasksForPlan(tasksList, mission?.planId) };
   }
 
   async applyOrReject(taskId: string, decision: 'apply' | 'reject'): Promise<void> {
@@ -1335,7 +1417,7 @@ export class Orchestrator {
 
     for (const mission of runningMissions) {
       console.log(`[Orchestrator] Recovering mission: ${mission.id}`);
-      const tasks = await this.workspaceManager.listTasks(mission.id);
+      const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(mission.id), mission.planId);
 
       const activeTasks = tasks.filter((t) => t.status === 'running' || t.status === 'revision_requested');
       for (const task of activeTasks) {

@@ -316,7 +316,21 @@ fn get_runtime_config(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // Register single-instance handling before every other plugin. A second
+    // launcher attempt should never create another runtime/sidecar; it only
+    // restores and focuses the existing main window, including when hidden in tray.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    let app = builder
         .manage(runtime::RuntimeState::default())
         .manage(CloseBehaviorState::default())
         .plugin(tauri_plugin_fs::init())

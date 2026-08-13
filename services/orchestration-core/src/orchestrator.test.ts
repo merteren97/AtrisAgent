@@ -244,6 +244,66 @@ async function runTests() {
     assert(candidateTasks[1].worktreeId?.includes('candidate-b') === true, 'Candidate B assigned candidate-b worktree');
   }
 
+  // Test 7: Logical subagent identity exists before runtime startup
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const assignedEvents: any[] = [];
+    const spawnedEvents: any[] = [];
+    const createdEvents: TaskCreated[] = [];
+
+    eventBus.on('task_assigned', (event: any) => {
+      assignedEvents.push(event);
+    });
+    eventBus.on('agent_spawned', (event: any) => {
+      spawnedEvents.push(event);
+    });
+    eventBus.on('task_created', (event: TaskCreated) => {
+      createdEvents.push(event);
+    });
+
+    const missionId = 'mission-correlated-agent';
+    const result = await orchestrator.startMission(missionId, 'Investigate a routing issue');
+    const state = await orchestrator.getMissionState(missionId);
+    const firstTask = state.tasks.find((task) => task.id === result.tasks[0].id);
+
+    assert(assignedEvents.length === 1, 'First task emits task_assigned before runtime startup');
+    assert(spawnedEvents.length === 1, 'First task emits agent_spawned before runtime startup');
+    assert(createdEvents.length === 1, 'First task still emits task_created for RuntimeHost dispatch');
+    assert(Boolean(assignedEvents[0]?.agentInstanceId), 'task_assigned has a preallocated agentInstanceId');
+    assert(assignedEvents[0]?.agentInstanceId === spawnedEvents[0]?.agentInstanceId, 'agent_spawned uses the same correlated agentInstanceId');
+    assert(assignedEvents[0]?.agentInstanceId === createdEvents[0]?.agentInstanceId, 'RuntimeHost task_created uses the same correlated agentInstanceId');
+    assert(firstTask?.assignedAgentId === assignedEvents[0]?.agentInstanceId, 'Task state persists the correlated subagent id immediately');
+  }
+
+  // Test 8: A follow-up turn keeps the conversation but isolates the active plan
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const userTurns: any[] = [];
+    const planRevisions: any[] = [];
+
+    eventBus.on('user_message', (event: any) => {
+      userTurns.push(event);
+    });
+    eventBus.on('plan_revised', (event: any) => {
+      planRevisions.push(event);
+    });
+
+    const missionId = 'mission-persistent-conversation';
+    const first = await orchestrator.startMission(missionId, 'Analyze the repository');
+    const second = await orchestrator.startMission(missionId, 'Now implement the recommended change');
+    const state = await orchestrator.getMissionState(missionId);
+
+    assert(first.missionId === second.missionId, 'Follow-up turn reuses the same mission/conversation id');
+    assert(first.planId !== second.planId, 'Follow-up turn creates a fresh plan id');
+    assert(state.mission?.planId === second.planId, 'Mission points at the newest turn plan');
+    assert(state.tasks.length === second.tasks.length, 'Mission state exposes only tasks from the active turn plan');
+    assert(state.tasks.every((task) => task.planId === second.planId), 'Historical turn tasks cannot leak into active plan scheduling');
+    assert(userTurns.length === 1 && userTurns[0]?.content.includes('Now implement'), 'Follow-up user message is emitted as a persisted conversation event');
+    assert(planRevisions.length === 1 && planRevisions[0]?.previousPlanId === first.planId, 'Plan revision links the previous and current conversation turns');
+  }
+
   console.log(`\nTest Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) {
     process.exit(1);

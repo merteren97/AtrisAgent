@@ -21,7 +21,9 @@ async function runTests() {
   }
 
   // A runtime can report a turn failure and then report the process closing.
-  // Both signals refer to one attempt and must consume only one retry.
+  // Both signals refer to one attempt and must consume only one retry. Runtime
+  // attempts now use the Orchestrator-preallocated agentInstanceId, so the test
+  // consumes the same correlated IDs that RuntimeHost receives in task_created.
   {
     const eventBus = new LocalEventBus();
     const orchestrator = new Orchestrator({
@@ -30,19 +32,22 @@ async function runTests() {
       maxTaskRetries: 2,
     });
 
-    let taskCreatedCount = 0;
-    eventBus.on('task_created', () => { taskCreatedCount += 1; });
+    const taskCreatedAgentIds: string[] = [];
+    eventBus.on('task_created', (event) => {
+      if (event.agentInstanceId) taskCreatedAgentIds.push(event.agentInstanceId);
+    });
 
     const missionId = 'mission-duplicate-terminal';
     const result = await orchestrator.startMission(missionId, 'Fix duplicate terminal event handling');
     const task = result.tasks[0];
+    const firstAttemptId = taskCreatedAgentIds[0];
 
     const duplicateFailure = {
       id: crypto.randomUUID(),
       type: 'task_failed' as const,
       missionId,
       taskId: task.id,
-      agentInstanceId: 'runtime-attempt-1',
+      agentInstanceId: firstAttemptId,
       error: 'runtime reported failure',
       timestamp: new Date().toISOString(),
     };
@@ -51,17 +56,18 @@ async function runTests() {
     eventBus.emit({ ...duplicateFailure, id: crypto.randomUUID(), error: 'process exited with code 1' });
     await waitForHandlers();
 
-    assert(taskCreatedCount === 2, 'Duplicate terminal signals from one runtime attempt schedule only one retry');
+    assert(taskCreatedAgentIds.length === 2, 'Duplicate terminal signals from one runtime attempt schedule only one retry');
 
+    const secondAttemptId = taskCreatedAgentIds[1];
     eventBus.emit({
       ...duplicateFailure,
       id: crypto.randomUUID(),
-      agentInstanceId: 'runtime-attempt-2',
+      agentInstanceId: secondAttemptId,
       error: 'second runtime attempt failed',
     });
     await waitForHandlers();
 
-    assert(taskCreatedCount === 3, 'A distinct runtime attempt can consume the next retry');
+    assert(taskCreatedAgentIds.length === 3, 'A distinct runtime attempt can consume the next retry');
     orchestrator.unsubscribeFromEvents();
   }
 
@@ -75,8 +81,10 @@ async function runTests() {
       maxTaskRetries: 0,
     });
 
-    let taskCreatedCount = 0;
-    eventBus.on('task_created', () => { taskCreatedCount += 1; });
+    const taskCreatedAgentIds: string[] = [];
+    eventBus.on('task_created', (event) => {
+      if (event.agentInstanceId) taskCreatedAgentIds.push(event.agentInstanceId);
+    });
 
     const missionId = 'mission-stale-terminal';
     const result = await orchestrator.startMission(missionId, 'Protect terminal mission state');
@@ -87,7 +95,7 @@ async function runTests() {
       type: 'task_failed',
       missionId,
       taskId: firstTask.id,
-      agentInstanceId: 'failed-attempt',
+      agentInstanceId: taskCreatedAgentIds[0],
       error: 'fatal runtime error',
       timestamp: new Date().toISOString(),
     });
@@ -101,7 +109,7 @@ async function runTests() {
       type: 'task_completed',
       missionId,
       taskId: firstTask.id,
-      agentInstanceId: 'late-runtime-event',
+      agentInstanceId: taskCreatedAgentIds[0],
       result: 'late completion after failure',
       timestamp: new Date().toISOString(),
     });
@@ -109,7 +117,7 @@ async function runTests() {
 
     const finalState = await orchestrator.getMissionState(missionId);
     assert(finalState.mission?.status === 'failed', 'Late completion cannot revive a failed mission');
-    assert(taskCreatedCount === 1, 'Late completion cannot schedule downstream work from a terminal mission');
+    assert(taskCreatedAgentIds.length === 1, 'Late completion cannot schedule downstream work from a terminal mission');
     orchestrator.unsubscribeFromEvents();
   }
 
