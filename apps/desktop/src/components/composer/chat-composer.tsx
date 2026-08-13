@@ -38,6 +38,7 @@ const COMMANDS = [
   { id: 'review', label: 'Request a focused review' },
   { id: 'summarize', label: 'Summarize current mission state' },
 ] as const;
+const TERMINAL_CONVERSATION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 function titleCase(value: string): string {
   return value === 'xhigh' ? 'Extra High' : value.charAt(0).toUpperCase() + value.slice(1);
@@ -60,6 +61,9 @@ export function ChatComposer() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const startMission = useMissionStore((state) => state.startMission);
+  const continueMission = useMissionStore((state) => state.continueMission);
+  const activeMissionId = useMissionStore((state) => state.activeMissionId);
+  const missions = useMissionStore((state) => state.missions);
   const loading = useMissionStore((state) => state.loading);
   const composerInput = useMissionStore((state) => state.composerInput);
   const setComposerInput = useMissionStore((state) => state.setComposerInput);
@@ -80,6 +84,15 @@ export function ChatComposer() {
   } = useSettingsStore();
 
   useEffect(() => { setSelectedRole('Orchestrator'); }, [setSelectedRole]);
+
+  const activeMission = useMemo(
+    () => missions.find((mission) => mission.id === activeMissionId),
+    [activeMissionId, missions],
+  );
+  const activeConversationCanContinue = Boolean(
+    activeMission && TERMINAL_CONVERSATION_STATUSES.has(activeMission.status),
+  );
+  const activeConversationBusy = Boolean(activeMission && !activeConversationCanContinue);
 
   const selectedModelObject = useMemo(
     () => discoveredModels.find((model) => model.catalogId === selectedModel),
@@ -151,7 +164,7 @@ export function ChatComposer() {
 
   const submit = async () => {
     const prompt = message.trim();
-    if (!prompt || loading || !directiveModelRoleCompatible || !activeWorkspaceId) return;
+    if (!prompt || loading || activeConversationBusy || !directiveModelRoleCompatible || !activeWorkspaceId) return;
     if (!serviceOnline) {
       setActiveView('accounts');
       return;
@@ -168,12 +181,7 @@ export function ChatComposer() {
         : scopedSelectedModel
           ? reasoningLevel
           : undefined;
-
-    setMessage('');
-    setAttachments([]);
-    setMentionOpen(false);
-    setCommandOpen(false);
-    await startMission(prompt, activeWorkspaceId, {
+    const options = {
       model: resolvedModel,
       reasoningLevel: resolvedReasoning,
       teamTemplate,
@@ -181,7 +189,17 @@ export function ChatComposer() {
       targetRole: directive.targetRole,
       routeRole: targetRole,
       command: directive.command,
-    });
+    };
+
+    setMessage('');
+    setAttachments([]);
+    setMentionOpen(false);
+    setCommandOpen(false);
+    if (activeMissionId && activeConversationCanContinue) {
+      await continueMission(activeMissionId, prompt, options);
+    } else {
+      await startMission(prompt, activeWorkspaceId, options);
+    }
     requestAnimationFrame(resizeInput);
   };
 
@@ -256,6 +274,13 @@ export function ChatComposer() {
   );
 
   const routeLabel = selectedModelObject?.name || 'Auto';
+  const composerPlaceholder = !activeWorkspaceId
+    ? 'Open a project before starting a mission…'
+    : activeConversationBusy
+      ? 'This mission is still running. Finish or stop it before sending the next turn…'
+      : activeConversationCanContinue
+        ? 'Continue this conversation with AtrisAgent…'
+        : 'Ask AtrisAgent to build, investigate, or review…';
 
   return (
     <div className="border-t border-border bg-background">
@@ -306,7 +331,7 @@ export function ChatComposer() {
             onChange={handleChange}
             onKeyDown={handleKeyDown}
             rows={1}
-            placeholder={activeWorkspaceId ? 'Ask AtrisAgent to build, investigate, or review…' : 'Open a project before starting a mission…'}
+            placeholder={composerPlaceholder}
             disabled={loading || !activeWorkspaceId}
             className="block max-h-[170px] min-h-[42px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/75 disabled:cursor-not-allowed disabled:opacity-60"
           />
@@ -434,9 +459,9 @@ export function ChatComposer() {
               <Button
                 size="icon"
                 className="h-8 w-8 rounded-lg"
-                disabled={!message.trim() || loading || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible}
+                disabled={!message.trim() || loading || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible}
                 onClick={() => void submit()}
-                aria-label="Send mission"
+                aria-label={activeConversationCanContinue ? 'Continue conversation' : 'Send mission'}
               >
                 {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
               </Button>
@@ -445,7 +470,7 @@ export function ChatComposer() {
         </div>
 
         <div className="mt-1.5 flex items-center justify-between px-1 text-[9px] text-muted-foreground/70">
-          <span>{activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
+          <span>{activeConversationBusy ? 'Mission is running · stop or finish it before the next turn' : activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
           {message.length > 0 && <span>~{Math.ceil(message.length / 4)} tokens</span>}
         </div>
       </div>
