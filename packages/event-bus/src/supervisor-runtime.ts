@@ -25,6 +25,15 @@ export function registerSupervisorTurnRunner(runner: SupervisorTurnRunner | null
   supervisorTurnRunner = runner;
 }
 
+/**
+ * Removes a runner only when the caller still owns the active registration.
+ * This matters in tests/restarts where a newer RuntimeHost may already have
+ * replaced an older host's bridge before the older instance finishes shutdown.
+ */
+export function unregisterSupervisorTurnRunner(runner: SupervisorTurnRunner): void {
+  if (supervisorTurnRunner === runner) supervisorTurnRunner = null;
+}
+
 export function getSupervisorTurnRunner(): SupervisorTurnRunner | null {
   return supervisorTurnRunner;
 }
