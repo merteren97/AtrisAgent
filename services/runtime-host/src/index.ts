@@ -1,5 +1,6 @@
-export { RuntimeHost } from './runtime-host';
-export type { RuntimeHostConfig } from './runtime-host';
+export { RuntimeHostV2 as RuntimeHost, RuntimeHostV2 } from './runtime-host-v2';
+export { RuntimeHost as LegacyRuntimeHost } from './runtime-host';
+export type { RuntimeHostConfig, MissionRoutingPreference } from './runtime-host';
 export { BaseRuntimeAdapter } from './adapters/base-adapter';
 export type { SpawnAgentOptions } from './adapters/base-adapter';
 export { CodexAdapter } from './adapters/codex-adapter';
