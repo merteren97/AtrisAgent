@@ -286,14 +286,26 @@ export function MemoryTab() {
           <p className="mt-1 max-w-64 text-[10px] leading-relaxed">Open a project workspace or select a retained memory backup above.</p>
         </div>
       ) : (
-        <div className={cn('min-h-0 flex-1', inspectorExpanded ? 'flex' : 'flex flex-col')}>
-          <div className="min-h-0 min-w-0 flex-1">
+        <div className={cn(
+          'min-h-0 flex-1 overflow-hidden',
+          inspectorExpanded
+            ? 'flex'
+            : selectedNode
+              ? 'grid grid-rows-[minmax(0,1fr)_minmax(220px,46%)]'
+              : 'flex flex-col',
+        )}>
+          <div className="min-h-0 min-w-0 overflow-hidden">
             {viewMode === 'graph'
               ? <MemoryGraphView nodes={visibleNodes} edges={visibleEdges} selectedNodeId={selectedNodeId} onSelect={selectNode} />
               : <MemoryNotesView nodes={visibleNodes} selectedNodeId={selectedNodeId} onSelect={selectNode} />}
           </div>
           {selectedNode ? (
-            <div className={cn(inspectorExpanded ? 'w-[380px] min-w-[340px] max-w-[440px]' : 'max-h-[46%] min-h-[220px]')}><MemoryNodeDetail node={selectedNode} compact={!inspectorExpanded} /></div>
+            <div className={cn(
+              'min-h-0 overflow-hidden [&>div]:h-full [&>div]:min-h-0',
+              inspectorExpanded ? 'w-[380px] min-w-[340px] max-w-[440px] shrink-0' : 'h-full',
+            )}>
+              <MemoryNodeDetail node={selectedNode} compact={!inspectorExpanded} />
+            </div>
           ) : inspectorExpanded ? (
             <div className="flex w-[340px] shrink-0 items-center justify-center border-l border-border bg-muted/10 px-8 text-center text-[11px] text-muted-foreground">Select a graph node or note to inspect provenance, confidence, status, tags, and editable details.</div>
           ) : null}

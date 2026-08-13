@@ -63,18 +63,29 @@ export interface StartMissionOptions {
   command?: string;
 }
 
+export interface QueuedMissionTurn {
+  id: string;
+  missionId: string;
+  request: string;
+  options?: StartMissionOptions;
+  queuedAt: string;
+}
+
 interface MissionState {
   missions: Mission[];
   activeMissionId: string | null;
   hydratedMissionId: string | null;
   timeline: TimelineItem[];
   activeTasks: TaskItem[];
+  queuedTurns: QueuedMissionTurn[];
   loading: boolean;
   error: string | null;
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
-  continueMission: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
+  continueMission: (missionId: string, request: string, options?: StartMissionOptions, skipOptimisticUserMessage?: boolean) => Promise<void>;
+  queueMissionTurn: (missionId: string, request: string, options?: StartMissionOptions) => void;
+  drainQueuedTurn: (missionId: string) => Promise<void>;
   deleteMission: (id: string) => Promise<boolean>;
   addMission: (mission: Mission) => void;
   setActiveMission: (id: string) => void;
@@ -93,6 +104,7 @@ interface MissionState {
 }
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+const drainingQueuedMissions = new Set<string>();
 
 function toExecutionMode(options?: StartMissionOptions): string {
   if (options?.executionMode) return options.executionMode;
@@ -192,6 +204,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   hydratedMissionId: null,
   timeline: [],
   activeTasks: [],
+  queuedTurns: [],
   loading: false,
   error: null,
   missionFilter: 'all',
@@ -260,11 +273,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
         if (current.activeMissionId !== missionId) return { missions };
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
-        // User turns after the first message are persisted as user_message events.
-        // Hydration therefore replaces optimistic composer cards with canonical
-        // persisted events instead of appending duplicate user messages.
+        // Canonical persisted turns replace normal optimistic cards. Future turns
+        // that are still queued remain visible until they actually start.
         const liveOnlyItems = current.timeline.filter((item) => (
-          item.type !== 'user_message'
+          (item.type !== 'user_message' || item.metadata?.queued === true)
           && !restoredIds.has(item.id)
         ));
         const activePlanId = state.mission?.planId;
@@ -276,6 +288,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           hydratedMissionId: missionId,
         };
       });
+
+      const refreshedMission = get().missions.find((mission) => mission.id === missionId);
+      if (refreshedMission && TERMINAL_CONVERSATION_STATUSES.has(refreshedMission.status)) {
+        void get().drainQueuedTurn(missionId);
+      }
     } catch (error: any) {
       if (get().activeMissionId === missionId) set({ error: error?.message || 'Failed to load mission state.' });
     }
@@ -328,9 +345,6 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         loading: false,
       }));
 
-      // The runtime starts asynchronously from task_created events. Re-read the
-      // persisted mission immediately so the first task cannot remain on the
-      // plan-time snapshot while its agent is already preparing or running.
       void get().fetchMissionState(data.missionId);
     } catch (error: any) {
       const errorCard: TimelineItem = {
@@ -349,7 +363,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 
-  continueMission: async (missionId, request, options) => {
+  continueMission: async (missionId, request, options, skipOptimisticUserMessage = false) => {
     const trimmed = request.trim();
     if (!trimmed) return;
     const mission = get().missions.find((item) => item.id === missionId);
@@ -358,7 +372,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       return;
     }
     if (!TERMINAL_CONVERSATION_STATUSES.has(mission.status)) {
-      set({ error: 'Wait for the current mission turn to finish or stop it before sending a new request in this conversation.' });
+      set({ error: 'The current turn is still executing. Send the request through the queued-turn path instead.' });
       return;
     }
 
@@ -380,7 +394,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       loading: true,
       error: null,
       activeTasks: [],
-      timeline: [...state.timeline, userMessage],
+      timeline: skipOptimisticUserMessage ? state.timeline : [...state.timeline, userMessage],
       missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'planning' } : item),
     }));
 
@@ -418,6 +432,72 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 
+  queueMissionTurn: (missionId, request, options) => {
+    const trimmed = request.trim();
+    if (!trimmed) return;
+    const queueId = crypto.randomUUID();
+    const queuedAt = new Date().toISOString();
+    const userMessage: TimelineItem = {
+      id: `queued-user-${queueId}`,
+      type: 'user_message',
+      content: trimmed,
+      timestamp: nowLabel(),
+      metadata: {
+        queued: true,
+        queueId,
+        targetRole: options?.targetRole,
+        routeRole: options?.routeRole,
+        command: options?.command,
+        modelCatalogId: options?.model,
+        reasoningLevel: options?.reasoningLevel,
+      },
+    };
+    const queuedCard: TimelineItem = {
+      id: `queued-event-${queueId}`,
+      type: 'event',
+      content: 'Queued for the next conversation turn. The current agents will finish first.',
+      timestamp: nowLabel(),
+      eventType: 'turn_queued',
+      agentRole: 'orchestrator',
+      metadata: { queueId },
+    };
+    set((state) => ({
+      error: null,
+      queuedTurns: [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options, queuedAt }],
+      timeline: [...state.timeline, userMessage, queuedCard],
+    }));
+  },
+
+  drainQueuedTurn: async (missionId) => {
+    if (drainingQueuedMissions.has(missionId)) return;
+    const state = get();
+    const mission = state.missions.find((item) => item.id === missionId);
+    if (!mission || !TERMINAL_CONVERSATION_STATUSES.has(mission.status)) return;
+    const next = state.queuedTurns.find((item) => item.missionId === missionId);
+    if (!next) return;
+
+    drainingQueuedMissions.add(missionId);
+    set((current) => ({
+      queuedTurns: current.queuedTurns.filter((item) => item.id !== next.id),
+      timeline: current.timeline.map((item) => {
+        if (item.metadata?.queueId !== next.id) return item;
+        if (item.type === 'user_message') {
+          return { ...item, metadata: { ...item.metadata, queued: false, starting: true } };
+        }
+        if (item.eventType === 'turn_queued') {
+          return { ...item, eventType: 'turn_started', content: 'Queued turn is starting now.' };
+        }
+        return item;
+      }),
+    }));
+
+    try {
+      await get().continueMission(missionId, next.request, next.options, true);
+    } finally {
+      drainingQueuedMissions.delete(missionId);
+    }
+  },
+
   deleteMission: async (id) => {
     try {
       await apiRequest(`/missions/${id}`, { method: 'DELETE' });
@@ -426,6 +506,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         const wasActive = state.activeMissionId === id;
         return {
           missions: state.missions.filter((mission) => mission.id !== id),
+          queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
           error: null,
           ...(wasActive ? {
             activeMissionId: null,
@@ -481,6 +562,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const mission = await apiRequest<Mission>(`/missions/${id}/cancel`, { method: 'POST' });
       set((state) => ({ missions: state.missions.map((item) => item.id === id ? mission : item) }));
+      if (TERMINAL_CONVERSATION_STATUSES.has(mission.status)) void get().drainQueuedTurn(id);
     } catch (error: any) {
       set({ error: error?.message || 'Mission cancellation failed.' });
     }

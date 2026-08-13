@@ -6,7 +6,7 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "test": "npx tsx src/runtime-host.test.ts && npx tsx src/runtime-utils.test.ts && npx tsx src/scheduler-policy.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/supervisor-runtime.test.ts && npx tsx src/antigravity-stream.test.ts && npx tsx src/antigravity-run-policy.test.ts",
+    "test": "npx tsx src/runtime-host.test.ts && npx tsx src/runtime-utils.test.ts && npx tsx src/scheduler-policy.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/supervisor-runtime.test.ts && npx tsx src/antigravity-stream.test.ts && npx tsx src/antigravity-run-policy.test.ts && npx tsx src/antigravity-model-catalog.test.ts",
     "typecheck": "tsc -b --pretty false"
   },
   "devDependencies": {
