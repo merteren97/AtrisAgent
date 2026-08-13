@@ -7,6 +7,7 @@ import { AgentsTab } from './agents-tab';
 import { ContextTab } from './context-tab';
 import { ChangesTab } from './changes-tab';
 import { ChecksTab } from './checks-tab';
+import { MemoryTab } from './memory-tab';
 import { ArtifactsTab } from './artifacts-tab';
 import { ActivityTab } from './activity-tab';
 import { useSettingsStore, type InspectorTab } from '@/stores/settings-store';
@@ -20,6 +21,7 @@ const PRIMARY_TABS: Array<{ id: InspectorTab; label: string }> = [
   { id: 'agents', label: 'Agents' },
   { id: 'changes', label: 'Changes' },
   { id: 'checks', label: 'Review' },
+  { id: 'memory', label: 'Memory' },
   { id: 'activity', label: 'Activity' },
 ];
 
@@ -194,6 +196,7 @@ export function InspectorPanel() {
         <Tabs.Content value="context" className="m-0 h-full min-w-0 border-none outline-none"><ContextTab /></Tabs.Content>
         <Tabs.Content value="changes" className="m-0 h-full min-w-0 border-none outline-none"><ChangesTab /></Tabs.Content>
         <Tabs.Content value="checks" className="m-0 h-full min-w-0 border-none outline-none"><ChecksTab /></Tabs.Content>
+        <Tabs.Content value="memory" className="m-0 h-full min-w-0 border-none outline-none"><MemoryTab /></Tabs.Content>
         <Tabs.Content value="artifacts" className="m-0 h-full min-w-0 border-none outline-none"><ArtifactsTab /></Tabs.Content>
         <Tabs.Content value="activity" className="m-0 h-full min-w-0 border-none outline-none"><ActivityTab /></Tabs.Content>
       </Tabs.Root>
