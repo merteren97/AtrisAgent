@@ -61,6 +61,15 @@ async function runTests() {
       updated_at TEXT NOT NULL,
       completed_at TEXT
     );
+    CREATE TABLE mission_events (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      task_id TEXT,
+      agent_instance_id TEXT,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
   const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
   // Match production construction: ProjectMemoryService discovers the underlying
@@ -83,7 +92,7 @@ async function runTests() {
     id: 'mission-1',
     workspaceId: 'workspace-1',
     title: 'Remember the architecture rules',
-    description: 'Remember the architecture rules',
+    description: 'The project must keep its architecture decisions across future conversations.',
     status: 'completed',
     teamTemplateId: 'default-core-dev-team',
     planId: null,
@@ -110,8 +119,30 @@ async function runTests() {
     completedAt: now,
   });
 
+  // Simulate a durable Phase-2 event that existed before the Phase-3 memory
+  // backend was installed. Lazy attachment must backfill this history.
+  await db.insert(schema.missionEvents).values({
+    id: 'historical-review-1',
+    missionId: 'mission-1',
+    taskId: 'task-1',
+    agentInstanceId: 'reviewer-old',
+    type: 'review_completed',
+    payload: {
+      id: 'historical-review-1',
+      type: 'review_completed',
+      missionId: 'mission-1',
+      taskId: 'task-1',
+      reviewerAgentId: 'reviewer-old',
+      approved: true,
+      findings: 'Historical review verified the local-first memory boundary.',
+      timestamp: now,
+    },
+    createdAt: now,
+  });
+
   // Lazy migration: existing workspaces gain a project identity on the first
-  // mission memory event without requiring an explicit database migration step.
+  // mission memory event, backfill the initial request + persisted event history,
+  // and then ingest the new live event.
   await service.ingestEvent({
     id: 'event-user-1',
     type: 'user_message',
@@ -143,9 +174,16 @@ async function runTests() {
   });
 
   const overview = await service.getOverview(project!.id);
-  assert(overview.evidenceCount === 2, 'evidence ledger is idempotent by canonical event id');
-  assert((overview.space?.nodeCount || 0) >= 4, 'Memory Curator creates project, requirement, task and research nodes');
-  assert((overview.space?.edgeCount || 0) >= 3, 'Memory Curator links curated facts into the project graph');
+  assert(overview.evidenceCount === 4, 'evidence ledger includes initial request, historical event and two live events without replay duplicates');
+  assert((overview.space?.nodeCount || 0) >= 6, 'Memory Curator creates project, requirement, task, verification and research nodes');
+  assert((overview.space?.edgeCount || 0) >= 5, 'Memory Curator links backfilled and live evidence into the project graph');
+
+  const historicalRecall = await service.search({
+    projectId: project!.id,
+    text: 'historical review local first memory boundary',
+    limit: 5,
+  });
+  assert(historicalRecall.some((hit) => hit.node.type === 'verification'), 'pre-Phase-3 mission history is backfilled into searchable project memory');
 
   const recalled = await service.search({
     projectId: project!.id,
@@ -159,7 +197,7 @@ async function runTests() {
   await service.detachWorkspace('workspace-1');
   const detached = await service.getOverview(project!.id);
   assert(detached.project.status === 'detached', 'removing the local workspace detaches project identity instead of deleting memory');
-  assert(detached.evidenceCount === 2, 'detached project keeps its evidence ledger');
+  assert(detached.evidenceCount === 4, 'detached project keeps its evidence ledger');
 
   // Re-adding the same path restores the same project identity and all memory.
   await db.insert(schema.workspaces).values({
