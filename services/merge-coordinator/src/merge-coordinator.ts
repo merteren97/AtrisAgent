@@ -21,6 +21,11 @@ export interface MergeResult {
   rebaseRequest?: RebaseRequest;
 }
 
+export interface RollbackContext {
+  workspaceId: string;
+  missionId: string;
+}
+
 export class MergeCoordinator {
   private generator: ReviewPackGenerator;
 
@@ -49,20 +54,22 @@ export class MergeCoordinator {
     if (!task.worktreeId) throw new Error(`Task "${taskId}" does not have an active worktree`);
 
     const mission = await this.workspaceManager.getMission(task.missionId);
-    let basePath = process.cwd();
-    if (mission?.workspaceId) {
-      const workspace = await this.workspaceManager.getWorkspace(mission.workspaceId);
-      if (workspace?.path) basePath = workspace.path;
-    }
+    if (!mission) throw new Error(`Mission with ID "${task.missionId}" not found for task "${taskId}"`);
+    const workspace = await this.workspaceManager.getWorkspace(mission.workspaceId);
+    if (!workspace?.path) throw new Error(`Workspace with ID "${mission.workspaceId}" not found for mission "${mission.id}"`);
 
     const worktreeManager = this.workspaceManager.getWorktreeManager();
-    basePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, basePath);
+    const basePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, workspace.path);
 
     const checkpointManager = this.workspaceManager.getCheckpointManager();
     const checkpointId = await checkpointManager.createCheckpoint(
       basePath,
       `pre-merge-task-${taskId}`,
-      { missionId: task.missionId, isRollbackTarget: true },
+      {
+        missionId: task.missionId,
+        workspaceId: mission.workspaceId,
+        isRollbackTarget: true,
+      },
     );
 
     const mergeOutput = await worktreeManager.merge(task.worktreeId, targetBranch, basePath);
@@ -100,8 +107,11 @@ export class MergeCoordinator {
     return { success: true, status: 'Merged', output: mergeOutput.output, checkpointId };
   }
 
-  async rollback(checkpointId: string, workspacePath: string): Promise<void> {
+  async rollback(checkpointId: string, workspacePath: string, context: RollbackContext): Promise<void> {
     const checkpointManager = this.workspaceManager.getCheckpointManager();
-    await checkpointManager.restoreCheckpoint(checkpointId, workspacePath);
+    await checkpointManager.restoreCheckpoint(checkpointId, workspacePath, {
+      expectedWorkspaceId: context.workspaceId,
+      expectedMissionId: context.missionId,
+    });
   }
 }
