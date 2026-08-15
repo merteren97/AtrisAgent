@@ -24,6 +24,8 @@ async function runTests() {
     }
   }
 
+  const decodeBase64 = (value: string | undefined) => Buffer.from(value || '', 'base64').toString('utf8');
+
   const quotedOpenCode = '"C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd"';
   assert(
     normalizeExecutablePath(quotedOpenCode) === 'C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd',
@@ -34,20 +36,27 @@ async function runTests() {
     quotedOpenCode,
     ['serve', '--hostname', '127.0.0.1', '--port', '4096'],
     'win32',
-    { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    { ComSpec: 'C:\\untrusted\\cmd.exe', SystemRoot: 'C:\\untrusted-windows' },
   );
-  assert(prepared.command === 'C:\\Windows\\System32\\cmd.exe', 'routes .cmd wrappers through cmd.exe');
+  assert(prepared.command === 'powershell.exe', 'routes Windows script shims through the static PowerShell bridge');
+  assert(prepared.usesPowerShellBridge === true, 'marks Windows script shims as bridged invocations');
+  assert(prepared.args.includes('-EncodedCommand'), 'uses a static encoded PowerShell program instead of a dynamic shell command string');
   assert(
-    prepared.args[0] === '/d'
-      && prepared.args[1] === '/v:off'
-      && prepared.args[2] === '/s'
-      && prepared.args[3] === '/c',
-    'disables AutoRun/delayed expansion and uses cmd.exe strict command parsing',
+    !prepared.args.join(' ').includes('opencode.cmd') && !prepared.args.join(' ').includes('serve'),
+    'does not interpolate executable paths or runtime arguments into PowerShell argv',
   );
-  assert(prepared.windowsVerbatimArguments === true, 'marks the already escaped cmd.exe command line as verbatim');
   assert(
-    prepared.args.at(-1)?.includes('C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd') === true,
-    'keeps the normalized OpenCode wrapper path inside the escaped command line',
+    decodeBase64(prepared.env?.ATRIS_RUNTIME_COMMAND_B64) === 'C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd',
+    'transfers the normalized wrapper path as an opaque environment value',
+  );
+  assert(
+    JSON.stringify(JSON.parse(decodeBase64(prepared.env?.ATRIS_RUNTIME_ARGS_B64)))
+      === JSON.stringify(['serve', '--hostname', '127.0.0.1', '--port', '4096']),
+    'transfers runtime argv losslessly through Base64 JSON',
+  );
+  assert(
+    prepared.command !== 'C:\\untrusted\\cmd.exe' && !prepared.args.join(' ').includes('C:\\untrusted-windows'),
+    'does not trust caller-controlled ComSpec or SystemRoot values as shell executables',
   );
 
   const resolutionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-path-resolution-'));
@@ -57,27 +66,42 @@ async function runTests() {
       'atris-cli',
       ['--version'],
       'win32',
-      { Path: resolutionRoot, ComSpec: 'cmd.exe' },
+      { Path: resolutionRoot, ComSpec: 'C:\\untrusted\\cmd.exe' },
     );
-    assert(resolvedBareCommand.command === 'cmd.exe', 'resolves a bare Windows CLI name to its PATH .cmd shim before spawning');
-    assert(resolvedBareCommand.args.at(-1)?.includes('atris-cli.cmd') === true, 'keeps the resolved PATH shim in the prepared command line');
+    assert(resolvedBareCommand.command === 'powershell.exe', 'resolves a bare Windows CLI name before entering the static bridge');
+    assert(
+      decodeBase64(resolvedBareCommand.env?.ATRIS_RUNTIME_COMMAND_B64).endsWith('atris-cli.cmd'),
+      'keeps the resolved PATH shim as an opaque bridge value',
+    );
   } finally {
     fs.rmSync(resolutionRoot, { recursive: true, force: true });
   }
 
+  const hostileArguments = [
+    'hello&echo injected',
+    'left|right',
+    'redirect>file',
+    '100% complete',
+    'caret^value',
+    'bang!value',
+    'quote"value',
+    'trailing\\',
+  ];
   const hostilePrepared = prepareRuntimeCommand(
     'C:\\tools\\agent.cmd',
-    ['hello&echo injected', 'left|right', 'redirect>file', '100% complete', 'caret^value', 'bang!value'],
+    hostileArguments,
     'win32',
-    { ComSpec: 'cmd.exe' },
+    { ComSpec: 'C:\\untrusted\\cmd.exe' },
   );
-  const hostileCommandLine = hostilePrepared.args.at(-1) || '';
-  assert(hostileCommandLine.includes('^&'), 'escapes command separators in batch-wrapper arguments');
-  assert(hostileCommandLine.includes('^|'), 'escapes pipe metacharacters in batch-wrapper arguments');
-  assert(hostileCommandLine.includes('^>'), 'escapes redirection metacharacters in batch-wrapper arguments');
-  assert(hostileCommandLine.includes('^%'), 'escapes percent expansion in batch-wrapper arguments');
-  assert(hostileCommandLine.includes('^^'), 'escapes literal carets in batch-wrapper arguments');
-  assert(hostileCommandLine.includes('^!'), 'escapes delayed-expansion metacharacters in batch-wrapper arguments');
+  const staticPowerShellArgv = hostilePrepared.args.join(' ');
+  assert(
+    hostileArguments.every((argument) => !staticPowerShellArgv.includes(argument)),
+    'keeps metacharacter-bearing runtime arguments out of the shell program text',
+  );
+  assert(
+    JSON.stringify(JSON.parse(decodeBase64(hostilePrepared.env?.ATRIS_RUNTIME_ARGS_B64))) === JSON.stringify(hostileArguments),
+    'preserves hostile-looking arguments as data rather than shell syntax',
+  );
 
   const missingCwd = path.join(os.tmpdir(), `atris-missing-cwd-${crypto.randomUUID()}`);
   try {
@@ -141,9 +165,6 @@ async function runTests() {
     const wrapper = path.join(root, 'test wrapper.cmd');
     const printer = path.join(root, 'print-args.cjs');
     fs.writeFileSync(printer, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));', 'utf8');
-    // This deliberately mirrors npm-generated .cmd shims: the second command
-    // parsing layer expands %*, so prepareRuntimeCommand must double-escape cmd
-    // metacharacters before the user arguments reach Node.
     fs.writeFileSync(wrapper, '@echo off\r\nnode "%~dp0print-args.cjs" %*\r\n', 'utf8');
     const dangerousArguments = [
       'hello world',
@@ -161,19 +182,19 @@ async function runTests() {
       const received = JSON.parse(result.stdout.trim()) as string[];
       assert(
         JSON.stringify(received) === JSON.stringify(dangerousArguments),
-        'preserves spaces, quotes and cmd.exe metacharacters as literal npm-shim arguments on Windows',
+        'preserves spaces, quotes and command metacharacters as literal .cmd arguments through the static bridge',
       );
       assert(!fs.existsSync(path.join(root, 'injected.txt')), 'does not allow a prompt argument to create a redirected file');
       assert(!result.stdout.includes('\nATRIS_INJECTED'), 'does not execute an injected command separator payload');
     } catch (error: any) {
-      console.error('[FAIL] securely executes a quoted npm-style .cmd path containing spaces on Windows');
+      console.error('[FAIL] securely executes a quoted .cmd path containing spaces through the static bridge');
       console.error(error?.message || error);
       failed += 1;
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   } else {
-    console.log('[SKIP] live .cmd execution and metacharacter isolation are covered by the Windows CI job');
+    console.log('[SKIP] live .cmd bridge and metacharacter isolation are covered by the Windows CI job');
   }
 
   console.log(`\nRuntime command utility tests: ${passed} passed, ${failed} failed`);
