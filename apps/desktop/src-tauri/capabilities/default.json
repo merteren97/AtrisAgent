@@ -3,7 +3,7 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": [
-    "*"
+    "main"
   ],
   "permissions": [
     "core:window:default",
@@ -11,7 +11,6 @@
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-start-dragging",
-    "shell:allow-open",
     "dialog:default"
   ]
 }
