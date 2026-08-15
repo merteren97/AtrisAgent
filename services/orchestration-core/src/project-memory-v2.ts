@@ -9,6 +9,7 @@ import {
   type ProjectSelect,
 } from '@atris-agent-code/database';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
+import { redactSensitiveValue } from '@atris-agent-code/event-bus';
 import {
   ProjectMemoryService,
   type ProjectMemoryOverview,
@@ -24,23 +25,6 @@ function resolveRawSqlite(db: AtrisDatabase, explicit?: RawSqliteConnection): Ra
     throw new Error('Project memory requires the local better-sqlite3 client exposed by the Atris database runtime.');
   }
   return candidate as RawSqliteConnection;
-}
-
-function redactMemoryValue(value: unknown): unknown {
-  if (typeof value === 'string') {
-    return value
-      .replace(/Authorization:\s*(?:Bearer|Basic)\s+[^\s"'\r\n]+/gi, 'Authorization: [REDACTED]')
-      .replace(/\b(?:sk-|ghp_|gho_|xox[baprs]-)[A-Za-z0-9_.-]{12,}\b/g, '[REDACTED_SECRET]')
-      .replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*["']?[^\s"']{8,}["']?/gi, '$1=[REDACTED]');
-  }
-  if (Array.isArray(value)) return value.map(redactMemoryValue);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .map(([key, item]) => [key, redactMemoryValue(item)]),
-    );
-  }
-  return value;
 }
 
 /**
@@ -67,7 +51,7 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
   }
 
   override async ingestEvent(event: AgentEvent): Promise<void> {
-    const redacted = redactMemoryValue(event) as AgentEvent;
+    const redacted = redactSensitiveValue(event) as AgentEvent;
     await super.ingestEvent(redacted);
   }
 
