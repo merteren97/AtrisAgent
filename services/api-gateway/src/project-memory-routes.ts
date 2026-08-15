@@ -1,9 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import type { Express, Request, Response } from 'express';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import type { ProjectMemoryServiceV2 } from '@atris-agent-code/orchestration-core';
 import type { MemoryNodeStatus, MemoryNodeType } from '@atris-agent-code/domain';
+import { resolveSafeMemoryExportPath, writeNewMemoryExport } from './memory-export-policy';
 
 const NODE_TYPES = new Set<MemoryNodeType>([
   'project', 'component', 'file', 'symbol', 'research_finding', 'decision', 'change', 'issue', 'bug',
@@ -164,20 +163,20 @@ export function installProjectMemoryRoutes(app: Express, options: ProjectMemoryR
 
   app.post('/api/memory/projects/:projectId/export', async (req: Request, res: Response) => {
     try {
-      const targetPath = String(req.body?.targetPath || '').trim();
-      if (!targetPath || targetPath.includes('\0') || !path.isAbsolute(targetPath)) return void res.status(400).json({ error: 'A valid absolute export path is required.' });
-      if (path.extname(targetPath).toLowerCase() !== '.json') return void res.status(400).json({ error: 'Memory backups must use the .json extension.' });
-      const parent = path.dirname(targetPath);
-      if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) return void res.status(400).json({ error: 'The selected backup directory does not exist.' });
-
+      const targetPath = resolveSafeMemoryExportPath(req.body?.targetPath);
       const snapshot = await memory.getSnapshot(routeParam(req.params.projectId));
       const payload = JSON.stringify({ format: 'atris-project-memory', version: 1, exportedAt: new Date().toISOString(), snapshot }, null, 2);
       const bytes = Buffer.byteLength(payload, 'utf8');
       if (bytes > MAX_EXPORT_BYTES) return void res.status(413).json({ error: 'Project memory backup is too large for the current export limit.' });
-      fs.writeFileSync(targetPath, payload, { encoding: 'utf8', flag: 'w' });
+      writeNewMemoryExport(targetPath, payload);
       res.json({ success: true, path: targetPath, bytes });
     } catch (error: any) {
-      res.status(500).json({ error: error?.message || 'Failed to export project memory.' });
+      if (error?.code === 'EEXIST') {
+        return void res.status(409).json({ error: 'Memory backup already exists. Choose a new filename; AtrisAgent never overwrites existing files.' });
+      }
+      const message = error?.message || 'Failed to export project memory.';
+      const clientError = /valid absolute export path|filenames must end|filename is too long|backup directory does not exist|backup already exists/i.test(message);
+      res.status(clientError ? 400 : 500).json({ error: message });
     }
   });
 }
