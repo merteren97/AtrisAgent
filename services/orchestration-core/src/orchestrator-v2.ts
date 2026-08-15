@@ -30,6 +30,8 @@ import {
 
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_TASK_STATUSES = new Set(['done', 'superseded']);
+const FAILED_TASK_STATUSES = new Set(['rejected']);
+const ACTIVE_TASK_STATUSES = new Set(['claimed', 'running', 'review', 'revision_requested', 'verified', 'applied']);
 const SCHEDULABLE_MISSION_STATUSES = new Set(['ready', 'running', 'revising']);
 const MAX_CONTEXT_EVENTS = 24;
 const MAX_CONTEXT_CHARS = 18_000;
@@ -409,14 +411,22 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const manager = this.v2WorkspaceManager;
     if (!manager) return super.startMission(missionId, request, options);
 
-    const existingMission = await manager.getMission(missionId);
-    if (!existingMission) return super.startMission(missionId, request, options);
-    const previousPlanId = existingMission.planId || null;
+    const initialMission = await manager.getMission(missionId);
+    if (!initialMission) return super.startMission(missionId, request, options);
+    const initialPlanId = initialMission.planId || null;
+    if (initialPlanId && SCHEDULABLE_MISSION_STATUSES.has(String(initialMission.status))) {
+      await this.reconcileMissionPlan(missionId, initialPlanId);
+    }
+
+    const existingMission = (await manager.getMission(missionId)) || initialMission;
+    const previousPlanId = existingMission.planId || initialPlanId;
     const existingTasks = await manager.listTasks(missionId);
     const activePlanTasks = previousPlanId
       ? existingTasks.filter((task) => task.planId === previousPlanId)
       : existingTasks;
-    const activeExecution = activePlanTasks.some((task) => ['running', 'ready', 'revision_requested'].includes(String(task.status)));
+    const activeExecution = activePlanTasks.some((task) =>
+      task.status === 'ready' || ACTIVE_TASK_STATUSES.has(String(task.status))
+    );
     if (activeExecution && !TERMINAL_MISSION_STATUSES.has(String(existingMission.status))) {
       throw new Error('The current conversation turn is still executing. Finish or stop it before starting another turn.');
     }
@@ -651,6 +661,82 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     });
   }
 
+  private async recoverNonProgressingPlan(
+    missionId: string,
+    planId: string | null,
+    planTasks: TaskSelect[],
+  ): Promise<boolean> {
+    const manager = this.v2WorkspaceManager;
+    if (!manager || !planId || planTasks.length === 0) return false;
+
+    const activeTasks = planTasks.filter((task) => ACTIVE_TASK_STATUSES.has(String(task.status)));
+    if (activeTasks.length > 0) return false;
+
+    const failedTasks = planTasks.filter((task) => FAILED_TASK_STATUSES.has(String(task.status)));
+    if (failedTasks.length > 0) {
+      const failedTask = failedTasks[0];
+      const reason = `Plan ${planId} cannot continue because task ${failedTask.id} is ${failedTask.status}.`;
+      await manager.updateMission(missionId, { status: 'failed', completedAt: new Date().toISOString() });
+      this.emitMissionFailed({ missionId, reason, failedTaskId: failedTask.id });
+      this.trace('plan-failed-dependency', { missionId, planId, failedTaskId: failedTask.id });
+      return true;
+    }
+
+    const allSuccessfulTerminal = planTasks.every((task) => TERMINAL_TASK_STATUSES.has(String(task.status)));
+    if (allSuccessfulTerminal) {
+      const hasBuilder = planTasks.some((task) => task.assignedRole === 'builder');
+      const action = this.planActions.get(planId) || (hasBuilder ? 'execute' : 'delegate');
+      if (action === 'delegate' || !hasBuilder) {
+        if (this.synthesizedPlans.has(planId)) return true;
+        this.synthesizedPlans.add(planId);
+        const summary = await this.synthesizePlanResult(missionId, planId);
+        await manager.updateMission(missionId, {
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        });
+        this.emitMissionCompleted({
+          missionId,
+          summary,
+          tasksCompleted: planTasks.length,
+          totalTasks: planTasks.length,
+        });
+        this.trace('read-only-plan-recovered', { missionId, planId, taskCount: planTasks.length });
+        return true;
+      }
+
+      const builderTask = planTasks.find((task) => task.assignedRole === 'builder');
+      const reason = 'All execution workers are terminal, but the mission did not complete its review/apply transition. AtrisAgent stopped automatic recovery to avoid applying Builder changes twice; inspect the completed work and retry from a new turn.';
+      await manager.updateMission(missionId, { status: 'failed', completedAt: new Date().toISOString() });
+      this.emitMissionFailed({ missionId, reason, failedTaskId: builderTask?.id });
+      this.trace('execute-plan-terminal-transition-missing', { missionId, planId, builderTaskId: builderTask?.id });
+      return true;
+    }
+
+    const pendingTasks = planTasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
+    if (pendingTasks.length === 0) return false;
+
+    const byId = new Map(planTasks.map((task) => [task.id, task]));
+    const blockers = pendingTasks.map((task) => {
+      const dependencies = ((task.dependsOn as string[]) || []);
+      const unresolved = dependencies.filter((dependencyId) => {
+        const dependency = byId.get(dependencyId);
+        return !dependency || !TERMINAL_TASK_STATUSES.has(String(dependency.status));
+      });
+      return {
+        taskId: task.id,
+        status: task.status,
+        unresolved: unresolved.length > 0 ? unresolved : ['no-runnable-transition'],
+      };
+    });
+    const reason = `Plan ${planId} has no active or dispatchable tasks. Dependency graph is blocked: ${blockers
+      .map((item) => `${item.taskId} waits for ${item.unresolved.join(', ')}`)
+      .join('; ')}.`;
+    await manager.updateMission(missionId, { status: 'failed', completedAt: new Date().toISOString() });
+    this.emitMissionFailed({ missionId, reason, failedTaskId: pendingTasks[0]?.id });
+    this.trace('plan-deadlock-failed', { missionId, planId, blockers });
+    return true;
+  }
+
   async reconcileMissionPlan(missionId: string, planId?: string | null): Promise<void> {
     const manager = this.v2WorkspaceManager;
     if (!manager) return;
@@ -713,7 +799,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       blocked,
     });
 
-    if (ready.length === 0) return;
+    if (ready.length === 0) {
+      await this.recoverNonProgressingPlan(missionId, planId, planTasks);
+      return;
+    }
 
     const candidateBuilders = planTasks.filter(
       (task) => task.assignedRole === 'builder' && task.title.includes('(Candidate'),
@@ -724,11 +813,22 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       && candidateBuilders.length > 1
       && !candidateResolved;
 
+    if (candidateSelectionPending && ready.some((task) => task.assignedRole === 'qa')) {
+      await manager.updateMission(missionId, { status: 'waiting_for_approval' });
+      await this.emitApprovalRequested({
+        missionId,
+        approvalType: 'candidate_selection',
+        description: `Select one Builder candidate before QA: ${candidateBuilders.map((task) => `${task.id} — ${task.title}`).join('; ')}`,
+      });
+      this.trace('candidate-selection-requested', {
+        missionId,
+        planId,
+        candidateTaskIds: candidateBuilders.map((task) => task.id),
+      });
+      return;
+    }
+
     for (const task of ready) {
-      if (candidateSelectionPending && task.assignedRole === 'qa') {
-        this.trace('candidate-gate-blocked-qa', { missionId, planId, taskId: task.id });
-        continue;
-      }
       const latest = await manager.getTask(task.id);
       if (!latest || (latest.status !== 'planned' && latest.status !== 'ready')) continue;
       if (latest.status === 'planned') {
