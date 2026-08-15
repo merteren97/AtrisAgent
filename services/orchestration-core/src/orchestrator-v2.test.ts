@@ -39,6 +39,16 @@ class FakeWorkspaceManager {
     return this.mission;
   }
 
+  async getWorkspace(id: string): Promise<any | null> {
+    if (id !== this.mission.workspaceId) return null;
+    return {
+      id,
+      name: 'Test Workspace',
+      path: 'test',
+      gitInitialized: false,
+    };
+  }
+
   async listTasks(missionId: string): Promise<TaskSelect[]> {
     return [...this.tasks.values()].filter((task) => task.missionId === missionId);
   }
@@ -68,6 +78,7 @@ function task(params: {
   planId: string;
   role: TaskSelect['assignedRole'];
   status: TaskSelect['status'];
+  title?: string;
   dependsOn?: string[];
   assignedAgentId?: string | null;
 }): TaskSelect {
@@ -76,7 +87,7 @@ function task(params: {
     id: params.id,
     missionId: params.missionId,
     planId: params.planId,
-    title: params.id,
+    title: params.title || params.id,
     description: params.id,
     status: params.status,
     priority: 'medium',
@@ -174,6 +185,105 @@ async function runTests() {
       orchestrator.reconcileMissionPlan(missionId, planId),
     ]);
     assert(spawnedTaskIds.filter((id) => id === 'builder').length === 1, 'repeated reconciliation is idempotent');
+  }
+
+  // Recovery: if read-only workers are already durably done but the final
+  // completion event was lost during a restart, reconciliation must synthesize
+  // once and return the conversation to the user instead of leaving it Running.
+  {
+    const missionId = 'mission-readonly-recovery';
+    const planId = 'plan-readonly-recovery';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('research-a', task({
+      id: 'research-a', missionId, planId, role: 'researcher', status: 'done', assignedAgentId: 'agent-ra',
+    }));
+    manager.tasks.set('research-b', task({
+      id: 'research-b', missionId, planId, role: 'researcher', status: 'done', assignedAgentId: 'agent-rb',
+    }));
+    const eventBus = new LocalEventBus();
+    let missionCompletedCount = 0;
+    eventBus.on('mission_completed', () => { missionCompletedCount += 1; });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    assert(manager.mission.status === 'completed', 'read-only terminal plan is recovered to Completed when its final event was lost');
+    assert(missionCompletedCount === 1, 'read-only recovery emits exactly one mission_completed event');
+
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    assert(missionCompletedCount === 1, 'repeated reconciliation does not synthesize the same read-only plan twice');
+  }
+
+  // Recovery: a dependency cycle/missing transition with no active worker must
+  // fail explicitly rather than remain Running forever with zero dispatchable work.
+  {
+    const missionId = 'mission-deadlock';
+    const planId = 'plan-deadlock';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('research-a', task({
+      id: 'research-a', missionId, planId, role: 'researcher', status: 'planned', dependsOn: ['research-b'],
+    }));
+    manager.tasks.set('research-b', task({
+      id: 'research-b', missionId, planId, role: 'researcher', status: 'planned', dependsOn: ['research-a'],
+    }));
+    const eventBus = new LocalEventBus();
+    let missionFailedReason = '';
+    let spawned = 0;
+    eventBus.on('mission_failed', (event) => { missionFailedReason = event.reason; });
+    eventBus.on('task_created', () => { spawned += 1; });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    assert(manager.mission.status === 'failed', 'scheduler deadlock moves the mission out of Running');
+    assert(missionFailedReason.includes('no active or dispatchable tasks'), 'deadlock failure explains that the plan cannot make progress');
+    assert(spawned === 0, 'deadlock recovery does not invent or duplicate worker dispatches');
+  }
+
+  // Candidate mode recovery must surface the candidate-selection approval rather
+  // than logging that QA is blocked and silently leaving the mission Running.
+  {
+    const missionId = 'mission-candidate-approval';
+    const planId = 'plan-candidate-approval';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission.executionMode = 'candidate';
+    manager.tasks.set('builder-a', task({
+      id: 'builder-a', missionId, planId, role: 'builder', status: 'done', title: 'Implement fix (Candidate A)',
+    }));
+    manager.tasks.set('builder-b', task({
+      id: 'builder-b', missionId, planId, role: 'builder', status: 'done', title: 'Implement fix (Candidate B)',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'planned', dependsOn: ['builder-a', 'builder-b'],
+    }));
+    const eventBus = new LocalEventBus();
+    let candidateApprovals = 0;
+    let qaSpawned = 0;
+    eventBus.on('approval_requested', (event) => {
+      if (event.approvalType === 'candidate_selection') candidateApprovals += 1;
+    });
+    eventBus.on('task_created', (event) => {
+      if (event.taskId === 'qa') qaSpawned += 1;
+    });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    assert(manager.mission.status === 'waiting_for_approval', 'candidate recovery enters waiting_for_approval before QA');
+    assert(candidateApprovals === 1, 'candidate recovery emits the candidate-selection approval request');
+    assert(qaSpawned === 0 && manager.tasks.get('qa')?.status === 'planned', 'QA remains gated until a candidate is selected');
   }
 
   // Dynamic pool: independent researcher work fills role capacity in parallel,
