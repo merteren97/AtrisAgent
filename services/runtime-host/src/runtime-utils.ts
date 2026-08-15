@@ -5,6 +5,44 @@ import os from 'os';
 import path from 'path';
 import type { RuntimeType } from '@atris-agent-code/domain';
 
+const DEFAULT_MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_CONFIGURABLE_COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024;
+const WINDOWS_SAFE_BRIDGE_CWD = () => path.dirname(process.execPath);
+
+const WINDOWS_RUNTIME_BRIDGE_SCRIPT = [
+  '$ErrorActionPreference = "Stop"',
+  'function DecodeAtris([string]$value) { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
+  '$runtimeCommand = DecodeAtris $env:ATRIS_RUNTIME_COMMAND_B64',
+  '$runtimeArgsJson = DecodeAtris $env:ATRIS_RUNTIME_ARGS_B64',
+  '$runtimeArgs = @(ConvertFrom-Json -InputObject $runtimeArgsJson)',
+  'if ($env:ATRIS_RUNTIME_CWD_B64) { Set-Location -LiteralPath (DecodeAtris $env:ATRIS_RUNTIME_CWD_B64) }',
+  'if ($env:ATRIS_RUNTIME_TITLE_B64) { $Host.UI.RawUI.WindowTitle = DecodeAtris $env:ATRIS_RUNTIME_TITLE_B64 }',
+  '$global:LASTEXITCODE = 0',
+  '& $runtimeCommand @runtimeArgs',
+  'exit $LASTEXITCODE',
+].join('; ');
+
+const WINDOWS_TERMINAL_LAUNCHER_SCRIPT = [
+  '$ErrorActionPreference = "Stop"',
+  'function DecodeAtris([string]$value) { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
+  '$targetCommand = DecodeAtris $env:ATRIS_TERMINAL_COMMAND_B64',
+  '$targetArgsJson = DecodeAtris $env:ATRIS_TERMINAL_ARGS_B64',
+  '$targetArgs = @(ConvertFrom-Json -InputObject $targetArgsJson)',
+  '$targetCwd = DecodeAtris $env:ATRIS_TERMINAL_CWD_B64',
+  'Start-Process -FilePath $targetCommand -ArgumentList $targetArgs -WorkingDirectory $targetCwd',
+].join('; ');
+
+function encodeUtf8Base64(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64');
+}
+
+function encodePowerShellCommand(value: string): string {
+  return Buffer.from(value, 'utf16le').toString('base64');
+}
+
+const WINDOWS_RUNTIME_BRIDGE_ENCODED = encodePowerShellCommand(WINDOWS_RUNTIME_BRIDGE_SCRIPT);
+const WINDOWS_TERMINAL_LAUNCHER_ENCODED = encodePowerShellCommand(WINDOWS_TERMINAL_LAUNCHER_SCRIPT);
+
 export interface CommandResult {
   stdout: string;
   stderr: string;
@@ -15,6 +53,8 @@ export interface PreparedRuntimeCommand {
   command: string;
   args: string[];
   windowsVerbatimArguments?: boolean;
+  env?: NodeJS.ProcessEnv;
+  usesPowerShellBridge?: boolean;
 }
 
 export function resolveAtrisDataDir(
@@ -111,67 +151,6 @@ export async function findExecutable(command: string): Promise<string | undefine
   }
 }
 
-const CMD_META_CHARACTERS = new Set([
-  '(', ')', '[', ']', '%', '!', '^', '"', '`', '<', '>', '&', '|', ';', ',', ' ', '*', '?',
-]);
-
-function escapeCmdMetaCharacters(value: string): string {
-  return [...value]
-    .map((character) => CMD_META_CHARACTERS.has(character) ? `^${character}` : character)
-    .join('');
-}
-
-/**
- * Quote one Windows argv value before cmd.exe sees it. Backslashes immediately
- * before quotes/end-of-argument follow the standard CreateProcess/CRT quoting
- * rules; cmd metacharacters are then caret-escaped so user prompt content cannot
- * become a second command, pipe, redirect, variable expansion, or wildcard.
- *
- * This follows the same proven escaping model used by cross-spawn 7.x, but is
- * kept local so runtime-host does not need a shell-execution dependency.
- */
-function escapeBatchArgument(value: string, doubleEscapeMetaCharacters = false): string {
-  let escaped = '';
-  let pendingBackslashes = 0;
-
-  for (const character of String(value)) {
-    if (character === '\\') {
-      pendingBackslashes += 1;
-      continue;
-    }
-
-    if (character === '"') {
-      escaped += '\\'.repeat(pendingBackslashes * 2 + 1);
-      escaped += '"';
-      pendingBackslashes = 0;
-      continue;
-    }
-
-    escaped += '\\'.repeat(pendingBackslashes);
-    pendingBackslashes = 0;
-    escaped += character;
-  }
-
-  escaped += '\\'.repeat(pendingBackslashes * 2);
-  escaped = `"${escaped}"`;
-  escaped = escapeCmdMetaCharacters(escaped);
-  if (doubleEscapeMetaCharacters) escaped = escapeCmdMetaCharacters(escaped);
-  return escaped;
-}
-
-function isNpmStyleCmdShim(command: string): boolean {
-  const normalized = command.replace(/\//g, '\\').toLowerCase();
-  if (/\\node_modules\\\.bin\\[^\\]+\.cmd$/.test(normalized) || /\\npm\\[^\\]+\.cmd$/.test(normalized)) {
-    return true;
-  }
-  try {
-    const prefix = fs.readFileSync(command, 'utf8').slice(0, 4_096);
-    return /%\*/.test(prefix) && /(?:node(?:\.exe)?|node_modules)/i.test(prefix);
-  } catch {
-    return false;
-  }
-}
-
 function resolveWindowsExecutableSync(command: string, env: NodeJS.ProcessEnv): string {
   // A path supplied by discovery/profile metadata is already authoritative.
   if (/[\\/]/.test(command) || path.extname(command)) return command;
@@ -241,10 +220,37 @@ export function describeRuntimeLaunchError(command: string, error: unknown, cwd?
   return `Runtime process could not start (${command}): ${details}`;
 }
 
+function prepareWindowsPowerShellBridge(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): PreparedRuntimeCommand {
+  return {
+    command: 'powershell.exe',
+    args: [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-EncodedCommand',
+      WINDOWS_RUNTIME_BRIDGE_ENCODED,
+    ],
+    env: {
+      ...env,
+      ATRIS_RUNTIME_COMMAND_B64: encodeUtf8Base64(command),
+      ATRIS_RUNTIME_ARGS_B64: encodeUtf8Base64(JSON.stringify(args)),
+    },
+    usesPowerShellBridge: true,
+  };
+}
+
 /**
- * Prepare a process invocation without enabling Node's `shell` mode. Keeping
- * this function deterministic and platform-parameterized lets CI validate the
- * exact Windows argv even when the main quality job runs on Linux.
+ * Prepare a process invocation without interpolating runtime paths or arguments
+ * into a shell command string. Native executables are spawned directly. Windows
+ * script shims are invoked through a static PowerShell bridge; executable path,
+ * argv and cwd cross the boundary only as Base64/JSON environment values and are
+ * consumed as typed values by PowerShell's call operator.
  */
 export function prepareRuntimeCommand(
   rawCommand: string,
@@ -259,32 +265,57 @@ export function prepareRuntimeCommand(
   if (platform !== 'win32') return { command, args };
 
   const extension = path.extname(command).toLowerCase();
-  if (extension === '.ps1') {
-    return {
-      command: env.SystemRoot
-        ? path.join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-        : 'powershell.exe',
-      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', command, ...args],
-    };
-  }
-
-  if (extension === '.cmd' || extension === '.bat') {
-    // .cmd/.bat files require cmd.exe on Windows. Build one already-escaped
-    // command line and use windowsVerbatimArguments so Node does not quote it a
-    // second time. /v:off prevents delayed ! expansion inside prompt content.
-    const doubleEscape = extension === '.cmd' && isNpmStyleCmdShim(command);
-    const shellCommand = [
-      escapeCmdMetaCharacters(command),
-      ...args.map((argument) => escapeBatchArgument(argument, doubleEscape)),
-    ].join(' ');
-    return {
-      command: env.ComSpec || 'cmd.exe',
-      args: ['/d', '/v:off', '/s', '/c', `"${shellCommand}"`],
-      windowsVerbatimArguments: true,
-    };
+  if (extension === '.ps1' || extension === '.cmd' || extension === '.bat') {
+    return prepareWindowsPowerShellBridge(command, args, env);
   }
 
   return { command, args };
+}
+
+function resolveCommandOutputLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_COMMAND_OUTPUT_BYTES;
+  return Math.min(MAX_CONFIGURABLE_COMMAND_OUTPUT_BYTES, Math.max(1_024, Math.floor(value)));
+}
+
+function appendWithinByteLimit(current: string, chunk: Buffer | string, usedBytes: number, limitBytes: number): {
+  value: string;
+  usedBytes: number;
+  exceeded: boolean;
+} {
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+  const remaining = Math.max(0, limitBytes - usedBytes);
+  if (buffer.length <= remaining) {
+    return {
+      value: current + buffer.toString('utf8'),
+      usedBytes: usedBytes + buffer.length,
+      exceeded: false,
+    };
+  }
+
+  return {
+    value: current + (remaining > 0 ? buffer.subarray(0, remaining).toString('utf8') : ''),
+    usedBytes: limitBytes,
+    exceeded: true,
+  };
+}
+
+function applyWindowsBridgeContext(
+  prepared: PreparedRuntimeCommand,
+  environment: NodeJS.ProcessEnv,
+  cwd: string | undefined,
+  title?: string,
+): { cwd: string | undefined; env: NodeJS.ProcessEnv } {
+  if (process.platform !== 'win32' || !prepared.usesPowerShellBridge) {
+    return { cwd, env: prepared.env ?? environment };
+  }
+  return {
+    cwd: WINDOWS_SAFE_BRIDGE_CWD(),
+    env: {
+      ...(prepared.env ?? environment),
+      ATRIS_RUNTIME_CWD_B64: encodeUtf8Base64(cwd || process.cwd()),
+      ...(title ? { ATRIS_RUNTIME_TITLE_B64: encodeUtf8Base64(title) } : {}),
+    },
+  };
 }
 
 export async function runCommand(
@@ -295,19 +326,24 @@ export async function runCommand(
     env?: NodeJS.ProcessEnv;
     timeoutMs?: number;
     input?: string;
+    maxOutputBytes?: number;
   } = {},
 ): Promise<CommandResult> {
   assertRuntimeLaunchPreconditions(command, options.cwd);
   const environment = { ...process.env, ...options.env };
   const prepared = prepareRuntimeCommand(command, args, process.platform, environment);
+  const bridgeContext = applyWindowsBridgeContext(prepared, environment, options.cwd);
+  const maxOutputBytes = resolveCommandOutputLimit(options.maxOutputBytes);
 
   return new Promise<CommandResult>((resolve, reject) => {
     let settled = false;
     let stdout = '';
     let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     const child = spawn(prepared.command, prepared.args, {
-      cwd: options.cwd,
-      env: environment,
+      cwd: bridgeContext.cwd,
+      env: bridgeContext.env,
       windowsHide: true,
       windowsVerbatimArguments: prepared.windowsVerbatimArguments,
       shell: false,
@@ -319,6 +355,23 @@ export async function runCommand(
       settled = true;
       clearTimeout(timer);
       callback();
+    };
+
+    const failForOutputLimit = (stream: 'stdout' | 'stderr') => {
+      if (!child.killed) child.kill('SIGKILL');
+      finish(() => {
+        const failure = Object.assign(
+          new Error(`Command ${stream} exceeded the ${maxOutputBytes}-byte capture limit: ${command}`),
+          {
+            code: 'OUTPUT_LIMIT_EXCEEDED',
+            stream,
+            stdout,
+            stderr,
+            exitCode: 1,
+          },
+        );
+        reject(failure);
+      });
     };
 
     const timer = setTimeout(() => {
@@ -333,8 +386,18 @@ export async function runCommand(
       });
     }, options.timeoutMs ?? 15_000);
 
-    child.stdout?.on('data', (chunk) => { stdout += chunk.toString(); });
-    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const next = appendWithinByteLimit(stdout, chunk, stdoutBytes, maxOutputBytes);
+      stdout = next.value;
+      stdoutBytes = next.usedBytes;
+      if (next.exceeded) failForOutputLimit('stdout');
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const next = appendWithinByteLimit(stderr, chunk, stderrBytes, maxOutputBytes);
+      stderr = next.value;
+      stderrBytes = next.usedBytes;
+      if (next.exceeded) failForOutputLimit('stderr');
+    });
     child.on('error', (error) => finish(() => reject(Object.assign(new Error(describeRuntimeLaunchError(command, error, options.cwd)), { cause: error, stdout, stderr, exitCode: 1 }))));
     child.on('close', (code) => finish(() => {
       const result = { stdout, stderr, exitCode: code ?? 1 };
@@ -407,19 +470,33 @@ export async function launchInteractiveTerminal(
   const title = options.title || 'AtrisAgent Runtime';
 
   if (process.platform === 'win32') {
-    const quoteCmd = (value: string) => `"${value.replace(/"/g, '""')}"`;
-    const quotePs = (value: string) => `'${value.replace(/'/g, "''")}'`;
-    const safeTitle = title.replace(/[&|<>^]/g, '').trim() || 'AtrisAgent Runtime';
+    const environment = { ...process.env };
     const normalizedCommand = normalizeExecutablePath(command);
-    const extension = path.extname(normalizedCommand).toLowerCase();
-    const executable = extension === '.ps1'
-      ? ['powershell.exe', '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', normalizedCommand, ...args].map(quoteCmd).join(' ')
-      : [quoteCmd(normalizedCommand), ...args.map(quoteCmd)].join(' ');
-    const commandLine = `title ${safeTitle} && ${/\.(?:cmd|bat)$/i.test(normalizedCommand) ? 'call ' : ''}${executable}`;
-    const script = `Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/k',${quotePs(commandLine)}) -WorkingDirectory ${quotePs(cwd)}`;
-    const launcher = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script], {
+    const resolvedCommand = resolveWindowsExecutableSync(normalizedCommand, environment);
+    assertRuntimeLaunchPreconditions(resolvedCommand, cwd);
+    const prepared = prepareWindowsPowerShellBridge(resolvedCommand, args, environment);
+    const bridgeContext = applyWindowsBridgeContext(prepared, environment, cwd, title);
+    const terminalArgs = ['-NoExit', ...prepared.args];
+    const launcherEnvironment = {
+      ...bridgeContext.env,
+      ATRIS_TERMINAL_COMMAND_B64: encodeUtf8Base64(prepared.command),
+      ATRIS_TERMINAL_ARGS_B64: encodeUtf8Base64(JSON.stringify(terminalArgs)),
+      ATRIS_TERMINAL_CWD_B64: encodeUtf8Base64(bridgeContext.cwd || WINDOWS_SAFE_BRIDGE_CWD()),
+    };
+    const launcher = spawn('powershell.exe', [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-WindowStyle',
+      'Hidden',
+      '-EncodedCommand',
+      WINDOWS_TERMINAL_LAUNCHER_ENCODED,
+    ], {
+      cwd: WINDOWS_SAFE_BRIDGE_CWD(),
+      env: launcherEnvironment,
       detached: true,
       windowsHide: true,
+      shell: false,
       stdio: 'ignore',
     });
     launcher.unref();
@@ -455,12 +532,14 @@ export function spawnHidden(command: string, args: string[], options: SpawnOptio
   assertRuntimeLaunchPreconditions(command, cwd);
   const environment = { ...process.env, ...options.env };
   const prepared = prepareRuntimeCommand(command, args, process.platform, environment);
+  const bridgeContext = applyWindowsBridgeContext(prepared, environment, cwd);
   const child = spawn(prepared.command, prepared.args, {
     ...options,
+    cwd: bridgeContext.cwd,
     windowsHide: true,
     windowsVerbatimArguments: prepared.windowsVerbatimArguments ?? options.windowsVerbatimArguments,
     shell: false,
-    env: environment,
+    env: bridgeContext.env,
   });
   // Node treats an unobserved child-process `error` event as fatal. Runtime
   // adapters attach their own listeners when they need diagnostics, while this
