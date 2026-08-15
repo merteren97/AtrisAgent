@@ -215,7 +215,6 @@ export class WorkspaceManager {
       accountProfileId: row.accountProfileId || undefined,
       reasoningLevel: row.reasoningLevel || undefined,
       fallbackCatalogIds: row.fallbackCatalogIds || [],
-      source: row.source,
     }));
   }
 
