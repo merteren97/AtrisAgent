@@ -5,6 +5,9 @@ import os from 'os';
 import path from 'path';
 import type { RuntimeType } from '@atris-agent-code/domain';
 
+const DEFAULT_MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_CONFIGURABLE_COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024;
+
 export interface CommandResult {
   stdout: string;
   stderr: string;
@@ -287,6 +290,33 @@ export function prepareRuntimeCommand(
   return { command, args };
 }
 
+function resolveCommandOutputLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_COMMAND_OUTPUT_BYTES;
+  return Math.min(MAX_CONFIGURABLE_COMMAND_OUTPUT_BYTES, Math.max(1_024, Math.floor(value)));
+}
+
+function appendWithinByteLimit(current: string, chunk: Buffer | string, usedBytes: number, limitBytes: number): {
+  value: string;
+  usedBytes: number;
+  exceeded: boolean;
+} {
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+  const remaining = Math.max(0, limitBytes - usedBytes);
+  if (buffer.length <= remaining) {
+    return {
+      value: current + buffer.toString('utf8'),
+      usedBytes: usedBytes + buffer.length,
+      exceeded: false,
+    };
+  }
+
+  return {
+    value: current + (remaining > 0 ? buffer.subarray(0, remaining).toString('utf8') : ''),
+    usedBytes: limitBytes,
+    exceeded: true,
+  };
+}
+
 export async function runCommand(
   command: string,
   args: string[] = [],
@@ -295,16 +325,20 @@ export async function runCommand(
     env?: NodeJS.ProcessEnv;
     timeoutMs?: number;
     input?: string;
+    maxOutputBytes?: number;
   } = {},
 ): Promise<CommandResult> {
   assertRuntimeLaunchPreconditions(command, options.cwd);
   const environment = { ...process.env, ...options.env };
   const prepared = prepareRuntimeCommand(command, args, process.platform, environment);
+  const maxOutputBytes = resolveCommandOutputLimit(options.maxOutputBytes);
 
   return new Promise<CommandResult>((resolve, reject) => {
     let settled = false;
     let stdout = '';
     let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     const child = spawn(prepared.command, prepared.args, {
       cwd: options.cwd,
       env: environment,
@@ -321,6 +355,23 @@ export async function runCommand(
       callback();
     };
 
+    const failForOutputLimit = (stream: 'stdout' | 'stderr') => {
+      if (!child.killed) child.kill('SIGKILL');
+      finish(() => {
+        const failure = Object.assign(
+          new Error(`Command ${stream} exceeded the ${maxOutputBytes}-byte capture limit: ${command}`),
+          {
+            code: 'OUTPUT_LIMIT_EXCEEDED',
+            stream,
+            stdout,
+            stderr,
+            exitCode: 1,
+          },
+        );
+        reject(failure);
+      });
+    };
+
     const timer = setTimeout(() => {
       if (!child.killed) child.kill('SIGKILL');
       finish(() => {
@@ -333,8 +384,18 @@ export async function runCommand(
       });
     }, options.timeoutMs ?? 15_000);
 
-    child.stdout?.on('data', (chunk) => { stdout += chunk.toString(); });
-    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const next = appendWithinByteLimit(stdout, chunk, stdoutBytes, maxOutputBytes);
+      stdout = next.value;
+      stdoutBytes = next.usedBytes;
+      if (next.exceeded) failForOutputLimit('stdout');
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const next = appendWithinByteLimit(stderr, chunk, stderrBytes, maxOutputBytes);
+      stderr = next.value;
+      stderrBytes = next.usedBytes;
+      if (next.exceeded) failForOutputLimit('stderr');
+    });
     child.on('error', (error) => finish(() => reject(Object.assign(new Error(describeRuntimeLaunchError(command, error, options.cwd)), { cause: error, stdout, stderr, exitCode: 1 }))));
     child.on('close', (code) => finish(() => {
       const result = { stdout, stderr, exitCode: code ?? 1 };
