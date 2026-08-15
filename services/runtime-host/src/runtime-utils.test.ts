@@ -111,6 +111,31 @@ async function runTests() {
     );
   }
 
+  // Discovery/auth helper commands are expected to return compact metadata. A
+  // malfunctioning or hostile CLI must not be able to grow the API process heap
+  // without bound before a timeout is reached.
+  try {
+    await runCommand(process.execPath, ['-e', 'process.stdout.write("x".repeat(32768))'], {
+      timeoutMs: 5_000,
+      maxOutputBytes: 4_096,
+    });
+    assert(false, 'rejects helper commands that exceed the configured stdout capture limit');
+  } catch (error: any) {
+    assert(error?.code === 'OUTPUT_LIMIT_EXCEEDED' && error?.stream === 'stdout', 'reports deterministic stdout output-limit failure');
+    assert(Buffer.byteLength(String(error?.stdout || ''), 'utf8') <= 4_096, 'keeps captured stdout memory within the configured byte limit');
+  }
+
+  try {
+    await runCommand(process.execPath, ['-e', 'process.stderr.write("e".repeat(32768))'], {
+      timeoutMs: 5_000,
+      maxOutputBytes: 4_096,
+    });
+    assert(false, 'rejects helper commands that exceed the configured stderr capture limit');
+  } catch (error: any) {
+    assert(error?.code === 'OUTPUT_LIMIT_EXCEEDED' && error?.stream === 'stderr', 'reports deterministic stderr output-limit failure');
+    assert(Buffer.byteLength(String(error?.stderr || ''), 'utf8') <= 4_096, 'keeps captured stderr memory within the configured byte limit');
+  }
+
   if (process.platform === 'win32') {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atris runtime wrapper '));
     const wrapper = path.join(root, 'test wrapper.cmd');
