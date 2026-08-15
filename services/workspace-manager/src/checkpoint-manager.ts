@@ -91,6 +91,10 @@ function removeEntriesMissingFromSnapshot(
     const workspaceEntry = path.join(workspaceDir, entry.name);
     const snapshotEntry = path.join(snapshotDir, entry.name);
     if (!fs.existsSync(snapshotEntry)) {
+      // Checkpoints intentionally do not traverse/copy symlinks. Preserve a
+      // standalone workspace symlink that has no snapshot counterpart rather
+      // than deleting a link that may have existed before the checkpoint.
+      if (entry.isSymbolicLink()) continue;
       fs.rmSync(workspaceEntry, { recursive: true, force: true });
       continue;
     }
