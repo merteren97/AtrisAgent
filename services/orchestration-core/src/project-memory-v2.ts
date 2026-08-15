@@ -10,10 +10,34 @@ import {
 } from '@atris-agent-code/database';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import {
+  redactSensitiveValue,
+  type LocalEventBus,
+  type Unsubscribe,
+} from '@atris-agent-code/event-bus';
+import {
   ProjectMemoryService,
   type ProjectMemoryOverview,
   type RawSqliteConnection,
 } from './project-memory';
+
+const LIVE_CURATOR_QUEUE_LIMIT = 512;
+const LIVE_CURATOR_EVENT_TYPES = new Set<AgentEvent['type']>([
+  'user_message',
+  'plan_generated',
+  'plan_revised',
+  'task_created',
+  'task_completed',
+  'task_failed',
+  'file_changed',
+  'approval_responded',
+  'check_completed',
+  'review_completed',
+  'verification_finding',
+  'verification_completed',
+  'changes_applied',
+  'mission_completed',
+  'mission_failed',
+]);
 
 function resolveRawSqlite(db: AtrisDatabase, explicit?: RawSqliteConnection): RawSqliteConnection {
   if (explicit) return explicit;
@@ -24,23 +48,6 @@ function resolveRawSqlite(db: AtrisDatabase, explicit?: RawSqliteConnection): Ra
     throw new Error('Project memory requires the local better-sqlite3 client exposed by the Atris database runtime.');
   }
   return candidate as RawSqliteConnection;
-}
-
-function redactMemoryValue(value: unknown): unknown {
-  if (typeof value === 'string') {
-    return value
-      .replace(/Authorization:\s*(?:Bearer|Basic)\s+[^\s"'\r\n]+/gi, 'Authorization: [REDACTED]')
-      .replace(/\b(?:sk-|ghp_|gho_|xox[baprs]-)[A-Za-z0-9_.-]{12,}\b/g, '[REDACTED_SECRET]')
-      .replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*["']?[^\s"']{8,}["']?/gi, '$1=[REDACTED]');
-  }
-  if (Array.isArray(value)) return value.map(redactMemoryValue);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .map(([key, item]) => [key, redactMemoryValue(item)]),
-    );
-  }
-  return value;
 }
 
 /**
@@ -56,6 +63,10 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
   private readonly backfillPromises = new Map<string, Promise<void>>();
   private readonly backfilledWorkspaceIds = new Set<string>();
   private readonly lifecycleSqlite: RawSqliteConnection;
+  private liveCuratorUnsubscribe?: Unsubscribe;
+  private readonly liveCuratorQueue: AgentEvent[] = [];
+  private liveCuratorDraining = false;
+  private liveCuratorDropped = 0;
 
   constructor(
     private readonly lifecycleDb: AtrisDatabase,
@@ -66,8 +77,52 @@ export class ProjectMemoryServiceV2 extends ProjectMemoryService {
     this.lifecycleSqlite = rawSqlite;
   }
 
+  override startCurator(eventBus: LocalEventBus): void {
+    this.liveCuratorUnsubscribe?.();
+    this.liveCuratorQueue.length = 0;
+    this.liveCuratorDropped = 0;
+    this.liveCuratorUnsubscribe = eventBus.on('*', (event) => {
+      if (!LIVE_CURATOR_EVENT_TYPES.has(event.type)) return;
+      if (this.liveCuratorQueue.length >= LIVE_CURATOR_QUEUE_LIMIT) {
+        this.liveCuratorDropped += 1;
+        if (this.liveCuratorDropped === 1 || this.liveCuratorDropped % 100 === 0) {
+          console.warn(
+            `[ProjectMemoryV2] Live curator queue is full; deferred ${this.liveCuratorDropped} event(s) to persisted-history recovery.`,
+          );
+        }
+        return;
+      }
+      this.liveCuratorQueue.push(event);
+      void this.drainLiveCuratorQueue();
+    });
+  }
+
+  override stopCurator(): void {
+    this.liveCuratorUnsubscribe?.();
+    this.liveCuratorUnsubscribe = undefined;
+    this.liveCuratorQueue.length = 0;
+  }
+
+  private async drainLiveCuratorQueue(): Promise<void> {
+    if (this.liveCuratorDraining) return;
+    this.liveCuratorDraining = true;
+    try {
+      while (this.liveCuratorQueue.length > 0) {
+        const event = this.liveCuratorQueue.shift()!;
+        try {
+          await this.ingestEvent(event);
+        } catch (error) {
+          console.warn('[ProjectMemoryV2] Live curator failed to ingest an event; persisted history can recover it later.', error);
+        }
+      }
+    } finally {
+      this.liveCuratorDraining = false;
+      if (this.liveCuratorQueue.length > 0) void this.drainLiveCuratorQueue();
+    }
+  }
+
   override async ingestEvent(event: AgentEvent): Promise<void> {
-    const redacted = redactMemoryValue(event) as AgentEvent;
+    const redacted = redactSensitiveValue(event) as AgentEvent;
     await super.ingestEvent(redacted);
   }
 
