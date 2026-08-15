@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import { execFileSync } from 'child_process';
 import { WorktreeManager } from './worktree-manager';
-import { CheckpointManager, isValidGitCommitSha } from './checkpoint-manager';
+import { CheckpointManager, isSafeCheckpointId, isValidGitCommitSha } from './checkpoint-manager';
 
 async function runTests() {
   console.log('--- Starting WorkspaceManager & Worktree & Checkpoint Tests ---');
@@ -42,6 +42,8 @@ async function runTests() {
     assert(isValidGitCommitSha('0123456789abcdef0123456789abcdef01234567'), '40-character Git commit SHA is accepted');
     assert(!isValidGitCommitSha('0123456789abcdef0123456789abcdef0123456'), 'Short Git commit ref is rejected');
     assert(!isValidGitCommitSha('0123456789abcdef0123456789abcdef0123456; echo injected'), 'Shell metacharacters in Git ref are rejected');
+    assert(isSafeCheckpointId(crypto.randomUUID()), 'Generated UUID is accepted as a checkpoint identifier');
+    assert(!isSafeCheckpointId('../checkpoint'), 'Traversal checkpoint identifier is rejected');
 
     const invalidGitDir = path.join(tmpDir, 'invalid-git-dir');
     fs.mkdirSync(path.join(invalidGitDir, '.git', 'info'), { recursive: true });
@@ -130,6 +132,9 @@ async function runTests() {
     const diffText = await worktreeManager.getDiff(wtPath);
     assert(diffText.includes('+export const x = 42;'), 'getDiff includes added line');
 
+    const nestedSourceDir = path.join(wsPath, 'src');
+    fs.mkdirSync(nestedSourceDir, { recursive: true });
+    fs.writeFileSync(path.join(nestedSourceDir, 'stable.ts'), 'export const stable = true;');
     const chkId = await checkpointManager.createCheckpoint(wsPath, 'pre-feature');
     assert(
       typeof chkId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chkId),
@@ -137,6 +142,8 @@ async function runTests() {
     );
 
     fs.writeFileSync(path.join(wsPath, 'index.ts'), 'MUTATED CONTENT');
+    fs.writeFileSync(path.join(wsPath, 'extra-after-checkpoint.ts'), 'must be removed');
+    fs.rmSync(nestedSourceDir, { recursive: true, force: true });
     assert(fs.readFileSync(path.join(wsPath, 'index.ts'), 'utf-8') === 'MUTATED CONTENT', 'Workspace content mutated');
 
     await checkpointManager.restoreCheckpoint(chkId, wsPath);
@@ -144,6 +151,16 @@ async function runTests() {
       fs.readFileSync(path.join(wsPath, 'index.ts'), 'utf-8') === 'console.log("hello world");',
       'restoreCheckpoint restores original workspace content'
     );
+    assert(!fs.existsSync(path.join(wsPath, 'extra-after-checkpoint.ts')), 'Exact restore removes files created after the checkpoint');
+    assert(fs.existsSync(path.join(wsPath, 'src', 'stable.ts')), 'Exact restore recreates source files deleted after the checkpoint');
+
+    let traversalRestoreError = '';
+    try {
+      await checkpointManager.restoreCheckpoint('../../outside', wsPath);
+    } catch (error) {
+      traversalRestoreError = error instanceof Error ? error.message : String(error);
+    }
+    assert(traversalRestoreError.includes('valid AtrisAgent checkpoint identifier'), 'Traversal checkpoint IDs fail before filesystem resolution');
 
     const validGitRef = execFileSync('git', ['rev-parse', 'HEAD'], {
       cwd: realRepo,
@@ -151,41 +168,111 @@ async function runTests() {
       encoding: 'utf-8',
     }).trim();
     fs.writeFileSync(path.join(realRepo, 'README.md'), 'MUTATED GIT CONTENT');
+    const validGitCheckpointId = crypto.randomUUID();
+    const validGitSnapshotPath = path.join(realRepo, '.atris-checkpoints', validGitCheckpointId);
+    fs.mkdirSync(validGitSnapshotPath, { recursive: true });
+    fs.writeFileSync(path.join(validGitSnapshotPath, 'README.md'), 'linked worktree probe');
     const validCheckpointDb = {
       select: () => ({
         from: () => ({
-          where: async () => [{ id: 'valid-git-checkpoint', snapshotPath: null, gitRef: validGitRef }],
+          where: async () => [{
+            id: validGitCheckpointId,
+            workspaceId: 'w1',
+            missionId: 'm1',
+            snapshotPath: validGitSnapshotPath,
+            gitRef: validGitRef,
+          }],
         }),
       }),
     } as unknown as NonNullable<Parameters<typeof checkpointManager.restoreCheckpoint>[2]>['db'];
-    await checkpointManager.restoreCheckpoint('valid-git-checkpoint', realRepo, { db: validCheckpointDb });
+    await checkpointManager.restoreCheckpoint(validGitCheckpointId, realRepo, {
+      db: validCheckpointDb,
+      expectedWorkspaceId: 'w1',
+      expectedMissionId: 'm1',
+    });
     assert(
       fs.readFileSync(path.join(realRepo, 'README.md'), 'utf-8') === 'linked worktree probe',
       'Valid Git ref restores the committed workspace state with argument-based Git execution',
     );
 
-    const restoreSnapshotPath = path.join(tmpDir, 'malicious-ref-snapshot');
+    const maliciousCheckpointId = crypto.randomUUID();
+    const restoreSnapshotPath = path.join(realRepo, '.atris-checkpoints', maliciousCheckpointId);
     fs.mkdirSync(restoreSnapshotPath, { recursive: true });
     fs.writeFileSync(path.join(restoreSnapshotPath, 'restored.txt'), 'snapshot fallback');
-    const maliciousCheckpointId = 'malicious-ref-checkpoint';
     const injectionMarkerPath = path.join(tmpDir, 'checkpoint-ref-injection-marker.txt');
     const maliciousCheckpointDb = {
       select: () => ({
         from: () => ({
           where: async () => [{
             id: maliciousCheckpointId,
+            workspaceId: 'w1',
+            missionId: 'm1',
             snapshotPath: restoreSnapshotPath,
             gitRef: `0123456789abcdef0123456789abcdef0123456 & echo injected > "${injectionMarkerPath}"`,
           }],
         }),
       }),
     } as unknown as NonNullable<Parameters<typeof checkpointManager.restoreCheckpoint>[2]>['db'];
-    await checkpointManager.restoreCheckpoint(maliciousCheckpointId, realRepo, { db: maliciousCheckpointDb });
+    await checkpointManager.restoreCheckpoint(maliciousCheckpointId, realRepo, {
+      db: maliciousCheckpointDb,
+      expectedWorkspaceId: 'w1',
+      expectedMissionId: 'm1',
+    });
     assert(
       fs.readFileSync(path.join(realRepo, 'restored.txt'), 'utf-8') === 'snapshot fallback',
-      'Invalid Git ref falls back to the checkpoint snapshot without invoking a shell',
+      'Invalid Git ref falls back to a contained checkpoint snapshot without invoking a shell',
     );
     assert(!fs.existsSync(injectionMarkerPath), 'Malicious Git ref cannot execute an injected shell command');
+
+    const escapedCheckpointId = crypto.randomUUID();
+    const escapedSnapshotPath = path.join(tmpDir, escapedCheckpointId);
+    fs.mkdirSync(escapedSnapshotPath, { recursive: true });
+    fs.writeFileSync(path.join(escapedSnapshotPath, 'escaped.txt'), 'must not restore');
+    const escapedCheckpointDb = {
+      select: () => ({
+        from: () => ({
+          where: async () => [{
+            id: escapedCheckpointId,
+            workspaceId: 'w1',
+            missionId: 'm1',
+            snapshotPath: escapedSnapshotPath,
+            gitRef: null,
+          }],
+        }),
+      }),
+    } as unknown as NonNullable<Parameters<typeof checkpointManager.restoreCheckpoint>[2]>['db'];
+    let escapedSnapshotError = '';
+    try {
+      await checkpointManager.restoreCheckpoint(escapedCheckpointId, realRepo, {
+        db: escapedCheckpointDb,
+        expectedWorkspaceId: 'w1',
+        expectedMissionId: 'm1',
+      });
+    } catch (error) {
+      escapedSnapshotError = error instanceof Error ? error.message : String(error);
+    }
+    assert(escapedSnapshotError.includes('escapes the expected workspace boundary'), 'Persisted snapshot paths outside checkpoint storage are rejected');
+    assert(!fs.existsSync(path.join(realRepo, 'escaped.txt')), 'Escaped snapshot content is never copied into the workspace');
+
+    const ownershipCheckpointId = crypto.randomUUID();
+    const ownershipDb = {
+      select: () => ({
+        from: () => ({
+          where: async () => [],
+        }),
+      }),
+    } as unknown as NonNullable<Parameters<typeof checkpointManager.restoreCheckpoint>[2]>['db'];
+    let ownershipError = '';
+    try {
+      await checkpointManager.restoreCheckpoint(ownershipCheckpointId, realRepo, {
+        db: ownershipDb,
+        expectedWorkspaceId: 'other-workspace',
+        expectedMissionId: 'other-mission',
+      });
+    } catch (error) {
+      ownershipError = error instanceof Error ? error.message : String(error);
+    }
+    assert(ownershipError.includes('not found for the requested workspace and mission'), 'Cross-workspace or cross-mission checkpoint lookup fails closed');
 
     const mergeResult = await worktreeManager.merge(wtPath, 'main', wsPath);
     assert(mergeResult.success === true, 'Non-git merge succeeds');

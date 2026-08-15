@@ -69,12 +69,14 @@ export interface CreateTaskInput {
 
 export class WorkspaceManager {
   private worktreeManager = new WorktreeManager();
-  private checkpointManager = new CheckpointManager();
+  private checkpointManager: CheckpointManager;
 
   constructor(
     private db: AtrisDatabase,
     _eventBus?: LocalEventBus
-  ) {}
+  ) {
+    this.checkpointManager = new CheckpointManager(db);
+  }
 
   getWorktreeManager(): WorktreeManager {
     return this.worktreeManager;

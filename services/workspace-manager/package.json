@@ -7,7 +7,7 @@
   "types": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npx tsx src/workspace-manager.test.ts"
+    "test": "npx tsx src/workspace-manager.test.ts && npx tsx src/checkpoint-manager.security.test.ts"
   },
   "dependencies": {
     "@atris-agent-code/database": "*",
