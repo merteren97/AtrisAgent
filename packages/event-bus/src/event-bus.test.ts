@@ -39,6 +39,14 @@ async function runTests() {
 
   const privateKey = '-----BEGIN PRIVATE KEY-----\nvery-secret-key-material\n-----END PRIVATE KEY-----';
   assert(!redactSensitiveString(privateKey).includes('very-secret-key-material'), 'redacts PEM private key blocks');
+  const prefixedPrivateKey = 'prefix\n-----BEGIN RSA PRIVATE KEY-----\nrsa-secret-material\n-----END RSA PRIVATE KEY-----\nsuffix';
+  const prefixedPrivateKeyResult = redactSensitiveString(prefixedPrivateKey);
+  assert(!prefixedPrivateKeyResult.includes('rsa-secret-material') && prefixedPrivateKeyResult.includes('prefix') && prefixedPrivateKeyResult.includes('suffix'), 'redacts labeled PEM blocks without consuming surrounding text');
+  const truncatedPrivateKey = 'before\n-----BEGIN OPENSSH PRIVATE KEY-----\ntruncated-secret-material';
+  const truncatedPrivateKeyResult = redactSensitiveString(truncatedPrivateKey);
+  assert(!truncatedPrivateKeyResult.includes('truncated-secret-material') && truncatedPrivateKeyResult.includes('before'), 'fails closed for truncated PEM private keys');
+  const repeatedHeaders = Array.from({ length: 1_000 }, () => '-----BEGIN PRIVATE KEY-----').join('\n');
+  assert(redactSensitiveString(repeatedHeaders) === REDACTED_SECRET_VALUE, 'handles repeated private-key headers without regex backtracking');
   assert(redactSensitiveString('github_pat_abcdefghijklmnopqrstuvwxyz1234567890') === REDACTED_SECRET_VALUE, 'redacts GitHub fine-grained token text');
 
   const bus = new LocalEventBus();
