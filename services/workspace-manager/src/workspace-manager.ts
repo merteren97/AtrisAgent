@@ -303,6 +303,16 @@ export class WorkspaceManager {
     return await this.db.select().from(tasks).where(eq(tasks.missionId, missionId));
   }
 
+  async cancelMissionTasks(missionId: string): Promise<void> {
+    const activeStatuses = new Set(['planned', 'ready', 'claimed', 'running', 'review', 'revision_requested', 'blocked']);
+    const missionTasks = await this.listTasks(missionId);
+    for (const task of missionTasks) {
+      if (activeStatuses.has(String(task.status))) {
+        await this.updateTask(task.id, { status: 'cancelled' });
+      }
+    }
+  }
+
   /** Update task fields by ID. */
   async updateTask(id: string, updates: Partial<TaskInsert>): Promise<TaskSelect> {
     const now = new Date().toISOString();

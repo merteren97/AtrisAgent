@@ -52,9 +52,13 @@ function QueuedTurnComposer() {
     }
 
     const targetRole = directive.targetRole || 'Orchestrator';
-    const selectedRouteApplies = !directive.targetRole || directive.targetRole.toLowerCase() === 'orchestrator';
-    const scopedSelectedModel = selectedRouteApplies ? selectedModel || undefined : undefined;
+    const scopedSelectedModel = selectedModel || undefined;
     const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
+    const routeScope: StartMissionOptions['routeScope'] = directive.modelCatalogId
+      ? 'role'
+      : scopedSelectedModel
+        ? 'mission'
+        : undefined;
     const resolvedReasoning = directive.reasoningLevel
       || (directive.modelCatalogId
         ? directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0]
@@ -66,6 +70,7 @@ function QueuedTurnComposer() {
       trustMode,
       targetRole: directive.targetRole,
       routeRole: targetRole,
+      routeScope,
       command: directive.command,
     };
 
@@ -107,7 +112,7 @@ function QueuedTurnComposer() {
           <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
             <div className="flex min-w-0 items-center gap-1.5 text-[9px] text-muted-foreground">
               {selectedModelObject ? <RuntimeBrandIcon runtimeId={selectedModelObject.runtimeType} className="h-3 w-3 shrink-0" /> : <Sparkles className="h-3 w-3 shrink-0 text-primary" />}
-              <span className="truncate">Next turn route: {selectedModelObject?.name || 'Auto routing'}</span>
+              <span className="truncate">Next turn model: {selectedModelObject?.name || 'Auto routing'}</span>
               {reasoningLevel && reasoningLevel !== 'none' && selectedModelObject?.supportedReasoning.length ? <span className="shrink-0">· {reasoningLevel}</span> : null}
             </div>
             <Button
@@ -147,8 +152,8 @@ export function ChatComposer() {
   );
 
   useEffect(() => {
-    if (!busy && activeMissionId && queuedCount > 0) void drainQueuedTurn(activeMissionId);
-  }, [activeMissionId, busy, drainQueuedTurn, queuedCount]);
+    if (!busy && activeMissionId && activeMission?.status !== 'cancelled' && queuedCount > 0) void drainQueuedTurn(activeMissionId);
+  }, [activeMissionId, activeMission?.status, busy, drainQueuedTurn, queuedCount]);
 
   return busy ? <QueuedTurnComposer /> : <StandardChatComposer />;
 }

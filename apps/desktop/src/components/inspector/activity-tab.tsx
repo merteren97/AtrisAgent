@@ -1,7 +1,9 @@
-import { useState, useRef, useEffect } from 'react';
-import { Activity, Filter } from 'lucide-react';
+import { useState, useRef, useEffect, type UIEvent } from 'react';
+import { Activity, ArrowDown, Filter } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { ToolCallRow } from '@/components/chat/tool-call-row';
 import { cn } from '@/lib/utils';
 import { useMissionStore } from '@/stores/mission-store';
 
@@ -16,12 +18,20 @@ const COORDINATION_EVENTS = new Set([
   'verification_started', 'verification_finding', 'verification_completed', 'review_completed', 'revision_requested',
 ]);
 const TOOL_EVENTS = new Set(['agent_tool_call', 'tool_call_started', 'tool_call_completed', 'file_changed']);
+const TOOL_CALL_EVENTS = new Set(['agent_tool_call', 'tool_call_started', 'tool_call_completed']);
+const BOTTOM_THRESHOLD = 32;
+
+function isNearBottom(viewport: HTMLElement): boolean {
+  return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= BOTTOM_THRESHOLD;
+}
 
 export function ActivityTab() {
-  const { timeline } = useMissionStore();
+  const timeline = useMissionStore((state) => state.timeline);
+  const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const [filter, setFilter] = useState<FilterType>('all');
   const [autoScroll, setAutoScroll] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const shouldFollowRef = useRef(true);
+  const viewportRef = useRef<HTMLDivElement>(null);
 
   const filteredTimeline = timeline.filter((item) => {
     const type = item.eventType || '';
@@ -34,8 +44,42 @@ export function ActivityTab() {
   });
 
   useEffect(() => {
-    if (autoScroll && scrollRef.current) scrollRef.current.scrollIntoView({ behavior: 'smooth' });
-  }, [filteredTimeline.length, autoScroll]);
+    shouldFollowRef.current = true;
+    setAutoScroll(true);
+  }, [activeMissionId]);
+
+  useEffect(() => {
+    if (timeline.length === 0) {
+      shouldFollowRef.current = true;
+      setAutoScroll(true);
+      return;
+    }
+
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    if (shouldFollowRef.current) {
+      viewport.scrollTop = viewport.scrollHeight;
+    } else if (isNearBottom(viewport)) {
+      shouldFollowRef.current = true;
+      setAutoScroll(true);
+    }
+  }, [filter, timeline]);
+
+  const handleViewportScroll = (event: UIEvent<HTMLDivElement>) => {
+    const shouldFollow = isNearBottom(event.currentTarget);
+    shouldFollowRef.current = shouldFollow;
+    setAutoScroll(shouldFollow);
+  };
+
+  const jumpToLatest = () => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    shouldFollowRef.current = true;
+    setAutoScroll(true);
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'auto' });
+  };
 
   if (timeline.length === 0) {
     return (
@@ -91,44 +135,60 @@ export function ActivityTab() {
         </div>
       </div>
 
-      <ScrollArea
-        className="flex-1"
-        onScroll={(event) => {
-          const target = event.target as HTMLDivElement;
-          setAutoScroll(target.scrollHeight - target.scrollTop <= target.clientHeight + 20);
-        }}
-      >
-        <div className="flex flex-col gap-3 p-3">
-          {filteredTimeline.map((item) => (
-            <div key={item.id} className="flex flex-col gap-1.5 border-b border-border/50 pb-3 last:border-0">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <Badge variant="secondary" className={cn('h-4 max-w-[150px] truncate border-transparent px-1.5 text-[9px] font-medium', getEventColor(item.eventType))}>
-                    {item.eventType || item.type}
-                  </Badge>
-                  {item.agentRole && (
-                    <Badge variant="outline" className="h-4 px-1.5 text-[9px] capitalize text-muted-foreground">
-                      {item.agentRole}
-                    </Badge>
-                  )}
-                </div>
-                <span className="shrink-0 text-[9px] text-muted-foreground">{item.timestamp}</span>
-              </div>
+      <div className="relative min-h-0 flex-1">
+        <ScrollArea
+          className="h-full"
+          viewportRef={viewportRef}
+          onViewportScroll={handleViewportScroll}
+        >
+          <div className="flex flex-col gap-3 p-3">
+            {filteredTimeline.map((item) => (
+              <div key={item.id} className="flex flex-col gap-1.5 border-b border-border/50 pb-3 last:border-0">
+                {TOOL_CALL_EVENTS.has(item.eventType || '') ? <ToolCallRow item={item} /> : (
+                  <>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <Badge variant="secondary" className={cn('h-4 max-w-[150px] truncate border-transparent px-1.5 text-[9px] font-medium', getEventColor(item.eventType))}>
+                          {item.eventType || item.type}
+                        </Badge>
+                        {item.agentRole && (
+                          <Badge variant="outline" className="h-4 px-1.5 text-[9px] capitalize text-muted-foreground">
+                            {item.agentRole}
+                          </Badge>
+                        )}
+                      </div>
+                      <span className="shrink-0 text-[9px] text-muted-foreground">{item.timestamp}</span>
+                    </div>
 
-              <div className={cn(
-                'break-words whitespace-pre-wrap text-[11px] leading-relaxed',
-                TOOL_EVENTS.has(item.eventType || '') ? 'rounded-md bg-muted/50 p-2 font-mono text-muted-foreground' : 'text-foreground',
-              )}>
-                {item.content}
+                    <div className={cn(
+                      'break-words whitespace-pre-wrap text-[11px] leading-relaxed',
+                      TOOL_EVENTS.has(item.eventType || '') ? 'rounded-md bg-muted/50 p-2 font-mono text-muted-foreground' : 'text-foreground',
+                    )}>
+                      {item.content}
+                    </div>
+                  </>
+                )}
               </div>
-            </div>
-          ))}
-          {!filteredTimeline.length && (
-            <div className="py-8 text-center text-[10px] text-muted-foreground">No events match this filter.</div>
-          )}
-          <div ref={scrollRef} />
-        </div>
-      </ScrollArea>
+            ))}
+            {!filteredTimeline.length && (
+              <div className="py-8 text-center text-[10px] text-muted-foreground">No events match this filter.</div>
+            )}
+          </div>
+        </ScrollArea>
+        {!autoScroll && (
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="absolute bottom-3 right-3 z-10 h-7 rounded-full border border-border/80 bg-card/95 px-2.5 text-[10px] shadow-md backdrop-blur-sm"
+            onClick={jumpToLatest}
+            aria-label="Jump to latest activity"
+          >
+            <ArrowDown className="h-3.5 w-3.5" />
+            <span>New activity</span>
+          </Button>
+        )}
+      </div>
     </div>
   );
 }

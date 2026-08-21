@@ -285,6 +285,52 @@ async function runTests() {
       });
       assert(wsReceived === true, 'WebSocket stream broadcasts eventBus events to connected clients');
     }
+
+    // 9. Conversation and workspace deletion
+    {
+      const cancelRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/cancel`, { method: 'POST' });
+      const cancelBody = await cancelRes.json();
+      assert(cancelRes.status === 200 && cancelBody.status === 'cancelled', 'POST /api/missions/:id/cancel makes a conversation deletable');
+
+      const deleteMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}`, { method: 'DELETE' });
+      assert(deleteMissionRes.status === 200, 'DELETE /api/missions/:id removes a terminal conversation');
+
+      const deletedMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}`);
+      assert(deletedMissionRes.status === 404, 'Deleted conversation is no longer available');
+
+      const childMissionRes = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId: createdWorkspaceId,
+          title: 'Workspace cascade conversation',
+          description: 'Verifies workspace deletion removes its conversations and events.',
+        }),
+      });
+      const childMission = await childMissionRes.json();
+      const childMissionId = childMission.id as string;
+      eventBus.emit({
+        id: crypto.randomUUID(),
+        type: 'agent_started',
+        missionId: childMissionId,
+        agentInstanceId: 'workspace-cascade-agent',
+        role: 'builder',
+        model: 'test-model',
+        timestamp: new Date().toISOString(),
+      });
+
+      const deleteWorkspaceRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`, { method: 'DELETE' });
+      assert(deleteWorkspaceRes.status === 200, 'DELETE /api/workspaces/:id removes a workspace with its conversations');
+
+      const deletedWorkspaceRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`);
+      assert(deletedWorkspaceRes.status === 404, 'Deleted workspace is no longer available');
+      const cascadedMissionsRes = await authorizedFetch(`${baseUrl}/api/missions?workspaceId=${createdWorkspaceId}`);
+      const cascadedMissions = await cascadedMissionsRes.json();
+      assert(cascadedMissionsRes.status === 200 && Array.isArray(cascadedMissions) && !cascadedMissions.some((mission: any) => mission.id === childMissionId), 'Workspace deletion cascades its conversation records');
+      const cascadedEventsRes = await authorizedFetch(`${baseUrl}/api/missions/${childMissionId}/events`);
+      const cascadedEvents = await cascadedEventsRes.json();
+      assert(cascadedEventsRes.status === 200 && Array.isArray(cascadedEvents) && cascadedEvents.length === 0, 'Workspace deletion cascades mission events');
+    }
   } finally {
     if (shouldCloseServer && server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()));

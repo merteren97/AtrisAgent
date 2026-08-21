@@ -12,6 +12,7 @@ export type TaskStatus =
   | 'applied'
   | 'done'
   | 'rejected'
+  | 'cancelled'
   | 'superseded';
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';

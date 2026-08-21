@@ -7,7 +7,6 @@ import { useMissionStore } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useLanguageStore, t } from '@/stores/language-store';
-import { UsageMeter } from '@/components/usage/UsageMeter';
 
 type WindowAction = 'move' | 'minimize' | 'maximize' | 'close';
 
@@ -156,8 +155,6 @@ export function Titlebar() {
         <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => activeMission && void retryMission(activeMission.id)} disabled={!activeMission} title={t('Retry')}>
           <RotateCcw className="h-3.5 w-3.5" />
         </Button>
-        <div className="mx-1 h-5 w-px bg-border" />
-        <UsageMeter />
         <Button variant="ghost" size="sm" className={`h-7 shrink-0 gap-1.5 text-xs ${devMode ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`} onClick={handleDevModeToggle}>
           <Cpu className="h-3.5 w-3.5" />{t('Developer Mode')}
         </Button>

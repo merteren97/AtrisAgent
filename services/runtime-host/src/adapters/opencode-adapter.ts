@@ -406,6 +406,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   }
 
   override async cancel(sessionId: string): Promise<void> {
+    this.markSessionCancelled(sessionId);
     const context = this.sessionContext.get(sessionId);
     if (context) {
       const server = this.getServer(context.serverKey);
@@ -607,8 +608,11 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       const text = properties.delta || part.text;
       if (part.type === 'text' && text) this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: text, timestamp });
       if (part.type === 'reasoning' && text) this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: text, timestamp });
-      if (part.type === 'tool' && part.state?.status === 'running') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', args: part.state?.input || {}, timestamp });
-      if (part.type === 'tool' && ['completed', 'error'].includes(part.state?.status)) this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', result: JSON.stringify(part.state?.output || part.state?.error || ''), success: part.state?.status === 'completed', timestamp });
+      if (part.type === 'tool') {
+        const correlation = openCodeCorrelationFields(part, properties);
+        if (part.state?.status === 'running') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', args: part.state?.input || {}, ...correlation, timestamp });
+        if (['completed', 'error'].includes(part.state?.status)) this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', result: JSON.stringify(part.state?.output || part.state?.error || ''), success: part.state?.status === 'completed', ...correlation, timestamp });
+      }
     } else if (type === 'permission.updated' || type === 'permission.asked') {
       const permission = properties.permission || properties;
       this.emitEvent({ id: crypto.randomUUID(), type: 'approval_requested', missionId: context.missionId, approvalId: `${sessionId}:${permission.id}`, approvalType: permission.type || 'tool', description: permission.title || permission.description || 'OpenCode permission required', timestamp });
@@ -648,4 +652,36 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
 function processEnv(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...process.env, ...extra };
+}
+
+function identifierValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+function openCodeCorrelationFields(
+  part: Record<string, any>,
+  properties: Record<string, any>,
+): { toolCallId?: string; runId?: string; attemptId?: string } {
+  const toolCallId = identifierValue(part.id, part.callID, part.callId, part.toolCallId);
+  const runId = identifierValue(
+    part.run_id,
+    part.runId,
+    properties.run_id,
+    properties.runId,
+  );
+  const attemptId = identifierValue(
+    part.attempt_id,
+    part.attemptId,
+    properties.attempt_id,
+    properties.attemptId,
+  );
+  return {
+    ...(toolCallId ? { toolCallId } : {}),
+    ...(runId ? { runId } : {}),
+    ...(attemptId ? { attemptId } : {}),
+  };
 }

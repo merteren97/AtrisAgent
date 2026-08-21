@@ -43,6 +43,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
 
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
+  private toolNamesBySession = new Map<string, Map<string, string>>();
 
   constructor(eventBus?: LocalEventBus) {
     super(eventBus);
@@ -293,6 +294,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     };
     this.activeSessions.set(sessionId, session);
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
+    this.toolNamesBySession.set(sessionId, new Map());
     this.emitEvent({ id: crypto.randomUUID(), type: 'agent_started', missionId: options.missionId, agentInstanceId: sessionId, role: String(options.role || 'builder'), model: options.model || 'Claude default', timestamp: new Date().toISOString() });
 
     const child = spawnHidden('claude', args, {
@@ -325,6 +327,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       this.activeSessions.delete(sessionId);
       mcpConfig.cleanup();
       revokeControlPlaneAgent(sessionId);
+      this.toolNamesBySession.delete(sessionId);
       if (code !== 0) this.emitFailure(sessionId, `Claude Code exited with code ${code}`, code);
       this.sessionContext.delete(sessionId);
     });
@@ -346,11 +349,47 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       for (const block of Array.isArray(blocks) ? blocks : []) {
         if (block.type === 'text' && block.text) this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: block.text, timestamp });
         if ((block.type === 'thinking' || block.type === 'reasoning') && block.thinking) this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: block.thinking, timestamp });
-        if (block.type === 'tool_use') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: block.name || 'tool', args: block.input || {}, timestamp });
+        if (block.type === 'tool_use') {
+          const toolCallId = identifierValue(block.id);
+          const toolName = stringValue(block.name) || 'tool';
+          if (toolCallId) {
+            const toolNames = this.toolNamesBySession.get(sessionId) || new Map<string, string>();
+            toolNames.set(toolCallId, toolName);
+            this.toolNamesBySession.set(sessionId, toolNames);
+          }
+          this.emitEvent({
+            id: crypto.randomUUID(),
+            type: 'tool_call_started',
+            missionId: context.missionId,
+            agentInstanceId: sessionId,
+            toolName,
+            args: block.input || {},
+            ...(toolCallId ? { toolCallId } : {}),
+            ...correlationFields(message),
+            timestamp,
+          });
+        }
       }
     } else if (message.type === 'user') {
       for (const block of message.message?.content || []) {
-        if (block.type === 'tool_result') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: block.tool_use_id || 'tool', result: redactSecrets(typeof block.content === 'string' ? block.content : JSON.stringify(block.content || '')), success: !block.is_error, timestamp });
+        if (block.type === 'tool_result') {
+          const toolCallId = identifierValue(block.tool_use_id);
+          const toolName = (toolCallId ? this.toolNamesBySession.get(sessionId)?.get(toolCallId) : undefined)
+            || stringValue(block.name, block.tool_name)
+            || 'tool';
+          this.emitEvent({
+            id: crypto.randomUUID(),
+            type: 'tool_call_completed',
+            missionId: context.missionId,
+            agentInstanceId: sessionId,
+            toolName,
+            result: redactSecrets(typeof block.content === 'string' ? block.content : JSON.stringify(block.content || '')),
+            success: !block.is_error,
+            ...(toolCallId ? { toolCallId } : {}),
+            ...correlationFields(message),
+            timestamp,
+          });
+        }
       }
     } else if (message.type === 'result') {
       if (message.is_error || message.subtype === 'error') this.emitFailure(sessionId, message.result || message.error || 'Claude run failed');
@@ -369,4 +408,28 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     if (!context) return;
     this.emitEvent({ id: crypto.randomUUID(), type: 'task_failed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, error: redactSecrets(error), exitCode, timestamp: new Date().toISOString() });
   }
+}
+
+function stringValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+}
+
+function identifierValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+function correlationFields(message: Record<string, any>): { runId?: string; attemptId?: string } {
+  const runId = identifierValue(message.run_id, message.runId);
+  const attemptId = identifierValue(message.attempt_id, message.attemptId);
+  return {
+    ...(runId ? { runId } : {}),
+    ...(attemptId ? { attemptId } : {}),
+  };
 }

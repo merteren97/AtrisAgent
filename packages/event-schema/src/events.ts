@@ -164,6 +164,13 @@ export interface AgentCompleted extends BaseEvent {
   summary?: string;
 }
 
+export interface AgentCancelled extends BaseEvent {
+  type: 'agent_cancelled';
+  agentInstanceId: string;
+  taskId?: string | null;
+  reason?: string;
+}
+
 export interface TextDelta extends BaseEvent {
   type: 'text_delta';
   agentInstanceId: string;
@@ -175,6 +182,9 @@ export interface ToolCallStarted extends BaseEvent {
   agentInstanceId: string;
   toolName: string;
   args: Record<string, unknown>;
+  toolCallId?: string;
+  runId?: string;
+  attemptId?: string;
 }
 
 export interface ToolCallCompleted extends BaseEvent {
@@ -183,6 +193,9 @@ export interface ToolCallCompleted extends BaseEvent {
   toolName: string;
   result: string;
   success: boolean;
+  toolCallId?: string;
+  runId?: string;
+  attemptId?: string;
 }
 
 export interface FileChanged extends BaseEvent {
@@ -313,6 +326,9 @@ export interface AgentToolCall extends BaseEvent {
   toolName: string;
   args?: Record<string, unknown>;
   agentInstanceId?: string;
+  toolCallId?: string;
+  runId?: string;
+  attemptId?: string;
 }
 
 export interface AgentError extends BaseEvent {
@@ -344,6 +360,7 @@ export type AgentEvent =
   | AgentContextAttached
   | AgentContextCompacted
   | AgentCompleted
+  | AgentCancelled
   | AgentThought
   | AgentToolCall
   | AgentError
