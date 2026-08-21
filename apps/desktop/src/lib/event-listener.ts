@@ -42,6 +42,14 @@ export function handleIncomingEvent(eventData: any): void {
   if (!eventData?.type) return;
   const missions = useMissionStore.getState();
   const agents = useAgentStore.getState();
+  const isCancelledExecution = (): boolean => {
+    const missionCancelled = missions.missions.find((mission) => mission.id === eventData.missionId)?.status === 'cancelled';
+    const taskCancelled = eventData.taskId
+      && missions.activeTasks.find((task) => task.id === eventData.taskId)?.status === 'cancelled';
+    const agentCancelled = eventData.agentInstanceId
+      && agents.agents.find((agent) => agent.id === eventData.agentInstanceId)?.status === 'cancelled';
+    return Boolean(missionCancelled || taskCancelled || agentCancelled);
+  };
 
   switch (eventData.type) {
     case 'user_message': {
@@ -115,6 +123,7 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'agent_spawned':
+      if (isCancelledExecution()) break;
       append(eventData, `${eventData.displayName || eventData.role || 'Agent'} spawned${eventData.parentAgentId ? ` by ${shortAgent(eventData.parentAgentId)}` : ''}: ${eventData.spawnReason || 'Specialized work required.'}`, {
         agentRole: eventData.role,
       });
@@ -138,6 +147,7 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'agent_started': {
+      if (isCancelledExecution()) break;
       append(eventData, `${eventData.displayName || eventData.role || 'Agent'} started with ${eventData.model || 'runtime-selected model'}.`, { agentRole: eventData.role });
       agents.upsertAgent({
         id: eventData.agentInstanceId,
@@ -163,6 +173,7 @@ export function handleIncomingEvent(eventData: any): void {
     }
 
     case 'agent_progressed': {
+      if (isCancelledExecution()) break;
       append(eventData, eventData.progress || 'Agent progress updated.', { agentRole: eventData.role || 'agent' });
       const activeAgent = agents.agents.find((agent) => agent.id === eventData.agentInstanceId);
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
@@ -177,6 +188,7 @@ export function handleIncomingEvent(eventData: any): void {
     }
 
     case 'agent_waiting':
+      if (isCancelledExecution()) break;
       append(eventData, `Agent waiting: ${eventData.reason || 'Waiting for another agent or dependency.'}`, { agentRole: eventData.role || 'agent' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         status: 'waiting', statusMessage: eventData.reason, lastActivityAt: eventData.timestamp,
@@ -184,17 +196,29 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'agent_resumed':
+      if (isCancelledExecution()) break;
       append(eventData, `Agent resumed${eventData.reason ? `: ${eventData.reason}` : '.'}`, { agentRole: eventData.role || 'agent' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         status: 'running', statusMessage: eventData.reason || 'Resumed', lastActivityAt: eventData.timestamp,
       });
       break;
 
-    case 'agent_completed':
+    case 'agent_completed': {
+      if (isCancelledExecution()) break;
       append(eventData, eventData.summary || 'Agent completed its execution.', { agentRole: eventData.role || 'agent' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         status: 'completed', progress: 100, statusMessage: eventData.summary || 'Completed', completedAt: eventData.timestamp, lastActivityAt: eventData.timestamp,
       });
+      break;
+    }
+
+    case 'agent_cancelled':
+      append(eventData, `Agent cancelled: ${eventData.reason || 'Mission cancelled.'}`, { agentRole: eventData.role || 'agent' });
+      if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
+        status: 'cancelled', statusMessage: eventData.reason || 'Mission cancelled.', completedAt: eventData.timestamp, lastActivityAt: eventData.timestamp,
+      });
+      if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'cancelled' });
+      if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'cancelled');
       break;
 
     case 'agent_message_sent': {
@@ -229,11 +253,13 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'agent_thought':
+      if (isCancelledExecution()) break;
       append(eventData, eventData.thought || 'Agent is reasoning.', { agentRole: eventData.agentRole || 'agent' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, { lastActivityAt: eventData.timestamp });
       break;
 
     case 'text_delta': {
+      if (isCancelledExecution()) break;
       const sourceAgent = agents.agents.find((agent) => agent.id === eventData.agentInstanceId);
       append(eventData, eventData.content || '', { type: 'orchestrator_message', agentRole: sourceAgent?.role || eventData.agentRole || 'agent' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, { lastActivityAt: eventData.timestamp });
@@ -242,6 +268,7 @@ export function handleIncomingEvent(eventData: any): void {
 
     case 'agent_tool_call':
     case 'tool_call_started':
+      if (isCancelledExecution()) break;
       append(eventData, `Tool started: ${eventData.toolName || 'tool'}`, {
         agentRole: eventData.agentRole || 'agent', metadata: { toolName: eventData.toolName, args: eventData.args },
       });
@@ -251,6 +278,7 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'tool_call_completed':
+      if (isCancelledExecution()) break;
       append(eventData, `${eventData.toolName || 'Tool'} ${eventData.success ? 'completed' : 'failed'}.`, {
         agentRole: eventData.agentRole || 'agent', metadata: { result: eventData.result, success: eventData.success },
       });
@@ -261,6 +289,7 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'file_changed':
+      if (isCancelledExecution()) break;
       append(eventData, `${eventData.changeType || 'Modified'} ${eventData.path}`, { agentRole: eventData.agentRole || 'builder' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         statusMessage: `${eventData.changeType || 'Modified'} ${eventData.path}`, lastActivityAt: eventData.timestamp,
@@ -268,9 +297,29 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'approval_requested':
-      append(eventData, eventData.description || 'Approval required.', { agentRole: 'orchestrator' });
+      append(eventData, eventData.description || 'Approval required.', {
+        agentRole: 'orchestrator',
+        metadata: { approvalStatus: 'pending' },
+      });
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'waiting_for_approval');
       break;
+
+    case 'approval_responded': {
+      const decision = typeof eventData.approved === 'boolean'
+        ? (eventData.approved ? 'approved' : 'rejected')
+        : undefined;
+      append(
+        eventData,
+        decision
+          ? `Approval ${decision} by ${eventData.decidedBy || 'user'}.`
+          : 'Approval decision recorded.',
+        {
+          agentRole: 'orchestrator',
+          metadata: decision ? { approvalStatus: decision } : {},
+        },
+      );
+      break;
+    }
 
     case 'verification_started':
       append(eventData, 'Verification started.', { agentRole: 'reviewer' });
@@ -304,13 +353,23 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'task_completed':
+      if (isCancelledExecution()) break;
       append(eventData, `Task completed: ${eventData.taskId}`, { agentRole: eventData.agentRole || 'builder' });
       if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'done' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, { status: 'completed', progress: 100, lastActivityAt: eventData.timestamp });
       void missions.fetchMissionState(eventData.missionId);
       break;
 
-    case 'task_failed':
+    case 'task_failed': {
+      const current = eventData.agentInstanceId
+        ? agents.agents.find((agent) => agent.id === eventData.agentInstanceId)
+        : undefined;
+      const cancelledTask = eventData.taskId && missions.activeTasks.find((task) => task.id === eventData.taskId)?.status === 'cancelled';
+      const cancelledMission = missions.missions.find((mission) => mission.id === eventData.missionId)?.status === 'cancelled';
+      if (current?.status === 'cancelled' || cancelledTask || cancelledMission) {
+        if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'cancelled' });
+        break;
+      }
       append(eventData, `Execution failed: ${eventData.error || 'Unknown runtime error'}`, { agentRole: eventData.agentRole || 'builder' });
       if (eventData.taskId) missions.patchTask(eventData.taskId, { status: 'rejected' });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
@@ -318,22 +377,29 @@ export function handleIncomingEvent(eventData: any): void {
       });
       void missions.fetchMissionState(eventData.missionId);
       break;
+    }
 
     case 'agent_error':
       // stderr/runtime diagnostics can be emitted before a terminal task_failed.
       // Surface the evidence without turning a still-running task into a false failure.
+      if (isCancelledExecution()) break;
       append(eventData, `Runtime diagnostic: ${eventData.error || 'Unknown runtime diagnostic'}`, { agentRole: eventData.agentRole || 'agent' });
-      if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
-        statusMessage: eventData.error || 'Runtime diagnostic', lastActivityAt: eventData.timestamp,
-      });
+      if (eventData.agentInstanceId) {
+        const current = agents.agents.find((agent) => agent.id === eventData.agentInstanceId);
+        if (current?.status !== 'cancelled') agents.patchAgent(eventData.agentInstanceId, {
+          statusMessage: eventData.error || 'Runtime diagnostic', lastActivityAt: eventData.timestamp,
+        });
+      }
       break;
 
     case 'mission_completed':
+      if (isCancelledExecution()) break;
       append(eventData, eventData.summary || 'Mission completed.', { type: 'orchestrator_message', agentRole: 'orchestrator' });
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'completed');
       break;
 
     case 'mission_failed':
+      if (isCancelledExecution()) break;
       append(eventData, `Mission failed: ${eventData.reason || 'Unknown error'}`, { agentRole: 'orchestrator' });
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'failed');
       break;

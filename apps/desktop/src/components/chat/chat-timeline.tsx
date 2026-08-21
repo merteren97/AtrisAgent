@@ -1,12 +1,15 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Button } from '@/components/ui/button';
 import { MessageCard } from './message-card';
 import { EventCard } from './event-card';
 import { ActivityGroup } from './activity-group';
+import { ThinkingStrip } from './thinking-strip';
+import { ToolCallRow } from './tool-call-row';
 import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAgentStore } from '@/stores/agent-store';
-import { Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
+import { ArrowDown, Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
 
 const COMPACT_EVENT_TYPES = new Set([
   'task_created',
@@ -20,13 +23,22 @@ const COMPACT_EVENT_TYPES = new Set([
   'agent_context_compacted',
   'agent_message_read',
   'agent_tool_call',
+  'agent_error',
   'tool_call_started',
   'tool_call_completed',
 ]);
+const TOOL_CALL_EVENT_TYPES = new Set(['agent_tool_call', 'tool_call_started', 'tool_call_completed']);
+const BOTTOM_THRESHOLD = 32;
+
+function isNearBottom(viewport: HTMLElement): boolean {
+  return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= BOTTOM_THRESHOLD;
+}
 
 type RenderEntry =
   | { kind: 'item'; item: TimelineItem }
-  | { kind: 'activity'; items: TimelineItem[] };
+  | { kind: 'activity'; items: TimelineItem[] }
+  | { kind: 'tool'; item: TimelineItem }
+  | { kind: 'thinking'; item: TimelineItem };
 
 function metadataString(item: TimelineItem, key: string): string | undefined {
   const value = item.metadata?.[key];
@@ -64,11 +76,15 @@ function isDuplicateTerminalDiagnostic(items: TimelineItem[], index: number): bo
   ));
 }
 
-function prepareTimeline(items: TimelineItem[]): RenderEntry[] {
+export function prepareTimeline(items: TimelineItem[], showLiveThinking: boolean): RenderEntry[] {
   const conversationalItems = items.filter((_, index) => !isDuplicateTerminalDiagnostic(items, index));
   const coalesced: TimelineItem[] = [];
+  const latestThinking = [...conversationalItems]
+    .filter((item) => item.eventType === 'agent_thought' && item.content.trim())
+    .slice(-1)[0];
 
   for (const item of conversationalItems) {
+    if (item.eventType === 'agent_thought' && showLiveThinking) continue;
     const previous = coalesced[coalesced.length - 1];
     const canMerge = item.type === 'orchestrator_message'
       && previous?.type === 'orchestrator_message'
@@ -93,8 +109,7 @@ function prepareTimeline(items: TimelineItem[]): RenderEntry[] {
 
   const flush = () => {
     if (activity.length === 0) return;
-    if (activity.length === 1) result.push({ kind: 'item', item: activity[0] });
-    else result.push({ kind: 'activity', items: activity });
+    result.push({ kind: 'activity', items: activity });
     activity = [];
   };
 
@@ -106,12 +121,16 @@ function prepareTimeline(items: TimelineItem[]): RenderEntry[] {
       continue;
     }
 
-    const previousRole = activity[0]?.agentRole || 'agent';
-    const nextRole = item.agentRole || 'agent';
-    if (activity.length > 0 && previousRole !== nextRole) flush();
+    if (TOOL_CALL_EVENT_TYPES.has(item.eventType || '')) {
+      flush();
+      result.push({ kind: 'tool', item });
+      continue;
+    }
+
     activity.push(item);
   }
   flush();
+  if (showLiveThinking && latestThinking) result.push({ kind: 'thinking', item: latestThinking });
   return result;
 }
 
@@ -125,7 +144,9 @@ export function ChatTimeline() {
   const workspaces = useWorkspaceStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const agents = useAgentStore((state) => state.agents);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const shouldFollowRef = useRef(true);
+  const [isDetached, setIsDetached] = useState(false);
 
   const activeMission = missions.find((mission) => mission.id === activeMissionId);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
@@ -136,11 +157,40 @@ export function ChatTimeline() {
   );
   const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
   const completedTasks = activeTasks.filter((task) => task.status === 'completed' || task.status === 'done').length;
-  const renderTimeline = useMemo(() => prepareTimeline(timeline), [timeline]);
+  const liveMission = Boolean(activeMission && !['completed', 'failed', 'cancelled'].includes(activeMission.status));
+  const renderTimeline = useMemo(() => prepareTimeline(timeline, liveMission), [liveMission, timeline]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [timeline]);
+    shouldFollowRef.current = true;
+    setIsDetached(false);
+  }, [activeMissionId]);
+
+  const handleViewportScroll = (event: UIEvent<HTMLDivElement>) => {
+    const shouldFollow = isNearBottom(event.currentTarget);
+    shouldFollowRef.current = shouldFollow;
+    setIsDetached(!shouldFollow);
+  };
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    if (shouldFollowRef.current) {
+      viewport.scrollTop = viewport.scrollHeight;
+    } else if (isNearBottom(viewport)) {
+      shouldFollowRef.current = true;
+      setIsDetached(false);
+    }
+  }, [renderTimeline, timeline]);
+
+  const jumpToLatest = () => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    shouldFollowRef.current = true;
+    setIsDetached(false);
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'auto' });
+  };
 
   const handleSuggestion = (text: string) => setComposerInput(text);
 
@@ -237,32 +287,56 @@ export function ChatTimeline() {
   );
 
   return (
-    <ScrollArea className="min-h-0 flex-1">
-      <div className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
-        {timeline.length === 0 ? emptyState : renderTimeline.map((entry, index) => {
-          if (entry.kind === 'activity') {
-            return <ActivityGroup key={`activity-${entry.items[0]?.id || index}`} items={entry.items} />;
-          }
-          const item = entry.item;
-          if (item.type === 'user_message') {
-            return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} />;
-          }
-          if (item.type === 'orchestrator_message') {
-            return <MessageCard key={item.id} role="orchestrator" content={item.content} timestamp={item.timestamp} />;
-          }
-          return (
-            <EventCard
-              key={item.id}
-              eventType={item.eventType || 'event'}
-              content={item.content}
-              timestamp={item.timestamp}
-              agentRole={item.agentRole}
-              metadata={item.metadata}
-            />
-          );
-        })}
-        <div ref={bottomRef} />
-      </div>
-    </ScrollArea>
+    <div className="relative min-h-0 flex-1">
+      <ScrollArea
+        className="h-full"
+        viewportRef={viewportRef}
+        onViewportScroll={handleViewportScroll}
+      >
+        <div className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+          {timeline.length === 0 ? emptyState : renderTimeline.map((entry, index) => {
+            if (entry.kind === 'thinking') {
+              return <ThinkingStrip key={`thinking-${entry.item.id || index}`} item={entry.item} />;
+            }
+            if (entry.kind === 'activity') {
+              return <ActivityGroup key={`activity-${entry.items[0]?.id || index}`} items={entry.items} />;
+            }
+            if (entry.kind === 'tool') {
+              return <ToolCallRow key={entry.item.id} item={entry.item} />;
+            }
+            const item = entry.item;
+            if (item.type === 'user_message') {
+              return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} />;
+            }
+            if (item.type === 'orchestrator_message') {
+              return <MessageCard key={item.id} role="orchestrator" content={item.content} timestamp={item.timestamp} />;
+            }
+            return (
+              <EventCard
+                key={item.id}
+                eventType={item.eventType || 'event'}
+                content={item.content}
+                timestamp={item.timestamp}
+                agentRole={item.agentRole}
+                metadata={item.metadata}
+              />
+            );
+          })}
+        </div>
+      </ScrollArea>
+      {isDetached && (
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          className="absolute bottom-4 right-4 z-10 h-7 rounded-full border border-border/80 bg-card/95 px-2.5 text-[10px] shadow-md backdrop-blur-sm"
+          onClick={jumpToLatest}
+          aria-label="Jump to latest activity"
+        >
+          <ArrowDown className="h-3.5 w-3.5" />
+          <span>New activity</span>
+        </Button>
+      )}
+    </div>
   );
 }

@@ -51,6 +51,7 @@ const ACTIVE_MISSION_STATUSES = new Set([
 interface PendingWorkspaceRemoval {
   workspace: Workspace;
   memory: MemorySnapshot | null;
+  missionCount: number;
   activeMissionCount: number;
 }
 
@@ -83,12 +84,11 @@ export function ProjectsView() {
 
   const requestRemoval = async (workspace: Workspace) => {
     setLoadingRemovalInfo(workspace.id);
-    const activeMissionCount = missions.filter((mission) =>
-      mission.workspaceId === workspace.id && ACTIVE_MISSION_STATUSES.has(mission.status),
-    ).length;
+    const workspaceMissions = missions.filter((mission) => mission.workspaceId === workspace.id);
+    const activeMissionCount = workspaceMissions.filter((mission) => ACTIVE_MISSION_STATUSES.has(mission.status)).length;
     const memory = await loadWorkspaceMemory(workspace.id);
     setLoadingRemovalInfo(null);
-    setPendingRemoval({ workspace, memory, activeMissionCount });
+    setPendingRemoval({ workspace, memory, missionCount: workspaceMissions.length, activeMissionCount });
   };
 
   const finishWorkspaceStateRemoval = (workspaceId: string) => {
@@ -102,6 +102,7 @@ export function ProjectsView() {
     setRemoving(true);
     const removed = await removeWorkspace(pending.workspace.id);
     if (removed) {
+      await fetchMissions();
       await fetchMemoryProjects();
       finishWorkspaceStateRemoval(pending.workspace.id);
       flash(pending.memory
@@ -125,6 +126,7 @@ export function ProjectsView() {
       return;
     }
 
+    await fetchMissions();
     let memoryDeleted = true;
     if (projectId) memoryDeleted = await deleteProjectMemory(projectId);
     finishWorkspaceStateRemoval(pending.workspace.id);
@@ -257,8 +259,11 @@ export function ProjectsView() {
                       onClick={() => void requestRemoval(selectedWorkspace)}
                       disabled={loadingRemovalInfo === selectedWorkspace.id}
                       className="gap-1.5"
+                      title={`Delete workspace ${selectedWorkspace.name}`}
+                      aria-label={`Delete workspace ${selectedWorkspace.name}`}
                     >
                       {loadingRemovalInfo === selectedWorkspace.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      <span className="hidden sm:inline">Delete workspace</span>
                     </Button>
                   </div>
                 </div>
@@ -297,16 +302,20 @@ export function ProjectsView() {
             <div className="mb-1 flex h-10 w-10 items-center justify-center rounded-xl border border-destructive/20 bg-destructive/10 text-destructive"><Trash2 className="h-4 w-4" /></div>
             <DialogTitle>Remove project workspace?</DialogTitle>
             <DialogDescription className="leading-relaxed">
-              The local workspace can be removed without throwing away AtrisAgent's accumulated project knowledge. Keeping memory is the recommended option and allows the same repository/folder to continue from its previous memory later.
+              This removes the workspace and all conversations stored inside it, including their timelines, tasks, events, and managed worktrees. Keeping memory is the recommended option and allows the same repository/folder to continue from its previous memory later.
             </DialogDescription>
           </DialogHeader>
 
           {pendingRemoval ? (
             <div className="space-y-3">
-              <div className="rounded-lg border border-border bg-muted/25 p-3">
-                <div className="text-sm font-semibold">{pendingRemoval.workspace.name}</div>
-                <div className="mt-1 break-all font-mono text-[10px] text-muted-foreground">{pendingRemoval.workspace.path}</div>
-              </div>
+               <div className="rounded-lg border border-border bg-muted/25 p-3">
+                 <div className="text-sm font-semibold">{pendingRemoval.workspace.name}</div>
+                 <div className="mt-1 break-all font-mono text-[10px] text-muted-foreground">{pendingRemoval.workspace.path}</div>
+                 <div className="mt-2 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                   <ListTodo className="h-3 w-3 text-primary" />
+                   {pendingRemoval.missionCount} conversation{pendingRemoval.missionCount === 1 ? '' : 's'} will be deleted
+                 </div>
+               </div>
 
               {pendingRemoval.activeMissionCount > 0 ? (
                 <div className="flex gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 p-3 text-xs text-amber-300">

@@ -571,6 +571,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       child.stderr?.destroy();
 
       if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
+      this.clearSessionCancellation(sessionId);
       this.publishedTerminalSessions.delete(sessionId);
     };
 
@@ -603,7 +604,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
 
   private handleStreamLine(sessionId: string, line: string): void {
     const context = this.sessionContext.get(sessionId);
-    if (!context || !line.trim()) return;
+    if (!context || this.isSessionCancelled(sessionId) || !line.trim()) return;
     const parsed = parseAntigravityStreamLine(line);
     const timestamp = new Date().toISOString();
 
@@ -643,7 +644,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       if (/thought|reason|plan/.test(stepType) && parsed.content) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: parsed.content, timestamp });
       } else if (/tool|command|shell|subagent/.test(stepType)) {
-        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_tool_call', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, toolName: parsed.toolName || parsed.stepType, args: parsed.args || {}, timestamp });
+        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_tool_call', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, toolName: parsed.toolName || parsed.stepType, args: parsed.args || {}, ...antigravityCorrelationFields(parsed.raw), timestamp });
       } else if (parsed.content) {
         this.lastOutputBySession.set(sessionId, parsed.content);
         this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: parsed.content, timestamp });
@@ -716,7 +717,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     code: number | null,
     signal: NodeJS.Signals | null = null,
   ): void {
-    if (this.terminalSessions.has(sessionId)) return;
+    if (this.terminalSessions.has(sessionId) || this.isSessionCancelled(sessionId)) return;
 
     const stderr = this.stderrBuffers.get(sessionId)?.trim();
     const detail = stderr ? `\n${stderr}` : '';
@@ -741,7 +742,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     outcome: PendingTerminalOutcome,
     requestShutdown = true,
   ): void {
-    if (this.terminalSessions.has(sessionId)) return;
+    if (this.terminalSessions.has(sessionId) || this.isSessionCancelled(sessionId)) return;
     this.clearSoftTerminalCandidate(sessionId);
     this.terminalSessions.add(sessionId);
     this.pendingTerminalBySession.set(sessionId, outcome);
@@ -789,7 +790,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     context: { missionId: string; taskId: string },
     outcome: PendingTerminalOutcome,
   ): void {
-    if (this.publishedTerminalSessions.has(sessionId)) return;
+    if (this.publishedTerminalSessions.has(sessionId) || this.isSessionCancelled(sessionId)) return;
     this.publishedTerminalSessions.add(sessionId);
     const timestamp = new Date().toISOString();
     if (outcome.kind === 'completed') {
@@ -816,4 +817,57 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       timestamp,
     });
   }
+}
+
+function identifierValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+function recordValue(value: unknown): Record<string, any> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
+}
+
+function antigravityCorrelationFields(
+  raw: Record<string, any>,
+): { toolCallId?: string; runId?: string; attemptId?: string } {
+  const stepUpdate = recordValue(raw.step_update);
+  const step = Object.keys(stepUpdate).length ? stepUpdate : raw;
+  const nestedStep = recordValue(step.step);
+  const toolCallId = identifierValue(
+    raw.step_id,
+    raw.stepId,
+    step.step_id,
+    step.stepId,
+    step.id,
+    nestedStep.step_id,
+    nestedStep.stepId,
+    nestedStep.id,
+    step.step_index,
+    nestedStep.step_index,
+  );
+  const runId = identifierValue(
+    raw.run_id,
+    raw.runId,
+    step.run_id,
+    step.runId,
+    nestedStep.run_id,
+    nestedStep.runId,
+  );
+  const attemptId = identifierValue(
+    raw.attempt_id,
+    raw.attemptId,
+    step.attempt_id,
+    step.attemptId,
+    nestedStep.attempt_id,
+    nestedStep.attemptId,
+  );
+  return {
+    ...(toolCallId ? { toolCallId } : {}),
+    ...(runId ? { runId } : {}),
+    ...(attemptId ? { attemptId } : {}),
+  };
 }

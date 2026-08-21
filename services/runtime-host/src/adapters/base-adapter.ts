@@ -50,6 +50,7 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
   protected activeSessions: Map<string, AgentSession> = new Map();
   protected stdoutBuffers: Map<string, string> = new Map();
   protected stderrBuffers: Map<string, string> = new Map();
+  private cancelledSessions = new Set<string>();
 
   constructor(eventBus?: LocalEventBus) {
     this.eventBus = eventBus;
@@ -76,6 +77,18 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
 
   protected unregisterProcess(sessionId: string): void {
     this.activeProcesses.delete(sessionId);
+  }
+
+  protected markSessionCancelled(sessionId: string): void {
+    this.cancelledSessions.add(sessionId);
+  }
+
+  protected isSessionCancelled(sessionId: string): boolean {
+    return this.cancelledSessions.has(sessionId);
+  }
+
+  protected clearSessionCancellation(sessionId: string): void {
+    this.cancelledSessions.delete(sessionId);
   }
 
   // 1. Installation Discovery
@@ -132,11 +145,13 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
 
   // 10. Cancellation & Shutdown
   async cancel(sessionId: string): Promise<void> {
+    this.markSessionCancelled(sessionId);
     const process = this.activeProcesses.get(sessionId);
     if (process && !process.killed) {
-      process.kill('SIGTERM');
+      try { process.kill('SIGTERM'); } catch { /* the process may have exited between lookup and kill */ }
       this.activeProcesses.delete(sessionId);
     }
+    this.activeSessions.delete(sessionId);
   }
 
   async cancelRun(runId: string): Promise<void> {
@@ -145,8 +160,9 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
 
   async shutdown(): Promise<void> {
     for (const [sessionId, child] of this.activeProcesses.entries()) {
+      this.markSessionCancelled(sessionId);
       if (!child.killed) {
-        child.kill('SIGKILL');
+        try { child.kill('SIGKILL'); } catch { /* process already exited */ }
       }
     }
     this.activeProcesses.clear();

@@ -64,6 +64,8 @@ export class CodexAdapter extends BaseRuntimeAdapter {
 
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
+  private terminalSessions = new Set<string>();
+  private fallbackToolEventSequence = new Map<string, number>();
 
   constructor(eventBus?: LocalEventBus) {
     super(eventBus);
@@ -370,24 +372,34 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     };
     this.activeSessions.set(sessionId, session);
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
+    this.fallbackToolEventSequence.set(sessionId, 0);
 
+    let child: ChildProcess;
+    try {
+      child = spawnHidden('codex', args, {
+        cwd,
+        env: {
+          ...process.env,
+          ...this.env(options.profileId),
+          ...options.env,
+          ...controlPlaneEnv(controlPlane),
+        },
+        // `codex exec` receives the prompt as an argument. Keeping stdin open
+        // makes some CLI versions wait for an additional prompt indefinitely.
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      this.activeSessions.delete(sessionId);
+      this.sessionContext.delete(sessionId);
+      revokeControlPlaneAgent(sessionId);
+      throw error;
+    }
+    this.registerProcess(sessionId, child);
     this.emitEvent({
       id: crypto.randomUUID(), type: 'agent_started', missionId: options.missionId,
       agentInstanceId: sessionId, role: String(options.role || 'builder'),
       model: model || 'Codex default', timestamp: new Date().toISOString(),
     });
-
-    const child = spawnHidden('codex', args, {
-      cwd,
-      env: {
-        ...process.env,
-        ...this.env(options.profileId),
-        ...options.env,
-        ...controlPlaneEnv(controlPlane),
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    this.registerProcess(sessionId, child);
 
     let buffer = '';
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -397,6 +409,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       for (const line of lines) this.handleJsonLine(sessionId, line);
     });
     child.stderr?.on('data', (chunk: Buffer) => {
+      if (this.isSessionCancelled(sessionId)) return;
       const error = redactSecrets(chunk.toString('utf8'));
       if (error.trim()) this.emitEvent({
         id: crypto.randomUUID(), type: 'agent_error', missionId: options.missionId,
@@ -405,21 +418,31 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       });
     });
     child.on('error', (error) => this.emitFailure(sessionId, error.message));
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (buffer.trim()) this.handleJsonLine(sessionId, buffer);
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
       revokeControlPlaneAgent(sessionId);
-      if (code !== 0) this.emitFailure(sessionId, `Codex exited with code ${code}` , code);
+      if (!this.isSessionCancelled(sessionId) && !this.terminalSessions.has(sessionId)) {
+        if (code === 0) this.emitCompleted(sessionId, 'Codex process completed.');
+        else this.emitFailure(
+          sessionId,
+          signal ? `Codex terminated by signal ${signal}` : `Codex exited with code ${code}`,
+          code,
+        );
+      }
       this.sessionContext.delete(sessionId);
+      this.terminalSessions.delete(sessionId);
+      this.fallbackToolEventSequence.delete(sessionId);
+      this.clearSessionCancellation(sessionId);
     });
     return session;
   }
 
   private handleJsonLine(sessionId: string, line: string): void {
     const context = this.sessionContext.get(sessionId);
-    if (!context || !line.trim()) return;
+    if (!context || this.isSessionCancelled(sessionId) || !line.trim()) return;
     let event: any;
     try { event = JSON.parse(line); } catch { return; }
     const timestamp = new Date().toISOString();
@@ -436,14 +459,22 @@ export class CodexAdapter extends BaseRuntimeAdapter {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: item.text || item.summary, timestamp });
       } else if (item.type === 'command_execution') {
         if (event.type === 'item.started') {
-          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: 'shell', args: { command: item.command }, timestamp });
+          const correlation = codexCorrelationFields(event, item, this.toolCallIdForEvent(sessionId, event, item));
+          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: 'shell', args: { command: item.command }, ...correlation, timestamp });
         } else if (event.type === 'item.completed') {
-          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: 'shell', result: redactSecrets(item.aggregated_output || ''), success: item.exit_code === 0, timestamp });
+          const correlation = codexCorrelationFields(event, item, this.toolCallIdForEvent(sessionId, event, item));
+          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: 'shell', result: redactSecrets(item.aggregated_output || ''), success: item.exit_code === 0, ...correlation, timestamp });
         }
       } else if (item.type === 'mcp_tool_call') {
         const name = item.tool || item.name || 'mcp_tool';
-        if (event.type === 'item.started') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: name, args: item.arguments || {}, timestamp });
-        if (event.type === 'item.completed') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: name, result: redactSecrets(JSON.stringify(item.result || '')), success: !item.error, timestamp });
+        if (event.type === 'item.started') {
+          const correlation = codexCorrelationFields(event, item, this.toolCallIdForEvent(sessionId, event, item));
+          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: name, args: item.arguments || {}, ...correlation, timestamp });
+        }
+        if (event.type === 'item.completed') {
+          const correlation = codexCorrelationFields(event, item, this.toolCallIdForEvent(sessionId, event, item));
+          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: name, result: redactSecrets(JSON.stringify(item.result || '')), success: !item.error, ...correlation, timestamp });
+        }
       } else if (item.type === 'file_change') {
         for (const change of item.changes || []) {
           this.emitEvent({ id: crypto.randomUUID(), type: 'file_changed', missionId: context.missionId, taskId: context.taskId, path: change.path || 'unknown', changeType: change.kind || 'modified', additions: change.additions || 0, deletions: change.deletions || 0, timestamp });
@@ -452,15 +483,84 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (event.type === 'turn.completed') {
-      this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: 'Codex turn completed', timestamp });
+      this.emitCompleted(sessionId, 'Codex turn completed');
     } else if (event.type === 'turn.failed' || event.type === 'error') {
       this.emitFailure(sessionId, event.error?.message || event.message || 'Codex turn failed');
     }
   }
 
-  private emitFailure(sessionId: string, error: string, exitCode?: number | null): void {
+  private toolCallIdForEvent(sessionId: string, event: any, item: any): string {
+    const providerId = identifierValue(
+      item.id,
+      item.call_id,
+      item.callId,
+      item.tool_call_id,
+      item.toolCallId,
+      item.provider_id,
+      item.providerId,
+      event.item_id,
+      event.itemId,
+      event.provider_id,
+      event.providerId,
+    );
+    if (providerId) return providerId;
+
+    // Without a provider item ID, keep the fallback event-scoped. Reusing it
+    // for a later completion would assert a pairing the provider did not give us.
+    const sequence = (this.fallbackToolEventSequence.get(sessionId) || 0) + 1;
+    this.fallbackToolEventSequence.set(sessionId, sequence);
+    return `codex:${sessionId}:${item.type}:${event.type}:${sequence}`;
+  }
+
+  private emitCompleted(sessionId: string, result: string): void {
+    if (this.isSessionCancelled(sessionId) || this.terminalSessions.has(sessionId)) return;
     const context = this.sessionContext.get(sessionId);
     if (!context) return;
+    this.terminalSessions.add(sessionId);
+    this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result, timestamp: new Date().toISOString() });
+  }
+
+  private emitFailure(sessionId: string, error: string, exitCode?: number | null): void {
+    if (this.isSessionCancelled(sessionId) || this.terminalSessions.has(sessionId)) return;
+    const context = this.sessionContext.get(sessionId);
+    if (!context) return;
+    this.terminalSessions.add(sessionId);
     this.emitEvent({ id: crypto.randomUUID(), type: 'task_failed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, error: redactSecrets(error), exitCode, timestamp: new Date().toISOString() });
   }
+}
+
+function identifierValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+function codexCorrelationFields(
+  event: Record<string, any>,
+  item: Record<string, any>,
+  toolCallId: string,
+): { toolCallId: string; runId?: string; attemptId?: string } {
+  const runId = identifierValue(
+    event.run_id,
+    event.runId,
+    event.turn_id,
+    event.turnId,
+    item.run_id,
+    item.runId,
+    item.turn_id,
+    item.turnId,
+  );
+  const attemptId = identifierValue(
+    event.attempt_id,
+    event.attemptId,
+    item.attempt_id,
+    item.attemptId,
+  );
+  return {
+    toolCallId,
+    ...(runId ? { runId } : {}),
+    ...(attemptId ? { attemptId } : {}),
+  };
 }

@@ -57,7 +57,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   override setMissionRoutingPreference(missionId: string, preference: MissionRoutingPreference): void {
     super.setMissionRoutingPreference(missionId, preference);
     const scope = preference.scopeRole || preference.targetRole;
-    if (!scope || scope === 'orchestrator') {
+    if (!scope || scope === 'orchestrator' || scope === 'mission') {
       // Keep the conversation's Orchestrator route durable across terminal turns.
       // The legacy runtime clears per-run routing on mission completion, but a
       // conversation-level supervisor should stay on the user's selected model.
@@ -65,10 +65,11 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     }
   }
 
-  override clearMissionRoutingPreference(missionId: string): void {
+  override clearMissionRoutingPreference(missionId: string, preserveSupervisor = true): void {
     // Clear the legacy per-run worker override while intentionally preserving the
     // supervisor route for the next turn in the same conversation.
     super.clearMissionRoutingPreference(missionId);
+    if (!preserveSupervisor) this.supervisorRouting.delete(missionId);
   }
 
   override async stopAll(): Promise<void> {

@@ -445,6 +445,57 @@ function normalizeFallbackCatalogIds(value: unknown, primaryCatalogId?: string):
   ));
 }
 
+const ACTIVE_MISSION_STATUSES = new Set([
+  'planning',
+  'ready',
+  'running',
+  'waiting_for_approval',
+  'applying',
+  'reviewing',
+  'verifying',
+  'revising',
+]);
+
+async function cleanupMissionResources(missionId: string): Promise<void> {
+  await runtimeHost.stopMission(missionId).catch(() => undefined);
+  const missionTasks = await workspaceManager.listTasks(missionId);
+  for (const task of missionTasks) {
+    if (task.worktreeId) await workspaceManager.removeWorktreeForTask(task.id);
+  }
+  await workspaceManager.deleteRoleExecutionPolicies('mission', missionId);
+  runtimeHost.clearMissionRoutingPreference(missionId, false);
+}
+
+function configureMissionRouting(missionId: string, body: Record<string, any>): void {
+  const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId ? body.modelCatalogId : undefined;
+  const accountProfileId = typeof body.accountProfileId === 'string' && body.accountProfileId ? body.accountProfileId : undefined;
+  const targetRole = typeof body.targetRole === 'string' ? body.targetRole.toLowerCase() : undefined;
+  const routeRole = typeof body.routeRole === 'string' ? body.routeRole.toLowerCase() : targetRole;
+  const routeScope = body.routeScope === 'mission'
+    ? 'mission'
+    : body.routeScope === 'role'
+      ? routeRole
+      : modelCatalogId
+        ? 'mission'
+        : routeRole;
+  const validSelectionModes = new Set(['auto', 'prefer', 'fixed']);
+  const selectionMode = validSelectionModes.has(String(body.routeSelectionMode))
+    ? String(body.routeSelectionMode)
+    : modelCatalogId ? 'fixed' : 'prefer';
+  const fallbackCatalogIds = normalizeFallbackCatalogIds(body.fallbackCatalogIds, modelCatalogId);
+
+  if (!modelCatalogId && !accountProfileId && !body.reasoningLevel && fallbackCatalogIds.length === 0) return;
+  runtimeHost.setMissionRoutingPreference(missionId, {
+    modelCatalogId,
+    accountProfileId,
+    reasoningLevel: typeof body.reasoningLevel === 'string' ? body.reasoningLevel.toLowerCase() as any : undefined,
+    fallbackCatalogIds,
+    selectionMode: selectionMode as any,
+    scopeRole: routeScope as any,
+    targetRole: targetRole as any,
+  });
+}
+
 // 4. REST API Routes
 app.get('/health', async (_req: Request, res: Response) => {
   const accounts = await runtimeHost.discoverAccounts();
@@ -489,13 +540,23 @@ app.get('/api/workspaces/:id', async (req: Request, res: Response) => {
 
 app.delete('/api/workspaces/:id', async (req: Request, res: Response) => {
   try {
-    const workspace = await workspaceManager.getWorkspace(req.params.id);
+    const workspaceId = routeParam(req.params.id);
+    const workspace = await workspaceManager.getWorkspace(workspaceId);
     if (!workspace) return void res.status(404).json({ error: 'Workspace not found' });
-    db.delete((schema as any).executionPolicies).where(and(
-      eq((schema as any).executionPolicies.scopeType, 'workspace'),
-      eq((schema as any).executionPolicies.scopeId, req.params.id),
-    )).run();
-    db.delete((schema as any).workspaces).where(eq((schema as any).workspaces.id, req.params.id)).run();
+
+    const workspaceMissions = await workspaceManager.listMissions(workspaceId);
+    const activeMissions = workspaceMissions.filter((mission) => ACTIVE_MISSION_STATUSES.has(String(mission.status)));
+    if (activeMissions.length > 0) {
+      return void res.status(409).json({
+        error: `Stop or finish ${activeMissions.length === 1 ? 'the active conversation' : 'all active conversations'} before deleting this workspace.`,
+      });
+    }
+
+    // Remove runtime-owned resources before the workspace cascade removes the
+    // mission rows that are needed to locate them.
+    for (const mission of workspaceMissions) await cleanupMissionResources(mission.id);
+    await workspaceManager.deleteRoleExecutionPolicies('workspace', workspaceId);
+    db.delete((schema as any).workspaces).where(eq((schema as any).workspaces.id, workspaceId)).run();
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to remove workspace' });
@@ -540,18 +601,8 @@ app.delete('/api/missions/:id', async (req: Request, res: Response) => {
       return void res.status(409).json({ error: 'Stop or finish this conversation before deleting it.' });
     }
 
-    await runtimeHost.stopMission(missionId).catch(() => undefined);
-    const missionTasks = await workspaceManager.listTasks(missionId);
-    for (const task of missionTasks) {
-      if (task.worktreeId) await workspaceManager.removeWorktreeForTask(task.id);
-    }
-
-    db.delete((schema as any).executionPolicies).where(and(
-      eq((schema as any).executionPolicies.scopeType, 'mission'),
-      eq((schema as any).executionPolicies.scopeId, missionId),
-    )).run();
+    await cleanupMissionResources(missionId);
     db.delete((schema as any).missions).where(eq((schema as any).missions.id, missionId)).run();
-    runtimeHost.clearMissionRoutingPreference(missionId);
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to delete conversation' });
@@ -563,7 +614,13 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     const missionId = routeParam(req.params.id);
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
-    res.json(await orchestrator.startMission(missionId, userRequest));
+    configureMissionRouting(missionId, req.body || {});
+    res.json(await orchestrator.startMission(missionId, userRequest, {
+      modelCatalogId: req.body?.modelCatalogId,
+      reasoningLevel: req.body?.reasoningLevel,
+      targetRole: req.body?.targetRole,
+      command: req.body?.command,
+    }));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to start mission' });
   }
@@ -609,28 +666,16 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       teamTemplateId: teamTemplate || 'default-core-dev-team',
     });
 
-    const validSelectionModes = new Set(['auto', 'prefer', 'fixed']);
-    const normalizedModel = typeof modelCatalogId === 'string' && modelCatalogId ? modelCatalogId : undefined;
-    const normalizedAccount = typeof accountProfileId === 'string' && accountProfileId ? accountProfileId : undefined;
-    const normalizedTargetRole = typeof targetRole === 'string' ? targetRole.toLowerCase() as any : undefined;
-    const normalizedRouteRole = typeof routeRole === 'string'
-      ? routeRole.toLowerCase() as any
-      : normalizedTargetRole;
-    const normalizedSelectionMode = validSelectionModes.has(String(routeSelectionMode))
-      ? String(routeSelectionMode) as any
-      : normalizedModel ? 'fixed' : 'prefer';
-
-    if (normalizedModel || normalizedAccount || reasoningLevel || (Array.isArray(fallbackCatalogIds) && fallbackCatalogIds.length)) {
-      runtimeHost.setMissionRoutingPreference(missionId, {
-        modelCatalogId: normalizedModel,
-        accountProfileId: normalizedAccount,
-        reasoningLevel: typeof reasoningLevel === 'string' ? reasoningLevel.toLowerCase() as any : undefined,
-        fallbackCatalogIds: Array.isArray(fallbackCatalogIds) ? fallbackCatalogIds.map(String).filter(Boolean) : [],
-        selectionMode: normalizedSelectionMode,
-        scopeRole: normalizedRouteRole,
-        targetRole: normalizedTargetRole,
-      });
-    }
+    configureMissionRouting(missionId, {
+      modelCatalogId,
+      accountProfileId,
+      reasoningLevel,
+      fallbackCatalogIds,
+      routeSelectionMode,
+      routeRole,
+      routeScope: req.body?.routeScope,
+      targetRole,
+    });
 
     const result = await orchestrator.startMission(missionId, promptText, {
       modelCatalogId,
@@ -1032,9 +1077,10 @@ app.post('/api/missions/:id/cancel', async (req, res) => {
   try {
     const mission = await workspaceManager.getMission(req.params.id);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
-    await runtimeHost.stopMission(req.params.id);
     const updated = await workspaceManager.updateMission(req.params.id, { status: 'cancelled' });
-    runtimeHost.clearMissionRoutingPreference(req.params.id);
+    await runtimeHost.stopMission(req.params.id).catch(() => undefined);
+    await workspaceManager.cancelMissionTasks(req.params.id);
+    runtimeHost.clearMissionRoutingPreference(req.params.id, false);
     res.json(updated);
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to cancel mission' });

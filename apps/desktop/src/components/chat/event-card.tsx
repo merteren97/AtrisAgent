@@ -22,6 +22,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { apiRequest } from '@/lib/api-client';
 import { cn } from '@/lib/utils';
+import { approvalDecisionFor, type ApprovalDecision } from '@/stores/mission-store';
 
 interface EventCardProps {
   eventType: string;
@@ -113,10 +114,22 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
     );
   }
 
-  if (eventType === 'approval_requested' || asString(metadata.approvalId)) {
+  if (eventType === 'approval_requested' || eventType === 'approval_responded' || asString(metadata.approvalId)) {
     const approvalId = asString(metadata.approvalId);
     const approvalType = asString(metadata.approvalType) || 'policy';
     const normalizedType = approvalType.replace(/_/g, ' ');
+    const isApprovalResponse = eventType === 'approval_responded';
+    const persistedDecision = approvalDecisionFor(eventType, metadata);
+    const effectiveDecision: ApprovalDecision | null = persistedDecision || decision;
+    const lifecycleStatus = asString(metadata.approvalStatus) || asString(metadata.status);
+    const isPendingApproval = !isApprovalResponse
+      && !effectiveDecision
+      && (!lifecycleStatus || lifecycleStatus === 'pending');
+    const isPlanApproval = approvalType === 'plan' || approvalType === 'plan_approval';
+    const decisionLabel = effectiveDecision === 'approved' ? 'Approved' : 'Rejected';
+    const title = effectiveDecision
+      ? `${isPlanApproval ? 'Execution plan' : normalizedType} ${effectiveDecision}`
+      : isPlanApproval ? 'Execution plan approval required' : `${normalizedType} approval required`;
 
     const handleDecision = async (nextDecision: 'approved' | 'rejected') => {
       if (!approvalId) {
@@ -143,28 +156,28 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
         <CardHeader
           icon={approvalIcon(approvalType)}
           iconClass="bg-amber-500/20"
-          title={approvalType === 'plan_approval' ? 'Execution plan approval required' : `${normalizedType} approval required`}
+          title={title}
           timestamp={timestamp}
         />
         <p className="text-sm leading-relaxed text-foreground/80">
           {content || asString(metadata.description) || 'The runtime requested permission for a restricted operation.'}
         </p>
-        {submitError && (
+        {submitError && !effectiveDecision && (
           <div className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">
             {submitError}
           </div>
         )}
         <div className="flex items-center gap-2">
-          {decision ? (
+          {effectiveDecision ? (
             <Badge
               variant="outline"
-              className={decision === 'approved'
+              className={effectiveDecision === 'approved'
                 ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-400'
                 : 'border-destructive/30 bg-destructive/5 text-destructive'}
             >
-              {decision === 'approved' ? 'Approved' : 'Rejected'}
+              {decisionLabel}
             </Badge>
-          ) : (
+          ) : isPendingApproval ? (
             <>
               <Button size="sm" disabled={isSubmitting || !approvalId} onClick={() => void handleDecision('approved')}>
                 <Check className="mr-1.5 h-4 w-4" /> Approve
@@ -173,6 +186,8 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
                 <X className="mr-1.5 h-4 w-4" /> Reject
               </Button>
             </>
+          ) : (
+            <Badge variant="outline">{isApprovalResponse ? 'Decision recorded' : 'Approval unavailable'}</Badge>
           )}
         </div>
       </Card>

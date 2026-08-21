@@ -36,7 +36,7 @@ export interface MissionRoutingPreference {
   fallbackCatalogIds?: string[];
   selectionMode?: RouteSelectionMode;
   /** Role whose route is overridden without changing the mission DAG. */
-  scopeRole?: AgentRole;
+  scopeRole?: AgentRole | 'mission';
   /** Backward-compatible direct-agent role used by older callers. */
   targetRole?: AgentRole;
 }
@@ -101,7 +101,7 @@ export class RuntimeHost {
     this.missionRouting.set(missionId, preference);
   }
 
-  clearMissionRoutingPreference(missionId: string): void {
+  clearMissionRoutingPreference(missionId: string, _preserveSupervisor = true): void {
     this.missionRouting.delete(missionId);
   }
 
@@ -337,7 +337,8 @@ export class RuntimeHost {
     // Older clients did not send a route scope. Treat an unscoped manual model
     // selection as an Orchestrator override rather than leaking one model across
     // Builder/Reviewer/QA roles.
-    const explicitAppliesToRole = explicitRole ? explicitRole === role : role === 'orchestrator';
+    const explicitAppliesToRole = explicitRole === 'mission'
+      || (explicitRole ? explicitRole === role : role === 'orchestrator');
     const hasExplicitPreference = explicitAppliesToRole && Boolean(
       missionPreference?.modelCatalogId
       || missionPreference?.accountProfileId
@@ -593,7 +594,21 @@ export class RuntimeHost {
     const sessionIds = [...this.activeSessions.entries()]
       .filter(([, active]) => active.missionId === missionId)
       .map(([sessionId]) => sessionId);
-    for (const sessionId of sessionIds) await this.stopSession(sessionId);
+    for (const sessionId of sessionIds) {
+      const active = this.activeSessions.get(sessionId);
+      if (active && this.eventBus) {
+        this.eventBus.emit({
+          id: crypto.randomUUID(),
+          type: 'agent_cancelled',
+          missionId,
+          taskId: active.taskId || null,
+          agentInstanceId: active.session.agentInstanceId || sessionId,
+          reason: 'Mission cancelled by the user.',
+          timestamp: new Date().toISOString(),
+        });
+      }
+      await this.stopSession(sessionId);
+    }
     this.clearMissionRoutingPreference(missionId);
   }
 

@@ -60,6 +60,8 @@ export interface StartMissionOptions {
   targetRole?: string;
   /** Route override scope without changing which role the mission DAG starts with. */
   routeRole?: string;
+  /** A selected mission route applies to every compatible child role by default. */
+  routeScope?: 'mission' | 'role';
   command?: string;
 }
 
@@ -104,6 +106,7 @@ interface MissionState {
 }
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+const AUTO_DRAIN_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed']);
 const drainingQueuedMissions = new Set<string>();
 
 function toExecutionMode(options?: StartMissionOptions): string {
@@ -135,6 +138,7 @@ function eventLabel(event: Record<string, any>): string {
     case 'agent_waiting': return `Agent waiting: ${event.reason || 'Waiting for a dependency.'}`;
     case 'agent_resumed': return `Agent resumed${event.reason ? `: ${event.reason}` : '.'}`;
     case 'agent_completed': return event.summary || 'Agent completed its execution.';
+    case 'agent_cancelled': return `Agent cancelled: ${event.reason || 'Mission cancelled.'}`;
     case 'agent_message_sent': return `${String(event.fromAgentId || 'agent').slice(0, 8)} → ${String(event.toAgentId || 'agent').slice(0, 8)}: ${event.content || ''}`;
     case 'agent_message_read': return `Agent message read by ${String(event.agentInstanceId || 'agent').slice(0, 8)}.`;
     case 'agent_context_attached': return `Context attached: ${event.label || event.sourceType || 'context'}`;
@@ -145,7 +149,9 @@ function eventLabel(event: Record<string, any>): string {
     case 'tool_call_completed': return `${event.toolName || 'Tool'} ${event.success ? 'completed' : 'failed'}.`;
     case 'file_changed': return `${event.changeType || 'Modified'} ${event.path}`;
     case 'approval_requested': return event.description || 'Approval required.';
-    case 'approval_responded': return `Approval ${event.approved ? 'approved' : 'rejected'} by ${event.decidedBy || 'user'}.`;
+    case 'approval_responded': return typeof event.approved === 'boolean'
+      ? `Approval ${event.approved ? 'approved' : 'rejected'} by ${event.decidedBy || 'user'}.`
+      : 'Approval decision recorded.';
     case 'verification_started': return 'Verification started.';
     case 'verification_finding': return `${String(event.severity || 'finding').toUpperCase()}: ${event.title || event.description || ''}`;
     case 'verification_completed': return `${event.passed ? 'Verification passed' : 'Verification found issues'} — ${event.summary || `${event.findingCount || 0} findings`}`;
@@ -182,6 +188,130 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
   };
 }
 
+export type ApprovalDecision = 'approved' | 'rejected';
+
+function metadataString(metadata: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = metadata?.[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return value === 'approved' || value === 'rejected';
+}
+
+export function approvalDecisionFor(
+  eventType: string | undefined,
+  metadata?: Record<string, unknown>,
+): ApprovalDecision | null {
+  const lifecycleStatus = metadata?.approvalStatus;
+  if (isApprovalDecision(lifecycleStatus)) return lifecycleStatus;
+
+  const persistedStatus = metadata?.status;
+  if (isApprovalDecision(persistedStatus)) return persistedStatus;
+
+  const decision = metadata?.decision;
+  if (isApprovalDecision(decision)) return decision;
+
+  if ((eventType === 'approval_requested' || eventType === 'approval_responded') && typeof metadata?.approved === 'boolean') {
+    return metadata.approved ? 'approved' : 'rejected';
+  }
+
+  return null;
+}
+
+interface ApprovalResolution {
+  decision: ApprovalDecision;
+  decidedBy?: string;
+  decidedAt?: string;
+  responseEventId?: string;
+}
+
+function approvalResolutionFor(item: TimelineItem): ApprovalResolution | undefined {
+  const decision = approvalDecisionFor(item.eventType, item.metadata);
+  if (!decision) return undefined;
+
+  return {
+    decision,
+    decidedBy: metadataString(item.metadata, 'decidedBy'),
+    decidedAt: metadataString(item.metadata, 'decidedAt')
+      || (item.eventType === 'approval_responded' ? metadataString(item.metadata, 'timestamp') : undefined),
+    responseEventId: item.eventType === 'approval_responded' ? item.id : undefined,
+  };
+}
+
+function approvalIdFor(item: TimelineItem): string | undefined {
+  return metadataString(item.metadata, 'approvalId');
+}
+
+/** Links approval requests to persisted decisions without dropping either event from history. */
+export function reconcileApprovalTimeline(items: TimelineItem[]): TimelineItem[] {
+  const resolutions = new Map<string, ApprovalResolution>();
+  const requestDetails = new Map<string, Record<string, unknown>>();
+
+  for (const item of items) {
+    const approvalId = approvalIdFor(item);
+    if (!approvalId) continue;
+
+    if (item.eventType === 'approval_requested') {
+      const details: Record<string, unknown> = {};
+      for (const key of ['approvalType', 'description', 'taskId', 'planId']) {
+        const value = item.metadata?.[key];
+        if (value !== undefined && value !== null && value !== '') details[key] = value;
+      }
+      if (details.description === undefined && item.content.trim()) details.description = item.content;
+      requestDetails.set(approvalId, details);
+    }
+
+    const resolution = approvalResolutionFor(item);
+    if (!resolution) continue;
+
+    const existing = resolutions.get(approvalId);
+    // A response event is authoritative over a request card that was already
+    // reconciled during an earlier render or hydration pass.
+    if (!existing || item.eventType === 'approval_responded' || !existing.responseEventId) {
+      resolutions.set(approvalId, resolution);
+    }
+  }
+
+  return items.map((item) => {
+    const approvalId = approvalIdFor(item);
+    if (!approvalId) return item;
+
+    const resolution = item.eventType === 'approval_requested'
+      ? resolutions.get(approvalId)
+      : approvalResolutionFor(item);
+    const inheritedDetails = requestDetails.get(approvalId);
+    let metadata = item.metadata;
+
+    if (item.eventType === 'approval_requested' && !resolution && approvalDecisionFor(item.eventType, metadata) === null) {
+      metadata = { ...metadata, approvalStatus: 'pending' };
+    }
+
+    if (item.eventType === 'approval_responded' && inheritedDetails) {
+      const mergedDetails = { ...metadata };
+      for (const key of ['approvalType', 'description', 'taskId', 'planId']) {
+        if ((mergedDetails[key] === undefined || mergedDetails[key] === null || mergedDetails[key] === '') && inheritedDetails[key] !== undefined) {
+          mergedDetails[key] = inheritedDetails[key];
+        }
+      }
+      metadata = mergedDetails;
+    }
+
+    if (resolution) {
+      metadata = {
+        ...metadata,
+        approvalStatus: resolution.decision,
+        approved: resolution.decision === 'approved',
+        ...(resolution.decidedBy ? { decidedBy: resolution.decidedBy } : {}),
+        ...(resolution.decidedAt ? { decidedAt: resolution.decidedAt } : {}),
+        ...(resolution.responseEventId ? { approvalResponseId: resolution.responseEventId } : {}),
+      };
+    }
+
+    return metadata === item.metadata ? item : { ...item, metadata };
+  });
+}
+
 function requestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions): Record<string, unknown> {
   return {
     request,
@@ -194,6 +324,7 @@ function requestBody(request: string, workspaceId: string | undefined, options?:
     executionMode: toExecutionMode(options),
     targetRole: options?.targetRole,
     routeRole: options?.routeRole,
+    routeScope: options?.routeScope,
     command: options?.command,
   };
 }
@@ -260,7 +391,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           timestamp: new Date(state.mission.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         });
       }
-      restoredTimeline.push(...events.map(timelineFromEvent));
+      restoredTimeline.push(...reconcileApprovalTimeline(events.map(timelineFromEvent)));
 
       useAgentStore.getState().hydrateMissionFromEvents(missionId, events);
 
@@ -284,13 +415,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         return {
           missions,
           activeTasks,
-          timeline: [...restoredTimeline, ...liveOnlyItems],
+          timeline: reconcileApprovalTimeline([...restoredTimeline, ...liveOnlyItems]),
           hydratedMissionId: missionId,
         };
       });
 
       const refreshedMission = get().missions.find((mission) => mission.id === missionId);
-      if (refreshedMission && TERMINAL_CONVERSATION_STATUSES.has(refreshedMission.status)) {
+      if (refreshedMission && AUTO_DRAIN_CONVERSATION_STATUSES.has(refreshedMission.status)) {
         void get().drainQueuedTurn(missionId);
       }
     } catch (error: any) {
@@ -311,6 +442,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       metadata: {
         targetRole: options?.targetRole,
         routeRole: options?.routeRole,
+        routeScope: options?.routeScope,
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
@@ -384,6 +516,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       metadata: {
         targetRole: options?.targetRole,
         routeRole: options?.routeRole,
+        routeScope: options?.routeScope,
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
@@ -447,6 +580,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         queueId,
         targetRole: options?.targetRole,
         routeRole: options?.routeRole,
+        routeScope: options?.routeScope,
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
@@ -472,7 +606,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     if (drainingQueuedMissions.has(missionId)) return;
     const state = get();
     const mission = state.missions.find((item) => item.id === missionId);
-    if (!mission || !TERMINAL_CONVERSATION_STATUSES.has(mission.status)) return;
+    if (!mission || !AUTO_DRAIN_CONVERSATION_STATUSES.has(mission.status)) return;
     const next = state.queuedTurns.find((item) => item.missionId === missionId);
     if (!next) return;
 
@@ -548,7 +682,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
   addTimelineItem: (item) => set((state) => state.timeline.some((entry) => entry.id === item.id)
     ? state
-    : { timeline: [...state.timeline, item] }),
+    : { timeline: reconcileApprovalTimeline([...state.timeline, item]) }),
   setTasks: (tasks) => set({ activeTasks: tasks }),
   patchTask: (id, updates) => set((state) => ({
     activeTasks: state.activeTasks.map((task) => task.id === id ? { ...task, ...updates } : task),
@@ -561,8 +695,28 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   stopMission: async (id) => {
     try {
       const mission = await apiRequest<Mission>(`/missions/${id}/cancel`, { method: 'POST' });
-      set((state) => ({ missions: state.missions.map((item) => item.id === id ? mission : item) }));
-      if (TERMINAL_CONVERSATION_STATUSES.has(mission.status)) void get().drainQueuedTurn(id);
+      set((state) => {
+        const cancelledQueueIds = new Set(state.queuedTurns
+          .filter((turn) => turn.missionId === id)
+          .map((turn) => turn.id));
+        return {
+          missions: state.missions.map((item) => item.id === id ? mission : item),
+          queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
+          timeline: state.timeline.map((item) => {
+            const queueId = typeof item.metadata?.queueId === 'string' ? item.metadata.queueId : undefined;
+            if (!queueId || !cancelledQueueIds.has(queueId)) return item;
+            if (item.type === 'user_message') {
+              return { ...item, metadata: { ...item.metadata, queued: false, cancelled: true } };
+            }
+            return {
+              ...item,
+              eventType: 'turn_cancelled',
+              content: 'Queued turn cancelled with the mission.',
+              metadata: { ...item.metadata, queued: false, cancelled: true },
+            };
+          }),
+        };
+      });
     } catch (error: any) {
       set({ error: error?.message || 'Mission cancellation failed.' });
     }

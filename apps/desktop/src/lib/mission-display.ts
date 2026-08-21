@@ -25,6 +25,7 @@ export function effectiveTaskStatus(
 ): EffectiveTaskStatus {
   if (taskStatus === 'completed' || taskStatus === 'done' || taskStatus === 'verified' || taskStatus === 'applied') return 'completed';
   if (taskStatus === 'failed' || taskStatus === 'blocked' || taskStatus === 'rejected') return 'failed';
+  if (taskStatus === 'cancelled') return 'cancelled';
   if (missionStatus === 'cancelled') return 'cancelled';
   if (taskStatus === 'running') return assignedAgentId ? 'running' : 'preparing';
   if (taskStatus === 'ready' || taskStatus === 'claimed' || taskStatus === 'revision_requested' || taskStatus === 'review') return 'preparing';

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type AgentStatus = 'idle' | 'running' | 'waiting' | 'paused' | 'completed' | 'failed';
+export type AgentStatus = 'idle' | 'running' | 'waiting' | 'paused' | 'completed' | 'failed' | 'cancelled';
 export type AgentWorkspaceMode = 'shared' | 'isolated_worktree' | 'read_only';
 
 export interface AgentInstance {
@@ -54,6 +54,10 @@ function applyEvent(map: Map<string, AgentInstance>, missionId: string, event: R
   const agentId = event.agentInstanceId as string | undefined;
   const existing = agentId ? map.get(agentId) : undefined;
   const timestamp = event.timestamp as string | undefined;
+
+  // Cancellation is terminal for the local projection even if a buffered
+  // runtime event is replayed after the process was asked to stop.
+  if (existing?.status === 'cancelled' && event.type !== 'agent_cancelled') return;
 
   if (event.type === 'agent_spawned' && agentId) {
     map.set(agentId, {
@@ -131,6 +135,8 @@ function applyEvent(map: Map<string, AgentInstance>, missionId: string, event: R
     map.set(agentId, { ...existing, status: 'completed', statusMessage: event.summary || 'Completed', progress: 100, completedAt: timestamp, lastActivityAt: timestamp });
   } else if (event.type === 'agent_error' || event.type === 'task_failed') {
     map.set(agentId, { ...existing, status: 'failed', statusMessage: event.error || 'Execution failed', completedAt: timestamp, lastActivityAt: timestamp });
+  } else if (event.type === 'agent_cancelled') {
+    map.set(agentId, { ...existing, status: 'cancelled', statusMessage: event.reason || 'Mission cancelled', completedAt: timestamp, lastActivityAt: timestamp });
   } else if (event.type === 'tool_call_started') {
     map.set(agentId, { ...existing, statusMessage: `Using ${event.toolName || 'tool'}`, lastActivityAt: timestamp });
   } else if (event.type === 'tool_call_completed') {

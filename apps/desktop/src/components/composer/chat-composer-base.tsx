@@ -171,9 +171,10 @@ export function ChatComposer() {
     }
 
     const targetRole = directive.targetRole || 'Orchestrator';
-    const selectedRouteApplies = !directive.targetRole || directive.targetRole.toLowerCase() === 'orchestrator';
-    const scopedSelectedModel = selectedRouteApplies ? selectedModel || undefined : undefined;
+    const explicitDirectiveModel = Boolean(directive.modelCatalogId);
+    const scopedSelectedModel = selectedModel || undefined;
     const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
+    const routeScope: 'role' | 'mission' | undefined = explicitDirectiveModel ? 'role' : scopedSelectedModel ? 'mission' : undefined;
     const resolvedReasoning = directive.reasoningLevel && directiveReasoningSupported
       ? directive.reasoningLevel
       : directive.modelCatalogId
@@ -188,6 +189,7 @@ export function ChatComposer() {
       trustMode,
       targetRole: directive.targetRole,
       routeRole: targetRole,
+      routeScope,
       command: directive.command,
     };
 
@@ -451,7 +453,7 @@ export function ChatComposer() {
                         </div>
                       </div>
                     )}
-                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · Orchestrator: {selectedModelObject?.name || 'Auto'} · child agents keep their role policies.</div>
+                     <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {selectedModelObject ? `Mission model: ${selectedModelObject.name} · all compatible agents` : 'Auto routing uses role policies.'}</div>
                   </div>
                 </DropdownMenuContent>
               </DropdownMenu>

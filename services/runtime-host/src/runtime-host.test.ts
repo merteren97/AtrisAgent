@@ -180,8 +180,8 @@ async function runTests() {
     (claudeAdapter as any).sessionContext.set('test-session-1', { missionId: 'm-1', taskId: 't-1' });
     const claudeLines = [
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'Analyzing repository structure' }] } }),
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'ReadFile', input: { path: 'package.json' } }] } }),
-      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'ReadFile', content: '{ "name": "app" }', is_error: false }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu-read-file-1', name: 'ReadFile', input: { path: 'package.json' } }] } }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu-read-file-1', content: '{ "name": "app" }', is_error: false }] } }),
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Analyzed package.json successfully.' }] } }),
       JSON.stringify({ type: 'result', is_error: true, result: 'Token quota warning' }),
     ];
@@ -192,6 +192,66 @@ async function runTests() {
     assert(claudeTypes.includes('tool_call_completed'), 'ClaudeCodeAdapter normalizes tool_result into tool_call_completed');
     assert(claudeTypes.includes('text_delta'), 'ClaudeCodeAdapter normalizes assistant text into text_delta');
     assert(claudeTypes.includes('task_failed'), 'ClaudeCodeAdapter normalizes terminal error results into task_failed');
+    const claudeStarted = emittedEvents.find((event) => event.type === 'tool_call_started') as any;
+    const claudeCompleted = emittedEvents.find((event) => event.type === 'tool_call_completed') as any;
+    assert(claudeStarted?.toolCallId === 'toolu-read-file-1' && claudeStarted.toolName === 'ReadFile', 'Claude preserves tool_use id without replacing the visible tool name');
+    assert(claudeCompleted?.toolCallId === 'toolu-read-file-1' && claudeCompleted.toolName === 'ReadFile', 'Claude matches tool_result by tool_use_id and keeps the start tool name');
+
+    emittedEvents.length = 0;
+    const codexAdapter = new CodexAdapter(eventBus);
+    const codexContext = { missionId: 'm-1', taskId: 't-codex' };
+    (codexAdapter as any).sessionContext.set('test-codex-session', codexContext);
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.started', run_id: 'codex-run-1', attempt_id: 'codex-attempt-1', item: { id: 'cmd-1', type: 'command_execution', command: 'npm test' } }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.completed', run_id: 'codex-run-1', attempt_id: 'codex-attempt-1', item: { id: 'cmd-1', type: 'command_execution', command: 'npm test', aggregated_output: 'ok', exit_code: 0 } }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.started', item: { id: 'mcp-1', type: 'mcp_tool_call', tool: 'search', arguments: { query: 'tool ids' } } }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.completed', item: { id: 'mcp-1', type: 'mcp_tool_call', tool: 'search', result: { hits: 1 } } }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command: 'echo fallback' } }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'echo fallback', aggregated_output: 'fallback', exit_code: 0 } }));
+    const codexToolEvents = emittedEvents.filter((event) => event.type === 'tool_call_started' || event.type === 'tool_call_completed') as any[];
+    const codexCommandEvents = codexToolEvents.filter((event) => event.toolName === 'shell');
+    const codexMcpEvents = codexToolEvents.filter((event) => event.toolName === 'search');
+    assert(codexCommandEvents[0]?.toolCallId === 'cmd-1' && codexCommandEvents[1]?.toolCallId === 'cmd-1', 'Codex preserves command item id across start and completion');
+    assert(codexCommandEvents[0]?.runId === 'codex-run-1' && codexCommandEvents[0]?.attemptId === 'codex-attempt-1', 'Codex preserves run and attempt ids when provided');
+    assert(codexMcpEvents[0]?.toolCallId === 'mcp-1' && codexMcpEvents[1]?.toolCallId === 'mcp-1', 'Codex preserves MCP item id across start and completion');
+    assert(codexCommandEvents[2]?.toolCallId && codexCommandEvents[3]?.toolCallId && codexCommandEvents[2].toolCallId !== codexCommandEvents[3].toolCallId, 'Codex fallback ids are deterministic event keys and do not fabricate a cross-event match');
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.completed' }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.failed', error: { message: 'late duplicate' } }));
+    assert(emittedEvents.filter((event) => event.type === 'task_completed').length === 1, 'CodexAdapter emits one terminal event when completed and failed signals race');
+
+    emittedEvents.length = 0;
+    const openCodeAdapter = new OpenCodeAdapter(eventBus);
+    (openCodeAdapter as any).sessionContext.set('test-opencode-session', {
+      missionId: 'm-1',
+      taskId: 't-opencode',
+      serverKey: '',
+      runtimeSessionId: 'opencode-runtime-session',
+    });
+    (openCodeAdapter as any).handleServerEvent('test-opencode-session', {
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 'opencode-runtime-session',
+        part: { id: 'part-tool-1', type: 'tool', tool: 'ReadFile', state: { status: 'running', input: { path: 'README.md' } } },
+      },
+    });
+    (openCodeAdapter as any).handleServerEvent('test-opencode-session', {
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 'opencode-runtime-session',
+        part: { id: 'part-tool-1', type: 'tool', tool: 'ReadFile', state: { status: 'completed', output: 'ok' } },
+      },
+    });
+    const openCodeToolEvents = emittedEvents.filter((event) => event.type === 'tool_call_started' || event.type === 'tool_call_completed') as any[];
+    assert(openCodeToolEvents[0]?.toolCallId === 'part-tool-1' && openCodeToolEvents[1]?.toolCallId === 'part-tool-1', 'OpenCode preserves part id across tool start and completion');
+
+    emittedEvents.length = 0;
+    (codexAdapter as any).sessionContext.set('cancelled-codex-session', { missionId: 'm-1', taskId: 't-cancelled-codex' });
+    (codexAdapter as any).activeProcesses.set('cancelled-codex-session', {
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    await codexAdapter.cancel('cancelled-codex-session');
+    (codexAdapter as any).handleJsonLine('cancelled-codex-session', JSON.stringify({ type: 'turn.completed' }));
+    assert(!emittedEvents.some((event) => event.type === 'task_completed' || event.type === 'task_failed'), 'CodexAdapter suppresses buffered terminal events after cancellation');
 
     emittedEvents.length = 0;
     const antigravityAdapter = new AntigravityAdapter(eventBus);
@@ -211,7 +271,7 @@ async function runTests() {
     });
     const antigravityLines = [
       JSON.stringify({ type: 'step_update', step_type: 'thought', text: 'Planning execution strategy' }),
-      JSON.stringify({ type: 'step_update', step_type: 'tool', tool_name: 'RunBuild', args: { command: 'npm run build' } }),
+      JSON.stringify({ type: 'step_update', step_id: 'agy-step-1', run_id: 'agy-run-1', step_type: 'tool', tool_name: 'RunBuild', args: { command: 'npm run build' } }),
       JSON.stringify({ type: 'step_update', step_type: 'progress', text: 'Build is running' }),
       JSON.stringify({ type: 'step_update', step_type: 'agent_response', state: 'DONE', text: 'Intermediate agent response' }),
     ];
@@ -225,6 +285,9 @@ async function runTests() {
     assert(antigravityTypesBeforeClose.includes('agent_thought'), 'AntigravityAdapter normalizes thought steps into agent_thought');
     assert(antigravityTypesBeforeClose.includes('agent_tool_call'), 'AntigravityAdapter normalizes tool steps into agent_tool_call');
     assert(antigravityTypesBeforeClose.includes('text_delta'), 'AntigravityAdapter normalizes progress text into text_delta');
+    const antigravityTool = emittedEvents.find((event) => event.type === 'agent_tool_call') as any;
+    assert(antigravityTool?.toolCallId === 'agy-step-1' && antigravityTool?.runId === 'agy-run-1', 'Antigravity preserves available step and run ids');
+    assert(!antigravityTypesBeforeClose.includes('tool_call_completed'), 'Antigravity does not invent a tool completion event without one in the stream');
     assert(!(antigravityAdapter as any).softTerminalTimers.has('test-session-2'), 'Authoritative result cancels the soft completion fallback');
     assert(failedStdinEnded, 'AntigravityAdapter closes print-mode stdin as soon as a terminal result is received');
     assert(!antigravityTypesBeforeClose.includes('task_failed') && pendingOutcome?.kind === 'failed', 'AntigravityAdapter defers terminal failure until native session cleanup');
@@ -262,6 +325,13 @@ async function runTests() {
 
     (antigravityAdapter as any).emitTerminalOutcome('test-session-3', successContext, successPendingOutcome);
     assert(emittedEvents.some((event) => event.type === 'task_completed'), 'AntigravityAdapter publishes task_completed after native cleanup so Orchestrator can schedule the next DAG task');
+
+    emittedEvents.length = 0;
+    const cancelledAntigravityContext = { missionId: 'm-cancelled', taskId: 'cancelled-antigravity-task' };
+    (antigravityAdapter as any).sessionContext.set('cancelled-antigravity-session', cancelledAntigravityContext);
+    (antigravityAdapter as any).markSessionCancelled('cancelled-antigravity-session');
+    (antigravityAdapter as any).emitTerminalOutcome('cancelled-antigravity-session', cancelledAntigravityContext, { kind: 'completed', result: 'late result' });
+    assert(!emittedEvents.some((event) => event.type === 'task_completed' || event.type === 'task_failed'), 'AntigravityAdapter suppresses terminal outcomes after cancellation');
 
     emittedEvents.length = 0;
     const cleanExitContext = { missionId: 'm-3', taskId: 'research-clean-exit' };
