@@ -2,6 +2,36 @@ export interface BaseEvent {
   id: string;
   missionId: string;
   timestamp: string;
+  sequence?: number;
+  schemaVersion?: number;
+  turnId?: string;
+  runId?: string;
+  clientMessageId?: string;
+}
+
+export interface TurnQueued extends BaseEvent {
+  type: 'turn_queued';
+  content: string;
+  delivery: 'steer' | 'queue' | 'stop_and_replan';
+  priorityPending: boolean;
+}
+
+export interface TurnStarted extends BaseEvent {
+  type: 'turn_started';
+  content: string;
+  delivery: 'steer' | 'queue' | 'stop_and_replan';
+}
+
+export interface TurnSteered extends BaseEvent {
+  type: 'turn_steered';
+  content: string;
+  targetTurnId?: string;
+  disposition: 'priority_pending' | 'applied_future_tasks' | 'applied_synthesis';
+}
+
+export interface TurnCancelled extends BaseEvent {
+  type: 'turn_cancelled';
+  reason: string;
 }
 
 export interface UserMessage extends BaseEvent {
@@ -340,6 +370,10 @@ export interface AgentError extends BaseEvent {
 
 export type AgentEvent =
   | UserMessage
+  | TurnQueued
+  | TurnStarted
+  | TurnSteered
+  | TurnCancelled
   | MissionStarted
   | PlanGenerated
   | PlanRevised

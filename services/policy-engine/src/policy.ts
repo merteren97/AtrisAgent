@@ -5,6 +5,20 @@ export type ExtendedActionPolicy = 'ask' | 'allowlisted' | 'automatic';
 export type ApplyPolicy = 'user_decides' | 'orchestrator_decides' | 'automatic';
 export type PushPolicy = 'never' | 'ask' | 'automatic';
 export type DeletePolicy = 'ask' | 'risk_based' | 'automatic';
+export type TrustProfile = 'ask' | 'review' | 'auto';
+export type AutomationDecision = 'ask' | 'review' | 'auto' | 'deny';
+export type AutomationAction = 'plan' | 'fileWrite' | 'deleteFiles' | 'commandExecution' | 'packageInstall'
+  | 'gitCommit' | 'databaseMigration' | 'workspaceApply' | 'gitPush' | 'pullRequest';
+
+const PROFILE_ACTIONS: Record<TrustProfile, Record<AutomationAction, AutomationDecision>> = {
+  ask: { plan: 'ask', fileWrite: 'ask', deleteFiles: 'ask', commandExecution: 'ask', packageInstall: 'ask', gitCommit: 'ask', databaseMigration: 'ask', workspaceApply: 'ask', gitPush: 'ask', pullRequest: 'ask' },
+  review: { plan: 'auto', fileWrite: 'review', deleteFiles: 'review', commandExecution: 'review', packageInstall: 'review', gitCommit: 'review', databaseMigration: 'ask', workspaceApply: 'review', gitPush: 'ask', pullRequest: 'review' },
+  auto: { plan: 'auto', fileWrite: 'auto', deleteFiles: 'auto', commandExecution: 'auto', packageInstall: 'auto', gitCommit: 'auto', databaseMigration: 'review', workspaceApply: 'auto', gitPush: 'ask', pullRequest: 'auto' },
+};
+
+export function resolveAutomationAction(profile: TrustProfile, action: AutomationAction, overrides: Partial<Record<AutomationAction, AutomationDecision>> = {}): AutomationDecision {
+  return overrides[action] || PROFILE_ACTIONS[profile]?.[action] || 'deny';
+}
 
 export interface PolicyConfig {
   executionMode: ExecutionMode;

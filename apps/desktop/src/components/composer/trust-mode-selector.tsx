@@ -20,10 +20,10 @@ import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 
 const MODES = [
-  { id: 'Review Driven', desc: 'Always ask for permission' },
-  { id: 'Balanced', desc: 'Ask for destructive actions' },
-  { id: 'Autonomous', desc: 'Do everything automatically' },
-  { id: 'Candidate', desc: 'Dual parallel builder evaluation' },
+  { id: 'Review Driven', label: 'Ask', desc: 'Request approval before governed actions' },
+  { id: 'Balanced', label: 'Review', desc: 'Work in isolation, then require quality review' },
+  { id: 'Autonomous', label: 'Auto', desc: 'Automate allowed actions; pushes still require approval' },
+  { id: 'Candidate', label: 'Review + Candidate', desc: 'Review policy with parallel Builder candidates' },
 ] as const;
 
 export function TrustModeSelector() {
@@ -36,7 +36,7 @@ export function TrustModeSelector() {
         <DropdownMenuTrigger asChild>
           <Button variant="ghost" size="sm" className="h-6 text-[10px] gap-1 text-muted-foreground hover:text-foreground" title={t('Trust Mode')}>
             <Shield className="w-3 h-3" />
-            {trustMode}
+            {MODES.find((mode) => mode.id === trustMode)?.label || trustMode}
             <ChevronDown className="w-2.5 h-2.5" />
           </Button>
         </DropdownMenuTrigger>
@@ -48,7 +48,7 @@ export function TrustModeSelector() {
               className="flex flex-col items-start gap-1 p-2"
             >
               <div className="flex items-center w-full justify-between font-medium">
-                {m.id}
+                {m.label}
                 {trustMode === m.id && <Check className="w-3 h-3 text-primary" />}
               </div>
               <span className="text-[10px] text-muted-foreground">{m.desc}</span>
@@ -76,7 +76,7 @@ export function TrustModeSelector() {
             </div>
             <Switch
               id="file-write"
-              checked={automationSettings.fileWrite}
+               checked={automationSettings.fileWrite === true}
               onCheckedChange={(c) => setAutomationSettings({ fileWrite: c })}
             />
           </div>
@@ -87,7 +87,7 @@ export function TrustModeSelector() {
             </div>
             <Switch
               id="git-commit"
-              checked={automationSettings.gitCommit}
+               checked={automationSettings.gitCommit === true}
               onCheckedChange={(c) => setAutomationSettings({ gitCommit: c })}
             />
           </div>
@@ -98,7 +98,7 @@ export function TrustModeSelector() {
             </div>
             <Switch
               id="pkg-install"
-              checked={automationSettings.packageInstall}
+               checked={automationSettings.packageInstall === true}
               onCheckedChange={(c) => setAutomationSettings({ packageInstall: c })}
             />
           </div>

@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import type {
   MissionStatus,
   ExecutionMode,
@@ -36,6 +36,8 @@ export const missions = sqliteTable('missions', {
   teamTemplateId: text('team_template_id').notNull().default(''),
   planId: text('plan_id'),
   executionMode: text('execution_mode').$type<ExecutionMode>().notNull().default('balanced'),
+  automationPolicy: text('automation_policy', { mode: 'json' }).$type<import('@atris-agent-code/domain').MissionAutomationPolicy>(),
+  activeRunId: text('active_run_id'),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
   completedAt: text('completed_at'),
@@ -50,10 +52,57 @@ export const missionEvents = sqliteTable('mission_events', {
   agentInstanceId: text('agent_instance_id'),
   type: text('type').notNull(),
   payload: text('payload', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  sequence: integer('sequence'),
+  schemaVersion: integer('schema_version'),
   createdAt: text('created_at').notNull(),
-});
+}, (table) => ({
+  missionSequence: uniqueIndex('idx_mission_events_mission_sequence').on(table.missionId, table.sequence),
+}));
 
 export const events = missionEvents;
+
+export const conversationTurns = sqliteTable('conversation_turns', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  content: text('content').notNull(),
+  delivery: text('delivery').$type<'steer' | 'queue' | 'stop_and_replan'>().notNull(),
+  options: text('options', { mode: 'json' }).$type<Record<string, unknown>>(),
+  status: text('status').$type<'queued' | 'pending_priority' | 'starting' | 'running' | 'completed' | 'failed' | 'cancelled'>().notNull().default('queued'),
+  idempotencyKey: text('idempotency_key'),
+  requestHash: text('request_hash'),
+  commandId: text('command_id'),
+  createdAt: text('created_at').notNull(),
+  startedAt: text('started_at'),
+  completedAt: text('completed_at'),
+});
+
+export const missionRuns = sqliteTable('mission_runs', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  turnId: text('turn_id').references(() => conversationTurns.id, { onDelete: 'set null' }),
+  commandId: text('command_id'),
+  status: text('status').$type<'starting' | 'running' | 'stopping' | 'completed' | 'failed' | 'cancelled'>().notNull().default('starting'),
+  planId: text('plan_id'),
+  startedAt: text('started_at').notNull(),
+  completedAt: text('completed_at'),
+  error: text('error'),
+  heartbeatAt: text('heartbeat_at'),
+});
+
+export const missionCommands = sqliteTable('mission_commands', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  turnId: text('turn_id').notNull().references(() => conversationTurns.id, { onDelete: 'cascade' }),
+  type: text('type').$type<'steer' | 'queue' | 'stop_and_replan'>().notNull(),
+  status: text('status').$type<'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'>().notNull().default('pending'),
+  priority: integer('priority').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+  processedAt: text('processed_at'),
+  claimedAt: text('claimed_at'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  requestHash: text('request_hash'),
+  error: text('error'),
+});
 
 export const tasks = sqliteTable('tasks', {
   id: text('id').primaryKey(),
@@ -256,6 +305,13 @@ export type MissionEventSelect = typeof missionEvents.$inferSelect;
 export type MissionEventInsert = typeof missionEvents.$inferInsert;
 export type EventSelect = MissionEventSelect;
 export type EventInsert = MissionEventInsert;
+
+export type ConversationTurnSelect = typeof conversationTurns.$inferSelect;
+export type ConversationTurnInsert = typeof conversationTurns.$inferInsert;
+export type MissionRunSelect = typeof missionRuns.$inferSelect;
+export type MissionRunInsert = typeof missionRuns.$inferInsert;
+export type MissionCommandSelect = typeof missionCommands.$inferSelect;
+export type MissionCommandInsert = typeof missionCommands.$inferInsert;
 
 export type TaskSelect = typeof tasks.$inferSelect;
 export type TaskInsert = typeof tasks.$inferInsert;

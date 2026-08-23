@@ -1,4 +1,4 @@
-import { PolicyEngine } from './policy';
+import { PolicyEngine, resolveAutomationAction } from './policy';
 
 async function runPolicyTests() {
   console.log('--- Starting PolicyEngine Security Controls Tests ---');
@@ -57,6 +57,10 @@ async function runPolicyTests() {
 
   const autoEngine = new PolicyEngine('autonomous');
   assert(autoEngine.getConfig().planApproval === 'never', 'autonomous has planApproval never');
+  assert(resolveAutomationAction('ask', 'fileWrite') === 'ask', 'Ask profile requires governed file-write approval');
+  assert(resolveAutomationAction('review', 'workspaceApply') === 'review', 'Review profile preserves a distinct reviewed workspace apply');
+  assert(resolveAutomationAction('auto', 'gitPush') === 'ask', 'Auto profile still requires explicit push approval');
+  assert(resolveAutomationAction('auto', 'packageInstall', { packageInstall: 'deny' }) === 'deny', 'per-action override wins over profile defaults');
 
   console.log(`\nPolicy Test Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) {

@@ -9,6 +9,7 @@ import { ToolCallRow } from './tool-call-row';
 import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAgentStore } from '@/stores/agent-store';
+import { useSettingsStore } from '@/stores/settings-store';
 import { ArrowDown, Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
 
 const COMPACT_EVENT_TYPES = new Set([
@@ -24,6 +25,7 @@ const COMPACT_EVENT_TYPES = new Set([
   'agent_message_read',
   'agent_tool_call',
   'agent_error',
+  'text_delta',
   'tool_call_started',
   'tool_call_completed',
 ]);
@@ -50,12 +52,7 @@ function streamIdentity(item: TimelineItem): string {
 }
 
 function joinStreamText(previous: string, next: string): string {
-  if (!previous) return next;
-  if (!next) return previous;
-  if (/\s$/.test(previous) || /^\s/.test(next)) return `${previous}${next}`;
-  if (/^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|>|---)/.test(next)) return `${previous}\n\n${next}`;
-  if (/[.!?;:)]$/.test(previous)) return `${previous}\n\n${next}`;
-  return `${previous} ${next}`;
+  return previous + next;
 }
 
 function isDuplicateTerminalDiagnostic(items: TimelineItem[], index: number): boolean {
@@ -140,6 +137,9 @@ export function ChatTimeline() {
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const activeTasks = useMissionStore((state) => state.activeTasks);
   const loading = useMissionStore((state) => state.loading);
+  const transportStatus = useMissionStore((state) => state.transportStatus);
+  const transportError = useMissionStore((state) => state.transportError);
+  const detailMode = useSettingsStore((state) => state.timelineDetailMode);
   const setComposerInput = useMissionStore((state) => state.setComposerInput);
   const workspaces = useWorkspaceStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
@@ -158,7 +158,16 @@ export function ChatTimeline() {
   const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
   const completedTasks = activeTasks.filter((task) => task.status === 'completed' || task.status === 'done').length;
   const liveMission = Boolean(activeMission && !['completed', 'failed', 'cancelled'].includes(activeMission.status));
-  const renderTimeline = useMemo(() => prepareTimeline(timeline, liveMission), [liveMission, timeline]);
+  const visibleTimeline = useMemo(() => timeline.filter((item) => {
+    if (detailMode === 'telemetry') return true;
+    if (item.type !== 'event') return true;
+    const type = item.eventType || '';
+    const important = type.includes('approval') || type.includes('failed') || type.includes('error') || type.includes('blocked') || type.startsWith('turn_')
+      || ['mission_started', 'plan_generated', 'plan_revised', 'mission_completed', 'verification_finding', 'verification_completed', 'review_completed', 'revision_requested'].includes(type);
+    if (detailMode === 'summary') return important;
+    return type !== 'agent_message_read' && type !== 'agent_context_compacted';
+  }), [detailMode, timeline]);
+  const renderTimeline = useMemo(() => prepareTimeline(visibleTimeline, liveMission && detailMode !== 'summary'), [detailMode, liveMission, visibleTimeline]);
 
   useEffect(() => {
     shouldFollowRef.current = true;
@@ -293,7 +302,13 @@ export function ChatTimeline() {
         viewportRef={viewportRef}
         onViewportScroll={handleViewportScroll}
       >
-        <div className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+        <div role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation timeline" className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+          {activeMissionId && transportStatus !== 'connected' && transportStatus !== 'idle' && (
+            <div role="status" className="flex items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-[10px] text-muted-foreground">
+              {transportStatus !== 'error' && <Loader2 className="h-3 w-3 animate-spin" />}
+              <span>{transportStatus === 'error' ? `Live updates unavailable${transportError ? `: ${transportError}` : '.'}` : 'Reconnecting live updates...'}</span>
+            </div>
+          )}
           {timeline.length === 0 ? emptyState : renderTimeline.map((entry, index) => {
             if (entry.kind === 'thinking') {
               return <ThinkingStrip key={`thinking-${entry.item.id || index}`} item={entry.item} />;
@@ -306,7 +321,8 @@ export function ChatTimeline() {
             }
             const item = entry.item;
             if (item.type === 'user_message') {
-              return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} />;
+              const deliveryState = item.metadata?.failed ? 'failed' : item.metadata?.cancelled ? 'cancelled' : item.metadata?.starting ? 'starting' : item.metadata?.queued ? 'queued' : undefined;
+              return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} deliveryState={deliveryState} />;
             }
             if (item.type === 'orchestrator_message') {
               return <MessageCard key={item.id} role="orchestrator" content={item.content} timestamp={item.timestamp} />;

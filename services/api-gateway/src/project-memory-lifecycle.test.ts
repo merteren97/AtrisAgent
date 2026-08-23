@@ -47,6 +47,7 @@ async function runTests() {
       created_at TEXT NOT NULL
     );
   `);
+  schema.migrateDatabase(sqlite as any);
   const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
   const memory = new ProjectMemoryService(db);
   const now = new Date().toISOString();

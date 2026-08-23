@@ -63,6 +63,7 @@ export interface StartMissionOptions {
   /** A selected mission route applies to every compatible child role by default. */
   routeScope?: 'mission' | 'role';
   command?: string;
+  automationSettings?: { fileWrite: boolean | null; gitCommit: boolean | null; packageInstall: boolean | null };
 }
 
 export interface QueuedMissionTurn {
@@ -71,7 +72,11 @@ export interface QueuedMissionTurn {
   request: string;
   options?: StartMissionOptions;
   queuedAt: string;
+  turnId?: string;
 }
+
+export type TurnDelivery = 'steer' | 'queue' | 'stop_and_replan';
+export type EventTransportStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 interface MissionState {
   missions: Mission[];
@@ -82,12 +87,16 @@ interface MissionState {
   queuedTurns: QueuedMissionTurn[];
   loading: boolean;
   error: string | null;
+  transportStatus: EventTransportStatus;
+  transportError: string | null;
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
   continueMission: (missionId: string, request: string, options?: StartMissionOptions, skipOptimisticUserMessage?: boolean) => Promise<void>;
-  queueMissionTurn: (missionId: string, request: string, options?: StartMissionOptions) => void;
+  queueMissionTurn: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
+  sendMissionCommand: (missionId: string, request: string, delivery: TurnDelivery, options?: StartMissionOptions) => Promise<void>;
   drainQueuedTurn: (missionId: string) => Promise<void>;
+  setTransportStatus: (status: EventTransportStatus, error?: string | null) => void;
   deleteMission: (id: string) => Promise<boolean>;
   addMission: (mission: Mission) => void;
   setActiveMission: (id: string) => void;
@@ -106,8 +115,6 @@ interface MissionState {
 }
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
-const AUTO_DRAIN_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed']);
-const drainingQueuedMissions = new Set<string>();
 
 function toExecutionMode(options?: StartMissionOptions): string {
   if (options?.executionMode) return options.executionMode;
@@ -124,6 +131,10 @@ function nowLabel(): string {
 function eventLabel(event: Record<string, any>): string {
   switch (event.type) {
     case 'user_message': return event.content || '';
+    case 'turn_queued': return 'Queued for the next conversation turn.';
+    case 'turn_started': return 'Conversation turn started.';
+    case 'turn_steered': return 'Guidance queued with priority for the next orchestrator turn.';
+    case 'turn_cancelled': return `Conversation turn cancelled${event.reason ? `: ${event.reason}` : '.'}`;
     case 'mission_started': return `Mission started: ${event.title || event.missionId}`;
     case 'plan_generated': return event.summary || `Generated ${event.taskCount || 0} tasks.`;
     case 'plan_revised': return `Plan revised: ${event.reason || 'Execution evidence changed the plan.'}`;
@@ -168,13 +179,20 @@ function eventLabel(event: Record<string, any>): string {
   }
 }
 
+function isOrchestratorTextEvent(event: Record<string, any>): boolean {
+  return event.type === 'text_delta'
+    && (event.agentRole === 'orchestrator'
+      || event.role === 'orchestrator'
+      || String(event.agentInstanceId || '').startsWith('orchestrator-'));
+}
+
 function timelineFromEvent(event: Record<string, any>): TimelineItem {
   const date = event.timestamp ? new Date(event.timestamp) : new Date();
   return {
     id: event.id || crypto.randomUUID(),
     type: event.type === 'user_message'
       ? 'user_message'
-      : event.type === 'text_delta' || event.type === 'mission_completed'
+       : event.type === 'mission_completed' || isOrchestratorTextEvent(event)
         ? 'orchestrator_message'
         : 'event',
     content: eventLabel(event),
@@ -326,6 +344,7 @@ function requestBody(request: string, workspaceId: string | undefined, options?:
     routeRole: options?.routeRole,
     routeScope: options?.routeScope,
     command: options?.command,
+    automationSettings: options?.automationSettings,
   };
 }
 
@@ -338,10 +357,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   queuedTurns: [],
   loading: false,
   error: null,
+  transportStatus: 'idle',
+  transportError: null,
   missionFilter: 'all',
   composerInput: '',
 
   setComposerInput: (input) => set({ composerInput: input }),
+  setTransportStatus: (transportStatus, transportError = null) => set({ transportStatus, transportError }),
   setMissionFilter: (filter) => set({ missionFilter: filter }),
 
   fetchMissions: async (workspaceId) => {
@@ -404,11 +426,14 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
         if (current.activeMissionId !== missionId) return { missions };
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
-        // Canonical persisted turns replace normal optimistic cards. Future turns
-        // that are still queued remain visible until they actually start.
         const liveOnlyItems = current.timeline.filter((item) => (
-          (item.type !== 'user_message' || item.metadata?.queued === true)
-          && !restoredIds.has(item.id)
+          !restoredIds.has(item.id)
+          && (item.type !== 'user_message'
+            || item.metadata?.queued === true
+            || item.metadata?.starting === true
+            || item.metadata?.failed === true
+            || item.metadata?.cancelled === true
+            || typeof item.metadata?.sequence === 'number')
         ));
         const activePlanId = state.mission?.planId;
         const activeTasks = (state.tasks || []).filter((task) => !activePlanId || !task.planId || task.planId === activePlanId);
@@ -420,10 +445,6 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         };
       });
 
-      const refreshedMission = get().missions.find((mission) => mission.id === missionId);
-      if (refreshedMission && AUTO_DRAIN_CONVERSATION_STATUSES.has(refreshedMission.status)) {
-        void get().drainQueuedTurn(missionId);
-      }
     } catch (error: any) {
       if (get().activeMissionId === missionId) set({ error: error?.message || 'Failed to load mission state.' });
     }
@@ -565,7 +586,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 
-  queueMissionTurn: (missionId, request, options) => {
+  queueMissionTurn: async (missionId, request, options) => {
+    await get().sendMissionCommand(missionId, request, 'queue', options);
+  },
+
+  sendMissionCommand: async (missionId, request, delivery, options) => {
     const trimmed = request.trim();
     if (!trimmed) return;
     const queueId = crypto.randomUUID();
@@ -576,7 +601,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       content: trimmed,
       timestamp: nowLabel(),
       metadata: {
-        queued: true,
+        queued: delivery !== 'stop_and_replan',
+        starting: delivery === 'stop_and_replan',
         queueId,
         targetRole: options?.targetRole,
         routeRole: options?.routeRole,
@@ -589,47 +615,45 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     const queuedCard: TimelineItem = {
       id: `queued-event-${queueId}`,
       type: 'event',
-      content: 'Queued for the next conversation turn. The current agents will finish first.',
+        content: delivery === 'queue' ? 'Queued for the next conversation turn.' : delivery === 'steer' ? 'Queued as priority guidance for the next orchestrator turn.' : 'Stopping and replanning with this request.',
       timestamp: nowLabel(),
-      eventType: 'turn_queued',
+       eventType: delivery === 'queue' ? 'turn_queued' : 'turn_steered',
       agentRole: 'orchestrator',
       metadata: { queueId },
     };
     set((state) => ({
       error: null,
-      queuedTurns: [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options, queuedAt }],
+      queuedTurns: delivery === 'queue' ? [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options, queuedAt }] : state.queuedTurns,
       timeline: [...state.timeline, userMessage, queuedCard],
-    }));
-  },
-
-  drainQueuedTurn: async (missionId) => {
-    if (drainingQueuedMissions.has(missionId)) return;
-    const state = get();
-    const mission = state.missions.find((item) => item.id === missionId);
-    if (!mission || !AUTO_DRAIN_CONVERSATION_STATUSES.has(mission.status)) return;
-    const next = state.queuedTurns.find((item) => item.missionId === missionId);
-    if (!next) return;
-
-    drainingQueuedMissions.add(missionId);
-    set((current) => ({
-      queuedTurns: current.queuedTurns.filter((item) => item.id !== next.id),
-      timeline: current.timeline.map((item) => {
-        if (item.metadata?.queueId !== next.id) return item;
-        if (item.type === 'user_message') {
-          return { ...item, metadata: { ...item.metadata, queued: false, starting: true } };
-        }
-        if (item.eventType === 'turn_queued') {
-          return { ...item, eventType: 'turn_started', content: 'Queued turn is starting now.' };
-        }
-        return item;
-      }),
     }));
 
     try {
-      await get().continueMission(missionId, next.request, next.options, true);
-    } finally {
-      drainingQueuedMissions.delete(missionId);
+      const durable = await apiRequest<Record<string, any>>(`/missions/${missionId}/messages`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': queueId },
+        body: JSON.stringify({ content: trimmed, delivery, options }),
+      });
+      const turnId = String(durable.turnId || durable.turn?.id || durable.commandId || durable.command?.id || durable.id || queueId);
+      set((state) => ({
+        queuedTurns: state.queuedTurns.map((turn) => turn.id === queueId ? { ...turn, turnId } : turn),
+        timeline: state.timeline.map((item) => item.metadata?.queueId === queueId
+          ? { ...item, metadata: { ...item.metadata, durable: true, turnId, delivery } }
+          : item),
+      }));
+    } catch (error: any) {
+      set((state) => ({
+        queuedTurns: state.queuedTurns.filter((turn) => turn.id !== queueId),
+        timeline: state.timeline.map((item) => item.metadata?.queueId === queueId
+          ? { ...item, eventType: item.type === 'event' ? 'turn_cancelled' : item.eventType, content: item.type === 'event' ? `Message could not be delivered: ${error?.message || 'Service unavailable.'}` : item.content, metadata: { ...item.metadata, queued: false, starting: false, failed: true } }
+          : item),
+        error: error?.message || 'Message delivery failed.',
+      }));
     }
+  },
+
+  drainQueuedTurn: async (missionId) => {
+    // Durable turns are scheduled by the backend; refresh instead of locally draining a FIFO.
+    await get().fetchMissionState(missionId);
   },
 
   deleteMission: async (id) => {
@@ -680,9 +704,45 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     missions: state.missions.map((mission) => mission.id === id ? { ...mission, status } : mission),
   })),
 
-  addTimelineItem: (item) => set((state) => state.timeline.some((entry) => entry.id === item.id)
-    ? state
-    : { timeline: reconcileApprovalTimeline([...state.timeline, item]) }),
+  addTimelineItem: (item) => set((state) => {
+    const turnId = metadataString(item.metadata, 'turnId') || metadataString(item.metadata, 'commandId');
+    if (turnId && item.eventType?.startsWith('turn_')) {
+      const clientMessageId = metadataString(item.metadata, 'clientMessageId');
+      const reconciled = state.timeline.map((entry) => {
+        const entryTurnId = metadataString(entry.metadata, 'turnId') || metadataString(entry.metadata, 'commandId');
+        if (entryTurnId !== turnId && entry.metadata?.queueId !== turnId && entry.metadata?.queueId !== clientMessageId) return entry;
+        if (entry.type === 'user_message') return {
+          ...entry,
+          metadata: { ...entry.metadata, queued: item.eventType === 'turn_queued', starting: item.eventType === 'turn_started', cancelled: item.eventType === 'turn_cancelled', turnId },
+        };
+        return entry;
+      });
+      const queuedTurns = item.eventType === 'turn_queued'
+        ? state.queuedTurns
+        : state.queuedTurns.filter((turn) => turn.turnId !== turnId && turn.id !== turnId);
+      if (reconciled.some((entry) => entry.id === item.id)) return { timeline: reconciled, queuedTurns };
+      return { timeline: reconcileApprovalTimeline([...reconciled, item]), queuedTurns };
+    }
+    const toolCallId = metadataString(item.metadata, 'toolCallId');
+    if (toolCallId && item.eventType === 'tool_call_completed') {
+      const startedIndex = state.timeline.findIndex((entry) => metadataString(entry.metadata, 'toolCallId') === toolCallId && ['agent_tool_call', 'tool_call_started'].includes(entry.eventType || ''));
+      if (startedIndex >= 0) {
+        const timeline = [...state.timeline];
+        timeline[startedIndex] = { ...timeline[startedIndex], content: item.content, timestamp: item.timestamp, eventType: item.eventType, metadata: { ...timeline[startedIndex].metadata, ...item.metadata } };
+        return { timeline };
+      }
+    }
+    if (item.eventType === 'text_delta') {
+      const agentId = metadataString(item.metadata, 'agentInstanceId');
+      const previous = state.timeline[state.timeline.length - 1];
+      if (previous?.eventType === 'text_delta' && metadataString(previous.metadata, 'agentInstanceId') === agentId) {
+        return { timeline: [...state.timeline.slice(0, -1), { ...previous, content: previous.content + item.content, timestamp: item.timestamp, metadata: { ...previous.metadata, ...item.metadata } }] };
+      }
+    }
+    return state.timeline.some((entry) => entry.id === item.id)
+      ? state
+      : { timeline: reconcileApprovalTimeline([...state.timeline, item]) };
+  }),
   setTasks: (tasks) => set({ activeTasks: tasks }),
   patchTask: (id, updates) => set((state) => ({
     activeTasks: state.activeTasks.map((task) => task.id === id ? { ...task, ...updates } : task),

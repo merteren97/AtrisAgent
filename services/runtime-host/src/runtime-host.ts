@@ -408,6 +408,21 @@ export class RuntimeHost {
       `[RuntimeHost] ${role} route -> ${route.adapterId}/${route.profile?.profileName || 'profile'}/${route.model?.displayName || 'runtime-default'} (${route.reasons.join('; ') || 'scheduler'})`,
     );
     const adapter = this.requireAdapter(route.adapterId as RuntimeType);
+    const mission = this.workspaceManager ? await this.workspaceManager.getMission(event.missionId) : null;
+    const automationPolicy = mission?.automationPolicy as any;
+    const governedActions = role === 'builder' && automationPolicy ? ['fileWrite', 'packageInstall', 'gitCommit'] : [];
+    const defaultDecision = automationPolicy?.profile === 'ask' ? 'ask' : automationPolicy?.profile === 'auto' ? 'auto' : 'review';
+    const decisions = governedActions.map((action) => ({ action, decision: automationPolicy?.overrides?.[action] || defaultDecision }));
+    const deniedOverride = role === 'builder' ? Object.entries(automationPolicy?.overrides || {}).find(([, decision]) => decision === 'deny') : undefined;
+    const denied = deniedOverride ? { action: deniedOverride[0], decision: 'deny' } : decisions.find((item) => item.decision === 'deny');
+    if (denied) throw new Error(`Mission policy denies Builder action: ${denied.action}.`);
+    const explicitAsk = role === 'builder' ? Object.entries(automationPolicy?.overrides || {})
+      .filter(([, decision]) => decision === 'ask').map(([action]) => ({ action, decision: 'ask' })) : [];
+    const approvalRequired = [...decisions.filter((item) => item.decision === 'ask'), ...explicitAsk]
+      .filter((item, index, all) => all.findIndex((candidate) => candidate.action === item.action) === index);
+    if (approvalRequired.length > 0 && route.adapterId !== 'opencode') {
+      throw new Error(`The selected runtime cannot pause for Ask-profile approvals (${approvalRequired.map((item) => item.action).join(', ')}). Select OpenCode or use Review mode.`);
+    }
     if (route.profile) adapter.configureProfile(route.profile);
     const execution = await this.resolveTaskExecutionContext(event, role);
     const prompt = [
@@ -415,7 +430,7 @@ export class RuntimeHost {
       task?.description ? `Instructions:\n${task.description}` : undefined,
       execution.promptContext,
       role === 'builder'
-        ? 'Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.'
+        ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
         : role === 'reviewer'
           ? 'Review only. Do not modify source files. Report concrete findings with file paths, severity, and an explicit approve or revision recommendation.'
           : role === 'qa'
