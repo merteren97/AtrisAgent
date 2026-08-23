@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -7,6 +8,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { and, eq } from 'drizzle-orm';
 import * as schema from '@atris-agent-code/database';
 import type { AtrisDatabase } from '@atris-agent-code/database';
+import { migrateDatabase } from '@atris-agent-code/database';
 import { LocalEventBus } from '@atris-agent-code/event-bus';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator } from '@atris-agent-code/orchestration-core';
@@ -265,6 +267,7 @@ sqlite.exec(`
     is_rollback_target INTEGER NOT NULL DEFAULT 0
   );
 `);
+migrateDatabase(sqlite as any);
 
 const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
 
@@ -366,15 +369,19 @@ eventBus.on('*', (event: AgentEvent) => {
     }
   }
   try {
-    db.insert((schema as any).missionEvents).values({
-      id: event.id,
-      missionId: event.missionId,
-      taskId,
-      agentInstanceId,
-      type: event.type,
-      payload,
-      createdAt: event.timestamp,
-    }).run();
+    const persisted = sqlite.transaction(() => {
+      const duplicate = sqlite.prepare('SELECT payload FROM mission_events WHERE id = ?').get(event.id) as { payload: string } | undefined;
+      if (duplicate) return JSON.parse(duplicate.payload) as AgentEvent;
+      const sequence = Number((sqlite.prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM mission_events WHERE mission_id = ?')
+        .get(event.missionId) as { sequence: number }).sequence);
+      const enriched = { ...payload, sequence, schemaVersion: 1 } as unknown as AgentEvent;
+      sqlite.prepare(`INSERT INTO mission_events
+        (id, mission_id, task_id, agent_instance_id, type, payload, sequence, schema_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`)
+        .run(event.id, event.missionId, taskId, agentInstanceId, event.type, JSON.stringify(enriched), sequence, event.timestamp);
+      return enriched;
+    })();
+    Object.assign(event, persisted);
   } catch (error) {
     console.warn('[API Gateway] Failed to persist mission event:', error);
   }
@@ -455,6 +462,178 @@ const ACTIVE_MISSION_STATUSES = new Set([
   'verifying',
   'revising',
 ]);
+const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const missionDrains = new Map<string, Promise<void>>();
+
+function stableJson(value: unknown): string {
+  const canonicalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(canonicalize);
+    if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, canonicalize(child)]));
+    return item;
+  };
+  return JSON.stringify(canonicalize(value));
+}
+
+function turnRequestHash(missionId: string, content: string, delivery: string, options: Record<string, unknown>): string {
+  return createHash('sha256').update(`${missionId}\n${content}\n${delivery}\n${stableJson(options)}`).digest('hex');
+}
+
+function turnDto(turn: any, command?: any): Record<string, unknown> {
+  const options = typeof turn.options === 'string' ? JSON.parse(turn.options || '{}') : turn.options || {};
+  return {
+    id: turn.id,
+    missionId: turn.mission_id,
+    commandId: turn.command_id || command?.id || null,
+    content: turn.content,
+    delivery: turn.delivery,
+    options,
+    status: turn.status,
+    priorityPending: turn.status === 'pending_priority',
+    createdAt: turn.created_at,
+    startedAt: turn.started_at || null,
+    completedAt: turn.completed_at || null,
+  };
+}
+
+function normalizeAutomationPolicy(body: Record<string, any>): import('@atris-agent-code/domain').MissionAutomationPolicy {
+  const legacy = String(body.trustMode || body.executionMode || '').toLowerCase();
+  const profile = body.trustProfile === 'ask' || body.trustProfile === 'review' || body.trustProfile === 'auto'
+    ? body.trustProfile
+    : legacy.includes('review driven') || legacy === 'review_driven' ? 'ask'
+      : legacy.includes('autonomous') || legacy === 'autonomous' ? 'auto' : 'review';
+  const strategy = body.executionStrategy === 'candidate' || legacy === 'candidate' ? 'candidate' : 'standard';
+  const allowedActions = new Set(['plan', 'fileWrite', 'deleteFiles', 'commandExecution', 'packageInstall', 'gitCommit', 'databaseMigration', 'workspaceApply', 'gitPush', 'pullRequest']);
+  const allowedDecisions = new Set(['ask', 'review', 'auto', 'deny']);
+  const overrides: Record<string, string> = {};
+  for (const [action, decision] of Object.entries(body.automationOverrides || {})) {
+    if (!allowedActions.has(action) || !allowedDecisions.has(String(decision))) throw new Error(`Invalid automation override: ${action}`);
+    overrides[action] = String(decision);
+  }
+  for (const [action, enabled] of Object.entries(body.automationSettings || {})) {
+    if (allowedActions.has(action) && typeof enabled === 'boolean' && overrides[action] === undefined) overrides[action] = enabled ? 'auto' : 'ask';
+  }
+  return { profile, strategy, overrides } as import('@atris-agent-code/domain').MissionAutomationPolicy;
+}
+
+function emitTurnEvent(event: AgentEvent): void {
+  eventBus.emit(event);
+}
+
+async function startDurableTurn(command: any, turn: any): Promise<void> {
+  const now = new Date().toISOString();
+  const runId = crypto.randomUUID();
+  sqlite.transaction(() => {
+    sqlite.prepare("UPDATE conversation_turns SET status = 'starting', started_at = ? WHERE id = ?").run(now, turn.id);
+    sqlite.prepare("INSERT INTO mission_runs (id, mission_id, turn_id, command_id, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'starting', ?, ?)")
+      .run(runId, command.mission_id, turn.id, command.id, now, now);
+    sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, command.mission_id);
+  })();
+  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
+    content: turn.content, delivery: turn.delivery, timestamp: now });
+  try {
+    const options = turn.options ? JSON.parse(turn.options) : {};
+    configureMissionRouting(command.mission_id, options);
+    const result = await orchestrator.startMission(command.mission_id, turn.content, { ...options, turnId: turn.id, runId });
+    sqlite.transaction(() => {
+      sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ?").run(new Date().toISOString(), command.id);
+      sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turn.id);
+      sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
+        .run(result.planId || null, new Date().toISOString(), runId);
+    })();
+  } catch (error: any) {
+    const failedAt = new Date().toISOString();
+    sqlite.transaction(() => {
+      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), command.id);
+      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turn.id);
+      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), runId);
+      sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(command.mission_id, runId);
+    })();
+    throw error;
+  }
+}
+
+function drainMissionCommands(missionId: string): Promise<void> {
+  const existing = missionDrains.get(missionId);
+  if (existing) return existing;
+  const drain = (async () => {
+    while (true) {
+      const mission = await workspaceManager.getMission(missionId);
+      if (!mission || !TERMINAL_MISSION_STATUSES.has(String(mission.status))) return;
+      const claimed = sqlite.transaction(() => {
+      const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
+      if (activeRun) return null;
+      const candidate = sqlite.prepare(`SELECT * FROM mission_commands WHERE mission_id = ? AND status = 'pending'
+        ORDER BY priority DESC, created_at, id LIMIT 1`).get(missionId) as any;
+      if (!candidate) return null;
+      const claim = sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
+        .run(new Date().toISOString(), candidate.id) as { changes: number };
+      return claim.changes === 1 ? candidate : null;
+      })();
+      const command = claimed as any;
+      if (!command) return;
+      const turn = sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(command.turn_id) as any;
+      if (!turn) {
+        sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = 'Conversation turn is missing' WHERE id = ?")
+          .run(new Date().toISOString(), command.id);
+        continue;
+      }
+      await startDurableTurn(command, turn);
+      const active = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
+      if (active) return;
+    }
+  })().catch((error) => console.warn('[API Gateway] Failed to drain mission command:', error))
+    .finally(() => missionDrains.delete(missionId));
+  missionDrains.set(missionId, drain);
+  return drain;
+}
+
+async function startMissionWithDurability(missionId: string, content: string, options: Record<string, any>): Promise<any> {
+  const now = new Date().toISOString();
+  const turnId = crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  sqlite.transaction(() => {
+    sqlite.prepare(`INSERT INTO conversation_turns
+      (id, mission_id, content, delivery, options, status, created_at, started_at)
+      VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
+    sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
+      VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
+    sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, missionId);
+  })();
+  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
+    content, delivery: 'queue', timestamp: now });
+  try {
+    const result = await orchestrator.startMission(missionId, content, { ...options, turnId, runId });
+    sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turnId);
+    sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
+      .run(result.planId || null, new Date().toISOString(), runId);
+    return result;
+  } catch (error: any) {
+    const failedAt = new Date().toISOString();
+    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turnId);
+    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?")
+      .run(failedAt, error?.message || String(error), runId);
+    sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(missionId, runId);
+    throw error;
+  }
+}
+
+eventBus.on('*', (event) => {
+  if (event.type !== 'mission_completed' && event.type !== 'mission_failed') return;
+  if (!event.runId) return;
+  const completedAt = event.timestamp;
+  sqlite.transaction(() => {
+    const run = sqlite.prepare("SELECT turn_id FROM mission_runs WHERE id = ? AND mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+      .get(event.runId, event.missionId) as { turn_id: string | null } | undefined;
+    if (!run) return;
+    sqlite.prepare("UPDATE mission_runs SET status = ?, completed_at = ? WHERE id = ?")
+      .run(event.type === 'mission_completed' ? 'completed' : 'failed', completedAt, event.runId);
+    if (run.turn_id) sqlite.prepare('UPDATE conversation_turns SET status = ?, completed_at = ? WHERE id = ?')
+      .run(event.type === 'mission_completed' ? 'completed' : 'failed', completedAt, run.turn_id);
+    sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(event.missionId, event.runId);
+  })();
+  setImmediate(() => void drainMissionCommands(event.missionId));
+});
 
 async function cleanupMissionResources(missionId: string): Promise<void> {
   await runtimeHost.stopMission(missionId).catch(() => undefined);
@@ -609,20 +788,143 @@ app.delete('/api/missions/:id', async (req: Request, res: Response) => {
   }
 });
 
+app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
+  try {
+    const missionId = routeParam(req.params.id);
+    const mission = await workspaceManager.getMission(missionId);
+    if (!mission) return void res.status(404).json({ error: 'Mission not found' });
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    const delivery = String(req.body?.delivery || '');
+    if (!content || !['steer', 'queue', 'stop_and_replan'].includes(delivery)) {
+      return void res.status(400).json({ error: "content and delivery ('steer', 'queue', or 'stop_and_replan') are required" });
+    }
+    const idempotencyKey = typeof req.header('Idempotency-Key') === 'string' ? req.header('Idempotency-Key')!.trim() : '';
+    const active = ACTIVE_MISSION_STATUSES.has(String(mission.status));
+    const turnId = crypto.randomUUID();
+    const commandId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const requestedOptions = req.body?.options && typeof req.body.options === 'object' ? req.body.options : {};
+    const turnOptions = {
+      ...requestedOptions,
+      modelCatalogId: requestedOptions.modelCatalogId || requestedOptions.model || undefined,
+    };
+    delete turnOptions.model;
+    const requestHash = turnRequestHash(missionId, content, delivery, turnOptions);
+    if (idempotencyKey) {
+      const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?')
+        .get(missionId, idempotencyKey) as any;
+      if (existing) {
+        if (existing.request_hash && existing.request_hash !== requestHash) {
+          return void res.status(409).json({ code: 'IDEMPOTENCY_KEY_REUSED', error: 'Idempotency key was already used for a different message.' });
+        }
+        return void res.status(200).json(turnDto(existing));
+      }
+    }
+    const priorityPending = active && delivery === 'steer';
+    const turnStatus = priorityPending ? 'pending_priority' : 'queued';
+    sqlite.transaction(() => {
+      sqlite.prepare(`INSERT INTO conversation_turns
+        (id, mission_id, content, delivery, options, status, idempotency_key, request_hash, command_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(turnId, missionId, content, delivery, JSON.stringify(turnOptions), turnStatus, idempotencyKey || null, requestHash, commandId, now);
+      sqlite.prepare(`INSERT INTO mission_commands
+        (id, mission_id, turn_id, type, status, priority, request_hash, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`)
+        .run(commandId, missionId, turnId, delivery, priorityPending ? 100 : delivery === 'stop_and_replan' ? 200 : 0, requestHash, now);
+    })();
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId, clientMessageId: idempotencyKey || undefined,
+      content, timestamp: now });
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content,
+      delivery: delivery as any, priorityPending, clientMessageId: idempotencyKey || undefined, timestamp: now });
+    if (priorityPending) {
+      const activeRun = sqlite.prepare("SELECT id, turn_id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running') ORDER BY started_at DESC LIMIT 1")
+        .get(missionId) as { id: string; turn_id: string } | undefined;
+      if (!activeRun) throw new Error('Active run metadata is unavailable for steering.');
+      sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
+        .run(now, commandId);
+      try {
+        const applied = await orchestrator.steerActiveTurn({ missionId, targetTurnId: activeRun.turn_id, content });
+        const appliedAt = new Date().toISOString();
+        sqlite.transaction(() => {
+          sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ?").run(appliedAt, commandId);
+          sqlite.prepare("UPDATE conversation_turns SET status = 'completed', started_at = ?, completed_at = ? WHERE id = ?").run(appliedAt, appliedAt, turnId);
+        })();
+        emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_steered', missionId, turnId, runId: activeRun.id,
+          targetTurnId: activeRun.turn_id, content, disposition: applied.boundary === 'future_tasks' ? 'applied_future_tasks' : 'applied_synthesis', timestamp: appliedAt });
+      } catch (error: any) {
+        sqlite.transaction(() => {
+          sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ?").run(new Date().toISOString(), error?.message || String(error), commandId);
+          sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(new Date().toISOString(), turnId);
+        })();
+        throw error;
+      }
+    }
+    if (delivery === 'stop_and_replan') {
+      const activeTurns = sqlite.prepare("SELECT id FROM conversation_turns WHERE mission_id = ? AND status IN ('starting', 'running')")
+        .all(missionId) as Array<{ id: string }>;
+      try {
+        await runtimeHost.stopMission(missionId);
+      } catch (error: any) {
+        const failedAt = new Date().toISOString();
+        sqlite.transaction(() => {
+          sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), commandId);
+          sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turnId);
+        })();
+        throw error;
+      }
+      await workspaceManager.cancelMissionTasks(missionId);
+      await workspaceManager.updateMission(missionId, { status: 'cancelled' });
+      const cancelledAt = new Date().toISOString();
+      sqlite.transaction(() => {
+        sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+          .run(cancelledAt, missionId);
+        sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running')")
+          .run(cancelledAt, missionId);
+        sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ?').run(missionId);
+      })();
+      for (const activeTurn of activeTurns) emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_cancelled',
+        missionId, turnId: activeTurn.id, reason: 'Stopped for replanning', timestamp: cancelledAt });
+      void drainMissionCommands(missionId);
+    } else if (!active) {
+      void drainMissionCommands(missionId);
+    }
+    res.status(202).json(turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }));
+  } catch (error: any) {
+    if (String(error?.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
+      const missionId = routeParam(req.params.id);
+      const key = String(req.header('Idempotency-Key') || '').trim();
+      const existing = key ? sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?').get(missionId, key) as any : null;
+      if (existing) {
+        const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+        const delivery = String(req.body?.delivery || '');
+        const requested = req.body?.options && typeof req.body.options === 'object' ? { ...req.body.options } : {};
+        requested.modelCatalogId = requested.modelCatalogId || requested.model || undefined;
+        delete requested.model;
+        if (existing.request_hash && existing.request_hash !== turnRequestHash(missionId, content, delivery, requested)) {
+          return void res.status(409).json({ code: 'IDEMPOTENCY_KEY_REUSED', error: 'Idempotency key was already used for a different message.' });
+        }
+        return void res.status(200).json(turnDto(existing));
+      }
+      return void res.status(409).json({ error: 'Idempotency key conflict' });
+    }
+    res.status(500).json({ error: error?.message || 'Failed to queue message' });
+  }
+});
+
 app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
     configureMissionRouting(missionId, req.body || {});
-    res.json(await orchestrator.startMission(missionId, userRequest, {
+    res.json(await startMissionWithDurability(missionId, userRequest, {
       modelCatalogId: req.body?.modelCatalogId,
       reasoningLevel: req.body?.reasoningLevel,
       targetRole: req.body?.targetRole,
       command: req.body?.command,
     }));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to start mission' });
+    const message = error?.message || 'Failed to start mission';
+    res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
   }
 });
 
@@ -643,8 +945,12 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       executionMode,
       targetRole,
       command,
+      automationSettings,
+      automationOverrides,
+      trustProfile,
+      executionStrategy,
     } = req.body;
-    void trustMode;
+    const automationPolicy = normalizeAutomationPolicy({ trustMode, executionMode, automationSettings, automationOverrides, trustProfile, executionStrategy });
     const promptText = request || title;
     if (!promptText) return void res.status(400).json({ error: 'title or request is required' });
 
@@ -663,6 +969,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       description: promptText,
       status: 'running',
       executionMode: executionMode || 'balanced',
+      automationPolicy,
       teamTemplateId: teamTemplate || 'default-core-dev-team',
     });
 
@@ -677,11 +984,12 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       targetRole,
     });
 
-    const result = await orchestrator.startMission(missionId, promptText, {
+    const result = await startMissionWithDurability(missionId, promptText, {
       modelCatalogId,
       reasoningLevel,
       targetRole,
       command,
+      automationPolicy,
     });
     res.status(201).json({
       missionId: result.missionId,
@@ -690,7 +998,8 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       status: (await workspaceManager.getMission(result.missionId))?.status || 'running',
     });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to start mission' });
+    const message = error?.message || 'Failed to start mission';
+    res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
   }
 });
 
@@ -701,9 +1010,31 @@ app.get('/api/tasks/:id/diff', async (req: Request, res: Response) => {
   } catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to generate diff' }); }
 });
 
+app.get('/api/tasks/:id/worktree', async (req: Request, res: Response) => {
+  try {
+    const task = await workspaceManager.getTask(routeParam(req.params.id));
+    if (!task) return void res.status(404).json({ error: 'Task not found' });
+    if (!task.worktreeId) return void res.status(409).json({ error: 'This task does not have an isolated worktree yet.' });
+    const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+    res.json(await workspaceManager.getWorktreeManager().inspectEntry(task.worktreeId, requestedPath));
+  } catch (error: any) {
+    const message = error?.message || 'Failed to inspect worktree';
+    const status = /relative|escapes|symbolic/i.test(message) ? 400 : /ENOENT/.test(String(error?.code || message)) ? 404 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
 app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
   try {
     const taskId = routeParam(req.params.id);
+    const task = await workspaceManager.getTask(taskId);
+    if (!task) return void res.status(404).json({ error: 'Task not found' });
+    const mission = await workspaceManager.getMission(task.missionId);
+    const policy = mission?.automationPolicy as any;
+    const workspaceApply = policy?.overrides?.workspaceApply || (policy?.profile === 'auto' ? 'auto' : policy?.profile === 'review' ? 'review' : 'ask');
+    if (workspaceApply !== 'auto') {
+      return void res.status(409).json({ code: 'APPROVAL_REQUIRED', error: 'Workspace apply must continue through the mission approval flow.' });
+    }
     const result = await mergeCoordinator.applyWorktree(taskId);
     if (!result.success) return void res.status(400).json({ error: result.output });
     res.json(result);
@@ -1031,10 +1362,10 @@ app.delete('/api/execution-policies/:scopeType/:scopeId', async (req, res) => {
 
 app.get('/api/missions/:id/events', async (req, res) => {
   try {
-    const rows = db.select().from((schema as any).missionEvents)
-      .where(eq((schema as any).missionEvents.missionId, req.params.id)).all() as any[];
-    rows.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
-    res.json(rows.map((row) => row.payload));
+    const afterSequence = Math.max(0, Number(req.query.afterSequence) || 0);
+    const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ?
+      ORDER BY sequence`).all(req.params.id, afterSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
+    res.json(rows.map((row) => ({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 })));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to fetch mission events' });
   }
@@ -1077,9 +1408,24 @@ app.post('/api/missions/:id/cancel', async (req, res) => {
   try {
     const mission = await workspaceManager.getMission(req.params.id);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
-    const updated = await workspaceManager.updateMission(req.params.id, { status: 'cancelled' });
-    await runtimeHost.stopMission(req.params.id).catch(() => undefined);
+    await runtimeHost.stopMission(req.params.id);
     await workspaceManager.cancelMissionTasks(req.params.id);
+    const cancelledAt = new Date().toISOString();
+    const cancelledTurns = sqlite.transaction(() => {
+      const turns = sqlite.prepare("SELECT id FROM conversation_turns WHERE mission_id = ? AND status IN ('queued', 'pending_priority', 'starting', 'running')")
+        .all(req.params.id) as Array<{ id: string }>;
+      sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE mission_id = ? AND status IN ('pending', 'processing')")
+        .run(cancelledAt, req.params.id);
+      sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+        .run(cancelledAt, req.params.id);
+      sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('queued', 'pending_priority', 'starting', 'running')")
+        .run(cancelledAt, req.params.id);
+      sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ?').run(req.params.id);
+      return turns;
+    })();
+    const updated = await workspaceManager.updateMission(req.params.id, { status: 'cancelled' });
+    for (const turn of cancelledTurns) emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_cancelled', missionId: req.params.id,
+      turnId: turn.id, reason: 'Mission cancelled by the user', timestamp: cancelledAt });
     runtimeHost.clearMissionRoutingPreference(req.params.id, false);
     res.json(updated);
   } catch (error: any) {
@@ -1188,10 +1534,36 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
+  const missionId = typeof req.query.missionId === 'string' ? req.query.missionId : undefined;
+  let lastSequence = Math.max(0, Number(req.query.afterSequence) || 0);
+  let replaying = Boolean(missionId);
+  const buffered: AgentEvent[] = [];
+  const writeEvent = (event: AgentEvent) => {
+    if (missionId && event.missionId !== missionId) return;
+    const sequence = Number(event.sequence || 0);
+    if (missionId && sequence && sequence <= lastSequence) return;
+    if (sequence) lastSequence = sequence;
+    res.write(`id: ${sequence || event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  };
   const unsubscribe = eventBus.on('*', (event: AgentEvent) => {
-    res.write(`data: ${JSON.stringify(event)}\n\n`);
+    if (replaying) buffered.push(event);
+    else writeEvent(event);
   });
-  req.on('close', () => unsubscribe());
+  if (missionId) {
+    while (true) {
+      const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ? ORDER BY sequence LIMIT 1000`)
+        .all(missionId, lastSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
+      for (const row of rows) writeEvent({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent);
+      if (rows.length < 1000) break;
+    }
+    replaying = false;
+    for (const event of buffered) writeEvent(event);
+  }
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15_000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -1259,6 +1631,20 @@ wss.on('connection', (ws: WebSocket) => {
 });
 
 const isMain = shouldAutoStartGateway();
+setImmediate(() => {
+  const recoveredAt = new Date().toISOString();
+  sqlite.transaction(() => {
+    sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = COALESCE(error, 'Gateway restarted while command was starting') WHERE status = 'processing'")
+      .run(recoveredAt);
+    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = COALESCE(error, 'Gateway restarted before completion was confirmed') WHERE status IN ('starting', 'running', 'stopping')")
+      .run(recoveredAt);
+    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE status IN ('starting', 'running')").run(recoveredAt);
+    sqlite.prepare("UPDATE missions SET status = 'failed', completed_at = ?, active_run_id = NULL WHERE active_run_id IS NOT NULL")
+      .run(recoveredAt);
+  })();
+  const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
+  for (const row of pending) void drainMissionCommands(row.mission_id);
+});
 if (isMain && process.env.NODE_ENV !== 'test' && !server.listening) {
   server.listen(PORT, '127.0.0.1', () => {
     const ready = emitRuntimeReady(server, gatewayVersion());

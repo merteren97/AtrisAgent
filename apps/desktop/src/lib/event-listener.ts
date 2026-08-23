@@ -8,6 +8,8 @@ let reconnectTimer: number | null = null;
 let streamAbortController: AbortController | null = null;
 let transportActive = false;
 let needsReconcile = false;
+let unsubscribeMission: (() => void) | null = null;
+const highestSequenceByMission = new Map<string, number>();
 
 function timestampLabel(value?: string): string {
   const date = value ? new Date(value) : new Date();
@@ -18,7 +20,7 @@ function timestampLabel(value?: string): string {
 
 function append(eventData: any, content: string, options: Partial<TimelineItem> = {}): void {
   const store = useMissionStore.getState();
-  if (store.activeMissionId && eventData.missionId && store.activeMissionId !== eventData.missionId) return;
+  if (!store.activeMissionId || eventData.missionId !== store.activeMissionId) return;
   store.addTimelineItem({
     id: eventData.id || crypto.randomUUID(),
     type: options.type || 'event',
@@ -41,6 +43,17 @@ function optionalString(value: unknown): string | undefined {
 export function handleIncomingEvent(eventData: any): void {
   if (!eventData?.type) return;
   const missions = useMissionStore.getState();
+  if (!missions.activeMissionId || eventData.missionId !== missions.activeMissionId) return;
+  if (typeof eventData.sequence === 'number') {
+    const previous = highestSequenceByMission.get(eventData.missionId) || 0;
+    if (eventData.sequence <= previous) return;
+    if (previous > 0 && eventData.sequence > previous + 1) {
+      markTransportGap();
+      streamAbortController?.abort();
+      scheduleReconnect();
+      return;
+    }
+  }
   const agents = useAgentStore.getState();
   const isCancelledExecution = (): boolean => {
     const missionCancelled = missions.missions.find((mission) => mission.id === eventData.missionId)?.status === 'cancelled';
@@ -55,17 +68,29 @@ export function handleIncomingEvent(eventData: any): void {
     case 'user_message': {
       const content = String(eventData.content || '').trim();
       if (!content) break;
-      // Continuation is optimistic in the composer, while the backend also
-      // persists/broadcasts the canonical user turn. Avoid a temporary duplicate;
-      // the next hydration replaces the optimistic card with this persisted event.
-      const alreadyVisible = missions.timeline.some((item) => item.type === 'user_message' && item.content.trim() === content);
-      if (!alreadyVisible) append(eventData, content, { type: 'user_message' });
+      const optimisticId = optionalString(eventData.clientMessageId);
+      const optimistic = optimisticId && missions.timeline.some((item) => item.metadata?.queueId === optimisticId && item.type === 'user_message');
+      if (optimistic) {
+        useMissionStore.setState((state) => ({ timeline: state.timeline.map((item) => item.metadata?.queueId === optimisticId && item.type === 'user_message'
+          ? { ...item, id: eventData.id, metadata: { ...item.metadata, ...eventData, durable: true, turnId: eventData.turnId } }
+          : item) }));
+      } else if (!missions.timeline.some((item) => item.id === eventData.id)) append(eventData, content, { type: 'user_message' });
       break;
     }
 
     case 'mission_started':
       append(eventData, `Mission started: ${eventData.title || eventData.missionId}`, { agentRole: 'orchestrator' });
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'running');
+      break;
+
+    case 'turn_queued':
+    case 'turn_started':
+    case 'turn_steered':
+    case 'turn_cancelled':
+      append(eventData, eventData.type === 'turn_queued' ? 'Queued for the next conversation turn.'
+        : eventData.type === 'turn_started' ? 'Conversation turn started.'
+          : eventData.type === 'turn_steered' ? 'Guidance queued with priority for the next orchestrator turn.'
+            : `Conversation turn cancelled${eventData.reason ? `: ${eventData.reason}` : '.'}`, { agentRole: 'orchestrator' });
       break;
 
     case 'plan_generated':
@@ -261,7 +286,9 @@ export function handleIncomingEvent(eventData: any): void {
     case 'text_delta': {
       if (isCancelledExecution()) break;
       const sourceAgent = agents.agents.find((agent) => agent.id === eventData.agentInstanceId);
-      append(eventData, eventData.content || '', { type: 'orchestrator_message', agentRole: sourceAgent?.role || eventData.agentRole || 'agent' });
+      const sourceRole = sourceAgent?.role || eventData.agentRole || eventData.role || 'agent';
+      const orchestratorOutput = sourceRole === 'orchestrator' || String(eventData.agentInstanceId || '').startsWith('orchestrator-');
+      append(eventData, eventData.content || '', { type: orchestratorOutput ? 'orchestrator_message' : 'event', agentRole: sourceRole });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, { lastActivityAt: eventData.timestamp });
       break;
     }
@@ -270,7 +297,7 @@ export function handleIncomingEvent(eventData: any): void {
     case 'tool_call_started':
       if (isCancelledExecution()) break;
       append(eventData, `Tool started: ${eventData.toolName || 'tool'}`, {
-        agentRole: eventData.agentRole || 'agent', metadata: { toolName: eventData.toolName, args: eventData.args },
+        agentRole: eventData.agentRole || 'agent', metadata: { toolCallId: eventData.toolCallId, toolName: eventData.toolName, args: eventData.args },
       });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         statusMessage: `Using ${eventData.toolName || 'tool'}`, lastActivityAt: eventData.timestamp,
@@ -280,7 +307,7 @@ export function handleIncomingEvent(eventData: any): void {
     case 'tool_call_completed':
       if (isCancelledExecution()) break;
       append(eventData, `${eventData.toolName || 'Tool'} ${eventData.success ? 'completed' : 'failed'}.`, {
-        agentRole: eventData.agentRole || 'agent', metadata: { result: eventData.result, success: eventData.success },
+        agentRole: eventData.agentRole || 'agent', metadata: { toolCallId: eventData.toolCallId, toolName: eventData.toolName, result: eventData.result, success: eventData.success },
       });
       if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, {
         statusMessage: `${eventData.toolName || 'Tool'} ${eventData.success ? 'completed' : 'failed'}`,
@@ -407,6 +434,7 @@ export function handleIncomingEvent(eventData: any): void {
     default:
       append(eventData, `Event: ${eventData.type}`);
   }
+  if (typeof eventData.sequence === 'number') highestSequenceByMission.set(eventData.missionId, eventData.sequence);
 }
 
 function markTransportGap(): void {
@@ -448,21 +476,36 @@ async function connectSse(): Promise<void> {
   streamAbortController?.abort();
   const controller = new AbortController();
   streamAbortController = controller;
+  const missionId = useMissionStore.getState().activeMissionId;
+  if (!missionId) {
+    useMissionStore.getState().setTransportStatus('idle');
+    return;
+  }
+  useMissionStore.getState().setTransportStatus(needsReconcile ? 'reconnecting' : 'connecting');
   try {
     const headers = runtimeHeaders({
       Accept: 'text/event-stream',
       Authorization: `Bearer ${token}`,
       'Cache-Control': 'no-cache',
     });
-    const response = await fetch(`${getApiOrigin()}/api/events/stream`, {
+    const restoredSequence = useMissionStore.getState().timeline.reduce((highest, item) => {
+      const sequence = Number(item.metadata?.sequence || 0);
+      return sequence > highest ? sequence : highest;
+    }, 0);
+    const afterSequence = Math.max(highestSequenceByMission.get(missionId) || 0, restoredSequence);
+    if (afterSequence > 0) highestSequenceByMission.set(missionId, afterSequence);
+    const query = new URLSearchParams({ missionId, afterSequence: String(afterSequence) });
+    const response = await fetch(`${getApiOrigin()}/api/events/stream?${query}`, {
       headers,
       signal: controller.signal,
     });
     if (response.status === 401) {
+      useMissionStore.getState().setTransportStatus('error', 'Live updates require authentication.');
       notifyUnauthorized();
       return;
     }
     if (!response.ok || !response.body) throw new Error(`SSE connection failed with ${response.status}`);
+    useMissionStore.getState().setTransportStatus('connected');
     reconcileAfterGap();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -479,12 +522,14 @@ async function connectSse(): Promise<void> {
     }
     if (buffer.trim()) handleSseFrame(buffer.replace(/\r/g, ''));
     if (transportActive && !controller.signal.aborted) {
+      useMissionStore.getState().setTransportStatus('reconnecting', 'Live updates disconnected. Reconnecting...');
       markTransportGap();
       scheduleReconnect();
     }
   } catch (error) {
     if (!transportActive || controller.signal.aborted) return;
     console.warn('[EventListener] Authenticated SSE connection failed:', error);
+    useMissionStore.getState().setTransportStatus('error', error instanceof Error ? error.message : 'Live updates unavailable.');
     markTransportGap();
     scheduleReconnect();
   } finally {
@@ -509,6 +554,14 @@ export function initEventListener(): () => void {
   streamAbortController?.abort();
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  unsubscribeMission?.();
+  unsubscribeMission = useMissionStore.subscribe((state, previous) => {
+    if (state.activeMissionId === previous.activeMissionId) return;
+    streamAbortController?.abort();
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    void connectSse();
+  });
   void connectSse();
   return () => {
     transportActive = false;
@@ -517,5 +570,8 @@ export function initEventListener(): () => void {
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
     needsReconcile = false;
+    unsubscribeMission?.();
+    unsubscribeMission = null;
+    useMissionStore.getState().setTransportStatus('idle');
   };
 }

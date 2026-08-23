@@ -76,6 +76,7 @@ export function ChatComposer() {
     selectedModel,
     reasoningLevel,
     trustMode,
+    automationSettings,
     teamTemplate,
     setSelectedRole,
     setSelectedModel,
@@ -191,6 +192,7 @@ export function ChatComposer() {
       routeRole: targetRole,
       routeScope,
       command: directive.command,
+      automationSettings,
     };
 
     setMessage('');

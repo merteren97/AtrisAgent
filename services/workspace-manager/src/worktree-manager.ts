@@ -52,6 +52,12 @@ export interface IsolationBase {
   kind: 'workspace-git' | 'nested-git' | 'mirror';
 }
 
+export type WorktreeInspectResult = {
+  kind: 'directory'; path: string; entries: Array<{ path: string; name: string; kind: 'directory' | 'file'; sizeBytes?: number }>; truncated: boolean;
+} | {
+  kind: 'file'; path: string; sizeBytes: number; content?: string; truncated: boolean; previewUnavailable?: 'binary' | 'special';
+};
+
 const DEFAULT_IGNORED_DIRS = new Set([
   'node_modules',
   '.git',
@@ -107,6 +113,50 @@ function normalizeProjectHint(value: string): string {
 }
 
 export class WorktreeManager {
+  async inspectEntry(worktreePath: string, requestedPath = ''): Promise<WorktreeInspectResult> {
+    if (requestedPath.includes('\0') || path.isAbsolute(requestedPath) || /^[a-zA-Z]:[\\/]/.test(requestedPath) || /^[/\\]{2}/.test(requestedPath)) {
+      throw new Error('Worktree preview path must be relative.');
+    }
+    const normalized = requestedPath.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (normalized.split('/').some((segment) => segment === '..')) throw new Error('Worktree preview path escapes the task worktree.');
+    const canonicalRoot = await fs.promises.realpath(worktreePath);
+    let cursor = canonicalRoot;
+    for (const segment of normalized.split('/').filter(Boolean)) {
+      cursor = path.join(cursor, segment);
+      const segmentStat = await fs.promises.lstat(cursor);
+      if (segmentStat.isSymbolicLink()) throw new Error('Symbolic links are not available in read-only previews.');
+    }
+    const candidate = normalized ? cursor : canonicalRoot;
+    const canonicalCandidate = await fs.promises.realpath(candidate);
+    const relative = path.relative(canonicalRoot, canonicalCandidate);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Worktree preview path escapes the task worktree.');
+    const stat = await fs.promises.lstat(canonicalCandidate);
+    const apiPath = relative.replace(/\\/g, '/');
+    if (stat.isDirectory()) {
+      const allEntries = (await fs.promises.readdir(canonicalCandidate, { withFileTypes: true }))
+        .filter((entry) => !shouldIgnoreEntry(entry.name, DEFAULT_IGNORED_DIRS) && !entry.isSymbolicLink())
+        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+      const entries = await Promise.all(allEntries.slice(0, 1000).map(async (entry) => {
+        const childRelative = [apiPath, entry.name].filter(Boolean).join('/');
+        const child = await fs.promises.lstat(path.join(canonicalCandidate, entry.name));
+        return { path: childRelative, name: entry.name, kind: entry.isDirectory() ? 'directory' as const : 'file' as const,
+          ...(entry.isFile() ? { sizeBytes: child.size } : {}) };
+      }));
+      return { kind: 'directory', path: apiPath, entries, truncated: allEntries.length > entries.length };
+    }
+    if (!stat.isFile()) return { kind: 'file', path: apiPath, sizeBytes: stat.size, truncated: false, previewUnavailable: 'special' };
+    const maxBytes = 256 * 1024;
+    const handle = await fs.promises.open(canonicalCandidate, 'r');
+    try {
+      const buffer = Buffer.alloc(Math.min(stat.size, maxBytes + 1));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      const content = buffer.subarray(0, bytesRead);
+      if (content.includes(0)) return { kind: 'file', path: apiPath, sizeBytes: stat.size, truncated: stat.size > maxBytes, previewUnavailable: 'binary' };
+      return { kind: 'file', path: apiPath, sizeBytes: stat.size, content: content.subarray(0, maxBytes).toString('utf8'), truncated: stat.size > maxBytes };
+    } finally {
+      await handle.close();
+    }
+  }
   async isGitRepository(dirPath: string): Promise<boolean> {
     return isGitWorktree(dirPath);
   }

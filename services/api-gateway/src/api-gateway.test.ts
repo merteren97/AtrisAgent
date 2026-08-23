@@ -205,6 +205,44 @@ async function runTests() {
 
     // 7. SSE (/api/events/stream) Event Stream Verification
     {
+      const firstEventId = crypto.randomUUID();
+      const secondEventId = crypto.randomUUID();
+      const otherMissionResponse = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'SSE filter control mission' }),
+      });
+      const otherMission = await otherMissionResponse.json();
+      eventBus.emit({ id: firstEventId, type: 'agent_progressed', missionId: createdMissionId,
+        agentInstanceId: 'sequence-agent', progress: 'first', timestamp: new Date().toISOString() });
+      eventBus.emit({ id: secondEventId, type: 'agent_progressed', missionId: createdMissionId,
+        agentInstanceId: 'sequence-agent', progress: 'second', timestamp: new Date().toISOString() });
+      eventBus.emit({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: otherMission.id,
+        agentInstanceId: 'other-agent', progress: 'filtered', timestamp: new Date().toISOString() });
+      const eventsRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events`);
+      const persistedEvents = await eventsRes.json();
+      const first = persistedEvents.find((event: any) => event.id === firstEventId);
+      const second = persistedEvents.find((event: any) => event.id === secondEventId);
+      assert(first?.sequence < second?.sequence && second?.schemaVersion === 1, 'mission events receive monotonic sequence and schema version');
+      const afterRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events?afterSequence=${first.sequence}`);
+      const afterEvents = await afterRes.json();
+      assert(afterEvents.some((event: any) => event.id === secondEventId) && !afterEvents.some((event: any) => event.id === firstEventId), 'mission event replay honors afterSequence');
+
+      const replayReceived = await new Promise<boolean>((resolve) => {
+        const request = http.get(`${baseUrl}/api/events/stream?missionId=${createdMissionId}&afterSequence=${first.sequence}`,
+          { headers: { Authorization: 'Bearer integration-premium-token', 'X-Atris-Runtime-Token': 'gateway-runtime-secret' } }, (response) => {
+            response.on('data', (chunk: Buffer) => {
+              const text = chunk.toString();
+              if (text.includes(secondEventId)) {
+                request.destroy();
+                resolve(!text.includes('filtered'));
+              }
+            });
+          });
+        setTimeout(() => { request.destroy(); resolve(false); }, 2000);
+      });
+      assert(replayReceived, 'SSE replays persisted mission events and filters other missions');
+
       const sseReceived = await new Promise<boolean>((resolve, reject) => {
         const timeout = setTimeout(() => resolve(false), 3000);
          const req = http.get(`${baseUrl}/api/events/stream`, { headers: { Authorization: 'Bearer integration-premium-token', 'X-Atris-Runtime-Token': 'gateway-runtime-secret' } }, (res) => {
@@ -232,6 +270,31 @@ async function runTests() {
         }, 100);
       });
       assert(sseReceived === true, 'SSE stream endpoint broadcasts eventBus events to connected clients');
+    }
+
+    // Durable queued messages and idempotency
+    {
+      await gateway.workspaceManager.updateMission(createdMissionId, { status: 'running' });
+      const key = `queue-${Date.now()}`;
+      const requestMessage = () => authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: JSON.stringify({ content: 'Run this after the active turn', delivery: 'queue', options: { targetRole: 'builder' } }),
+      });
+      const firstResponse = await requestMessage();
+      const firstTurn = await firstResponse.json();
+      const duplicateResponse = await requestMessage();
+      const duplicateTurn = await duplicateResponse.json();
+      assert(firstResponse.status === 202 && duplicateResponse.status === 200 && firstTurn.id === duplicateTurn.id,
+        'queued message is durable and Idempotency-Key returns the existing turn');
+      assert(firstTurn.commandId === duplicateTurn.commandId && !('mission_id' in duplicateTurn) && duplicateTurn.missionId === createdMissionId,
+        'initial and idempotent message responses share one normalized DTO');
+      const conflictingResponse = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: JSON.stringify({ content: 'Different content must not reuse the key', delivery: 'queue' }),
+      });
+      assert(conflictingResponse.status === 409, 'Idempotency-Key reuse with different content is rejected');
     }
 
     // 8. WebSocket (/ws/events) Event Stream Verification

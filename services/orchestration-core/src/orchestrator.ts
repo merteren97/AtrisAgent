@@ -8,7 +8,7 @@ import type {
   TaskFailed,
 } from '@atris-agent-code/event-schema';
 import type { ExecutionMode, AgentRole, MissionStatus } from '@atris-agent-code/domain';
-import { PolicyEngine } from '@atris-agent-code/policy-engine';
+import { PolicyEngine, resolveAutomationAction } from '@atris-agent-code/policy-engine';
 
 export interface OrchestratorConfig {
   workspacePath: string;
@@ -508,6 +508,7 @@ export class Orchestrator {
   }> {
     const now = new Date().toISOString();
     let currentExecutionMode = this.config.executionMode ?? 'balanced';
+    let currentAutomationPolicy: any = null;
     let previousPlanId: string | null = null;
 
     // 1. STATE: Draft/Terminal -> Planning
@@ -526,6 +527,7 @@ export class Orchestrator {
       } else {
         previousPlanId = existingMission.planId ?? null;
         currentExecutionMode = (existingMission.executionMode as ExecutionMode) || currentExecutionMode;
+        currentAutomationPolicy = existingMission.automationPolicy || null;
         await this.workspaceManager.updateMission(missionId, { status: 'planning', completedAt: null });
       }
     } else {
@@ -549,6 +551,8 @@ export class Orchestrator {
           teamTemplateId: this.config.teamTemplateId ?? 'default-team',
           planId: null,
           executionMode: currentExecutionMode,
+          automationPolicy: null,
+          activeRunId: null,
           createdAt: now,
           updatedAt: now,
           completedAt: null,
@@ -727,10 +731,12 @@ export class Orchestrator {
 
     // 4. Policy Engine check for Plan Approval
     const policyEngine = new PolicyEngine(currentExecutionMode as any);
-    const autoApproved = await policyEngine.requestApproval(
-      'plan',
-      `Approve execution plan with ${createdTasks.length} tasks for: ${request}`
-    );
+    const planDecision = currentAutomationPolicy
+      ? resolveAutomationAction(currentAutomationPolicy.profile, 'plan', currentAutomationPolicy.overrides)
+      : null;
+    if (planDecision === 'deny') throw new Error('Mission policy denies plan execution.');
+    const autoApproved = planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
+      'plan', `Approve execution plan with ${createdTasks.length} tasks for: ${request}`);
 
     if (!autoApproved) {
       // STATE: Planning -> AwaitingPlanApproval (waiting_for_approval)
@@ -972,6 +978,7 @@ export class Orchestrator {
         : this.inMemoryMissions.get(missionId);
       if (mission && TERMINAL_MISSION_STATUSES.has(String(mission.status))) return;
       const executionMode = (mission?.executionMode || this.config.executionMode || 'balanced') as ExecutionMode;
+      const automationPolicy = mission?.automationPolicy as any;
       const reviewerDone = allTasks.some((task) => task.assignedRole === 'reviewer' && task.status === 'done');
       const qaTasks = allTasks.filter((task) => task.assignedRole === 'qa');
       const qaDone = qaTasks.length === 0 || qaTasks.every((task) => task.status === 'done');
@@ -1007,10 +1014,15 @@ export class Orchestrator {
       }
 
       const policyEngine = new PolicyEngine(executionMode as any);
-      const applyApproved = await policyEngine.requestApproval(
-        'apply',
-        `Apply ${allTasks.filter((task) => task.assignedRole === 'builder').length} Builder worktree result(s) to the workspace`,
-      );
+      const applyDecision = automationPolicy
+        ? resolveAutomationAction(automationPolicy.profile, 'workspaceApply', automationPolicy.overrides)
+        : null;
+      if (applyDecision === 'deny') {
+        if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'blocked' });
+        return;
+      }
+      const applyApproved = applyDecision ? applyDecision === 'auto' : await policyEngine.requestApproval(
+        'apply', `Apply ${allTasks.filter((task) => task.assignedRole === 'builder').length} Builder worktree result(s) to the workspace`);
 
       if (!applyApproved || !this.applyTaskChanges) {
         if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'waiting_for_approval' });

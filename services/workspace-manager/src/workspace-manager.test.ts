@@ -132,6 +132,17 @@ async function runTests() {
     const diffText = await worktreeManager.getDiff(wtPath);
     assert(diffText.includes('+export const x = 42;'), 'getDiff includes added line');
 
+    const worktreeRoot = await worktreeManager.inspectEntry(wtPath);
+    assert(worktreeRoot.kind === 'directory' && worktreeRoot.entries.some((entry) => entry.path === 'index.ts'), 'read-only worktree inspector lists relative entries');
+    const worktreeFile = await worktreeManager.inspectEntry(wtPath, 'index.ts');
+    assert(worktreeFile.kind === 'file' && Boolean(worktreeFile.content?.includes('updated world')), 'read-only worktree inspector previews bounded text content');
+    let previewTraversalRejected = false;
+    try { await worktreeManager.inspectEntry(wtPath, '../index.ts'); } catch { previewTraversalRejected = true; }
+    assert(previewTraversalRejected, 'read-only worktree inspector rejects traversal');
+    fs.writeFileSync(path.join(wtPath, 'binary.bin'), Buffer.from([0, 1, 2, 3]));
+    const binaryPreview = await worktreeManager.inspectEntry(wtPath, 'binary.bin');
+    assert(binaryPreview.kind === 'file' && binaryPreview.previewUnavailable === 'binary' && !binaryPreview.content, 'read-only worktree inspector does not expose binary content');
+
     const nestedSourceDir = path.join(wsPath, 'src');
     fs.mkdirSync(nestedSourceDir, { recursive: true });
     fs.writeFileSync(path.join(nestedSourceDir, 'stable.ts'), 'export const stable = true;');

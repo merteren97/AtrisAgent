@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { ToolCallRow } from '@/components/chat/tool-call-row';
 import { cn } from '@/lib/utils';
 import { useMissionStore } from '@/stores/mission-store';
+import { useSettingsStore, type TimelineDetailMode } from '@/stores/settings-store';
 
 type FilterType = 'all' | 'agents' | 'tools' | 'coordination' | 'errors';
 
@@ -28,6 +29,8 @@ function isNearBottom(viewport: HTMLElement): boolean {
 export function ActivityTab() {
   const timeline = useMissionStore((state) => state.timeline);
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
+  const detailMode = useSettingsStore((state) => state.timelineDetailMode);
+  const setDetailMode = useSettingsStore((state) => state.setTimelineDetailMode);
   const [filter, setFilter] = useState<FilterType>('all');
   const [autoScroll, setAutoScroll] = useState(true);
   const shouldFollowRef = useRef(true);
@@ -133,6 +136,16 @@ export function ActivityTab() {
             </button>
           ))}
         </div>
+        <div className="ml-auto flex shrink-0 rounded-md border border-border/70 bg-background/50 p-0.5" aria-label="Timeline detail">
+          {(['summary', 'activity', 'telemetry'] as TimelineDetailMode[]).map((mode) => <button
+            key={mode}
+            type="button"
+            onClick={() => setDetailMode(mode)}
+            aria-pressed={detailMode === mode}
+            title={`${mode} timeline detail`}
+            className={cn('rounded px-1.5 py-0.5 text-[8px] capitalize', detailMode === mode ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground')}
+          >{mode}</button>)}
+        </div>
       </div>
 
       <div className="relative min-h-0 flex-1">
@@ -149,7 +162,7 @@ export function ActivityTab() {
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex min-w-0 items-center gap-2">
                         <Badge variant="secondary" className={cn('h-4 max-w-[150px] truncate border-transparent px-1.5 text-[9px] font-medium', getEventColor(item.eventType))}>
-                          {item.eventType || item.type}
+                          {item.eventType === 'agent_thought' ? 'progress summary' : item.eventType || item.type}
                         </Badge>
                         {item.agentRole && (
                           <Badge variant="outline" className="h-4 px-1.5 text-[9px] capitalize text-muted-foreground">

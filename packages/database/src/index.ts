@@ -6,6 +6,7 @@ import * as memorySchema from './memory-schema';
 export * from './schema';
 export * from './execution-policy-schema';
 export * from './memory-schema';
+export * from './migrations';
 
 type DatabaseSchema = typeof coreSchema & typeof executionPolicySchema & typeof memorySchema;
 

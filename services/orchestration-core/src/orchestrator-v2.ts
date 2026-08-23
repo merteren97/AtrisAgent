@@ -42,6 +42,8 @@ interface StartMissionOptionsV2 {
   targetRole?: string;
   command?: string;
   rawModelPlanOutput?: string;
+  turnId?: string;
+  runId?: string;
 }
 
 /**
@@ -65,6 +67,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   private readonly missionQueues = new Map<string, Promise<void>>();
   private readonly planActions = new Map<string, OrchestratorTurnAction>();
   private readonly synthesizedPlans = new Set<string>();
+  private readonly lifecycleByMission = new Map<string, { turnId?: string; runId?: string }>();
+  private readonly pendingSteers = new Map<string, string[]>();
 
   constructor(
     config: OrchestratorConfig,
@@ -85,6 +89,20 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     console.info(`[OrchestratorV2][Scheduler] ${stage} ${JSON.stringify(details)}`);
   }
 
+  override emitMissionCompleted(params: { missionId?: string; summary: string; tasksCompleted: number; totalTasks: number }): void {
+    const missionId = params.missionId || '';
+    const lifecycle = this.lifecycleByMission.get(missionId);
+    this.v2EventBus?.emit({ id: crypto.randomUUID(), type: 'mission_completed', missionId, ...lifecycle,
+      summary: params.summary, tasksCompleted: params.tasksCompleted, totalTasks: params.totalTasks, timestamp: new Date().toISOString() });
+  }
+
+  override emitMissionFailed(params: { missionId?: string; reason: string; failedTaskId?: string | null }): void {
+    const missionId = params.missionId || '';
+    const lifecycle = this.lifecycleByMission.get(missionId);
+    this.v2EventBus?.emit({ id: crypto.randomUUID(), type: 'mission_failed', missionId, ...lifecycle,
+      reason: params.reason, failedTaskId: params.failedTaskId ?? null, timestamp: new Date().toISOString() });
+  }
+
   private enqueueMission<T>(missionId: string, work: () => Promise<T>): Promise<T> {
     const previous = this.missionQueues.get(missionId) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(work);
@@ -92,6 +110,26 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     this.missionQueues.set(missionId, tracked);
     return next.finally(() => {
       if (this.missionQueues.get(missionId) === tracked) this.missionQueues.delete(missionId);
+    });
+  }
+
+  async steerActiveTurn(params: { missionId: string; targetTurnId: string; content: string }): Promise<{ boundary: 'future_tasks' | 'synthesis' }> {
+    return this.enqueueMission(params.missionId, async () => {
+      const lifecycle = this.lifecycleByMission.get(params.missionId);
+      if (!lifecycle?.turnId || lifecycle.turnId !== params.targetTurnId) throw new Error('The active turn changed before steering could be applied.');
+      const manager = this.v2WorkspaceManager;
+      if (!manager) throw new Error('Durable orchestration is unavailable.');
+      const mission = await manager.getMission(params.missionId);
+      if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status))) throw new Error('The active turn has already finished.');
+      const tasks = (await manager.listTasks(params.missionId)).filter((task) => task.planId === mission.planId);
+      const future = tasks.filter((task) => task.status === 'planned' || task.status === 'ready');
+      for (const task of future) {
+        await manager.updateTask(task.id, { description: `${task.description}\n\nOrchestrator steering for the next safe boundary:\n${params.content}` });
+      }
+      const pending = this.pendingSteers.get(params.missionId) || [];
+      pending.push(params.content);
+      this.pendingSteers.set(params.missionId, pending);
+      return { boundary: future.length > 0 ? 'future_tasks' : 'synthesis' };
     });
   }
 
@@ -431,7 +469,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       throw new Error('The current conversation turn is still executing. Finish or stop it before starting another turn.');
     }
 
-    const turnId = crypto.randomUUID();
+    const turnId = options?.turnId || crypto.randomUUID();
+    this.lifecycleByMission.set(missionId, { turnId, runId: options?.runId });
     const { decision, hasPriorConversation } = await this.decideTurn(missionId, turnId, request, options);
     this.trace('turn-decision', {
       missionId,
@@ -515,6 +554,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       `Completed ${planTasks.length} delegated task${planTasks.length === 1 ? '' : 's'}.`,
       currentResult?.trim(),
     ].filter(Boolean).join('\n\n');
+    const steering = this.pendingSteers.get(missionId) || [];
+    this.pendingSteers.delete(missionId);
     if (!runner) return fallback || 'Delegated work completed.';
 
     try {
@@ -530,7 +571,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           'Return normal prose/Markdown only, not JSON.',
           '',
           'Conversation and worker evidence:',
-          loaded.conversationContext,
+           loaded.conversationContext,
+          steering.length ? `\nUser steering received during execution:\n${steering.join('\n')}` : '',
           currentResult ? `\nLatest worker result:\n${currentResult}` : '',
         ].join('\n'),
       })).trim() || fallback;
@@ -599,6 +641,12 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           agentInstanceId: event.agentInstanceId,
         });
         await super.handleTaskCompleted(event);
+        return;
+      }
+
+      const currentMission = await manager.getMission(event.missionId);
+      if (currentMission?.planId && task.planId !== currentMission.planId) {
+        this.trace('stale-plan-completion-ignored', { missionId: event.missionId, taskId: task.id, taskPlanId: task.planId, activePlanId: currentMission.planId });
         return;
       }
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, Copy, Sparkles, User } from 'lucide-react';
+import { Check, Copy, Loader2, Sparkles, User } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownContent } from './markdown-content';
 import {
@@ -15,9 +15,10 @@ interface MessageCardProps {
   role: 'user' | 'orchestrator';
   content: string;
   timestamp: string;
+  deliveryState?: 'queued' | 'starting' | 'cancelled' | 'failed';
 }
 
-export function MessageCard({ role, content, timestamp }: MessageCardProps) {
+export function MessageCard({ role, content, timestamp, deliveryState }: MessageCardProps) {
   const isUser = role === 'user';
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
   const resetCopyStateTimer = useRef<number | null>(null);
@@ -69,6 +70,10 @@ export function MessageCard({ role, content, timestamp }: MessageCardProps) {
             <div className="flex items-center gap-2 px-1">
               <span className="text-xs font-semibold text-foreground/80">{isUser ? 'You' : 'Orchestrator'}</span>
               <span className="text-[10px] text-muted-foreground">{timestamp}</span>
+              {deliveryState && <span className="flex items-center gap-1 text-[9px] capitalize text-muted-foreground">
+                {(deliveryState === 'queued' || deliveryState === 'starting') && <Loader2 className="h-2.5 w-2.5 animate-spin" />}
+                {deliveryState === 'starting' ? 'starting' : deliveryState}
+              </span>}
             </div>
             <div className={cn(
               'w-full min-w-0 select-text px-4 py-3 text-sm leading-relaxed shadow-sm',

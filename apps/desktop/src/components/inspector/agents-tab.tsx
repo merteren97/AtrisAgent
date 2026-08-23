@@ -211,6 +211,7 @@ export function AgentsTab() {
             <span>Mission cancelled. Unfinished agent sessions are shown as cancelled instead of active.</span>
           </div>
         )}
+        <p className="mt-2 text-[9px] leading-relaxed text-muted-foreground">Read-only worker workspace. Send all instructions and controls through Orchestrator.</p>
       </div>
 
       <ScrollArea className="min-h-0 flex-1">
@@ -267,7 +268,7 @@ export function AgentsTab() {
                     {selectedActivity.map((item) => (
                       <div key={item.id} className="rounded-md border border-border/60 bg-background/55 px-2 py-1.5">
                         <div className="flex items-center gap-2 text-[8px] text-muted-foreground">
-                          <span className="font-mono uppercase text-primary/90">{item.eventType || item.type}</span>
+                          <span className="font-mono uppercase text-primary/90">{item.eventType === 'agent_thought' ? 'progress summary' : item.eventType || item.type}</span>
                           <span className="ml-auto">{item.timestamp}</span>
                         </div>
                         <p className="mt-0.5 whitespace-pre-wrap break-words text-[9px] leading-relaxed text-foreground/85">{item.content}</p>

@@ -1,4 +1,4 @@
-export { PolicyEngine } from './policy';
+export { PolicyEngine, resolveAutomationAction } from './policy';
 export type {
   PolicyConfig,
   ExecutionMode,
@@ -8,5 +8,8 @@ export type {
   ApplyPolicy,
   PushPolicy,
   DeletePolicy,
+  TrustProfile,
+  AutomationAction,
+  AutomationDecision,
 } from './policy';
 

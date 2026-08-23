@@ -6,6 +6,7 @@ export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate
 export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' | 'checks' | 'memory' | 'artifacts' | 'activity';
 export type CloseBehavior = 'quit' | 'tray';
 export type UpdateBehavior = 'notify' | 'automatic';
+export type TimelineDetailMode = 'summary' | 'activity' | 'telemetry';
 
 interface SettingsState {
   hasSeenOnboarding: boolean;
@@ -21,10 +22,11 @@ interface SettingsState {
   trustMode: TrustMode;
   closeBehavior: CloseBehavior;
   updateBehavior: UpdateBehavior;
+  timelineDetailMode: TimelineDetailMode;
   automationSettings: {
-    fileWrite: boolean;
-    gitCommit: boolean;
-    packageInstall: boolean;
+    fileWrite: boolean | null;
+    gitCommit: boolean | null;
+    packageInstall: boolean | null;
   };
   sidebarCollapsed: boolean;
   sidebarWidth: number;
@@ -44,6 +46,7 @@ interface SettingsState {
   setTrustMode: (mode: TrustMode) => void;
   setCloseBehavior: (behavior: CloseBehavior) => void;
   setUpdateBehavior: (behavior: UpdateBehavior) => void;
+  setTimelineDetailMode: (mode: TimelineDetailMode) => void;
   setAutomationSettings: (settings: Partial<SettingsState['automationSettings']>) => void;
   toggleSidebar: () => void;
   setSidebarWidth: (width: number) => void;
@@ -70,10 +73,11 @@ export const useSettingsStore = create<SettingsState>()(
       trustMode: 'Balanced',
       closeBehavior: 'quit',
       updateBehavior: 'notify',
+      timelineDetailMode: 'summary',
       automationSettings: {
-        fileWrite: true,
-        gitCommit: false,
-        packageInstall: false,
+        fileWrite: null,
+        gitCommit: null,
+        packageInstall: null,
       },
       sidebarCollapsed: false,
       sidebarWidth: 256,
@@ -93,6 +97,7 @@ export const useSettingsStore = create<SettingsState>()(
       setTrustMode: (mode) => set({ trustMode: mode }),
       setCloseBehavior: (behavior) => set({ closeBehavior: behavior }),
       setUpdateBehavior: (behavior) => set({ updateBehavior: behavior }),
+      setTimelineDetailMode: (timelineDetailMode) => set({ timelineDetailMode }),
       setAutomationSettings: (settings) =>
         set((state) => ({ automationSettings: { ...state.automationSettings, ...settings } })),
       toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
@@ -113,7 +118,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 7,
+      version: 9,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
         const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
@@ -124,8 +129,12 @@ export const useSettingsStore = create<SettingsState>()(
           teamTemplate: state.teamTemplate === 'Core Dev Team' || !state.teamTemplate ? 'default-core-dev-team' : state.teamTemplate,
           closeBehavior: state.closeBehavior === 'tray' ? 'tray' : 'quit',
           updateBehavior: state.updateBehavior === 'automatic' ? 'automatic' : 'notify',
+          timelineDetailMode: ['activity', 'telemetry'].includes(state.timelineDetailMode || '')
+            ? state.timelineDetailMode
+            : 'summary',
           inspectorTab: validInspectorTabs.includes(state.inspectorTab as InspectorTab) ? state.inspectorTab : 'agents',
           inspectorExpanded: false,
+          automationSettings: { fileWrite: null, gitCommit: null, packageInstall: null },
           // Direct role selection is now an advanced capability; normal missions always
           // enter through the orchestrator and @mentions can still target specialists.
           selectedRole: 'Orchestrator',

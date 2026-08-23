@@ -23,6 +23,8 @@ class FakeWorkspaceManager {
       teamTemplateId: 'default-core-dev-team',
       planId,
       executionMode: 'balanced',
+      automationPolicy: null,
+      activeRunId: null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,

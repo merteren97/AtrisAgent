@@ -30,6 +30,7 @@ import type {
   RoleExecutionPolicy,
   EffectiveRoutingPreference,
   RoutingPreferenceSource,
+  MissionAutomationPolicy,
 } from '@atris-agent-code/domain';
 
 export interface CreateWorkspaceInput {
@@ -50,6 +51,7 @@ export interface CreateMissionInput {
   executionMode?: ExecutionMode;
   status?: MissionStatus;
   id?: string;
+  automationPolicy?: MissionAutomationPolicy;
 }
 
 export interface CreateTaskInput {
@@ -135,6 +137,7 @@ export class WorkspaceManager {
       teamTemplateId: input.teamTemplateId ?? '',
       planId: input.planId ?? null,
       executionMode: input.executionMode ?? 'balanced',
+      automationPolicy: input.automationPolicy,
       createdAt: now,
       updatedAt: now,
     };

@@ -18,6 +18,8 @@ class FakeWorkspaceManager {
       teamTemplateId: 'default-core-dev-team',
       planId: params.planId || null,
       executionMode: 'balanced',
+      automationPolicy: null,
+      activeRunId: null,
       createdAt: now,
       updatedAt: now,
       completedAt: params.status === 'completed' ? now : null,
@@ -213,7 +215,7 @@ async function runTests() {
       manager as unknown as WorkspaceManager,
     );
 
-    const result = await orchestrator.startMission(missionId, 'İki bağımsız sorunu düzelt.');
+    const result = await orchestrator.startMission(missionId, 'İki bağımsız sorunu düzelt.', { turnId: 'turn-execute', runId: 'run-execute' });
     const builders = result.tasks.filter((task) => task.assignedRole === 'builder');
     const reviewers = result.tasks.filter((task) => task.assignedRole === 'reviewer');
     const qa = result.tasks.filter((task) => task.assignedRole === 'qa');
@@ -226,6 +228,12 @@ async function runTests() {
     for (const qaTask of qa) {
       assert((qaTask.dependsOn as string[]).length === 1 && reviewers.some((reviewer) => reviewer.id === (qaTask.dependsOn as string[])[0]), 'each QA task depends on its lane Reviewer');
     }
+    const steer = await orchestrator.steerActiveTurn({ missionId, targetTurnId: 'turn-execute', content: 'Also verify cache invalidation before applying.' });
+    const steeredReviewer = await manager.getTask(reviewers[0].id);
+    assert(steer.boundary === 'future_tasks' && Boolean(steeredReviewer?.description.includes('verify cache invalidation')), 'Steer applies guidance to undispatched work at the next safe boundary');
+    let staleSteerRejected = false;
+    try { await orchestrator.steerActiveTurn({ missionId, targetTurnId: 'older-turn', content: 'stale' }); } catch { staleSteerRejected = true; }
+    assert(staleSteerRejected, 'Steer rejects stale target-turn correlation');
   }
 
   // Explicit plan requests produce a graph but do not start execution.
