@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import type { TimelineItem } from '@/stores/mission-store';
 import { prepareTimeline } from './chat-timeline';
+import { tailWindow } from '@/lib/timeline-window';
 
 function item(overrides: Partial<TimelineItem>): TimelineItem {
   return {
@@ -27,6 +28,10 @@ assert.equal(
   false,
   'live projection keeps raw thinking events out of the main conversation stream',
 );
+
+const projectedWindow = tailWindow(liveTimeline, 2);
+assert.equal(projectedWindow.items.length, 2, 'long projections render through a bounded tail window');
+assert.equal(projectedWindow.hiddenCount, liveTimeline.length - 2, 'the window reports updates available above');
 assert.equal(
   liveTimeline.filter((entry) => entry.kind === 'activity').length,
   1,

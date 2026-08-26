@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'net';
 import { WebSocket } from 'ws';
+import { eq } from 'drizzle-orm';
 
 async function runTests() {
   console.log('--- Starting API Gateway REST, SSE & WebSocket Tests ---');
@@ -119,6 +120,44 @@ async function runTests() {
       assert(listRes.status === 200 && Array.isArray(listBody) && listBody.some((m: any) => m.id === createdMissionId), 'GET /api/missions returns missions for workspace');
     }
 
+    // Start and continuation turns must have one durable, turn-correlated user message.
+    let durableMissionId = '';
+    {
+      const createRes = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Durable conversation turn test' }),
+      });
+      const mission = await createRes.json();
+      durableMissionId = mission.id;
+
+      const firstStart = await authorizedFetch(`${baseUrl}/api/missions/${durableMissionId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ request: 'Please clarify this request' }),
+      });
+      assert(firstStart.status === 200, 'starting a conversation turn succeeds');
+      const firstEventsResponse = await authorizedFetch(`${baseUrl}/api/missions/${durableMissionId}/events`);
+      const firstEvents = await firstEventsResponse.json();
+      const firstMessages = firstEvents.filter((event: any) => event.type === 'user_message' && event.content === 'Please clarify this request');
+      assert(firstMessages.length === 1 && typeof firstMessages[0]?.turnId === 'string',
+        'initial start persists exactly one user_message with turnId');
+
+      const continuation = await authorizedFetch(`${baseUrl}/api/missions/${durableMissionId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ request: 'Please clarify this follow-up' }),
+      });
+      assert(continuation.status === 200, 'starting a continuation turn succeeds');
+      const continuationEventsResponse = await authorizedFetch(`${baseUrl}/api/missions/${durableMissionId}/events`);
+      const continuationEvents = await continuationEventsResponse.json();
+      const continuationMessages = continuationEvents.filter((event: any) => event.type === 'user_message');
+      const followUpMessages = continuationMessages.filter((event: any) => event.content === 'Please clarify this follow-up');
+      assert(followUpMessages.length === 1 && typeof followUpMessages[0]?.turnId === 'string'
+        && new Set(continuationMessages.map((event: any) => event.turnId)).size === continuationMessages.length,
+      'continuation persists one new turn-correlated user_message without duplicating history');
+    }
+
     // 4. GET & POST /api/accounts
     let createdAccountId = '';
     {
@@ -217,6 +256,9 @@ async function runTests() {
         agentInstanceId: 'sequence-agent', progress: 'first', timestamp: new Date().toISOString() });
       eventBus.emit({ id: secondEventId, type: 'agent_progressed', missionId: createdMissionId,
         agentInstanceId: 'sequence-agent', progress: 'second', timestamp: new Date().toISOString() });
+      const thirdEventId = crypto.randomUUID();
+      eventBus.emit({ id: thirdEventId, type: 'agent_progressed', missionId: createdMissionId,
+        agentInstanceId: 'sequence-agent', progress: 'third', timestamp: new Date().toISOString() });
       eventBus.emit({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: otherMission.id,
         agentInstanceId: 'other-agent', progress: 'filtered', timestamp: new Date().toISOString() });
       const eventsRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events`);
@@ -227,6 +269,13 @@ async function runTests() {
       const afterRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events?afterSequence=${first.sequence}`);
       const afterEvents = await afterRes.json();
       assert(afterEvents.some((event: any) => event.id === secondEventId) && !afterEvents.some((event: any) => event.id === firstEventId), 'mission event replay honors afterSequence');
+      const pageRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events?afterSequence=${first.sequence}&limit=1`);
+      const pageEvents = await pageRes.json();
+      const nextCursor = pageRes.headers.get('X-Next-Cursor');
+      assert(pageEvents.length === 1 && pageEvents[0]?.id === secondEventId && Boolean(nextCursor), 'mission event endpoint returns bounded cursor pages');
+      const nextPageRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events?cursor=${encodeURIComponent(nextCursor || '')}&limit=1`);
+      const nextPage = await nextPageRes.json();
+      assert(nextPage.length === 1 && nextPage[0]?.id === thirdEventId, 'mission event cursor resumes from the previous page without duplicates');
 
       const replayReceived = await new Promise<boolean>((resolve) => {
         const request = http.get(`${baseUrl}/api/events/stream?missionId=${createdMissionId}&afterSequence=${first.sequence}`,
@@ -295,6 +344,131 @@ async function runTests() {
         body: JSON.stringify({ content: 'Different content must not reuse the key', delivery: 'queue' }),
       });
       assert(conflictingResponse.status === 409, 'Idempotency-Key reuse with different content is rejected');
+      const queueResponse = await authorizedFetch(`${baseUrl}/api/mission-commands?workspaceId=${encodeURIComponent(createdWorkspaceId)}`);
+      const queueBody = await queueResponse.json();
+      assert(queueResponse.status === 200 && queueBody.items.some((item: any) => item.id === firstTurn.commandId && item.preview.includes('Run this after')),
+        'workspace command queue exposes the durable pending follow-up');
+      const eventsResponse = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events`);
+      const events = await eventsResponse.json();
+      assert(Array.isArray(events) && !events.some((event: any) => event.type === 'user_message' && event.turnId === firstTurn.id),
+        'queued follow-up is not exposed as active conversation context before execution starts');
+
+      const { approvals } = await import('@atris-agent-code/database');
+      const approvalId = `approval-race-${Date.now()}`;
+      (gateway.workspaceManager as any).db.insert(approvals).values({
+        id: approvalId,
+        missionId: createdMissionId,
+        type: 'plan',
+        description: 'Concurrent decision test',
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      }).run();
+      const decide = () => authorizedFetch(`${baseUrl}/api/approvals/${approvalId}/decide`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'rejected' }),
+      });
+      const decisions = await Promise.all([decide(), decide()]);
+      assert(decisions.map((response) => response.status).sort().join(',') === '200,409',
+        'concurrent approval decisions atomically claim one execution');
+
+      const reconcileApprovalId = `reconcile-approval-${Date.now()}`;
+      (gateway.workspaceManager as any).db.insert(approvals).values({
+        id: reconcileApprovalId,
+        missionId: createdMissionId,
+        type: 'tool_call',
+        description: 'Interrupted external approval test',
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      }).run();
+      const interruptedDecision = await authorizedFetch(`${baseUrl}/api/approvals/${reconcileApprovalId}/decide`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'approved' }),
+      });
+      const interruptedApproval = (gateway.workspaceManager as any).db.select().from(approvals)
+        .where(eq(approvals.id, reconcileApprovalId)).all()[0];
+      assert(interruptedDecision.status === 400 && interruptedApproval.status === 'reconcile_required',
+        'failed external approval execution remains explicitly unresolved');
+      const reconciled = await authorizedFetch(`${baseUrl}/api/approvals/${reconcileApprovalId}/reconcile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ outcome: 'not_applied' }),
+      });
+      const reconciledApproval = (gateway.workspaceManager as any).db.select().from(approvals)
+        .where(eq(approvals.id, reconcileApprovalId)).all()[0];
+      assert(reconciled.status === 200 && reconciledApproval.status === 'pending',
+        'manual not-applied reconciliation safely returns an approval to pending');
+
+      // stop_and_replan must fence the old run without cancelling the newly queued command.
+      const stopMissionResponse = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Stop and replan fence test' }),
+      });
+      const stopMission = await stopMissionResponse.json();
+      const stopMissionId = stopMission.id as string;
+      const stopDb = (gateway.workspaceManager as any).db;
+      const { conversationTurns, missionCommands, missionRuns } = await import('@atris-agent-code/database');
+      const activeTurnId = `active-turn-${Date.now()}`;
+      const activeRunId = `active-run-${Date.now()}`;
+      const activeCommandId = `active-command-${Date.now()}`;
+      const stopNow = new Date().toISOString();
+      stopDb.insert(conversationTurns).values({
+        id: activeTurnId,
+        missionId: stopMissionId,
+        content: 'Old active request',
+        delivery: 'queue',
+        options: {},
+        status: 'running',
+        createdAt: stopNow,
+        startedAt: stopNow,
+      }).run();
+      stopDb.insert(missionCommands).values({
+        id: activeCommandId,
+        missionId: stopMissionId,
+        turnId: activeTurnId,
+        type: 'queue',
+        status: 'processing',
+        priority: 0,
+        createdAt: stopNow,
+      }).run();
+      stopDb.insert(missionRuns).values({
+        id: activeRunId,
+        missionId: stopMissionId,
+        turnId: activeTurnId,
+        commandId: activeCommandId,
+        status: 'running',
+        planId: 'old-plan',
+        startedAt: stopNow,
+        heartbeatAt: stopNow,
+      }).run();
+      await gateway.workspaceManager.updateMission(stopMissionId, { status: 'running', activeRunId });
+
+      const stopResponse = await authorizedFetch(`${baseUrl}/api/missions/${stopMissionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Replan this conversation', delivery: 'stop_and_replan' }),
+      });
+      const stopTurn = await stopResponse.json();
+      assert(stopResponse.status === 202 && stopTurn.status !== 'cancelled',
+        'stop_and_replan leaves the newly queued turn claimable');
+
+      let replannedCommand: any;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        replannedCommand = (stopDb.select().from(missionCommands).where(eq(missionCommands.id, stopTurn.commandId)).all() as any[])[0];
+        if (replannedCommand?.status === 'completed' || replannedCommand?.status === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const stoppedRun = (stopDb.select().from(missionRuns).where(eq(missionRuns.id, activeRunId)).all() as any[])[0];
+      const stoppedTurn = (stopDb.select().from(conversationTurns).where(eq(conversationTurns.id, activeTurnId)).all() as any[])[0];
+      const stopEventsResponse = await authorizedFetch(`${baseUrl}/api/missions/${stopMissionId}/events`);
+      const stopEvents = await stopEventsResponse.json();
+      const replannedMessages = stopEvents.filter((event: any) => event.type === 'user_message' && event.turnId === stopTurn.id);
+      assert(replannedCommand?.status === 'completed' && stoppedRun?.status === 'cancelled' && stoppedTurn?.status === 'cancelled',
+        'stop_and_replan cancels only the prior run before processing the replacement command');
+      assert(replannedMessages.length === 1 && stopEvents.some((event: any) => event.type === 'turn_cancelled' && event.turnId === activeTurnId),
+        'replacement history is emitted after the stopped turn is fenced');
     }
 
     // 8. WebSocket (/ws/events) Event Stream Verification

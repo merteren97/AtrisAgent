@@ -49,7 +49,7 @@ export interface ApiRequestInit extends RequestInit {
   suppressUnauthorized?: boolean;
 }
 
-export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {}): Promise<T> {
+export async function apiRequestWithHeaders<T>(pathname: string, init: ApiRequestInit = {}): Promise<{ data: T; headers: Headers }> {
   const { skipAuth = false, suppressUnauthorized = false, ...requestInit } = init;
   const headers = runtimeHeaders(requestInit.headers);
   if (requestInit.body && !(requestInit.body instanceof FormData)) headers.set('Content-Type', 'application/json');
@@ -70,7 +70,11 @@ export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {})
       : `Request failed with ${response.status}`;
     throw new ApiError(message, response.status, payload);
   }
-  return payload as T;
+  return { data: payload as T, headers: response.headers };
+}
+
+export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {}): Promise<T> {
+  return (await apiRequestWithHeaders<T>(pathname, init)).data;
 }
 
 export async function checkApiHealth(): Promise<{ status: string; version?: string; connectedAccounts?: number }> {

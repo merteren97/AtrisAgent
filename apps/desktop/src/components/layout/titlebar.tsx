@@ -1,12 +1,13 @@
 import { useEffect, useState, type MouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { MoreHorizontal, Play, Pause, Square, RotateCcw, Cpu, Minus, X, Maximize, SquarePen } from 'lucide-react';
+import { Square, RotateCcw, Cpu, Minus, X, Maximize, SquarePen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useMissionStore } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useLanguageStore, t } from '@/stores/language-store';
+import { canRetryMission, isMissionCancellable, missionStatusLabel } from '@/lib/mission-display';
 
 type WindowAction = 'move' | 'minimize' | 'maximize' | 'close';
 
@@ -28,14 +29,16 @@ function getErrorMessage(error: unknown): string {
 }
 
 export function Titlebar() {
-  const { devMode, toggleDevMode, setActiveView } = useSettingsStore();
+  const { devMode, toggleDevMode, setActiveView, activeView } = useSettingsStore();
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<'stop' | 'retry' | null>(null);
   useLanguageStore();
 
   const {
     missions,
     activeMissionId,
-    pauseMission,
+    activeTasks,
+    hydratedMissionId,
     stopMission,
     retryMission,
     clearActiveMission,
@@ -44,6 +47,16 @@ export function Titlebar() {
   const { workspaces, activeWorkspaceId } = useWorkspaceStore();
   const activeMission = missions.find((mission) => mission.id === activeMissionId);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+  const showMissionControls = activeView === 'chat' && Boolean(activeMission);
+  const canStop = Boolean(activeMission && isMissionCancellable(activeMission.status));
+  const canRetry = Boolean(activeMission && hydratedMissionId === activeMission.id
+    && canRetryMission(activeMission.status, activeTasks.map((task) => task.status)));
+  const viewTitle = activeView === 'dashboard' ? 'Command Center'
+    : activeView === 'projects' ? 'Projects'
+      : activeView === 'agents' ? 'Agents'
+        : activeView === 'accounts' ? 'Accounts'
+          : activeView === 'settings' ? 'Settings'
+            : activeMission?.title || (activeWorkspace ? 'New chat' : 'AtrisAgent');
 
   const reportWindowError = (action: WindowAction, error: unknown) => {
     const details = getErrorMessage(error);
@@ -77,10 +90,17 @@ export function Titlebar() {
     window.setTimeout(() => setFeedback(null), 2_000);
   };
 
-  const handlePlayPause = () => {
-    if (!activeMission) return;
-    if (activeMission.status === 'running') void pauseMission(activeMission.id);
-    else void retryMission(activeMission.id);
+  const runMissionAction = async (action: 'stop' | 'retry') => {
+    if (!activeMission || pendingAction) return;
+    setPendingAction(action);
+    try {
+      if (action === 'stop') await stopMission(activeMission.id);
+      else await retryMission(activeMission.id);
+    } catch (error) {
+      setFeedback(getErrorMessage(error));
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   const handleNewChat = () => {
@@ -118,11 +138,11 @@ export function Titlebar() {
       >
         <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
           <h1 data-tauri-drag-region className="pointer-events-none min-w-0 truncate text-sm font-semibold">
-            {activeMission?.title || (activeWorkspace ? 'New chat' : 'AtrisAgent')}
+            {viewTitle}
           </h1>
-          {activeMission ? (
+          {activeView === 'chat' && activeMission ? (
             <Badge data-tauri-drag-region variant={activeMission.status === 'running' ? 'success' : 'secondary'} className="pointer-events-none shrink-0 text-[10px] uppercase">
-              {activeMission.status}
+              {missionStatusLabel(activeMission.status)}
             </Badge>
           ) : activeWorkspace ? (
             <Badge data-tauri-drag-region variant="secondary" className="pointer-events-none shrink-0 border-primary/20 bg-primary/[0.06] text-[9px] uppercase tracking-wide text-primary">
@@ -145,21 +165,19 @@ export function Titlebar() {
         >
           <SquarePen className="h-3.5 w-3.5" />
         </Button>
-        <div className="mx-0.5 h-5 w-px bg-border" />
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={handlePlayPause} disabled={!activeMission} title={activeMission?.status === 'running' ? t('Pause') : t('Play')}>
-          {activeMission?.status === 'running' ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-        </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => activeMission && void stopMission(activeMission.id)} disabled={!activeMission || activeMission.status === 'cancelled'} title={t('Stop')}>
-          <Square className="h-3.5 w-3.5" />
-        </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => activeMission && void retryMission(activeMission.id)} disabled={!activeMission} title={t('Retry')}>
-          <RotateCcw className="h-3.5 w-3.5" />
-        </Button>
-        <Button variant="ghost" size="sm" className={`h-7 shrink-0 gap-1.5 text-xs ${devMode ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`} onClick={handleDevModeToggle}>
-          <Cpu className="h-3.5 w-3.5" />{t('Developer Mode')}
-        </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => console.log('More options clicked')}>
-          <MoreHorizontal className="h-3.5 w-3.5" />
+        {showMissionControls && <div className="mx-0.5 h-5 w-px bg-border" />}
+        {showMissionControls && canStop && (
+          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('stop')} disabled={Boolean(pendingAction)} title={activeMission?.status === 'draft' || activeMission?.status === 'ready' ? 'Cancel' : t('Stop')} aria-label={activeMission?.status === 'draft' || activeMission?.status === 'ready' ? 'Cancel mission' : 'Stop mission'}>
+            <Square className="h-3.5 w-3.5" />
+          </Button>
+        )}
+        {showMissionControls && canRetry && (
+          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('retry')} disabled={Boolean(pendingAction)} title={t('Retry')} aria-label="Retry failed mission tasks">
+            <RotateCcw className="h-3.5 w-3.5" />
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" className={`h-7 shrink-0 gap-1.5 text-xs ${devMode ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`} onClick={handleDevModeToggle} aria-label={devMode ? 'Disable Developer Mode' : 'Enable Developer Mode'} title={devMode ? 'Disable Developer Mode' : 'Enable Developer Mode'}>
+          <Cpu className="h-3.5 w-3.5" /><span className="hidden xl:inline">{t('Developer Mode')}</span>
         </Button>
         <div className="mx-1 h-5 w-px bg-border" />
         <Button
@@ -168,6 +186,7 @@ export function Titlebar() {
           size="icon"
           className="h-9 w-10 shrink-0 rounded-none"
           onClick={() => void runWindowAction('minimize').catch((error) => reportWindowError('minimize', error))}
+          aria-label="Minimize window"
           title="Minimize"
         >
           <Minus className="h-4 w-4" />
@@ -178,6 +197,7 @@ export function Titlebar() {
           size="icon"
           className="h-9 w-10 shrink-0 rounded-none"
           onClick={() => void runWindowAction('maximize').catch((error) => reportWindowError('maximize', error))}
+          aria-label="Maximize or restore window"
           title="Maximize or restore"
         >
           <Maximize className="h-3.5 w-3.5" />
@@ -188,6 +208,7 @@ export function Titlebar() {
           size="icon"
           className="h-9 w-10 shrink-0 rounded-none hover:bg-destructive hover:text-destructive-foreground"
           onClick={() => void runWindowAction('close').catch((error) => reportWindowError('close', error))}
+          aria-label="Close window"
           title="Close AtrisAgent"
         >
           <X className="h-4 w-4" />

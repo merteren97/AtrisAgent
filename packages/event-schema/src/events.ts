@@ -243,6 +243,12 @@ export interface ApprovalRequested extends BaseEvent {
   approvalId: string;
   approvalType: string;
   description: string;
+  taskId?: string;
+  agentInstanceId?: string;
+  toolName?: string;
+  path?: string;
+  command?: string;
+  args?: Record<string, unknown>;
 }
 
 export interface ApprovalResponded extends BaseEvent {
@@ -250,6 +256,12 @@ export interface ApprovalResponded extends BaseEvent {
   approvalId: string;
   approved: boolean;
   decidedBy: string;
+}
+
+export interface ApprovalReconciled extends BaseEvent {
+  type: 'approval_reconciled';
+  approvalId: string;
+  outcome: 'applied' | 'not_applied';
 }
 
 export interface CheckCompleted extends BaseEvent {
@@ -368,6 +380,23 @@ export interface AgentError extends BaseEvent {
   agentInstanceId?: string;
 }
 
+export interface RuntimeTelemetry extends BaseEvent {
+  type: 'runtime_telemetry';
+  taskId: string;
+  agentInstanceId: string;
+  adapterId: string;
+  accountProfileId?: string;
+  outcome: 'completed' | 'failed';
+  inputTokens: number;
+  outputTokens: number;
+  cost: number | null;
+  currency: string;
+  queueWaitMs: number;
+  durationMs: number;
+  retryCount: number;
+  workerUtilization: number;
+}
+
 export type AgentEvent =
   | UserMessage
   | TurnQueued
@@ -398,12 +427,14 @@ export type AgentEvent =
   | AgentThought
   | AgentToolCall
   | AgentError
+  | RuntimeTelemetry
   | TextDelta
   | ToolCallStarted
   | ToolCallCompleted
   | FileChanged
   | ApprovalRequested
   | ApprovalResponded
+  | ApprovalReconciled
   | CheckCompleted
   | ReviewCompleted
   | VerificationStarted

@@ -42,6 +42,7 @@ import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
 import { ThemeToggle } from '../theme-toggle';
 import { useAuthSession } from '@/lib/auth-session';
+import { needsMissionAttention } from '@/lib/mission-display';
 
 interface SidebarItemProps {
   icon: ReactNode;
@@ -56,6 +57,7 @@ function SidebarItem({ icon, label, badge, isActive, onClick, collapsed }: Sideb
   const content = (
     <button
       onClick={onClick}
+      aria-label={collapsed ? label : undefined}
       className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${isActive ? 'bg-sidebar-accent text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
     >
       {icon}
@@ -167,7 +169,7 @@ export function Sidebar() {
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
   const [deletingMissionId, setDeletingMissionId] = useState<string | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
-  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission } = useWorkspaceStore();
+  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
   const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput, deleteMission } = useMissionStore();
   const agents = useAgentStore((state) => state.agents);
   const selectedAgentId = useAgentStore((state) => state.selectedAgentId);
@@ -228,7 +230,7 @@ export function Sidebar() {
     () => activeMissionAgents.filter((agent) => !agent.parentAgentId || !activeAgentIds.has(agent.parentAgentId)),
     [activeAgentIds, activeMissionAgents],
   );
-  const attentionCount = missions.filter((mission) => ['waiting_for_approval', 'reviewing', 'blocked', 'failed'].includes(mission.status)).length;
+  const attentionCount = missions.filter((mission) => mission.workspaceId === activeWorkspaceId && needsMissionAttention(mission.status)).length;
 
   const handleDrag = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -294,6 +296,7 @@ export function Sidebar() {
 
   return (
     <aside
+      aria-label="Project navigation"
       className="relative flex flex-col select-none border-r border-sidebar-border bg-sidebar transition-[width] duration-300 ease-in-out"
       style={{ width: currentWidth, minWidth: currentWidth }}
     >
@@ -312,7 +315,7 @@ export function Sidebar() {
         </div>
         <div className={`flex items-center gap-1 ${sidebarCollapsed ? 'flex-col' : ''}`}>
           {!sidebarCollapsed && <ThemeToggle compact />}
-          <Button variant="ghost" size="icon" className="h-7 w-7 text-sidebar-muted hover:text-sidebar-foreground" onClick={toggleSidebar}>
+          <Button variant="ghost" size="icon" aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} className="h-7 w-7 text-sidebar-muted hover:text-sidebar-foreground" onClick={toggleSidebar}>
             {sidebarCollapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}
           </Button>
         </div>
@@ -320,6 +323,8 @@ export function Sidebar() {
 
       <div className="px-2 py-2">
         <button
+          type="button"
+          aria-label="Search workspaces and missions"
           onClick={() => setCommandPaletteOpen(true)}
           className={`flex w-full items-center rounded-md border border-sidebar-border/70 bg-sidebar-accent py-1.5 text-xs text-sidebar-muted transition-colors hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-2.5'}`}
         >
@@ -349,7 +354,7 @@ export function Sidebar() {
         {!sidebarCollapsed && <p className="px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-sidebar-muted">Workspaces</p>}
         <Tooltip delayDuration={0}>
           <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">
+            <Button variant="ghost" size="icon" aria-label="Open project" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">
               <Plus className="h-3.5 w-3.5" />
             </Button>
           </TooltipTrigger>
@@ -358,7 +363,20 @@ export function Sidebar() {
       </div>
 
       <ScrollArea className="flex-1 px-2">
-        {workspaces.length === 0 && !sidebarCollapsed && (
+        {workspaceError && (
+          <div role="alert" className="mt-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[10px] text-destructive">
+            <p>{workspaceError}</p>
+            <Button type="button" variant="outline" size="sm" className="mt-2 h-6 text-[10px]" onClick={() => void fetchWorkspaces()} disabled={workspacesLoading}>
+              Retry
+            </Button>
+          </div>
+        )}
+        {workspacesLoading && workspaces.length === 0 && !sidebarCollapsed && (
+          <div role="status" className="mt-2 flex items-center gap-2 rounded-lg border border-sidebar-border px-3 py-3 text-[10px] text-sidebar-muted">
+            <Loader2 className="h-3 w-3 animate-spin" /> Loading projects…
+          </div>
+        )}
+        {workspaces.length === 0 && !sidebarCollapsed && !workspacesLoading && !workspaceError && (
           <button type="button" onClick={() => setIsWorkspaceDialogOpen(true)} className="mt-2 w-full rounded-lg border border-dashed border-sidebar-border px-3 py-4 text-center text-[11px] text-sidebar-muted hover:border-primary/40 hover:text-sidebar-foreground">
             Open your first project
           </button>
@@ -366,7 +384,7 @@ export function Sidebar() {
 
         {workspaces.map((workspace) => {
           const isActiveWorkspace = workspace.id === activeWorkspaceId;
-          const workspaceMissions = isActiveWorkspace ? missions : [];
+          const workspaceMissions = isActiveWorkspace ? missions.filter((mission) => mission.workspaceId === workspace.id) : [];
           return (
             <div key={workspace.id} className="mb-2">
               <div
@@ -376,6 +394,7 @@ export function Sidebar() {
                 <button
                   type="button"
                   onClick={() => handleWorkspaceSelect(workspace.id)}
+                  aria-label={sidebarCollapsed ? workspace.name : undefined}
                   className={`flex min-w-0 flex-1 items-center ${sidebarCollapsed ? 'justify-center py-1.5' : 'gap-1.5 py-1.5 pl-1.5'}`}
                 >
                   {!sidebarCollapsed && <ChevronRight className={`h-3 w-3 shrink-0 text-sidebar-muted transition-transform ${isActiveWorkspace ? 'rotate-90' : ''}`} />}

@@ -18,7 +18,7 @@ import type {
   AuthPollResult,
   CanonicalReasoning,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
+import { BaseRuntimeAdapter, isReadOnlyAgentRole, type SpawnAgentOptions } from './base-adapter';
 import {
   appendControlPlaneInstructions,
   claudeAllowedMcpTools,
@@ -81,7 +81,9 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       modelSelection: /--model/.test(help),
       reasoningControl: /--effort/.test(help),
       toolCallEvents: /stream-json/.test(help),
-      interactiveApproval: /permission-prompt-tool|permission-mode/.test(help),
+      // Help text alone is not enough: this adapter has no callback transport
+      // for interactive permission decisions yet.
+      interactiveApproval: false,
       usageInfo: /output-format/.test(help),
       cancellation: true,
       worktreeAwareness: /--worktree/.test(help),
@@ -282,7 +284,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
     if (options.model) args.push('--model', options.model);
     if (options.reasoningLevel && capabilities.reasoningControl) args.push('--effort', options.reasoningLevel);
-    const readOnly = ['reviewer', 'researcher', 'orchestrator'].includes(String(options.role || '').toLowerCase());
+    const readOnly = isReadOnlyAgentRole(options.role);
     args.push('--permission-mode', readOnly ? 'plan' : 'acceptEdits');
     if (mcpConfig.path) {
       args.push('--mcp-config', mcpConfig.path, '--allowedTools', ...claudeAllowedMcpTools());

@@ -6,7 +6,7 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "test": "npx tsx src/event-bus.test.ts",
+    "test": "npx tsx src/event-bus.test.ts && npx tsx src/bounded-event-queue.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

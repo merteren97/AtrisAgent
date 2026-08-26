@@ -40,6 +40,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   private readonly v2WorkspaceManager?: WorkspaceManager;
   private readonly v2WorkspacePath: string;
   private readonly supervisorRouting = new Map<string, MissionRoutingPreference>();
+  private readonly activeSupervisorTurns = new Map<string, Set<{ adapter: BaseRuntimeAdapter; cancel: () => void }>>();
   private readonly supervisorRunner: SupervisorTurnRunner;
 
   constructor(
@@ -75,7 +76,21 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   override async stopAll(): Promise<void> {
     unregisterSupervisorTurnRunner(this.supervisorRunner);
     this.supervisorRouting.clear();
+    const turns = [...this.activeSupervisorTurns.values()].flatMap((missionTurns) => [...missionTurns]);
+    for (const turn of turns) turn.cancel();
+    await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
+    this.activeSupervisorTurns.clear();
     await super.stopAll();
+  }
+
+  override async stopMission(missionId: string): Promise<void> {
+    const turns = [...(this.activeSupervisorTurns.get(missionId) || [])];
+    if (turns.length > 0) {
+      for (const turn of turns) turn.cancel();
+      await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
+      this.activeSupervisorTurns.delete(missionId);
+    }
+    await super.stopMission(missionId);
   }
 
   private async resolveSupervisorPreference(missionId: string): Promise<EffectiveRoutingPreference | undefined> {
@@ -164,6 +179,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     let unsubscribeDelta: Unsubscribe = () => undefined;
     let unsubscribeCompleted: Unsubscribe = () => undefined;
     let unsubscribeFailed: Unsubscribe = () => undefined;
+    let cancelTurn: () => void = () => undefined;
 
     const cleanup = () => {
       if (timeout) clearTimeout(timeout);
@@ -183,6 +199,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
         cleanup();
         callback();
       };
+      cancelTurn = () => finish(() => reject(new Error('Supervisor turn cancelled.')));
       unsubscribeDelta = turnBus.on('text_delta', (event) => {
         if (event.agentInstanceId !== sessionId) return;
         streamedText += event.content || '';
@@ -200,6 +217,10 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
         finish(() => reject(new Error(`Supervisor turn timed out after ${SUPERVISOR_TIMEOUT_MS / 1000}s.`)));
       }, SUPERVISOR_TIMEOUT_MS);
     });
+    const activeTurn = { adapter, cancel: () => cancelTurn() };
+    const missionTurns = this.activeSupervisorTurns.get(request.missionId) || new Set();
+    missionTurns.add(activeTurn);
+    this.activeSupervisorTurns.set(request.missionId, missionTurns);
 
     try {
       try {
@@ -224,6 +245,9 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       return await resultPromise;
     } finally {
       cleanup();
+      const active = this.activeSupervisorTurns.get(request.missionId);
+      active?.delete(activeTurn);
+      if (active?.size === 0) this.activeSupervisorTurns.delete(request.missionId);
       await adapter.shutdown().catch(() => undefined);
     }
   }

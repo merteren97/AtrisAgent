@@ -457,6 +457,11 @@ function scheduleReconnect(): void {
 }
 
 function handleSseFrame(frame: string): void {
+  const eventType = frame
+    .split('\n')
+    .find((line) => line.startsWith('event:'))
+    ?.slice(6)
+    .trim();
   const data = frame
     .split('\n')
     .filter((line) => line.startsWith('data:'))
@@ -464,7 +469,14 @@ function handleSseFrame(frame: string): void {
     .join('\n');
   if (!data) return;
   try {
-    handleIncomingEvent(JSON.parse(data));
+    const parsed = JSON.parse(data);
+    if (eventType === 'stream_gap' || parsed?.type === 'stream_gap') {
+      markTransportGap();
+      streamAbortController?.abort();
+      scheduleReconnect();
+      return;
+    }
+    handleIncomingEvent(parsed);
   } catch (error) {
     console.error('[EventListener] Invalid SSE event:', error);
   }

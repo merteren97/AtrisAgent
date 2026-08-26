@@ -123,7 +123,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       modelSelection: /--model\b/.test(help),
       reasoningControl: /--effort\b/.test(help),
       toolCallEvents: /stream-json/.test(help),
-      interactiveApproval: /permissions|sandbox/.test(help),
+      // Antigravity exposes sandbox flags but no in-process approval callback.
+      interactiveApproval: false,
       usageInfo: /usage|quota/.test(help),
       cancellation: true,
       worktreeAwareness: true,

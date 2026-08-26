@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { apiRequest } from '@/lib/api-client';
+import { apiRequest, apiRequestWithHeaders } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
 
 export type MissionStatus =
@@ -23,6 +23,8 @@ export interface Mission {
   title: string;
   status: MissionStatus;
   createdAt: string;
+  updatedAt?: string;
+  completedAt?: string | null;
   checkpointId?: string;
   taskCount?: number;
   description?: string;
@@ -75,6 +77,20 @@ export interface QueuedMissionTurn {
   turnId?: string;
 }
 
+export interface DurableMissionCommand {
+  id: string;
+  missionId: string;
+  missionTitle: string;
+  type: string;
+  delivery: string;
+  status: 'pending' | 'processing';
+  priority: number;
+  claimedAt: string | null;
+  attemptCount: number;
+  preview: string;
+  createdAt: string;
+}
+
 export type TurnDelivery = 'steer' | 'queue' | 'stop_and_replan';
 export type EventTransportStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
@@ -85,12 +101,16 @@ interface MissionState {
   timeline: TimelineItem[];
   activeTasks: TaskItem[];
   queuedTurns: QueuedMissionTurn[];
+  commandQueue: DurableMissionCommand[];
   loading: boolean;
   error: string | null;
+  missionStateLoading: boolean;
+  missionStateError: string | null;
   transportStatus: EventTransportStatus;
   transportError: string | null;
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
+  fetchCommandQueue: (workspaceId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
   continueMission: (missionId: string, request: string, options?: StartMissionOptions, skipOptimisticUserMessage?: boolean) => Promise<void>;
   queueMissionTurn: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
@@ -115,6 +135,27 @@ interface MissionState {
 }
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+let commandQueueRequestId = 0;
+
+async function fetchMissionEvents(missionId: string): Promise<Array<Record<string, any>>> {
+  const events: Array<Record<string, any>> = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 100; page += 1) {
+    const query = new URLSearchParams({ limit: '500' });
+    if (cursor) query.set('cursor', cursor);
+    const response = await apiRequestWithHeaders<Array<Record<string, any>>>(
+      `/missions/${missionId}/events?${query.toString()}`,
+    );
+    events.push(...response.data);
+    const next = response.headers.get('X-Next-Cursor') || undefined;
+    if (!next || response.data.length === 0) break;
+    if (seenCursors.has(next)) throw new Error('Mission event cursor repeated during hydration.');
+    seenCursors.add(next);
+    cursor = next;
+  }
+  return events;
+}
 
 function toExecutionMode(options?: StartMissionOptions): string {
   if (options?.executionMode) return options.executionMode;
@@ -355,8 +396,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   timeline: [],
   activeTasks: [],
   queuedTurns: [],
+  commandQueue: [],
   loading: false,
   error: null,
+  missionStateLoading: false,
+  missionStateError: null,
   transportStatus: 'idle',
   transportError: null,
   missionFilter: 'all',
@@ -397,11 +441,23 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 
+  fetchCommandQueue: async (workspaceId) => {
+    const requestId = ++commandQueueRequestId;
+    set({ commandQueue: [], error: null });
+    try {
+      const result = await apiRequest<{ items: DurableMissionCommand[] }>(`/mission-commands?workspaceId=${encodeURIComponent(workspaceId)}&limit=50`);
+      if (requestId === commandQueueRequestId) set({ commandQueue: result.items, error: null });
+    } catch (error: any) {
+      if (requestId === commandQueueRequestId) set({ commandQueue: [], error: error?.message || 'Failed to fetch queued commands.' });
+    }
+  },
+
   fetchMissionState: async (missionId) => {
+    if (get().activeMissionId === missionId) set({ missionStateLoading: true, missionStateError: null });
     try {
       const [state, events] = await Promise.all([
         apiRequest<{ mission?: Mission & { description?: string }; tasks?: TaskItem[] }>(`/missions/${missionId}`),
-        apiRequest<Array<Record<string, any>>>(`/missions/${missionId}/events`).catch(() => []),
+        fetchMissionEvents(missionId),
       ]);
 
       const restoredTimeline: TimelineItem[] = [];
@@ -442,11 +498,19 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           activeTasks,
           timeline: reconcileApprovalTimeline([...restoredTimeline, ...liveOnlyItems]),
           hydratedMissionId: missionId,
+          missionStateLoading: false,
+          missionStateError: null,
         };
       });
 
     } catch (error: any) {
-      if (get().activeMissionId === missionId) set({ error: error?.message || 'Failed to load mission state.' });
+      if (get().activeMissionId === missionId) {
+        set({
+          missionStateLoading: false,
+          missionStateError: error?.message || 'Failed to load mission state.',
+          error: error?.message || 'Failed to load mission state.',
+        });
+      }
     }
   },
 
@@ -567,6 +631,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           ? { ...item, status: 'running', planId: data.planId, taskCount: data.tasks?.length || 0 }
           : item),
       }));
+      void get().fetchCommandQueue(mission.workspaceId);
       await get().fetchMissionState(missionId);
     } catch (error: any) {
       const errorCard: TimelineItem = {
@@ -640,6 +705,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           ? { ...item, metadata: { ...item.metadata, durable: true, turnId, delivery } }
           : item),
       }));
+      const mission = get().missions.find((item) => item.id === missionId);
+      if (mission) void get().fetchCommandQueue(mission.workspaceId);
     } catch (error: any) {
       set((state) => ({
         queuedTurns: state.queuedTurns.filter((turn) => turn.id !== queueId),
@@ -690,6 +757,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     set({
       activeMissionId: id,
       error: null,
+      missionStateError: null,
+      missionStateLoading: !sameMission || get().hydratedMissionId !== id,
       ...(sameMission ? {} : { timeline: [], activeTasks: [], hydratedMissionId: null }),
     });
     if (!sameMission || get().hydratedMissionId !== id) void get().fetchMissionState(id);
@@ -697,14 +766,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
   clearActiveMission: () => {
     useAgentStore.getState().setSelectedAgent(null);
-    set({ activeMissionId: null, hydratedMissionId: null, timeline: [], activeTasks: [] });
+    set({ activeMissionId: null, hydratedMissionId: null, timeline: [], activeTasks: [], missionStateLoading: false, missionStateError: null });
   },
 
   updateMissionStatus: (id, status) => set((state) => ({
     missions: state.missions.map((mission) => mission.id === id ? { ...mission, status } : mission),
   })),
 
-  addTimelineItem: (item) => set((state) => {
+  addTimelineItem: (item) => {
+    set((state) => {
     const turnId = metadataString(item.metadata, 'turnId') || metadataString(item.metadata, 'commandId');
     if (turnId && item.eventType?.startsWith('turn_')) {
       const clientMessageId = metadataString(item.metadata, 'clientMessageId');
@@ -742,7 +812,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     return state.timeline.some((entry) => entry.id === item.id)
       ? state
       : { timeline: reconcileApprovalTimeline([...state.timeline, item]) };
-  }),
+    });
+    if (item.eventType?.startsWith('turn_')) {
+      const state = get();
+      const mission = state.missions.find((candidate) => candidate.id === state.activeMissionId);
+      if (mission) void state.fetchCommandQueue(mission.workspaceId);
+    }
+  },
   setTasks: (tasks) => set({ activeTasks: tasks }),
   patchTask: (id, updates) => set((state) => ({
     activeTasks: state.activeTasks.map((task) => task.id === id ? { ...task, ...updates } : task),

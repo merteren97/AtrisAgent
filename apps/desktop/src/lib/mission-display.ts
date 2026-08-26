@@ -5,10 +5,22 @@ export type EffectiveTaskStatus = 'completed' | 'preparing' | 'running' | 'faile
 const ACTIVE_MISSION_STATUSES = new Set<MissionStatus>([
   'planning',
   'running',
+  'waiting_for_approval',
+  'reviewing',
   'revising',
   'applying',
   'verifying',
 ]);
+
+const ATTENTION_STATUSES = new Set<MissionStatus>(['waiting_for_approval', 'blocked', 'failed']);
+const QUEUED_STATUSES = new Set<MissionStatus>(['draft', 'ready']);
+const OUTCOME_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+const CANCELLABLE_STATUSES = new Set<MissionStatus>([
+  'draft', 'planning', 'ready', 'running', 'waiting_for_approval', 'blocked', 'reviewing', 'revising', 'applying', 'verifying',
+]);
+const RETRYABLE_TASK_STATUSES = new Set(['blocked', 'rejected', 'revision_requested']);
+
+export type MissionStage = 'queue' | 'plan' | 'execute' | 'review' | 'attention' | 'outcome';
 
 export function isMissionActive(status: MissionStatus): boolean {
   return ACTIVE_MISSION_STATUSES.has(status);
@@ -16,6 +28,39 @@ export function isMissionActive(status: MissionStatus): boolean {
 
 export function isMissionCancelled(status: MissionStatus): boolean {
   return status === 'cancelled';
+}
+
+export function needsMissionAttention(status: MissionStatus): boolean {
+  return ATTENTION_STATUSES.has(status);
+}
+
+export function isMissionQueued(status: MissionStatus): boolean {
+  return QUEUED_STATUSES.has(status);
+}
+
+export function isMissionOutcome(status: MissionStatus): boolean {
+  return OUTCOME_STATUSES.has(status);
+}
+
+export function isMissionCancellable(status: MissionStatus): boolean {
+  return CANCELLABLE_STATUSES.has(status);
+}
+
+export function canRetryMission(status: MissionStatus, taskStatuses: string[]): boolean {
+  return (status === 'blocked' || status === 'failed') && taskStatuses.some((taskStatus) => RETRYABLE_TASK_STATUSES.has(taskStatus));
+}
+
+export function missionActivityTimestamp(mission: { createdAt: string; updatedAt?: string; completedAt?: string | null }): string {
+  return mission.completedAt || mission.updatedAt || mission.createdAt;
+}
+
+export function missionStage(status: MissionStatus): MissionStage {
+  if (status === 'draft' || status === 'ready') return 'queue';
+  if (status === 'planning') return 'plan';
+  if (status === 'running' || status === 'revising' || status === 'applying') return 'execute';
+  if (status === 'reviewing' || status === 'verifying') return 'review';
+  if (status === 'waiting_for_approval' || status === 'blocked') return 'attention';
+  return 'outcome';
 }
 
 export function effectiveTaskStatus(

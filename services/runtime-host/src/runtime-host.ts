@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { LocalEventBus, Unsubscribe } from '@atris-agent-code/event-bus';
-import type { TaskCreated } from '@atris-agent-code/event-schema';
+import type { ApprovalRequested, TaskCompleted, TaskCreated, TaskFailed } from '@atris-agent-code/event-schema';
 import type {
   AgentSession,
   WorkerRequest,
@@ -20,6 +20,7 @@ import type {
   EffectiveRoutingPreference,
 } from '@atris-agent-code/domain';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
+import { ActionBroker, type AutomationAction, type TrustProfile } from '@atris-agent-code/policy-engine';
 import { BaseRuntimeAdapter } from './adapters/base-adapter';
 import { CodexAdapter } from './adapters/codex-adapter';
 import { AntigravityAdapter } from './adapters/antigravity-adapter';
@@ -54,14 +55,35 @@ export class RuntimeHost {
   private eventBus?: LocalEventBus;
   private workspaceManager?: WorkspaceManager;
   private adapters = new Map<string, BaseRuntimeAdapter>();
-  private activeSessions = new Map<string, { adapterId: string; session: AgentSession; missionId?: string; taskId?: string }>();
+  private activeSessions = new Map<string, {
+    adapterId: string;
+    session: AgentSession;
+    missionId?: string;
+    taskId?: string;
+    accountProfileId?: string;
+    queuedAt: number;
+    startedAt: number;
+    retryCount: number;
+    role?: AgentRole | string;
+  }>();
   private scheduler: Scheduler;
   private profileManager: AccountProfileManager;
   private catalogService: ModelCatalogService;
   private unsubscribeTaskCreated?: Unsubscribe;
+  private unsubscribeRuntimeApproval?: Unsubscribe;
   private unsubscribeMissionTerminal?: Unsubscribe;
   private unsubscribeTaskTerminal?: Unsubscribe;
   private missionRouting = new Map<string, MissionRoutingPreference>();
+  private taskAttemptCounts = new Map<string, number>();
+  private pendingRuntimeApprovals = new Map<string, {
+    missionId: string;
+    taskId?: string;
+    agentInstanceId?: string;
+    approvalType: string;
+    toolName?: string;
+    path?: string;
+    command?: string;
+  }>();
 
   constructor(eventBus?: LocalEventBus, config: RuntimeHostConfig = {}, workspaceManager?: WorkspaceManager) {
     this.config = config;
@@ -125,6 +147,21 @@ export class RuntimeHost {
       });
     });
 
+    this.unsubscribeRuntimeApproval = eventBus.on('approval_requested', (event: ApprovalRequested) => {
+      // Runtime-originated approval IDs are session-scoped. Orchestrator
+      // approvals are persisted separately and must not enter this map.
+      if (!event.approvalId.includes(':')) return;
+      this.pendingRuntimeApprovals.set(event.approvalId, {
+        missionId: event.missionId,
+        taskId: event.taskId,
+        agentInstanceId: event.agentInstanceId,
+        approvalType: event.approvalType,
+        toolName: event.toolName,
+        path: event.path,
+        command: event.command,
+      });
+    });
+
     const clearRouting = (event: { missionId: string }) => this.clearMissionRoutingPreference(event.missionId);
     const completed = eventBus.on('mission_completed', clearRouting);
     const failed = eventBus.on('mission_failed', clearRouting);
@@ -133,29 +170,33 @@ export class RuntimeHost {
     const taskCompleted = eventBus.on('task_completed', (event) => {
       for (const [sessionId, active] of this.activeSessions.entries()) {
         if (active.missionId !== event.missionId || active.taskId !== event.taskId) continue;
+        if (!this.isCorrelatedTerminalEvent(event, sessionId, active)) continue;
         eventBus.emit({
           id: crypto.randomUUID(),
           type: 'agent_completed',
           missionId: event.missionId,
           agentInstanceId: sessionId,
-          summary: event.result,
-          timestamp: new Date().toISOString(),
-        });
+           summary: event.result,
+           timestamp: new Date().toISOString(),
+         });
+        void this.emitRuntimeTelemetry(event, active, 'completed');
         this.activeSessions.delete(sessionId);
       }
     });
     const taskFailed = eventBus.on('task_failed', (event) => {
       for (const [sessionId, active] of this.activeSessions.entries()) {
         if (active.missionId !== event.missionId || active.taskId !== event.taskId) continue;
+        if (!this.isCorrelatedTerminalEvent(event, sessionId, active)) continue;
         eventBus.emit({
           id: crypto.randomUUID(),
           type: 'agent_error',
           missionId: event.missionId,
           taskId: event.taskId,
           agentInstanceId: sessionId,
-          error: event.error,
-          timestamp: new Date().toISOString(),
-        });
+           error: event.error,
+           timestamp: new Date().toISOString(),
+         });
+        void this.emitRuntimeTelemetry(event, active, 'failed');
         this.activeSessions.delete(sessionId);
       }
     });
@@ -165,10 +206,71 @@ export class RuntimeHost {
   private unsubscribeToEventBus(): void {
     this.unsubscribeTaskCreated?.();
     this.unsubscribeTaskCreated = undefined;
+    this.unsubscribeRuntimeApproval?.();
+    this.unsubscribeRuntimeApproval = undefined;
     this.unsubscribeMissionTerminal?.();
     this.unsubscribeMissionTerminal = undefined;
     this.unsubscribeTaskTerminal?.();
     this.unsubscribeTaskTerminal = undefined;
+  }
+
+  private isCorrelatedTerminalEvent(
+    event: TaskCompleted | TaskFailed,
+    sessionId: string,
+    active: { missionId?: string; taskId?: string; session: AgentSession },
+  ): boolean {
+    if (event.agentInstanceId) {
+      return event.agentInstanceId === sessionId || event.agentInstanceId === active.session.agentInstanceId;
+    }
+    // An uncorrelated terminal event is only safe when this task has one live
+    // attempt. During retries, ignore it instead of closing the new session.
+    const matches = [...this.activeSessions.entries()].filter(([, candidate]) =>
+      candidate.missionId === active.missionId && candidate.taskId === active.taskId);
+    return matches.length === 1;
+  }
+
+  private async emitRuntimeTelemetry(
+    event: TaskCompleted | TaskFailed,
+    active: {
+      adapterId: string;
+      session: AgentSession;
+      accountProfileId?: string;
+      queuedAt: number;
+      startedAt: number;
+      retryCount: number;
+      role?: AgentRole | string;
+    },
+    outcome: 'completed' | 'failed',
+  ): Promise<void> {
+    if (!this.eventBus) return;
+    const now = Date.now();
+    const adapter = this.adapters.get(active.adapterId);
+    let usage: Awaited<ReturnType<BaseRuntimeAdapter['getUsage']>> = null;
+    try {
+      usage = adapter ? await adapter.getUsage(active.session.id) : null;
+    } catch {
+      // Usage discovery is best effort; lifecycle telemetry remains durable.
+    }
+    const maxSessions = Math.max(1, this.config.maxConcurrentSessions || 1);
+    this.eventBus.emit({
+      id: crypto.randomUUID(),
+      type: 'runtime_telemetry',
+      missionId: event.missionId,
+      taskId: event.taskId,
+      agentInstanceId: active.session.agentInstanceId || active.session.id,
+      adapterId: active.adapterId,
+      accountProfileId: active.accountProfileId,
+      outcome,
+      inputTokens: Math.max(0, Math.round(usage?.inputTokens || 0)),
+      outputTokens: Math.max(0, Math.round(usage?.outputTokens || 0)),
+      cost: usage?.totalCost == null ? null : Math.max(0, Number(usage.totalCost) || 0),
+      currency: usage?.currency || 'USD',
+      queueWaitMs: Math.max(0, active.startedAt - active.queuedAt),
+      durationMs: Math.max(0, now - active.startedAt),
+      retryCount: Math.max(1, active.retryCount),
+      workerUtilization: Math.min(1, this.activeSessions.size / maxSessions),
+      timestamp: new Date(now).toISOString(),
+    });
   }
 
   async discoverRuntimeStatuses(): Promise<RuntimeStatus[]> {
@@ -362,6 +464,10 @@ export class RuntimeHost {
     const missionPreference = this.missionRouting.get(event.missionId);
     const role = (event.assignedRole || missionPreference?.targetRole || 'builder') as AgentRole;
     const task = this.workspaceManager ? await this.workspaceManager.getTask(event.taskId) : null;
+    const retryCount = (this.taskAttemptCounts.get(event.taskId) || 0) + 1;
+    this.taskAttemptCounts.set(event.taskId, retryCount);
+    const queuedAt = Date.parse(event.timestamp);
+    const queuedAtMs = Number.isFinite(queuedAt) ? queuedAt : Date.now();
     const eventPreference: EffectiveRoutingPreference | undefined = Boolean(
       event.modelCatalogId || event.accountProfileId || event.reasoningLevel || event.fallbackCatalogIds?.length,
     ) ? {
@@ -409,19 +515,34 @@ export class RuntimeHost {
     );
     const adapter = this.requireAdapter(route.adapterId as RuntimeType);
     const mission = this.workspaceManager ? await this.workspaceManager.getMission(event.missionId) : null;
-    const automationPolicy = mission?.automationPolicy as any;
-    const governedActions = role === 'builder' && automationPolicy ? ['fileWrite', 'packageInstall', 'gitCommit'] : [];
-    const defaultDecision = automationPolicy?.profile === 'ask' ? 'ask' : automationPolicy?.profile === 'auto' ? 'auto' : 'review';
-    const decisions = governedActions.map((action) => ({ action, decision: automationPolicy?.overrides?.[action] || defaultDecision }));
-    const deniedOverride = role === 'builder' ? Object.entries(automationPolicy?.overrides || {}).find(([, decision]) => decision === 'deny') : undefined;
-    const denied = deniedOverride ? { action: deniedOverride[0], decision: 'deny' } : decisions.find((item) => item.decision === 'deny');
-    if (denied) throw new Error(`Mission policy denies Builder action: ${denied.action}.`);
-    const explicitAsk = role === 'builder' ? Object.entries(automationPolicy?.overrides || {})
-      .filter(([, decision]) => decision === 'ask').map(([action]) => ({ action, decision: 'ask' })) : [];
-    const approvalRequired = [...decisions.filter((item) => item.decision === 'ask'), ...explicitAsk]
-      .filter((item, index, all) => all.findIndex((candidate) => candidate.action === item.action) === index);
-    if (approvalRequired.length > 0 && route.adapterId !== 'opencode') {
-      throw new Error(`The selected runtime cannot pause for Ask-profile approvals (${approvalRequired.map((item) => item.action).join(', ')}). Select OpenCode or use Review mode.`);
+    const automationPolicy = mission?.automationPolicy as {
+      profile?: TrustProfile;
+      overrides?: Partial<Record<AutomationAction, 'ask' | 'review' | 'auto' | 'deny'>>;
+    } | null;
+    const governedActions: AutomationAction[] = role === 'builder' && automationPolicy
+      ? ['fileWrite', 'commandExecution', 'packageInstall', 'gitCommit']
+      : role === 'qa' && automationPolicy
+        ? ['commandExecution']
+        : [];
+    const actionBroker = new ActionBroker();
+    const runtimeCapabilities = await adapter.probeCapabilities(route.profile?.id);
+    const actionDecisions = governedActions.map((action) => actionBroker.authorize({
+      action,
+      profile: automationPolicy?.profile || 'review',
+      overrides: automationPolicy?.overrides,
+      requiredCapabilities: task?.requiredCapabilities as string[] | undefined,
+      role,
+       // QA validates the upstream Builder worktree with a read-only runtime
+       // mode, so its allowlisted checks do not require an interactive prompt.
+       boundary: role === 'builder' || role === 'qa' ? 'isolated' : 'control_plane',
+      runtimeCapabilities,
+    }));
+    const denied = actionDecisions.find((item) => !item.allowed && !item.requiresApproval);
+    if (denied) throw new Error(`Mission policy denies ${role} action '${denied.action}': ${denied.reason || 'policy denied'}`);
+    const approvalRequired = actionDecisions.filter((item) => item.requiresApproval);
+    const unsupportedApproval = approvalRequired.filter((item) => !item.allowed);
+    if (unsupportedApproval.length > 0) {
+      throw new Error(`The selected runtime cannot pause for governed approvals (${unsupportedApproval.map((item) => item.action).join(', ')}). Select a runtime with interactive approval support or use Review mode.`);
     }
     if (route.profile) adapter.configureProfile(route.profile);
     const execution = await this.resolveTaskExecutionContext(event, role);
@@ -430,7 +551,7 @@ export class RuntimeHost {
       task?.description ? `Instructions:\n${task.description}` : undefined,
       execution.promptContext,
       role === 'builder'
-        ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
+         ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
         : role === 'reviewer'
           ? 'Review only. Do not modify source files. Report concrete findings with file paths, severity, and an explicit approve or revision recommendation.'
           : role === 'qa'
@@ -453,7 +574,17 @@ export class RuntimeHost {
       worktreePath: execution.worktreePath,
       cwd: execution.cwd,
     });
-    this.activeSessions.set(session.id, { adapterId: adapter.id, session, missionId: event.missionId, taskId: event.taskId });
+      this.activeSessions.set(session.id, {
+      adapterId: adapter.id,
+      session,
+      missionId: event.missionId,
+      taskId: event.taskId,
+      accountProfileId: route.profile?.id,
+      queuedAt: queuedAtMs,
+      startedAt: Date.now(),
+        retryCount,
+        role,
+    });
     if (this.workspaceManager && task?.assignedAgentId !== session.id) {
       await this.workspaceManager.updateTask(event.taskId, { assignedAgentId: session.id }).catch(() => undefined);
     }
@@ -585,7 +716,13 @@ export class RuntimeHost {
 
   async startSession(adapterId: string, request: StartSessionRequest): Promise<string> {
     const session = await this.requireAdapter(adapterId).startSession(request);
-    this.activeSessions.set(session.id, { adapterId, session });
+    this.activeSessions.set(session.id, {
+      adapterId,
+      session,
+      queuedAt: Date.now(),
+      startedAt: Date.now(),
+      retryCount: 1,
+    });
     return session.id;
   }
 
@@ -602,7 +739,33 @@ export class RuntimeHost {
     if (!active) throw new Error(`No active runtime session was found for approval ${requestId}.`);
     const adapter = this.adapters.get(active.adapterId);
     if (!adapter) throw new Error(`Runtime adapter ${active.adapterId} is not registered.`);
+    const pending = this.pendingRuntimeApprovals.get(requestId);
+    if (pending?.agentInstanceId && pending.agentInstanceId !== sessionId) {
+      throw new Error(`Runtime approval ${requestId} does not belong to the active session.`);
+    }
+    if (decision === 'approved') {
+      const mission = this.workspaceManager ? await this.workspaceManager.getMission(pending?.missionId || active.missionId || '') : null;
+      const workspace = mission && this.workspaceManager ? await this.workspaceManager.getWorkspace(mission.workspaceId) : null;
+      const automationPolicy = mission?.automationPolicy as {
+        profile?: TrustProfile;
+        overrides?: Partial<Record<AutomationAction, 'ask' | 'review' | 'auto' | 'deny'>>;
+      } | null;
+      const runtimeCapabilities = await adapter.probeCapabilities();
+      new ActionBroker().assertAllowed({
+        action: automationActionForApproval(pending?.approvalType || 'tool'),
+        profile: automationPolicy?.profile || 'review',
+        overrides: automationPolicy?.overrides,
+        role: active.role,
+        toolName: pending?.toolName,
+        path: pending?.path,
+        command: pending?.command,
+        workspacePath: workspace?.path,
+        boundary: active.role === 'builder' ? 'isolated' : 'control_plane',
+        runtimeCapabilities,
+      });
+    }
     await adapter.approveToolCall(requestId, decision);
+    this.pendingRuntimeApprovals.delete(requestId);
   }
 
   async stopMission(missionId: string): Promise<void> {
@@ -656,4 +819,16 @@ export class RuntimeHost {
     if (runtimeType === 'antigravity') return capabilities?.structuredEventStreaming ? 'Print mode stream-json' : 'TUI only (update required)';
     return 'Local HTTP server + SSE';
   }
+}
+
+function automationActionForApproval(approvalType: string): AutomationAction {
+  const type = approvalType.trim().toLowerCase().replace(/[\s.-]+/g, '_');
+  if (type.includes('file') || type.includes('write') || type.includes('edit')) return 'fileWrite';
+  if (type.includes('delete') || type.includes('remove')) return 'deleteFiles';
+  if (type.includes('package') || type.includes('depend')) return 'packageInstall';
+  if (type.includes('commit')) return 'gitCommit';
+  if (type.includes('migration') || type.includes('database')) return 'databaseMigration';
+  if (type.includes('push')) return 'gitPush';
+  if (type.includes('pull') || type.includes('request')) return 'pullRequest';
+  return 'commandExecution';
 }

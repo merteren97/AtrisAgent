@@ -9,7 +9,7 @@ import { and, eq } from 'drizzle-orm';
 import * as schema from '@atris-agent-code/database';
 import type { AtrisDatabase } from '@atris-agent-code/database';
 import { migrateDatabase } from '@atris-agent-code/database';
-import { LocalEventBus } from '@atris-agent-code/event-bus';
+import { BoundedEventQueue, LocalEventBus } from '@atris-agent-code/event-bus';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator } from '@atris-agent-code/orchestration-core';
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
@@ -30,6 +30,8 @@ import {
   createRuntimeShutdownCoordinator,
   installRuntimeShutdownRoute,
 } from './runtime-lifecycle';
+import { cursorFromQuery, encodeEventCursor } from './event-cursor';
+import { persistRuntimeTelemetry } from './runtime-telemetry-store';
 
 import path from 'path';
 import fs from 'fs';
@@ -147,8 +149,33 @@ sqlite.exec(`
     description TEXT NOT NULL DEFAULT '',
     status TEXT DEFAULT 'pending',
     decided_by TEXT,
+    requested_decision TEXT,
+    claimed_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    execution_error TEXT,
     created_at TEXT NOT NULL,
     decided_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS approval_operations (
+    approval_id TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS mission_completions (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT,
+    tasks_completed INTEGER NOT NULL,
+    total_tasks INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (mission_id, plan_id)
   );
 
   CREATE TABLE IF NOT EXISTS mission_events (
@@ -368,6 +395,13 @@ eventBus.on('*', (event: AgentEvent) => {
       console.warn('[API Gateway] Failed to persist approval request:', error);
     }
   }
+  if (event.type === 'runtime_telemetry') {
+    try {
+      persistRuntimeTelemetry(sqlite, event);
+    } catch (error) {
+      console.warn('[API Gateway] Failed to persist runtime telemetry:', error);
+    }
+  }
   try {
     const persisted = sqlite.transaction(() => {
       const duplicate = sqlite.prepare('SELECT payload FROM mission_events WHERE id = ?').get(event.id) as { payload: string } | undefined;
@@ -463,7 +497,30 @@ const ACTIVE_MISSION_STATUSES = new Set([
   'revising',
 ]);
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const DRAINABLE_MISSION_STATUSES = new Set(['draft', 'ready', ...TERMINAL_MISSION_STATUSES]);
 const missionDrains = new Map<string, Promise<void>>();
+const missionTurnOperations = new Map<string, Set<Promise<void>>>();
+
+function trackMissionTurn<T>(missionId: string, operation: () => Promise<T>): Promise<T> {
+  const operationPromise = Promise.resolve().then(operation);
+  const tracked = operationPromise.then(() => undefined, () => undefined).finally(() => {
+    const operations = missionTurnOperations.get(missionId);
+    operations?.delete(tracked);
+    if (operations && operations.size === 0) missionTurnOperations.delete(missionId);
+  });
+  const operations = missionTurnOperations.get(missionId) || new Set<Promise<void>>();
+  operations.add(tracked);
+  missionTurnOperations.set(missionId, operations);
+  return operationPromise;
+}
+
+async function waitForMissionTurns(missionId: string): Promise<void> {
+  while (true) {
+    const operations = missionTurnOperations.get(missionId);
+    if (!operations || operations.size === 0) return;
+    await Promise.all([...operations]);
+  }
+}
 
 function stableJson(value: unknown): string {
   const canonicalize = (item: unknown): unknown => {
@@ -523,20 +580,29 @@ function emitTurnEvent(event: AgentEvent): void {
 async function startDurableTurn(command: any, turn: any): Promise<void> {
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
-  sqlite.transaction(() => {
-    sqlite.prepare("UPDATE conversation_turns SET status = 'starting', started_at = ? WHERE id = ?").run(now, turn.id);
-    sqlite.prepare("INSERT INTO mission_runs (id, mission_id, turn_id, command_id, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'starting', ?, ?)")
-      .run(runId, command.mission_id, turn.id, command.id, now, now);
-    sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, command.mission_id);
-  })();
-  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
-    content: turn.content, delivery: turn.delivery, timestamp: now });
   try {
+    sqlite.transaction(() => {
+      const commandState = sqlite.prepare('SELECT status FROM mission_commands WHERE id = ?').get(command.id) as { status: string } | undefined;
+      if (commandState?.status !== 'processing') throw new Error('The queued command is no longer claimable.');
+      const transitioned = sqlite.prepare("UPDATE conversation_turns SET status = 'starting', started_at = ? WHERE id = ? AND status IN ('queued', 'pending_priority')")
+        .run(now, turn.id) as { changes: number };
+      if (transitioned.changes !== 1) throw new Error('The queued turn was cancelled before execution started.');
+      sqlite.prepare("INSERT INTO mission_runs (id, mission_id, turn_id, command_id, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'starting', ?, ?)")
+        .run(runId, command.mission_id, turn.id, command.id, now, now);
+      sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, command.mission_id);
+    })();
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId: command.mission_id, turnId: turn.id,
+      content: turn.content, timestamp: now });
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
+      content: turn.content, delivery: turn.delivery, timestamp: now });
     const options = turn.options ? JSON.parse(turn.options) : {};
     configureMissionRouting(command.mission_id, options);
     const result = await orchestrator.startMission(command.mission_id, turn.content, { ...options, turnId: turn.id, runId });
     sqlite.transaction(() => {
-      sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ?").run(new Date().toISOString(), command.id);
+      const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, command.mission_id) as { status: string } | undefined;
+      const mission = sqlite.prepare('SELECT active_run_id FROM missions WHERE id = ?').get(command.mission_id) as { active_run_id: string | null } | undefined;
+      if (run?.status !== 'starting' || mission?.active_run_id !== runId) return;
+      sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ? AND status = 'processing'").run(new Date().toISOString(), command.id);
       sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turn.id);
       sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
         .run(result.planId || null, new Date().toISOString(), runId);
@@ -544,9 +610,9 @@ async function startDurableTurn(command: any, turn: any): Promise<void> {
   } catch (error: any) {
     const failedAt = new Date().toISOString();
     sqlite.transaction(() => {
-      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), command.id);
-      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turn.id);
-      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), runId);
+      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ? AND status = 'processing'").run(failedAt, error?.message || String(error), command.id);
+      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turn.id);
+      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')").run(failedAt, error?.message || String(error), runId);
       sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(command.mission_id, runId);
     })();
     throw error;
@@ -559,7 +625,7 @@ function drainMissionCommands(missionId: string): Promise<void> {
   const drain = (async () => {
     while (true) {
       const mission = await workspaceManager.getMission(missionId);
-      if (!mission || !TERMINAL_MISSION_STATUSES.has(String(mission.status))) return;
+      if (!mission || !DRAINABLE_MISSION_STATUSES.has(String(mission.status))) return;
       const claimed = sqlite.transaction(() => {
       const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
       if (activeRun) return null;
@@ -578,7 +644,7 @@ function drainMissionCommands(missionId: string): Promise<void> {
           .run(new Date().toISOString(), command.id);
         continue;
       }
-      await startDurableTurn(command, turn);
+      await trackMissionTurn(missionId, () => startDurableTurn(command, turn));
       const active = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
       if (active) return;
     }
@@ -592,26 +658,33 @@ async function startMissionWithDurability(missionId: string, content: string, op
   const now = new Date().toISOString();
   const turnId = crypto.randomUUID();
   const runId = crypto.randomUUID();
-  sqlite.transaction(() => {
-    sqlite.prepare(`INSERT INTO conversation_turns
-      (id, mission_id, content, delivery, options, status, created_at, started_at)
-      VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
-    sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
-      VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
-    sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, missionId);
-  })();
-  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
-    content, delivery: 'queue', timestamp: now });
   try {
+    sqlite.transaction(() => {
+      sqlite.prepare(`INSERT INTO conversation_turns
+        (id, mission_id, content, delivery, options, status, created_at, started_at)
+        VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
+      sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
+        VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
+      sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, missionId);
+    })();
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
+      content, timestamp: now });
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
+      content, delivery: 'queue', timestamp: now });
     const result = await orchestrator.startMission(missionId, content, { ...options, turnId, runId });
-    sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turnId);
-    sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
-      .run(result.planId || null, new Date().toISOString(), runId);
+    sqlite.transaction(() => {
+      const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, missionId) as { status: string } | undefined;
+      const mission = sqlite.prepare('SELECT active_run_id FROM missions WHERE id = ?').get(missionId) as { active_run_id: string | null } | undefined;
+      if (run?.status !== 'starting' || mission?.active_run_id !== runId) return;
+      sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turnId);
+      sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
+        .run(result.planId || null, new Date().toISOString(), runId);
+    })();
     return result;
   } catch (error: any) {
     const failedAt = new Date().toISOString();
-    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turnId);
-    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?")
+    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turnId);
+    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')")
       .run(failedAt, error?.message || String(error), runId);
     sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(missionId, runId);
     throw error;
@@ -622,17 +695,21 @@ eventBus.on('*', (event) => {
   if (event.type !== 'mission_completed' && event.type !== 'mission_failed') return;
   if (!event.runId) return;
   const completedAt = event.timestamp;
-  sqlite.transaction(() => {
-    const run = sqlite.prepare("SELECT turn_id FROM mission_runs WHERE id = ? AND mission_id = ? AND status IN ('starting', 'running', 'stopping')")
-      .get(event.runId, event.missionId) as { turn_id: string | null } | undefined;
-    if (!run) return;
+  const shouldDrain = sqlite.transaction(() => {
+    const run = sqlite.prepare("SELECT turn_id, command_id FROM mission_runs WHERE id = ? AND mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+      .get(event.runId, event.missionId) as { turn_id: string | null; command_id: string | null } | undefined;
+    if (!run) return false;
+    const terminalStatus = event.type === 'mission_completed' ? 'completed' : 'failed';
+    if (run.command_id) sqlite.prepare('UPDATE mission_commands SET status = ?, processed_at = ? WHERE id = ? AND status = \'processing\'')
+      .run(terminalStatus, completedAt, run.command_id);
     sqlite.prepare("UPDATE mission_runs SET status = ?, completed_at = ? WHERE id = ?")
-      .run(event.type === 'mission_completed' ? 'completed' : 'failed', completedAt, event.runId);
+      .run(terminalStatus, completedAt, event.runId);
     if (run.turn_id) sqlite.prepare('UPDATE conversation_turns SET status = ?, completed_at = ? WHERE id = ?')
-      .run(event.type === 'mission_completed' ? 'completed' : 'failed', completedAt, run.turn_id);
+      .run(terminalStatus, completedAt, run.turn_id);
     sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(event.missionId, event.runId);
+    return true;
   })();
-  setImmediate(() => void drainMissionCommands(event.missionId));
+  if (shouldDrain) setImmediate(() => void drainMissionCommands(event.missionId));
 });
 
 async function cleanupMissionResources(missionId: string): Promise<void> {
@@ -758,6 +835,39 @@ app.get('/api/missions', async (req: Request, res: Response) => {
   catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to list missions' }); }
 });
 
+app.get('/api/mission-commands', (req: Request, res: Response) => {
+  try {
+    const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId.trim() : '';
+    if (!workspaceId) return void res.status(400).json({ error: 'workspaceId is required' });
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isInteger(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 50;
+    const rows = sqlite.prepare(`SELECT command.id, command.mission_id, command.type, command.status, command.priority,
+        command.created_at, command.claimed_at, command.attempt_count, turn.content, turn.delivery, mission.title AS mission_title
+      FROM mission_commands command
+      JOIN conversation_turns turn ON turn.id = command.turn_id
+      JOIN missions mission ON mission.id = command.mission_id
+      WHERE mission.workspace_id = ? AND command.status IN ('pending', 'processing')
+      ORDER BY command.priority DESC, command.created_at, command.id LIMIT ?`).all(workspaceId, limit) as any[];
+    res.json({
+      items: rows.map((row) => ({
+        id: row.id,
+        missionId: row.mission_id,
+        missionTitle: row.mission_title,
+        type: row.type,
+        delivery: row.delivery,
+        status: row.status,
+        priority: row.priority,
+        claimedAt: row.claimed_at,
+        attemptCount: row.attempt_count,
+        preview: String(row.content || '').slice(0, 240),
+        createdAt: row.created_at,
+      })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to list queued mission commands' });
+  }
+});
+
 app.get('/api/missions/:id', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
@@ -831,8 +941,6 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         (id, mission_id, turn_id, type, status, priority, request_hash, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`)
         .run(commandId, missionId, turnId, delivery, priorityPending ? 100 : delivery === 'stop_and_replan' ? 200 : 0, requestHash, now);
     })();
-    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId, clientMessageId: idempotencyKey || undefined,
-      content, timestamp: now });
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content,
       delivery: delivery as any, priorityPending, clientMessageId: idempotencyKey || undefined, timestamp: now });
     if (priorityPending) {
@@ -841,6 +949,8 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       if (!activeRun) throw new Error('Active run metadata is unavailable for steering.');
       sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
         .run(now, commandId);
+      emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
+        clientMessageId: idempotencyKey || undefined, content, timestamp: now });
       try {
         const applied = await orchestrator.steerActiveTurn({ missionId, targetTurnId: activeRun.turn_id, content });
         const appliedAt = new Date().toISOString();
@@ -859,8 +969,24 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       }
     }
     if (delivery === 'stop_and_replan') {
+      const activeRuns = sqlite.prepare("SELECT id, turn_id, command_id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+        .all(missionId) as Array<{ id: string; turn_id: string | null; command_id: string | null }>;
+      const activeTurnIds = new Set<string>(activeRuns.map((run) => run.turn_id).filter((id): id is string => Boolean(id)));
       const activeTurns = sqlite.prepare("SELECT id FROM conversation_turns WHERE mission_id = ? AND status IN ('starting', 'running')")
         .all(missionId) as Array<{ id: string }>;
+      for (const turn of activeTurns) activeTurnIds.add(turn.id);
+      const activeCommandIds = new Set<string>(activeRuns.map((run) => run.command_id).filter((id): id is string => Boolean(id)));
+      if (activeTurnIds.size > 0) {
+        const placeholders = [...activeTurnIds].map(() => '?').join(', ');
+        const commands = sqlite.prepare(`SELECT id FROM mission_commands WHERE mission_id = ? AND turn_id IN (${placeholders}) AND status IN ('pending', 'processing')`)
+          .all(missionId, ...activeTurnIds) as Array<{ id: string }>;
+        for (const command of commands) activeCommandIds.add(command.id);
+      }
+      const cancelRun = (orchestrator as any).cancelRun;
+      if (typeof cancelRun === 'function') {
+        for (const run of activeRuns) cancelRun.call(orchestrator, missionId, run.id);
+        if (activeRuns.length === 0) cancelRun.call(orchestrator, missionId);
+      }
       try {
         await runtimeHost.stopMission(missionId);
       } catch (error: any) {
@@ -871,18 +997,24 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         })();
         throw error;
       }
-      await workspaceManager.cancelMissionTasks(missionId);
-      await workspaceManager.updateMission(missionId, { status: 'cancelled' });
       const cancelledAt = new Date().toISOString();
+      await workspaceManager.updateMission(missionId, { status: 'cancelled', completedAt: cancelledAt });
+      await workspaceManager.cancelMissionTasks(missionId);
       sqlite.transaction(() => {
-        sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')")
-          .run(cancelledAt, missionId);
-        sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running')")
-          .run(cancelledAt, missionId);
+        for (const run of activeRuns) sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')")
+          .run(cancelledAt, run.id);
+        for (const turnIdToCancel of activeTurnIds) sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')")
+          .run(cancelledAt, turnIdToCancel);
+        for (const activeCommandId of activeCommandIds) sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE id = ? AND status IN ('pending', 'processing')")
+          .run(cancelledAt, activeCommandId);
         sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ?').run(missionId);
       })();
+      await waitForMissionTurns(missionId);
+      await runtimeHost.stopMission(missionId).catch(() => undefined);
+      await workspaceManager.cancelMissionTasks(missionId);
       for (const activeTurn of activeTurns) emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_cancelled',
         missionId, turnId: activeTurn.id, reason: 'Stopped for replanning', timestamp: cancelledAt });
+      await workspaceManager.updateMission(missionId, { status: 'ready', completedAt: null });
       void drainMissionCommands(missionId);
     } else if (!active) {
       void drainMissionCommands(missionId);
@@ -916,12 +1048,12 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
     configureMissionRouting(missionId, req.body || {});
-    res.json(await startMissionWithDurability(missionId, userRequest, {
+    res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, {
       modelCatalogId: req.body?.modelCatalogId,
       reasoningLevel: req.body?.reasoningLevel,
       targetRole: req.body?.targetRole,
       command: req.body?.command,
-    }));
+    })));
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
     res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
@@ -984,13 +1116,13 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       targetRole,
     });
 
-    const result = await startMissionWithDurability(missionId, promptText, {
+    const result = await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, promptText, {
       modelCatalogId,
       reasoningLevel,
       targetRole,
       command,
       automationPolicy,
-    });
+    }));
     res.status(201).json({
       missionId: result.missionId,
       planId: result.planId,
@@ -1362,10 +1494,22 @@ app.delete('/api/execution-policies/:scopeType/:scopeId', async (req, res) => {
 
 app.get('/api/missions/:id/events', async (req, res) => {
   try {
-    const afterSequence = Math.max(0, Number(req.query.afterSequence) || 0);
-    const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ?
-      ORDER BY sequence`).all(req.params.id, afterSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
-    res.json(rows.map((row) => ({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 })));
+    const cursor = cursorFromQuery(req.query);
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(500, Math.floor(requestedLimit))
+      : 200;
+    const rows = sqlite.prepare(`SELECT id, payload, sequence, schema_version FROM mission_events
+      WHERE mission_id = ? AND sequence > ? ORDER BY sequence LIMIT ?`)
+      .all(req.params.id, cursor.sequence, limit + 1) as Array<{ id: string; payload: string; sequence: number; schema_version: number }>;
+    const hasMore = rows.length > limit;
+    const visibleRows = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore && visibleRows.length > 0
+      ? encodeEventCursor({ sequence: visibleRows[visibleRows.length - 1].sequence, eventId: visibleRows[visibleRows.length - 1].id })
+      : '';
+    res.setHeader('X-Has-More', String(hasMore));
+    if (nextCursor) res.setHeader('X-Next-Cursor', nextCursor);
+    res.json(visibleRows.map((row) => ({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 })));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to fetch mission events' });
   }
@@ -1383,8 +1527,15 @@ app.get('/api/missions/:id/artifacts', async (req, res) => {
 
 app.get('/api/missions/:id/usage', (req, res) => {
   try {
-    const rows = db.select().from((schema as any).usageSnapshots)
+    const telemetryRows = sqlite.prepare(`SELECT input_tokens AS inputTokens, output_tokens AS outputTokens,
+      cost, currency, duration_ms AS durationMs, queue_wait_ms AS queueWaitMs, retry_count AS retryCount,
+      worker_utilization AS workerUtilization, recorded_at AS recordedAt
+      FROM runtime_telemetry WHERE mission_id = ? ORDER BY recorded_at`).all(req.params.id) as any[];
+    const snapshotRows = db.select().from((schema as any).usageSnapshots)
       .where(eq((schema as any).usageSnapshots.missionId, req.params.id)).all() as any[];
+    // Runtime telemetry is the authoritative source once available. Keep the
+    // legacy snapshot fallback for missions created before telemetry v5.
+    const rows = telemetryRows.length > 0 ? telemetryRows : snapshotRows;
     const inputTokens = rows.reduce((sum, row) => sum + Number(row.inputTokens || 0), 0);
     const outputTokens = rows.reduce((sum, row) => sum + Number(row.outputTokens || 0), 0);
     const costValues = rows.map((row) => row.cost).filter((value) => value !== null && value !== undefined);
@@ -1398,6 +1549,13 @@ app.get('/api/missions/:id/usage', (req, res) => {
       currency: currencies.length === 1 ? currencies[0] : null,
       snapshotCount: rows.length,
       lastRecordedAt: rows.map((row) => row.recordedAt).filter(Boolean).sort().at(-1) || null,
+      telemetryCount: telemetryRows.length,
+      totalDurationMs: telemetryRows.reduce((sum, row) => sum + Number(row.durationMs || 0), 0),
+      totalQueueWaitMs: telemetryRows.reduce((sum, row) => sum + Number(row.queueWaitMs || 0), 0),
+      retryCount: telemetryRows.reduce((sum, row) => sum + Number(row.retryCount || 0), 0),
+      averageWorkerUtilization: telemetryRows.length > 0
+        ? telemetryRows.reduce((sum, row) => sum + Number(row.workerUtilization || 0), 0) / telemetryRows.length
+        : null,
     });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to fetch usage snapshots' });
@@ -1453,25 +1611,116 @@ app.post('/api/tasks/:id/retry', async (req, res) => {
   catch (error: any) { res.status(400).json({ error: error?.message || 'Failed to retry task' }); }
 });
 
+function claimApproval(approvalId: string, decision: 'approved' | 'rejected'): any | null {
+  return sqlite.transaction(() => {
+    const approval = sqlite.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as any;
+    if (!approval || approval.status !== 'pending') return null;
+    const claimedAt = new Date().toISOString();
+    const result = sqlite.prepare(`UPDATE approvals SET status = 'processing', requested_decision = ?, claimed_at = ?,
+      attempt_count = attempt_count + 1, execution_error = NULL WHERE id = ? AND status = 'pending'`)
+      .run(decision, claimedAt, approvalId) as { changes: number };
+    if (result.changes === 1) {
+      const attempt = Number(approval.attempt_count || 0) + 1;
+      const idempotencyKey = `approval:${approvalId}:${attempt}`;
+      sqlite.prepare(`INSERT INTO approval_operations
+        (approval_id, decision, status, operation_type, resource_id, idempotency_key, result, started_at,
+         completed_at, reconciled_at, reconcile_attempts, error)
+        VALUES (?, ?, 'applying', ?, ?, ?, NULL, ?, NULL, NULL, 0, NULL)
+        ON CONFLICT(approval_id) DO UPDATE SET decision = excluded.decision, status = 'applying',
+          operation_type = excluded.operation_type, resource_id = excluded.resource_id,
+          idempotency_key = excluded.idempotency_key, result = NULL, started_at = excluded.started_at,
+          completed_at = NULL, reconciled_at = NULL, error = NULL`)
+        .run(approvalId, decision, approvalId.includes(':') ? 'runtime_approval' : 'orchestrator_approval',
+          approval.task_id || approval.mission_id, idempotencyKey, claimedAt);
+    }
+    return result.changes === 1 ? {
+      id: approval.id,
+      missionId: approval.mission_id,
+      taskId: approval.task_id,
+      runId: approval.run_id,
+      type: approval.type,
+      description: approval.description,
+      status: 'processing',
+      requestedDecision: decision,
+      claimedAt,
+    } : null;
+  })();
+}
+
+function finalizeApproval(approvalId: string, decision: 'approved' | 'rejected'): boolean {
+  return sqlite.transaction(() => {
+    const completedAt = new Date().toISOString();
+    const operation = sqlite.prepare(`UPDATE approval_operations SET status = 'completed', completed_at = ?, error = NULL
+      , result = ?
+      WHERE approval_id = ? AND decision = ? AND status = 'applying'`)
+      .run(completedAt, JSON.stringify({ outcome: 'applied', decision }), approvalId, decision) as { changes: number };
+    if (operation.changes !== 1) return false;
+    const approval = sqlite.prepare(`UPDATE approvals SET status = ?, decided_by = 'user', decided_at = ?, execution_error = NULL
+      WHERE id = ? AND status = 'processing' AND requested_decision = ?`)
+      .run(decision, completedAt, approvalId, decision) as { changes: number };
+    if (approval.changes !== 1) throw new Error('Approval finalization lost its claim.');
+    return true;
+  })();
+}
+
+function failApproval(approvalId: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  sqlite.transaction(() => {
+    sqlite.prepare(`UPDATE approval_operations SET status = 'reconcile_required', error = ?, reconciled_at = NULL,
+      reconcile_attempts = reconcile_attempts + 1
+      WHERE approval_id = ? AND status = 'applying'`).run(message, approvalId);
+    sqlite.prepare(`UPDATE approvals SET status = 'reconcile_required', execution_error = ?, decided_at = NULL
+      WHERE id = ? AND status = 'processing'`).run(message, approvalId);
+  })();
+}
+
+function reconcileApproval(approvalId: string, outcome: 'applied' | 'not_applied'): any | null {
+  return sqlite.transaction(() => {
+    const approval = sqlite.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as any;
+    const operation = sqlite.prepare('SELECT * FROM approval_operations WHERE approval_id = ? AND status = \'reconcile_required\'')
+      .get(approvalId) as any;
+    if (!approval || !operation) return null;
+    const reconciledAt = new Date().toISOString();
+    const result = JSON.stringify({ outcome, decision: operation.decision, reconciledManually: true });
+    const operationUpdate = sqlite.prepare(`UPDATE approval_operations SET status = 'completed', result = ?,
+      reconciled_at = ?, completed_at = COALESCE(completed_at, ?), error = NULL
+      WHERE approval_id = ? AND status = 'reconcile_required'`).run(result, reconciledAt, reconciledAt, approvalId) as { changes: number };
+    if (operationUpdate.changes !== 1) return null;
+    if (outcome === 'not_applied') {
+      sqlite.prepare(`UPDATE approvals SET status = 'pending', requested_decision = NULL, claimed_at = NULL,
+        execution_error = NULL, decided_at = NULL WHERE id = ? AND status = 'reconcile_required'`).run(approvalId);
+    } else {
+      const status = operation.decision === 'approved' ? 'approved' : 'rejected';
+      sqlite.prepare(`UPDATE approvals SET status = ?, decided_by = 'user', decided_at = ?,
+        execution_error = NULL WHERE id = ? AND status = 'reconcile_required'`).run(status, reconciledAt, approvalId);
+    }
+    const updated = sqlite.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as any;
+    return { approval: updated, operation: { ...operation, status: 'completed', result, reconciledAt } };
+  })();
+}
+
 app.post('/api/missions/:id/candidates/:taskId/select', async (req, res) => {
+  let claimedApproval: any | null = null;
   try {
     const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
       ? req.body.reason.trim()
       : 'Selected by the user from the Candidate board.';
-    await orchestrator.selectCandidate(req.params.id, req.params.taskId, reason);
     const pendingApprovals = (db.select().from((schema as any).approvals)
       .where(eq((schema as any).approvals.missionId, req.params.id)).all() as any[])
       .filter((approval) => approval.type === 'candidate_selection' && approval.status === 'pending');
+    if (pendingApprovals.length > 0) {
+      claimedApproval = claimApproval(pendingApprovals[0].id, 'approved');
+      if (!claimedApproval) return void res.status(409).json({ error: 'Candidate approval is already being processed.' });
+    }
+    await orchestrator.selectCandidate(req.params.id, req.params.taskId, reason);
     const now = new Date().toISOString();
-    for (const approval of pendingApprovals) {
-      db.update((schema as any).approvals)
-        .set({ status: 'approved', decidedBy: 'user', decidedAt: now })
-        .where(eq((schema as any).approvals.id, approval.id)).run();
+    if (claimedApproval) {
+      if (!finalizeApproval(claimedApproval.id, 'approved')) throw new Error('Candidate approval finalization lost its claim.');
       eventBus.emit({
         id: crypto.randomUUID(),
         type: 'approval_responded',
         missionId: req.params.id,
-        approvalId: approval.id,
+        approvalId: claimedApproval.id,
         approved: true,
         decidedBy: 'user',
         timestamp: now,
@@ -1479,6 +1728,7 @@ app.post('/api/missions/:id/candidates/:taskId/select', async (req, res) => {
     }
     res.json({ success: true, selectedCandidateId: req.params.taskId });
   } catch (error: any) {
+    if (claimedApproval) failApproval(claimedApproval.id, error);
     res.status(400).json({ error: error?.message || 'Failed to select candidate' });
   }
 });
@@ -1493,13 +1743,17 @@ app.get('/api/missions/:id/approvals', async (req, res) => {
 });
 
 app.post('/api/approvals/:id/decide', async (req, res) => {
+  let claimedApproval: any | null = null;
   try {
     const decision = String(req.body?.decision || '').toLowerCase();
     if (!['approved', 'rejected'].includes(decision)) return void res.status(400).json({ error: "decision must be 'approved' or 'rejected'" });
-    const approval = (db.select().from((schema as any).approvals)
+    const existingApproval = (db.select().from((schema as any).approvals)
       .where(eq((schema as any).approvals.id, req.params.id)).all() as any[])[0];
-    if (!approval) return void res.status(404).json({ error: 'Approval not found' });
-    if (approval.status !== 'pending') return void res.status(409).json({ error: `Approval has already been ${approval.status}.` });
+    if (!existingApproval) return void res.status(404).json({ error: 'Approval not found' });
+    if (existingApproval.status !== 'pending') return void res.status(409).json({ error: `Approval has already been ${existingApproval.status}.` });
+    claimedApproval = claimApproval(req.params.id, decision as 'approved' | 'rejected');
+    if (!claimedApproval) return void res.status(409).json({ error: 'Approval is already being processed.' });
+    const approval = claimedApproval;
     const approved = decision === 'approved';
     if (String(approval.id).includes(':')) {
       await runtimeHost.respondToRuntimeApproval(approval.id, approved ? 'approved' : 'rejected');
@@ -1511,9 +1765,7 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
     }
 
     const now = new Date().toISOString();
-    db.update((schema as any).approvals)
-      .set({ status: decision, decidedBy: 'user', decidedAt: now })
-      .where(eq((schema as any).approvals.id, req.params.id)).run();
+    if (!finalizeApproval(approval.id, decision as 'approved' | 'rejected')) throw new Error('Approval finalization lost its claim.');
     eventBus.emit({
       id: crypto.randomUUID(),
       type: 'approval_responded',
@@ -1525,6 +1777,7 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
     });
     res.json({ success: true, decision });
   } catch (error: any) {
+    if (claimedApproval) failApproval(claimedApproval.id, error);
     res.status(400).json({ error: error?.message || 'Failed to decide approval' });
   }
 });
@@ -1535,9 +1788,14 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
   const missionId = typeof req.query.missionId === 'string' ? req.query.missionId : undefined;
-  let lastSequence = Math.max(0, Number(req.query.afterSequence) || 0);
+  let lastSequence = cursorFromQuery(req.query).sequence;
   let replaying = Boolean(missionId);
-  const buffered: AgentEvent[] = [];
+  let closed = false;
+  const queue = new BoundedEventQueue<AgentEvent>({
+    maxItems: 2_000,
+    maxBytes: 8 * 1024 * 1024,
+    sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), 'utf8'),
+  });
   const writeEvent = (event: AgentEvent) => {
     if (missionId && event.missionId !== missionId) return;
     const sequence = Number(event.sequence || 0);
@@ -1545,25 +1803,82 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
     if (sequence) lastSequence = sequence;
     res.write(`id: ${sequence || event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
   };
+  const flush = () => {
+    if (closed || res.writableEnded || res.writableNeedDrain || replaying) return;
+    const dropped = queue.takeDroppedCount();
+    if (dropped > 0 && !res.writableNeedDrain) {
+      res.write(`event: stream_gap\ndata: ${JSON.stringify({ type: 'stream_gap', dropped, afterSequence: lastSequence })}\n\n`);
+    }
+    while (!res.writableNeedDrain && queue.length > 0) {
+      const next = queue.dequeue(1)[0];
+      if (next) writeEvent(next);
+    }
+    if (!res.writableNeedDrain && queue.length > 0) setImmediate(flush);
+  };
+  const enqueue = (event: AgentEvent) => {
+    if (missionId && event.missionId !== missionId) return;
+    queue.enqueue(event);
+    flush();
+  };
   const unsubscribe = eventBus.on('*', (event: AgentEvent) => {
-    if (replaying) buffered.push(event);
-    else writeEvent(event);
+    enqueue(event);
   });
   if (missionId) {
     while (true) {
       const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ? ORDER BY sequence LIMIT 1000`)
         .all(missionId, lastSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
-      for (const row of rows) writeEvent({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent);
+      for (const row of rows) queue.enqueue({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent);
       if (rows.length < 1000) break;
     }
     replaying = false;
-    for (const event of buffered) writeEvent(event);
+    flush();
   }
-  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15_000);
+  const onDrain = () => flush();
+  res.on('drain', onDrain);
+  const heartbeat = setInterval(() => {
+    if (!closed && !res.writableEnded && !res.writableNeedDrain) res.write(': heartbeat\n\n');
+  }, 15_000);
   req.on('close', () => {
+    closed = true;
     clearInterval(heartbeat);
+    res.off('drain', onDrain);
+    queue.clear();
     unsubscribe();
   });
+});
+
+app.post('/api/approvals/:id/reconcile', async (req, res) => {
+  try {
+    const outcome = String(req.body?.outcome || '').toLowerCase();
+    if (outcome !== 'applied' && outcome !== 'not_applied') {
+      return void res.status(400).json({ error: "outcome must be 'applied' or 'not_applied'" });
+    }
+    const reconciled = reconcileApproval(req.params.id, outcome);
+    if (!reconciled) return void res.status(409).json({ error: 'Approval is not awaiting reconciliation.' });
+    const approval = reconciled.approval;
+    eventBus.emit({
+      id: crypto.randomUUID(),
+      type: 'approval_reconciled',
+      missionId: approval.mission_id,
+      approvalId: approval.id,
+      outcome,
+      timestamp: new Date().toISOString(),
+    });
+    if (outcome === 'applied') {
+      eventBus.emit({
+        id: crypto.randomUUID(),
+        type: 'approval_responded',
+        missionId: approval.mission_id,
+        approvalId: approval.id,
+        approved: approval.status === 'approved',
+        decidedBy: 'user',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    res.json({ success: true, outcome, approval });
+  } catch (error: any) {
+    res.status(400).json({ error: error?.message || 'Failed to reconcile approval' });
+  }
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -1617,31 +1932,87 @@ server.on('upgrade', async (request, socket, head) => {
 
 wss.on('connection', (ws: WebSocket) => {
   console.log('[API-Gateway] WebSocket client connected');
+  const queue = new BoundedEventQueue<AgentEvent>({
+    maxItems: 2_000,
+    maxBytes: 8 * 1024 * 1024,
+    sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), 'utf8'),
+  });
+  const MAX_BUFFERED_BYTES = 1 * 1024 * 1024;
+  let closed = false;
+  let slowClientTimer: ReturnType<typeof setTimeout> | undefined;
+  const flush = () => {
+    if (closed || ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      if (!slowClientTimer) {
+        slowClientTimer = setTimeout(() => {
+          slowClientTimer = undefined;
+          if (!closed && ws.readyState === WebSocket.OPEN && ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+            ws.close(1013, 'Client is too slow for the event stream.');
+          }
+        }, 1_000);
+      }
+      return;
+    }
+    if (slowClientTimer) {
+      clearTimeout(slowClientTimer);
+      slowClientTimer = undefined;
+    }
+    const dropped = queue.takeDroppedCount();
+    if (dropped > 0 && ws.bufferedAmount <= MAX_BUFFERED_BYTES) {
+      ws.send(JSON.stringify({ type: 'stream_gap', dropped }));
+    }
+    while (queue.length > 0 && ws.bufferedAmount <= MAX_BUFFERED_BYTES) {
+      const event = queue.dequeue(1)[0];
+      if (event) ws.send(JSON.stringify(event));
+    }
+    if (queue.length > 0) setTimeout(flush, 25);
+  };
   const unsubscribe = eventBus.on('*', (event: AgentEvent) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+    queue.enqueue(event);
+    flush();
   });
   ws.on('close', () => {
+    closed = true;
+    if (slowClientTimer) clearTimeout(slowClientTimer);
+    queue.clear();
     console.log('[API-Gateway] WebSocket client disconnected');
     unsubscribe();
   });
   ws.on('error', (err: unknown) => {
+    closed = true;
+    if (slowClientTimer) clearTimeout(slowClientTimer);
+    queue.clear();
     console.error('[API-Gateway] WebSocket error:', err);
     unsubscribe();
   });
 });
 
 const isMain = shouldAutoStartGateway();
-setImmediate(() => {
+setImmediate(async () => {
   const recoveredAt = new Date().toISOString();
+  const pendingCompletionMissions = (sqlite.prepare("SELECT DISTINCT mission_id FROM mission_completions WHERE status IN ('synthesis_pending', 'event_pending')")
+    .all() as Array<{ mission_id: string }>).map((row) => row.mission_id);
+  const pendingMissionPlaceholders = pendingCompletionMissions.map(() => '?').join(', ');
+  const pendingRunGuard = pendingMissionPlaceholders ? ` AND mission_id NOT IN (${pendingMissionPlaceholders})` : '';
+  const pendingMissionGuard = pendingMissionPlaceholders ? ` AND id NOT IN (${pendingMissionPlaceholders})` : '';
   sqlite.transaction(() => {
     sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = COALESCE(error, 'Gateway restarted while command was starting') WHERE status = 'processing'")
       .run(recoveredAt);
-    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = COALESCE(error, 'Gateway restarted before completion was confirmed') WHERE status IN ('starting', 'running', 'stopping')")
-      .run(recoveredAt);
-    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE status IN ('starting', 'running')").run(recoveredAt);
-    sqlite.prepare("UPDATE missions SET status = 'failed', completed_at = ?, active_run_id = NULL WHERE active_run_id IS NOT NULL")
-      .run(recoveredAt);
+    sqlite.prepare(`UPDATE mission_runs SET status = 'failed', completed_at = ?, error = COALESCE(error, 'Gateway restarted before completion was confirmed')
+      WHERE status IN ('starting', 'running', 'stopping')${pendingRunGuard}`)
+      .run(recoveredAt, ...pendingCompletionMissions);
+    sqlite.prepare(`UPDATE conversation_turns SET status = 'failed', completed_at = ?
+      WHERE status IN ('starting', 'running')${pendingRunGuard}`).run(recoveredAt, ...pendingCompletionMissions);
+    sqlite.prepare(`UPDATE missions SET status = 'failed', completed_at = ?, active_run_id = NULL
+      WHERE active_run_id IS NOT NULL${pendingMissionGuard}`).run(recoveredAt, ...pendingCompletionMissions);
+    sqlite.prepare(`UPDATE approval_operations SET status = 'reconcile_required',
+      error = COALESCE(error, 'Gateway restarted before approval side effect could be confirmed'),
+      reconcile_attempts = reconcile_attempts + 1 WHERE status = 'applying'`).run();
+    sqlite.prepare(`UPDATE approvals SET status = 'reconcile_required', decided_at = NULL,
+      execution_error = COALESCE(execution_error, 'Approval outcome requires reconciliation after restart')
+      WHERE id IN (SELECT approval_id FROM approval_operations WHERE status = 'reconcile_required')`).run();
   })();
+  await orchestrator.recoverPendingCompletions();
   const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
   for (const row of pending) void drainMissionCommands(row.mission_id);
 });

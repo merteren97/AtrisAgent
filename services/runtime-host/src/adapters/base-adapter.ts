@@ -40,6 +40,10 @@ export interface SpawnAgentOptions {
   profileId?: string;
 }
 
+export function isReadOnlyAgentRole(role?: string): boolean {
+  return ['orchestrator', 'reviewer', 'researcher', 'qa'].includes(String(role || '').toLowerCase());
+}
+
 export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
   abstract readonly id: string;
   abstract readonly name: string;

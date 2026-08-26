@@ -5,11 +5,15 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 2;
+export const DATABASE_SCHEMA_VERSION = 8;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
     .some((row) => (row as { name?: string }).name === column);
+}
+
+function hasTable(sqlite: SQLiteMigrationDatabase, table: string): boolean {
+  return sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").all(table).length > 0;
 }
 
 export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
@@ -82,5 +86,100 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
         WHERE status IN ('starting', 'running', 'stopping');
       PRAGMA user_version = 2;
     `);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 3) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'approvals')) {
+      if (!hasColumn(sqlite, 'approvals', 'requested_decision')) sqlite.exec('ALTER TABLE approvals ADD COLUMN requested_decision TEXT');
+      if (!hasColumn(sqlite, 'approvals', 'claimed_at')) sqlite.exec('ALTER TABLE approvals ADD COLUMN claimed_at TEXT');
+      if (!hasColumn(sqlite, 'approvals', 'attempt_count')) sqlite.exec('ALTER TABLE approvals ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0');
+      if (!hasColumn(sqlite, 'approvals', 'execution_error')) sqlite.exec('ALTER TABLE approvals ADD COLUMN execution_error TEXT');
+       sqlite.exec(`UPDATE approvals SET status = 'reconcile_required', execution_error = COALESCE(execution_error, 'Gateway restarted while approval execution was in progress')
+         WHERE status = 'processing'`);
+    }
+    sqlite.exec('PRAGMA user_version = 3');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 4) sqlite.transaction(() => {
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS approval_operations (
+        approval_id TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
+        decision TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL,
+        completed_at TEXT, error TEXT);
+      CREATE TABLE IF NOT EXISTS mission_completions (
+        mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        plan_id TEXT NOT NULL, status TEXT NOT NULL, summary TEXT,
+        tasks_completed INTEGER NOT NULL, total_tasks INTEGER NOT NULL,
+        created_at TEXT NOT NULL, completed_at TEXT,
+        PRIMARY KEY (mission_id, plan_id));
+      UPDATE approval_operations SET status = 'reconcile_required',
+        error = COALESCE(error, 'Gateway restarted before approval side effect could be confirmed')
+        WHERE status = 'applying';
+       UPDATE approvals SET status = 'reconcile_required',
+         execution_error = COALESCE(execution_error, 'Approval outcome requires reconciliation after restart')
+        WHERE id IN (SELECT approval_id FROM approval_operations WHERE status = 'reconcile_required');
+      PRAGMA user_version = 4;
+    `);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 5) sqlite.transaction(() => {
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS runtime_telemetry (
+        id TEXT PRIMARY KEY,
+        mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        agent_instance_id TEXT NOT NULL,
+        adapter_id TEXT NOT NULL,
+        account_profile_id TEXT,
+        outcome TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cost REAL,
+        currency TEXT NOT NULL DEFAULT 'USD',
+        queue_wait_ms INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        retry_count INTEGER NOT NULL DEFAULT 1,
+        worker_utilization REAL NOT NULL DEFAULT 0,
+        recorded_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_runtime_telemetry_mission_recorded
+        ON runtime_telemetry(mission_id, recorded_at);
+      PRAGMA user_version = 5;
+    `);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 6) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'approval_operations')) {
+      if (!hasColumn(sqlite, 'approval_operations', 'operation_type')) sqlite.exec("ALTER TABLE approval_operations ADD COLUMN operation_type TEXT NOT NULL DEFAULT 'approval'");
+      if (!hasColumn(sqlite, 'approval_operations', 'resource_id')) sqlite.exec('ALTER TABLE approval_operations ADD COLUMN resource_id TEXT');
+      if (!hasColumn(sqlite, 'approval_operations', 'idempotency_key')) sqlite.exec('ALTER TABLE approval_operations ADD COLUMN idempotency_key TEXT');
+      if (!hasColumn(sqlite, 'approval_operations', 'result')) sqlite.exec('ALTER TABLE approval_operations ADD COLUMN result TEXT');
+      if (!hasColumn(sqlite, 'approval_operations', 'reconciled_at')) sqlite.exec('ALTER TABLE approval_operations ADD COLUMN reconciled_at TEXT');
+      if (!hasColumn(sqlite, 'approval_operations', 'reconcile_attempts')) sqlite.exec('ALTER TABLE approval_operations ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0');
+      sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_operations_idempotency ON approval_operations(idempotency_key) WHERE idempotency_key IS NOT NULL');
+    }
+    sqlite.exec('PRAGMA user_version = 6');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 7) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'mission_completions')) {
+      if (!hasColumn(sqlite, 'mission_completions', 'run_id')) sqlite.exec('ALTER TABLE mission_completions ADD COLUMN run_id TEXT');
+      if (!hasColumn(sqlite, 'mission_completions', 'turn_id')) sqlite.exec('ALTER TABLE mission_completions ADD COLUMN turn_id TEXT');
+      sqlite.exec('CREATE INDEX IF NOT EXISTS idx_mission_completions_pending ON mission_completions(status, mission_id)');
+    }
+    sqlite.exec('PRAGMA user_version = 7');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 8) sqlite.transaction(() => {
+    // Older migrations used `failed` for an interrupted approval. Preserve the
+    // audit trail while making the unresolved external side effect explicit.
+    if (hasTable(sqlite, 'approvals')) {
+      sqlite.exec(`UPDATE approvals SET status = 'reconcile_required'
+        WHERE status = 'failed' AND execution_error IN (
+          'Gateway restarted while approval execution was in progress',
+          'Approval outcome requires reconciliation after restart'
+        )`);
+    }
+    sqlite.exec('PRAGMA user_version = 8');
   })();
 }

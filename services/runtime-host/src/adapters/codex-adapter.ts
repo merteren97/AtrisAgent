@@ -19,7 +19,7 @@ import type {
   AuthPollResult,
   CanonicalReasoning,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
+import { BaseRuntimeAdapter, isReadOnlyAgentRole, type SpawnAgentOptions } from './base-adapter';
 import {
   appendControlPlaneInstructions,
   codexControlPlaneArgs,
@@ -97,7 +97,9 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       modelSelection: /--model\b/.test(execHelp) || /-m,?\s+--model/.test(execHelp),
       reasoningControl: /reasoning/.test(help) || /reasoning/.test(execHelp),
       toolCallEvents: /--json\b/.test(execHelp),
-      interactiveApproval: /approval/.test(help),
+      // Codex exec approvals must be configured before launch; this adapter
+      // cannot answer an in-flight approval request.
+      interactiveApproval: false,
       usageInfo: false,
       cancellation: true,
       worktreeAwareness: true,
@@ -356,7 +358,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     const model = options.model || '';
     const controlPlane = prepareControlPlaneSession(options, sessionId);
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, cwd);
-    const readOnly = ['orchestrator', 'reviewer', 'researcher'].includes(String(options.role || '').toLowerCase());
+    const readOnly = isReadOnlyAgentRole(options.role);
     const args = ['exec', '--json', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '--skip-git-repo-check'];
     args.push(...codexControlPlaneArgs(controlPlane));
     if (model) args.push('--model', model);

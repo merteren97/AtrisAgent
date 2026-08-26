@@ -336,6 +336,7 @@ export function ChatComposer() {
             onKeyDown={handleKeyDown}
             rows={1}
             placeholder={composerPlaceholder}
+            aria-label="Mission message"
             disabled={loading || !activeWorkspaceId}
             className="block max-h-[170px] min-h-[42px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/75 disabled:cursor-not-allowed disabled:opacity-60"
           />
@@ -344,7 +345,7 @@ export function ChatComposer() {
             <div className="flex items-center gap-0.5">
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Attach context" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading}>
                     <Paperclip className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -352,7 +353,7 @@ export function ChatComposer() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading}>
                     <AtSign className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -360,7 +361,7 @@ export function ChatComposer() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Mission commands" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading}>
                     <Terminal className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -412,7 +413,7 @@ export function ChatComposer() {
                       {RUNTIME_BRANDS.map((runtime) => (
                         <Tooltip key={runtime.id}>
                           <TooltipTrigger asChild>
-                            <button type="button" onClick={(event) => { event.preventDefault(); setModelRuntimeFilter(runtime.id); }} className={cn('flex h-7 w-7 items-center justify-center rounded-md border', modelRuntimeFilter === runtime.id ? 'border-primary bg-primary/10' : 'border-border text-muted-foreground')}>
+                            <button type="button" aria-label={`Filter ${runtime.label} routes`} aria-pressed={modelRuntimeFilter === runtime.id} onClick={(event) => { event.preventDefault(); setModelRuntimeFilter(runtime.id); }} className={cn('flex h-7 w-7 items-center justify-center rounded-md border', modelRuntimeFilter === runtime.id ? 'border-primary bg-primary/10' : 'border-border text-muted-foreground')}>
                               <RuntimeBrandIcon runtimeId={runtime.id} className="h-3.5 w-3.5" />
                             </button>
                           </TooltipTrigger>
@@ -421,7 +422,7 @@ export function ChatComposer() {
                       ))}
                       <div className="relative ml-auto w-[190px]">
                         <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
-                        <input value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="Search routes…" className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[10px] outline-none focus:border-primary" />
+                        <input aria-label="Search connected routes" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="Search routes…" className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[10px] outline-none focus:border-primary" />
                       </div>
                     </div>
                   </div>

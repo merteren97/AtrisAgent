@@ -186,6 +186,18 @@ async function runTests() {
       );
       assert(!fs.existsSync(path.join(root, 'injected.txt')), 'does not allow a prompt argument to create a redirected file');
       assert(!result.stdout.includes('\nATRIS_INJECTED'), 'does not execute an injected command separator payload');
+
+      const genericWrapper = path.join(root, 'generic wrapper.cmd');
+      const powershellPrinter = path.join(root, 'print-args.ps1');
+      fs.writeFileSync(powershellPrinter, 'ConvertTo-Json -InputObject ([string[]]$args) -Compress', 'utf8');
+      fs.writeFileSync(genericWrapper, '@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -File "%~dp0print-args.ps1" %*\r\n', 'utf8');
+      const genericArguments = ['hello world', '--mode', 'safe'];
+      const genericResult = await runCommand(`"${genericWrapper}"`, genericArguments, { cwd: root, timeoutMs: 5_000 });
+      const genericReceived = JSON.parse(genericResult.stdout.trim()) as string[];
+      assert(
+        JSON.stringify(genericReceived) === JSON.stringify(genericArguments),
+        'forwards arguments to a non-Node .cmd wrapper without relying on NODE_OPTIONS',
+      );
     } catch (error: any) {
       console.error('[FAIL] securely executes a quoted .cmd path containing spaces through the static bridge');
       console.error(error?.message || error);

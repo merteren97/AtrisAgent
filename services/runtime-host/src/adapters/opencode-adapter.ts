@@ -479,7 +479,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
   private mapAgentMode(role?: string): 'build' | 'plan' {
     const normalized = String(role || 'builder').toLowerCase();
-    return normalized === 'builder' || normalized === 'qa' ? 'build' : 'plan';
+    return normalized === 'builder' ? 'build' : 'plan';
   }
 
   private parseModelRoute(model?: string): { providerID: string; modelID: string } | undefined {
@@ -615,7 +615,21 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       }
     } else if (type === 'permission.updated' || type === 'permission.asked') {
       const permission = properties.permission || properties;
-      this.emitEvent({ id: crypto.randomUUID(), type: 'approval_requested', missionId: context.missionId, approvalId: `${sessionId}:${permission.id}`, approvalType: permission.type || 'tool', description: permission.title || permission.description || 'OpenCode permission required', timestamp });
+      const input = permission.input || permission.metadata || {};
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'approval_requested',
+        missionId: context.missionId,
+        taskId: context.taskId,
+        agentInstanceId: sessionId,
+        approvalId: `${sessionId}:${permission.id}`,
+        approvalType: permission.type || 'tool',
+        toolName: permission.tool || permission.name || permission.type || 'tool',
+        path: typeof input.path === 'string' ? input.path : typeof permission.path === 'string' ? permission.path : undefined,
+        command: typeof input.command === 'string' ? input.command : typeof permission.command === 'string' ? permission.command : undefined,
+        description: permission.title || permission.description || 'OpenCode permission required',
+        timestamp,
+      });
     } else if (type === 'session.idle') {
       this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: 'OpenCode session completed', timestamp });
       const session = this.activeSessions.get(sessionId);

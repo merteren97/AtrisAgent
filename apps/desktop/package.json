@@ -11,7 +11,7 @@
     "build:runtime-sidecar": "node ../../scripts/build-runtime-sidecar.mjs",
     "test:runtime-sidecar": "node ../../scripts/runtime-sidecar-smoke.mjs",
     "icons:generate": "tauri icon public/logo.svg",
-    "test": "npx tsx --tsconfig tsconfig.app.json src/components/chat/chat-timeline.test.ts && npx tsx --tsconfig tsconfig.app.json src/stores/mission-store.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/auth-contract.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/sse-parser.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/runtime-config.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/memory-graph.test.ts",
+    "test": "npx tsx --tsconfig tsconfig.app.json src/components/chat/chat-timeline.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/timeline-window.test.ts && npx tsx --tsconfig tsconfig.app.json src/stores/mission-store.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/mission-display.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/auth-contract.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/sse-parser.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/runtime-config.test.ts && npx tsx --tsconfig tsconfig.app.json src/lib/memory-graph.test.ts",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:build:windows": "tauri build --bundles nsis,msi",
@@ -35,7 +35,6 @@
     "radix-ui": "^1.6.7",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "recharts": "^3.10.1",
     "tailwind-merge": "^3.3.0",
     "zustand": "^5.0.5",
     "@atris-agent-code/domain": "*"

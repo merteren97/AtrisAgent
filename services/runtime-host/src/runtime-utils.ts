@@ -9,6 +9,21 @@ const DEFAULT_MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_CONFIGURABLE_COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024;
 const WINDOWS_SAFE_BRIDGE_CWD = () => path.dirname(process.execPath);
 
+const WINDOWS_RUNTIME_ARGUMENT_BRIDGE_SOURCE = [
+  "'use strict';",
+  "const { spawnSync } = require('node:child_process');",
+  "const decode = (value) => Buffer.from(value || '', 'base64').toString('utf8');",
+  "const command = decode(process.env.ATRIS_RUNTIME_COMMAND_B64);",
+  "const args = JSON.parse(decode(process.env.ATRIS_RUNTIME_ARGS_B64));",
+  "const shell = decode(process.env.ATRIS_RUNTIME_SHELL_B64);",
+  "const cwd = decode(process.env.ATRIS_RUNTIME_CWD_B64) || process.cwd();",
+  "const quote = (value) => { let output = '\"', backslashes = 0; for (const char of String(value)) { if (char === '\\\\') { backslashes += 1; continue; } if (char === '\"') { output += '\\\\'.repeat(backslashes * 2 + 1) + '\"'; backslashes = 0; continue; } output += '\\\\'.repeat(backslashes) + char; backslashes = 0; } return output + '\\\\'.repeat(backslashes * 2) + '\"'; };",
+  "const commandLine = '\"' + quote(command) + (args.length ? ' ' + args.map(quote).join(' ') : '') + '\"';",
+  "const result = spawnSync(shell, ['/d', '/s', '/c', commandLine], { cwd, env: process.env, stdio: 'inherit', windowsVerbatimArguments: true });",
+  'if (result.error) { console.error(result.error.message); process.exit(1); }',
+  'process.exit(result.status === null ? 1 : result.status);',
+].join('\n');
+
 const WINDOWS_RUNTIME_BRIDGE_SCRIPT = [
   '$ErrorActionPreference = "Stop"',
   'function DecodeAtris([string]$value) { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
@@ -18,7 +33,22 @@ const WINDOWS_RUNTIME_BRIDGE_SCRIPT = [
   'if ($env:ATRIS_RUNTIME_CWD_B64) { Set-Location -LiteralPath (DecodeAtris $env:ATRIS_RUNTIME_CWD_B64) }',
   'if ($env:ATRIS_RUNTIME_TITLE_B64) { $Host.UI.RawUI.WindowTitle = DecodeAtris $env:ATRIS_RUNTIME_TITLE_B64 }',
   '$global:LASTEXITCODE = 0',
-  '& $runtimeCommand @runtimeArgs',
+  '$runtimeExtension = [IO.Path]::GetExtension($runtimeCommand)',
+  'if ($runtimeExtension -in @(".cmd", ".bat")) {',
+  '  $launcher = Join-Path ([IO.Path]::GetTempPath()) ("atris-runtime-" + [Guid]::NewGuid().ToString("N") + ".cjs")',
+  '  $launcherSource = DecodeAtris $env:ATRIS_RUNTIME_ARGUMENT_BRIDGE_B64',
+  '  [IO.File]::WriteAllText($launcher, $launcherSource, [Text.Encoding]::ASCII)',
+  '  $env:ATRIS_RUNTIME_SHELL_B64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::Combine([Environment]::SystemDirectory, "cmd.exe")))',
+  '  try {',
+  '    $nodeCommand = DecodeAtris $env:ATRIS_RUNTIME_NODE_B64',
+  '    & $nodeCommand $launcher',
+  '    $global:LASTEXITCODE = $LASTEXITCODE',
+  '  } finally {',
+  '    Remove-Item -LiteralPath $launcher -Force -ErrorAction SilentlyContinue',
+  '  }',
+  '} else {',
+  '  & $runtimeCommand @runtimeArgs',
+  '}',
   'exit $LASTEXITCODE',
 ].join('; ');
 
@@ -240,6 +270,8 @@ function prepareWindowsPowerShellBridge(
       ...env,
       ATRIS_RUNTIME_COMMAND_B64: encodeUtf8Base64(command),
       ATRIS_RUNTIME_ARGS_B64: encodeUtf8Base64(JSON.stringify(args)),
+      ATRIS_RUNTIME_NODE_B64: encodeUtf8Base64(process.execPath),
+      ATRIS_RUNTIME_ARGUMENT_BRIDGE_B64: encodeUtf8Base64(WINDOWS_RUNTIME_ARGUMENT_BRIDGE_SOURCE),
     },
     usesPowerShellBridge: true,
   };

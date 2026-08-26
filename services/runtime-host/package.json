@@ -17,6 +17,7 @@
     "@atris-agent-code/domain": "*",
     "@atris-agent-code/event-bus": "*",
     "@atris-agent-code/event-schema": "*",
+    "@atris-agent-code/policy-engine": "*",
     "@atris-agent-code/workspace-manager": "*"
   }
 }

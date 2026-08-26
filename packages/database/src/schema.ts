@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real, primaryKey, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import type {
   MissionStatus,
   ExecutionMode,
@@ -237,9 +237,41 @@ export const approvals = sqliteTable('approvals', {
   description: text('description').notNull().default(''),
   status: text('status').$type<ApprovalStatus>().default('pending'),
   decidedBy: text('decided_by'),
+  requestedDecision: text('requested_decision').$type<'approved' | 'rejected'>(),
+  claimedAt: text('claimed_at'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  executionError: text('execution_error'),
   createdAt: text('created_at').notNull(),
   decidedAt: text('decided_at'),
 });
+
+export const approvalOperations = sqliteTable('approval_operations', {
+  approvalId: text('approval_id').primaryKey().references(() => approvals.id, { onDelete: 'cascade' }),
+  decision: text('decision').$type<'approved' | 'rejected'>().notNull(),
+  status: text('status').$type<'applying' | 'completed' | 'reconcile_required'>().notNull(),
+  operationType: text('operation_type').notNull().default('approval'),
+  resourceId: text('resource_id'),
+  idempotencyKey: text('idempotency_key'),
+  result: text('result', { mode: 'json' }).$type<Record<string, unknown>>(),
+  startedAt: text('started_at').notNull(),
+  completedAt: text('completed_at'),
+  reconciledAt: text('reconciled_at'),
+  reconcileAttempts: integer('reconcile_attempts').notNull().default(0),
+  error: text('error'),
+});
+
+export const missionCompletions = sqliteTable('mission_completions', {
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  planId: text('plan_id').notNull(),
+  runId: text('run_id'),
+  turnId: text('turn_id'),
+  status: text('status').$type<'synthesis_pending' | 'event_pending' | 'completed'>().notNull(),
+  summary: text('summary'),
+  tasksCompleted: integer('tasks_completed').notNull(),
+  totalTasks: integer('total_tasks').notNull(),
+  createdAt: text('created_at').notNull(),
+  completedAt: text('completed_at'),
+}, (table) => [primaryKey({ columns: [table.missionId, table.planId] })]);
 
 export const artifacts = sqliteTable('artifacts', {
   id: text('id').primaryKey(),
@@ -267,6 +299,25 @@ export const usageSnapshots = sqliteTable('usage_snapshots', {
   outputTokens: integer('output_tokens').notNull().default(0),
   cost: integer('cost'),
   currency: text('currency').default('USD'),
+  recordedAt: text('recorded_at').notNull(),
+});
+
+export const runtimeTelemetry = sqliteTable('runtime_telemetry', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  taskId: text('task_id').notNull(),
+  agentInstanceId: text('agent_instance_id').notNull(),
+  adapterId: text('adapter_id').notNull(),
+  accountProfileId: text('account_profile_id'),
+  outcome: text('outcome').$type<'completed' | 'failed'>().notNull(),
+  inputTokens: integer('input_tokens').notNull().default(0),
+  outputTokens: integer('output_tokens').notNull().default(0),
+  cost: real('cost'),
+  currency: text('currency').notNull().default('USD'),
+  queueWaitMs: integer('queue_wait_ms').notNull().default(0),
+  durationMs: integer('duration_ms').notNull().default(0),
+  retryCount: integer('retry_count').notNull().default(1),
+  workerUtilization: real('worker_utilization').notNull().default(0),
   recordedAt: text('recorded_at').notNull(),
 });
 
@@ -342,12 +393,18 @@ export type ResourceLeaseInsert = typeof resourceLeases.$inferInsert;
 
 export type ApprovalSelect = typeof approvals.$inferSelect;
 export type ApprovalInsert = typeof approvals.$inferInsert;
+export type ApprovalOperationSelect = typeof approvalOperations.$inferSelect;
+export type ApprovalOperationInsert = typeof approvalOperations.$inferInsert;
+export type MissionCompletionSelect = typeof missionCompletions.$inferSelect;
+export type MissionCompletionInsert = typeof missionCompletions.$inferInsert;
 
 export type ArtifactSelect = typeof artifacts.$inferSelect;
 export type ArtifactInsert = typeof artifacts.$inferInsert;
 
 export type UsageSnapshotSelect = typeof usageSnapshots.$inferSelect;
 export type UsageSnapshotInsert = typeof usageSnapshots.$inferInsert;
+export type RuntimeTelemetrySelect = typeof runtimeTelemetry.$inferSelect;
+export type RuntimeTelemetryInsert = typeof runtimeTelemetry.$inferInsert;
 
 export type WorktreeSelect = typeof worktrees.$inferSelect;
 export type WorktreeInsert = typeof worktrees.$inferInsert;

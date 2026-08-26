@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type UIEvent } from 'react';
+import { useState, useRef, useEffect, useMemo, type UIEvent } from 'react';
 import { Activity, ArrowDown, Filter } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';
@@ -7,6 +7,7 @@ import { ToolCallRow } from '@/components/chat/tool-call-row';
 import { cn } from '@/lib/utils';
 import { useMissionStore } from '@/stores/mission-store';
 import { useSettingsStore, type TimelineDetailMode } from '@/stores/settings-store';
+import { DEFAULT_TIMELINE_WINDOW, growTimelineWindow, tailWindow } from '@/lib/timeline-window';
 
 type FilterType = 'all' | 'agents' | 'tools' | 'coordination' | 'errors';
 
@@ -33,10 +34,11 @@ export function ActivityTab() {
   const setDetailMode = useSettingsStore((state) => state.setTimelineDetailMode);
   const [filter, setFilter] = useState<FilterType>('all');
   const [autoScroll, setAutoScroll] = useState(true);
+  const [visibleItemCount, setVisibleItemCount] = useState(DEFAULT_TIMELINE_WINDOW);
   const shouldFollowRef = useRef(true);
   const viewportRef = useRef<HTMLDivElement>(null);
 
-  const filteredTimeline = timeline.filter((item) => {
+  const filteredTimeline = useMemo(() => timeline.filter((item) => {
     const type = item.eventType || '';
     if (filter === 'all') return true;
     if (filter === 'agents') return AGENT_EVENTS.has(type);
@@ -44,12 +46,16 @@ export function ActivityTab() {
     if (filter === 'coordination') return COORDINATION_EVENTS.has(type);
     if (filter === 'errors') return type === 'task_failed' || type === 'mission_failed' || type === 'agent_error';
     return true;
-  });
+  }), [filter, timeline]);
+  const timelineWindow = useMemo(() => tailWindow(filteredTimeline, visibleItemCount), [filteredTimeline, visibleItemCount]);
 
   useEffect(() => {
     shouldFollowRef.current = true;
     setAutoScroll(true);
+    setVisibleItemCount(DEFAULT_TIMELINE_WINDOW);
   }, [activeMissionId]);
+
+  useEffect(() => setVisibleItemCount(DEFAULT_TIMELINE_WINDOW), [filter]);
 
   useEffect(() => {
     if (timeline.length === 0) {
@@ -82,6 +88,17 @@ export function ActivityTab() {
     shouldFollowRef.current = true;
     setAutoScroll(true);
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'auto' });
+  };
+
+  const loadOlder = () => {
+    const viewport = viewportRef.current;
+    const previousHeight = viewport?.scrollHeight || 0;
+    shouldFollowRef.current = false;
+    setAutoScroll(false);
+    setVisibleItemCount((current) => growTimelineWindow(current, filteredTimeline.length));
+    requestAnimationFrame(() => {
+      if (viewport) viewport.scrollTop += viewport.scrollHeight - previousHeight;
+    });
   };
 
   if (timeline.length === 0) {
@@ -155,7 +172,12 @@ export function ActivityTab() {
           onViewportScroll={handleViewportScroll}
         >
           <div className="flex flex-col gap-3 p-3">
-            {filteredTimeline.map((item) => (
+            {timelineWindow.hiddenCount > 0 && (
+              <Button type="button" variant="outline" size="sm" className="mx-auto h-7 text-[10px]" onClick={loadOlder}>
+                Load {Math.min(DEFAULT_TIMELINE_WINDOW, timelineWindow.hiddenCount)} older events
+              </Button>
+            )}
+            {timelineWindow.items.map((item) => (
               <div key={item.id} className="flex flex-col gap-1.5 border-b border-border/50 pb-3 last:border-0">
                 {TOOL_CALL_EVENTS.has(item.eventType || '') ? <ToolCallRow item={item} /> : (
                   <>

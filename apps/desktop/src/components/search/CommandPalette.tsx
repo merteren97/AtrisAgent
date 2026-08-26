@@ -39,7 +39,7 @@ export function CommandPalette() {
     // Views
     ...[
       { id: 'view-chat', title: 'Go to Chat', icon: Activity, type: 'View', onSelect: () => { setActiveView('chat'); setMissionFilter('active'); } },
-      { id: 'view-dashboard', title: 'Go to Dashboard', icon: Activity, type: 'View', onSelect: () => setActiveView('dashboard') },
+      { id: 'view-dashboard', title: 'Go to Command Center', icon: Activity, type: 'View', onSelect: () => setActiveView('dashboard') },
       { id: 'view-projects', title: 'Go to Projects', icon: FolderGit2, type: 'View', onSelect: () => setActiveView('projects') },
       { id: 'view-agents', title: 'Go to Agents', icon: Bot, type: 'View', onSelect: () => setActiveView('agents') },
       { id: 'view-accounts', title: 'Go to Accounts & Models', icon: Settings, type: 'View', onSelect: () => setActiveView('accounts') },

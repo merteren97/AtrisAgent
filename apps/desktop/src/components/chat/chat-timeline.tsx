@@ -10,6 +10,7 @@ import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAgentStore } from '@/stores/agent-store';
 import { useSettingsStore } from '@/stores/settings-store';
+import { DEFAULT_TIMELINE_WINDOW, growTimelineWindow, tailWindow } from '@/lib/timeline-window';
 import { ArrowDown, Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
 
 const COMPACT_EVENT_TYPES = new Set([
@@ -137,6 +138,9 @@ export function ChatTimeline() {
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const activeTasks = useMissionStore((state) => state.activeTasks);
   const loading = useMissionStore((state) => state.loading);
+  const missionStateLoading = useMissionStore((state) => state.missionStateLoading);
+  const missionStateError = useMissionStore((state) => state.missionStateError);
+  const fetchMissionState = useMissionStore((state) => state.fetchMissionState);
   const transportStatus = useMissionStore((state) => state.transportStatus);
   const transportError = useMissionStore((state) => state.transportError);
   const detailMode = useSettingsStore((state) => state.timelineDetailMode);
@@ -147,6 +151,7 @@ export function ChatTimeline() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const shouldFollowRef = useRef(true);
   const [isDetached, setIsDetached] = useState(false);
+  const [visibleEntryCount, setVisibleEntryCount] = useState(DEFAULT_TIMELINE_WINDOW);
 
   const activeMission = missions.find((mission) => mission.id === activeMissionId);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
@@ -168,11 +173,15 @@ export function ChatTimeline() {
     return type !== 'agent_message_read' && type !== 'agent_context_compacted';
   }), [detailMode, timeline]);
   const renderTimeline = useMemo(() => prepareTimeline(visibleTimeline, liveMission && detailMode !== 'summary'), [detailMode, liveMission, visibleTimeline]);
+  const timelineWindow = useMemo(() => tailWindow(renderTimeline, visibleEntryCount), [renderTimeline, visibleEntryCount]);
 
   useEffect(() => {
     shouldFollowRef.current = true;
     setIsDetached(false);
+    setVisibleEntryCount(DEFAULT_TIMELINE_WINDOW);
   }, [activeMissionId]);
+
+  useEffect(() => setVisibleEntryCount(DEFAULT_TIMELINE_WINDOW), [detailMode]);
 
   const handleViewportScroll = (event: UIEvent<HTMLDivElement>) => {
     const shouldFollow = isNearBottom(event.currentTarget);
@@ -203,6 +212,16 @@ export function ChatTimeline() {
 
   const handleSuggestion = (text: string) => setComposerInput(text);
 
+  const loadOlder = () => {
+    const viewport = viewportRef.current;
+    const previousHeight = viewport?.scrollHeight || 0;
+    shouldFollowRef.current = false;
+    setVisibleEntryCount((current) => growTimelineWindow(current, renderTimeline.length));
+    requestAnimationFrame(() => {
+      if (viewport) viewport.scrollTop += viewport.scrollHeight - previousHeight;
+    });
+  };
+
   const emptyState = activeMission ? (
     <div className="flex min-h-[420px] items-center justify-center px-4 py-12">
       <div className="w-full max-w-lg rounded-2xl border border-border bg-card/50 p-6 shadow-sm">
@@ -212,6 +231,8 @@ export function ChatTimeline() {
               ? <Ban className="h-4 w-4 text-muted-foreground" />
               : ['failed', 'blocked'].includes(activeMission.status)
                 ? <AlertCircle className="h-4 w-4 text-destructive" />
+                : missionStateError
+                  ? <AlertCircle className="h-4 w-4 text-destructive" />
                 : activeMission.status === 'completed'
                   ? <Check className="h-4 w-4 text-emerald-400" />
                   : <Loader2 className="h-4 w-4 animate-spin text-primary" />}
@@ -220,7 +241,9 @@ export function ChatTimeline() {
             <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Mission</div>
             <h2 className="mt-1 line-clamp-2 text-lg font-semibold tracking-tight">{activeMission.title}</h2>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              {loading
+              {missionStateError
+                ? missionStateError
+                : loading || missionStateLoading
                 ? 'Restoring the mission timeline and agent sessions…'
                 : missionCancelled
                   ? 'This mission was cancelled. Completed work and recorded agent activity remain available, but unfinished work is no longer active.'
@@ -232,6 +255,11 @@ export function ChatTimeline() {
             </p>
           </div>
         </div>
+        {missionStateError && (
+          <Button type="button" size="sm" variant="outline" className="mt-4" onClick={() => void fetchMissionState(activeMission.id)}>
+            Retry mission state
+          </Button>
+        )}
         <div className="mt-5 flex flex-wrap gap-2">
           <div className="min-w-[100px] flex-1 rounded-lg border border-border bg-background/60 px-3 py-2">
             <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Agents</div>
@@ -303,13 +331,28 @@ export function ChatTimeline() {
         onViewportScroll={handleViewportScroll}
       >
         <div role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation timeline" className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+          {timelineWindow.hiddenCount > 0 && (
+            <div className="flex justify-center pb-1">
+              <Button type="button" variant="outline" size="sm" className="h-7 text-[10px]" onClick={loadOlder}>
+                Load {Math.min(DEFAULT_TIMELINE_WINDOW, timelineWindow.hiddenCount)} older updates
+              </Button>
+            </div>
+          )}
           {activeMissionId && transportStatus !== 'connected' && transportStatus !== 'idle' && (
             <div role="status" className="flex items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-[10px] text-muted-foreground">
               {transportStatus !== 'error' && <Loader2 className="h-3 w-3 animate-spin" />}
               <span>{transportStatus === 'error' ? `Live updates unavailable${transportError ? `: ${transportError}` : '.'}` : 'Reconnecting live updates...'}</span>
             </div>
           )}
-          {timeline.length === 0 ? emptyState : renderTimeline.map((entry, index) => {
+          {missionStateError && timeline.length > 0 && (
+            <div role="alert" className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[10px] text-destructive">
+              <span className="min-w-0 truncate">Mission state could not be restored: {missionStateError}</span>
+              <Button type="button" variant="outline" size="sm" className="h-6 shrink-0 text-[10px]" onClick={() => activeMissionId && void fetchMissionState(activeMissionId)}>
+                Retry
+              </Button>
+            </div>
+          )}
+          {timeline.length === 0 ? emptyState : timelineWindow.items.map((entry, index) => {
             if (entry.kind === 'thinking') {
               return <ThinkingStrip key={`thinking-${entry.item.id || index}`} item={entry.item} />;
             }

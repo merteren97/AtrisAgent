@@ -11,6 +11,7 @@ import { AntigravityAdapter } from './adapters/antigravity-adapter';
 import { ModelCatalogService } from './model-catalog-service';
 import { AccountProfileManager } from './account-profile-manager';
 import { runtimeProfileEnv } from './runtime-utils';
+import { isReadOnlyAgentRole } from './adapters/base-adapter';
 
 async function runTests() {
   console.log('--- Starting RuntimeHost & Adapters Tests ---');
@@ -58,6 +59,13 @@ async function runTests() {
       const capabilities = await adapter.probeCapabilities();
       assert(validCapabilitySnapshot(capabilities), `${adapter.name} returns a complete boolean capability snapshot when unavailable`);
     }
+  }
+
+  // Read-only roles must remain read-only across every CLI adapter.
+  {
+    assert(isReadOnlyAgentRole('qa'), 'QA is classified as a read-only runtime role');
+    assert(isReadOnlyAgentRole('reviewer'), 'Reviewer is classified as a read-only runtime role');
+    assert(!isReadOnlyAgentRole('builder'), 'Builder retains write-capable runtime mode');
   }
 
   // 2. Runtime profile isolation is defined by public environment helpers, not adapter-private methods.
