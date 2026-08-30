@@ -395,6 +395,7 @@ export class WorktreeManager {
     worktreePath: string,
     targetBranch?: string,
     basePath?: string,
+    operation?: { idempotencyKey?: string },
   ): Promise<{ success: boolean; output: string }> {
     let rootPath = basePath || path.dirname(path.dirname(worktreePath));
     const worktreeIsGit = fs.existsSync(worktreePath) && await this.isGitRepository(worktreePath);
@@ -402,6 +403,31 @@ export class WorktreeManager {
     const isGit = worktreeIsGit || await this.isGitRepository(rootPath);
 
     if (isGit) {
+      const operationMarker = operation?.idempotencyKey?.trim()
+        ? `AtrisAgent-Operation: ${operation.idempotencyKey.trim()}`
+        : undefined;
+
+      try {
+        if (targetBranch) {
+          const { stdout: currentBranch } = await git(['rev-parse', '--abbrev-ref', 'HEAD'], rootPath);
+          const current = currentBranch.trim();
+          if (current !== targetBranch) {
+            return { success: false, output: `Workspace is on branch "${current}"; expected target branch "${targetBranch}".` };
+          }
+        }
+
+        if (operationMarker) {
+          const { stdout: existingOperation } = await git([
+            'log', 'HEAD', '--format=%H', '--fixed-strings', `--grep=${operationMarker}`, '-n', '1',
+          ], rootPath);
+          if (existingOperation.trim()) {
+            return { success: true, output: `Merge operation ${operationMarker} was already applied.` };
+          }
+        }
+      } catch (error: any) {
+        return { success: false, output: error?.stderr || error?.message || 'Git merge preflight failed' };
+      }
+
       if (fs.existsSync(worktreePath)) {
         try {
           await git(['add', '-A'], worktreePath);
@@ -437,7 +463,10 @@ export class WorktreeManager {
         const { stdout } = await git([
           '-c', 'user.name=AtrisAgent',
           '-c', 'user.email=local@atrisagent',
-          'merge', '--no-ff', branchName, '-m', `Merge task worktree ${branchName}`,
+          'merge', '--no-ff', branchName, '-m', [
+            `Merge task worktree ${branchName}`,
+            operationMarker,
+          ].filter(Boolean).join('\n\n'),
         ], rootPath);
         return { success: true, output: stdout };
       } catch (error: any) {

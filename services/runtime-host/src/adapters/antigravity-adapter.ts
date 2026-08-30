@@ -94,12 +94,23 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private pendingTerminalBySession = new Map<string, PendingTerminalOutcome>();
   private lastOutputBySession = new Map<string, string>();
   private softTerminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private softTerminalResultsBySession = new Map<string, string>();
   private terminalReleaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private liveModelFamilies: AntigravityCliModelFamily[] = [];
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
   constructor(eventBus?: LocalEventBus) {
     super(eventBus);
+  }
+
+  override async cancel(sessionId: string): Promise<void> {
+    await super.cancel(sessionId);
+    this.cleanupSessionState(sessionId);
+  }
+
+  override async shutdown(): Promise<void> {
+    await super.shutdown();
+    this.cleanupAllSessionState();
   }
 
   async discoverInstallation(): Promise<InstallationStatus> {
@@ -607,10 +618,16 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const context = this.sessionContext.get(sessionId);
     if (!context || this.isSessionCancelled(sessionId) || !line.trim()) return;
     const parsed = parseAntigravityStreamLine(line);
+    const softTerminalResult = this.softTerminalResultsBySession.get(sessionId);
+    this.clearSoftTerminalCandidate(sessionId);
     const timestamp = new Date().toISOString();
 
-    if (parsed.kind === 'malformed') return;
+    if (parsed.kind === 'malformed') {
+      if (softTerminalResult !== undefined) this.scheduleSoftTerminalCandidate(sessionId, softTerminalResult);
+      return;
+    }
     if (parsed.kind === 'unknown') {
+      if (softTerminalResult !== undefined) this.scheduleSoftTerminalCandidate(sessionId, softTerminalResult);
       this.emitEvent({
         id: crypto.randomUUID(),
         type: 'agent_progressed',
@@ -623,7 +640,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'init') {
-      this.clearSoftTerminalCandidate(sessionId);
       const session = this.activeSessions.get(sessionId);
       if (session && parsed.conversationId) session.runtimeSessionId = parsed.conversationId;
       this.emitEvent({
@@ -638,7 +654,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'step') {
-      this.clearSoftTerminalCandidate(sessionId);
       const stepType = parsed.stepType.toLowerCase();
       const isFinalResponseCandidate = /(?:^|[_-])(?:agent|final)[_-]?response(?:$|[_-])/.test(stepType)
         && /^(?:done|completed|success|succeeded)$/i.test(parsed.state || '');
@@ -660,7 +675,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'result') {
-      this.clearSoftTerminalCandidate(sessionId);
       if (this.terminalSessions.has(sessionId)) return;
       if (!parsed.success) {
         this.recordTerminalOutcome(sessionId, {
@@ -684,6 +698,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const timer = this.softTerminalTimers.get(sessionId);
     if (timer) clearTimeout(timer);
     this.softTerminalTimers.delete(sessionId);
+    this.softTerminalResultsBySession.delete(sessionId);
   }
 
   private clearTerminalRelease(sessionId: string): void {
@@ -692,8 +707,40 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.terminalReleaseTimers.delete(sessionId);
   }
 
+  private cleanupSessionState(sessionId: string): void {
+    this.clearSoftTerminalCandidate(sessionId);
+    this.clearTerminalRelease(sessionId);
+    this.activeProcesses.delete(sessionId);
+    this.activeSessions.delete(sessionId);
+    this.sessionContext.delete(sessionId);
+    this.terminalSessions.delete(sessionId);
+    this.publishedTerminalSessions.delete(sessionId);
+    this.pendingTerminalBySession.delete(sessionId);
+    this.lastOutputBySession.delete(sessionId);
+    this.stdoutBuffers.delete(sessionId);
+    this.stderrBuffers.delete(sessionId);
+    revokeControlPlaneAgent(sessionId);
+  }
+
+  private cleanupAllSessionState(): void {
+    for (const timer of this.softTerminalTimers.values()) clearTimeout(timer);
+    for (const timer of this.terminalReleaseTimers.values()) clearTimeout(timer);
+    for (const sessionId of this.sessionContext.keys()) revokeControlPlaneAgent(sessionId);
+    this.sessionContext.clear();
+    this.terminalSessions.clear();
+    this.publishedTerminalSessions.clear();
+    this.pendingTerminalBySession.clear();
+    this.lastOutputBySession.clear();
+    this.softTerminalTimers.clear();
+    this.softTerminalResultsBySession.clear();
+    this.terminalReleaseTimers.clear();
+    this.stdoutBuffers.clear();
+    this.stderrBuffers.clear();
+  }
+
   private scheduleSoftTerminalCandidate(sessionId: string, result: string): void {
     this.clearSoftTerminalCandidate(sessionId);
+    this.softTerminalResultsBySession.set(sessionId, result);
     const timer = setTimeout(() => {
       this.promoteSoftTerminalCandidate(sessionId, result);
     }, FINAL_RESPONSE_QUIET_GRACE_MS);

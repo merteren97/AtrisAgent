@@ -1,8 +1,9 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, lte, max } from 'drizzle-orm';
 import {
   workspaces,
   missions,
   tasks,
+  taskAttempts,
   worktrees,
   teamRoles,
   executionPolicies,
@@ -12,6 +13,8 @@ import {
   type MissionInsert,
   type TaskSelect,
   type TaskInsert,
+  type TaskAttemptSelect,
+  type TaskAttemptInsert,
   type WorktreeSelect,
   type WorktreeInsert,
   type ExecutionPolicyScope,
@@ -66,6 +69,16 @@ export interface CreateTaskInput {
   requiredCapabilities?: string[];
   dependsOn?: string[];
   worktreeId?: string | null;
+  id?: string;
+}
+
+export interface ClaimTaskAttemptInput {
+  taskId: string;
+  missionId: string;
+  agentInstanceId: string;
+  worktreePath?: string | null;
+  leaseExpiresAt: string;
+  now?: string;
   id?: string;
 }
 
@@ -323,6 +336,89 @@ export class WorkspaceManager {
     const updated = await this.getTask(id);
     if (!updated) throw new Error(`Failed to retrieve updated task "${id}"`);
     return updated;
+  }
+
+  async claimTaskAttempt(input: ClaimTaskAttemptInput): Promise<TaskAttemptSelect> {
+    const claimed = this.db.transaction((tx) => {
+      const rows = tx.select({ value: max(taskAttempts.attemptNumber) })
+        .from(taskAttempts).where(eq(taskAttempts.taskId, input.taskId)).all() as Array<{ value: number | null }>;
+      const now = input.now ?? new Date().toISOString();
+      const attempt: TaskAttemptInsert = {
+        id: input.id ?? crypto.randomUUID(),
+        taskId: input.taskId,
+        missionId: input.missionId,
+        agentInstanceId: input.agentInstanceId,
+        attemptNumber: Number(rows[0]?.value || 0) + 1,
+        status: 'claimed',
+        worktreePath: input.worktreePath ?? null,
+        runtimeSessionId: null,
+        heartbeatAt: now,
+        leaseExpiresAt: input.leaseExpiresAt,
+        retryable: false,
+        claimedAt: now,
+        startedAt: now,
+      };
+      tx.insert(taskAttempts).values(attempt).run();
+      const created = tx.select().from(taskAttempts).where(eq(taskAttempts.id, attempt.id)).get();
+      if (!created) throw new Error(`Failed to retrieve claimed task attempt "${attempt.id}"`);
+      return created;
+    }) as TaskAttemptSelect | undefined;
+    if (!claimed) throw new Error(`Failed to claim task attempt for task "${input.taskId}"`);
+    return claimed;
+  }
+
+  async markTaskAttemptRunning(attemptId: string, runtimeSessionId: string, heartbeatAt: string, leaseExpiresAt: string): Promise<boolean> {
+    const result = await this.db.update(taskAttempts).set({
+      status: 'running', runtimeSessionId, heartbeatAt, leaseExpiresAt,
+    }).where(and(eq(taskAttempts.id, attemptId), eq(taskAttempts.status, 'claimed'))).returning({ id: taskAttempts.id });
+    return result.length === 1;
+  }
+
+  async heartbeatTaskAttempt(attemptId: string, heartbeatAt: string, leaseExpiresAt: string): Promise<boolean> {
+    const result = await this.db.update(taskAttempts).set({ heartbeatAt, leaseExpiresAt })
+      .where(and(eq(taskAttempts.id, attemptId), inArray(taskAttempts.status, ['claimed', 'running'])))
+      .returning({ id: taskAttempts.id });
+    return result.length === 1;
+  }
+
+  async finishTaskAttempt(
+    attemptId: string,
+    status: 'completed' | 'failed' | 'cancelled' | 'expired',
+    options: { completedAt?: string; error?: string | null; resultSummary?: string | null; retryable?: boolean } = {},
+  ): Promise<boolean> {
+    const completedAt = options.completedAt ?? new Date().toISOString();
+    const result = await this.db.update(taskAttempts).set({
+      status,
+      completedAt,
+      heartbeatAt: completedAt,
+      leaseExpiresAt: completedAt,
+      error: options.error,
+      resultSummary: options.resultSummary,
+      retryable: options.retryable ?? false,
+    }).where(and(eq(taskAttempts.id, attemptId), inArray(taskAttempts.status, ['claimed', 'running'])))
+      .returning({ id: taskAttempts.id });
+    return result.length === 1;
+  }
+
+  async expireStaleTaskAttempts(cutoff: string, completedAt = new Date().toISOString()): Promise<TaskAttemptSelect[]> {
+    return this.db.update(taskAttempts).set({
+      status: 'expired', completedAt, heartbeatAt: completedAt, leaseExpiresAt: completedAt,
+      retryable: true, error: 'Runtime session lease expired before completion was confirmed',
+    }).where(and(
+      inArray(taskAttempts.status, ['claimed', 'running']),
+      lte(taskAttempts.leaseExpiresAt, cutoff),
+    )).returning();
+  }
+
+  async expireOrphanedTaskAttempts(completedAt = new Date().toISOString()): Promise<TaskAttemptSelect[]> {
+    return this.db.update(taskAttempts).set({
+      status: 'expired', completedAt, heartbeatAt: completedAt, leaseExpiresAt: completedAt,
+      retryable: true, error: 'Runtime host restarted before session completion was confirmed',
+    }).where(inArray(taskAttempts.status, ['claimed', 'running'])).returning();
+  }
+
+  async listTaskAttempts(taskId: string): Promise<TaskAttemptSelect[]> {
+    return this.db.select().from(taskAttempts).where(eq(taskAttempts.taskId, taskId));
   }
 
   /**

@@ -304,6 +304,268 @@ async function runTests() {
     assert(planRevisions.length === 1 && planRevisions[0]?.previousPlanId === first.planId, 'Plan revision links the previous and current conversation turns');
   }
 
+  // Test 9: Forward dependency indices survive normalization and task creation
+  // so a later Researcher root, rather than the dependent Builder, starts first.
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const taskCreatedEvents: TaskCreated[] = [];
+    eventBus.on('task_created', (event: TaskCreated) => { taskCreatedEvents.push(event); });
+
+    const result = await orchestrator.startMission('mission-forward-dependency', 'Respect task ordering', {
+      rawModelPlanOutput: JSON.stringify({
+        planId: 'plan-forward-dependency',
+        assumptions: ['Forward dependency regression test'],
+        questions: [],
+        tasks: [
+          {
+            title: 'Build after research',
+            description: 'Implement only after the research task completes.',
+            role: 'builder',
+            priority: 'high',
+            requiredCapabilities: ['write_to_file'],
+            dependsOnIndices: [1],
+          },
+          {
+            title: 'Research first',
+            description: 'Inspect the implementation constraints.',
+            role: 'researcher',
+            priority: 'high',
+            requiredCapabilities: ['read_file'],
+            dependsOnIndices: [],
+          },
+        ],
+      }),
+    });
+    const [builderTask, researchTask] = result.tasks;
+    const state = await orchestrator.getMissionState('mission-forward-dependency');
+
+    assert(result.structuredPlan.tasks[0].dependsOnIndices?.[0] === 1, 'Preserves a valid forward dependency index');
+    assert((builderTask.dependsOn as string[])[0] === researchTask.id, 'Persists the forward dependency on the later task ID');
+    assert(taskCreatedEvents.length === 1 && taskCreatedEvents[0].taskId === researchTask.id, 'Dispatches only the dependency-free Researcher root');
+    assert(state.mission?.status === 'running' && state.tasks.find((task) => task.id === builderTask.id)?.status === 'planned', 'Forward-dependent Builder remains planned');
+  }
+
+  // Test 10: A cyclic plan has no roots and must fail without dispatching a
+  // Builder through the legacy fallback path.
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const taskCreatedEvents: TaskCreated[] = [];
+    let missionFailedEvent: MissionFailed | null = null;
+    eventBus.on('task_created', (event: TaskCreated) => { taskCreatedEvents.push(event); });
+    eventBus.on('mission_failed', (event: MissionFailed) => { missionFailedEvent = event; });
+
+    const result = await orchestrator.startMission('mission-cyclic-plan', 'Reject cyclic execution graphs', {
+      rawModelPlanOutput: JSON.stringify({
+        planId: 'plan-cyclic-plan',
+        assumptions: ['Cycle regression test'],
+        questions: [],
+        tasks: [
+          {
+            title: 'Builder in cycle',
+            description: 'Must never start without its dependency.',
+            role: 'builder',
+            priority: 'critical',
+            requiredCapabilities: ['write_to_file'],
+            dependsOnIndices: [1],
+          },
+          {
+            title: 'Researcher in cycle',
+            description: 'Depends on the Builder task in this malformed graph.',
+            role: 'researcher',
+            priority: 'high',
+            requiredCapabilities: ['read_file'],
+            dependsOnIndices: [0],
+          },
+        ],
+      }),
+    });
+    const state = await orchestrator.getMissionState('mission-cyclic-plan');
+    const failedEvent = missionFailedEvent as MissionFailed | null;
+
+    assert(state.mission?.status === 'failed', 'No-root cycle moves the mission to failed');
+    assert(failedEvent !== null && failedEvent.failedTaskId === result.tasks[0].id && failedEvent.reason.includes('no dependency-free root tasks'), 'No-root cycle emits a correlated diagnostic failure');
+    assert(taskCreatedEvents.length === 0, 'No-root cycle dispatches no task and cannot start its Builder');
+    assert(result.tasks.every((task) => task.status === 'planned'), 'No-root cycle leaves all tasks undispatched');
+  }
+
+  // Test 11: A cycle behind an independent root is reconciled after the root
+  // completes instead of leaving the mission running indefinitely.
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const taskCreatedEvents: TaskCreated[] = [];
+    let missionFailedEvent: MissionFailed | null = null;
+    eventBus.on('task_created', (event: TaskCreated) => { taskCreatedEvents.push(event); });
+    eventBus.on('mission_failed', (event: MissionFailed) => { missionFailedEvent = event; });
+
+    const result = await orchestrator.startMission('mission-cycle-after-root', 'Reconcile a blocked graph', {
+      rawModelPlanOutput: JSON.stringify({
+        planId: 'plan-cycle-after-root',
+        assumptions: ['Cycle reconciliation regression test'],
+        questions: [],
+        tasks: [
+          {
+            title: 'Independent root',
+            description: 'This task can start independently.',
+            role: 'researcher',
+            priority: 'medium',
+            requiredCapabilities: ['read_file'],
+            dependsOnIndices: [],
+          },
+          {
+            title: 'Builder in blocked cycle',
+            description: 'Must not start after only the independent root completes.',
+            role: 'builder',
+            priority: 'high',
+            requiredCapabilities: ['write_to_file'],
+            dependsOnIndices: [2],
+          },
+          {
+            title: 'Researcher in blocked cycle',
+            description: 'Forms a cycle with the Builder task.',
+            role: 'researcher',
+            priority: 'high',
+            requiredCapabilities: ['read_file'],
+            dependsOnIndices: [1],
+          },
+        ],
+      }),
+    });
+    const rootTask = result.tasks[0];
+    eventBus.emit({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId: 'mission-cycle-after-root',
+      taskId: rootTask.id,
+      timestamp: new Date().toISOString(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const state = await orchestrator.getMissionState('mission-cycle-after-root');
+    const postRootFailure = missionFailedEvent as MissionFailed | null;
+
+    assert(state.mission?.status === 'failed', 'Post-root cycle reconciliation moves the mission to failed');
+    assert(postRootFailure !== null && postRootFailure.reason.includes('Dependency graph is blocked'), 'Post-root cycle emits an explicit blocked-graph failure');
+    assert(taskCreatedEvents.length === 1 && taskCreatedEvents[0].taskId === rootTask.id, 'Post-root cycle never dispatches the cyclic Builder');
+  }
+
+  // Test 12: Late terminal events cannot mutate terminal tasks or revive a
+  // still-running mission through the completion/retry paths.
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const taskCreatedEvents: TaskCreated[] = [];
+    eventBus.on('task_created', (event: TaskCreated) => { taskCreatedEvents.push(event); });
+
+    const missionId = 'mission-late-terminal-events';
+    const result = await orchestrator.startMission(missionId, 'Ignore late terminal events');
+    const [completedTask, mutableTask] = result.tasks;
+    eventBus.emit({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: completedTask.id,
+      timestamp: new Date().toISOString(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const taskMap = (orchestrator as any).inMemoryTasks as Map<string, any>;
+    const terminalCases: Array<{
+      taskId: string;
+      status: 'done' | 'superseded' | 'cancelled';
+    }> = [
+      { taskId: completedTask.id, status: 'done' },
+      { taskId: mutableTask.id, status: 'superseded' },
+      { taskId: mutableTask.id, status: 'cancelled' },
+    ];
+
+    for (const terminalCase of terminalCases) {
+      const current = taskMap.get(terminalCase.taskId);
+      taskMap.set(terminalCase.taskId, { ...current, status: terminalCase.status });
+      for (const eventType of ['task_completed', 'task_failed'] as const) {
+        const agentInstanceId = taskMap.get(terminalCase.taskId)?.assignedAgentId || undefined;
+        eventBus.emit(eventType === 'task_completed'
+          ? {
+              id: crypto.randomUUID(),
+              type: 'task_completed',
+              missionId,
+              taskId: terminalCase.taskId,
+              agentInstanceId,
+              timestamp: new Date().toISOString(),
+            }
+          : {
+              id: crypto.randomUUID(),
+              type: 'task_failed',
+              missionId,
+              taskId: terminalCase.taskId,
+              agentInstanceId,
+              error: 'late runtime signal',
+              timestamp: new Date().toISOString(),
+            });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      const state = await orchestrator.getMissionState(missionId);
+      assert(state.tasks.find((task) => task.id === terminalCase.taskId)?.status === terminalCase.status,
+        `Late events preserve ${terminalCase.status} task state`);
+    }
+
+    const finalState = await orchestrator.getMissionState(missionId);
+    assert(taskCreatedEvents.length === 2, 'Late terminal events do not retry or dispatch another task');
+    assert(finalState.mission?.status === 'running', 'Late terminal events do not revive or alter the nonterminal mission');
+  }
+
+  // Test 13: RuntimeHost can persist rejection before reporting task_failed;
+  // the first correlated failure fails the mission exactly once without retrying.
+  {
+    const eventBus = new LocalEventBus();
+    const orchestrator = new Orchestrator({ workspacePath: 'test-workspace', eventBus });
+    const taskCreatedEvents: TaskCreated[] = [];
+    const missionFailedEvents: MissionFailed[] = [];
+    eventBus.on('task_created', (event: TaskCreated) => { taskCreatedEvents.push(event); });
+    eventBus.on('mission_failed', (event: MissionFailed) => { missionFailedEvents.push(event); });
+
+    const missionId = 'mission-runtime-rejected-task';
+    const result = await orchestrator.startMission(missionId, 'Reconcile a runtime rejection');
+    const taskMap = (orchestrator as any).inMemoryTasks as Map<string, any>;
+    const runningTask = taskMap.get(result.tasks[0].id);
+    taskMap.set(runningTask.id, { ...runningTask, status: 'rejected' });
+
+    const rejectedTaskFailed: TaskFailed = {
+      id: crypto.randomUUID(),
+      type: 'task_failed',
+      missionId,
+      taskId: runningTask.id,
+      agentInstanceId: runningTask.assignedAgentId,
+      error: 'Runtime startup failed',
+      timestamp: new Date().toISOString(),
+    };
+    eventBus.emit(rejectedTaskFailed);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const failedState = await orchestrator.getMissionState(missionId);
+    assert(failedState.mission?.status === 'failed', 'Rejected RuntimeHost task fails a nonterminal mission');
+    assert(failedState.tasks.find((task) => task.id === runningTask.id)?.status === 'rejected', 'Rejected RuntimeHost task remains rejected');
+    assert(missionFailedEvents.length === 1 && missionFailedEvents[0].failedTaskId === runningTask.id, 'Rejected RuntimeHost task emits one correlated mission_failed event');
+    assert(taskCreatedEvents.length === 1, 'Rejected RuntimeHost task is not retried');
+
+    eventBus.emit({ ...rejectedTaskFailed, id: crypto.randomUUID(), error: 'Duplicate runtime signal' });
+    eventBus.emit({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: runningTask.id,
+      agentInstanceId: runningTask.assignedAgentId,
+      timestamp: new Date().toISOString(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const finalState = await orchestrator.getMissionState(missionId);
+    assert(missionFailedEvents.length === 1, 'Duplicate rejected failure does not emit mission_failed again');
+    assert(finalState.mission?.status === 'failed' && finalState.tasks.find((task) => task.id === runningTask.id)?.status === 'rejected', 'Post-failure terminal signals cannot revive the mission or task');
+  }
+
   console.log(`\nTest Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) {
     process.exit(1);

@@ -164,6 +164,7 @@ export function ChatTimeline() {
   const completedTasks = activeTasks.filter((task) => task.status === 'completed' || task.status === 'done').length;
   const liveMission = Boolean(activeMission && !['completed', 'failed', 'cancelled'].includes(activeMission.status));
   const visibleTimeline = useMemo(() => timeline.filter((item) => {
+    if (item.eventType?.startsWith('process_')) return false;
     if (detailMode === 'telemetry') return true;
     if (item.type !== 'event') return true;
     const type = item.eventType || '';

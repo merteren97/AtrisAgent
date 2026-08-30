@@ -348,6 +348,36 @@ async function runTests() {
       const queueBody = await queueResponse.json();
       assert(queueResponse.status === 200 && queueBody.items.some((item: any) => item.id === firstTurn.commandId && item.preview.includes('Run this after')),
         'workspace command queue exposes the durable pending follow-up');
+      const { conversationTurns: cursorConversationTurns, missionCommands: cursorMissionCommands } = await import('@atris-agent-code/database');
+      const queueDb = (gateway.workspaceManager as any).db;
+      const cursorSeed = Date.now();
+      const cursorRows = [
+        { suffix: 'a', priority: 90, content: 'Cursor page A' },
+        { suffix: 'b', priority: 80, content: 'Cursor page B' },
+      ];
+      for (const row of cursorRows) {
+        const turnId = `cursor-turn-${cursorSeed}-${row.suffix}`;
+        const commandId = `cursor-command-${cursorSeed}-${row.suffix}`;
+        const createdAt = new Date(cursorSeed + (row.suffix === 'a' ? 1 : 2)).toISOString();
+        queueDb.insert(cursorConversationTurns).values({
+          id: turnId, missionId: createdMissionId, content: row.content, delivery: 'queue',
+          options: {}, status: 'queued', createdAt,
+        }).run();
+        queueDb.insert(cursorMissionCommands).values({
+          id: commandId, missionId: createdMissionId, turnId, type: 'queue', status: 'pending',
+          priority: row.priority, createdAt,
+        }).run();
+      }
+      const firstQueuePageResponse = await authorizedFetch(`${baseUrl}/api/mission-commands?workspaceId=${encodeURIComponent(createdWorkspaceId)}&limit=1`);
+      const firstQueuePage = await firstQueuePageResponse.json();
+      const queueCursor = firstQueuePageResponse.headers.get('X-Next-Cursor');
+      const secondQueuePageResponse = await authorizedFetch(`${baseUrl}/api/mission-commands?workspaceId=${encodeURIComponent(createdWorkspaceId)}&limit=1&cursor=${encodeURIComponent(queueCursor || '')}`);
+      const secondQueuePage = await secondQueuePageResponse.json();
+      assert(firstQueuePageResponse.status === 200 && firstQueuePage.items.length === 1 && Boolean(queueCursor),
+        'mission command queue returns a bounded page and deterministic next cursor');
+      assert(secondQueuePageResponse.status === 200 && secondQueuePage.items.length === 1
+        && secondQueuePage.items[0].id !== firstQueuePage.items[0].id,
+      'mission command cursor resumes after the previous item without duplicates');
       const eventsResponse = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events`);
       const events = await eventsResponse.json();
       assert(Array.isArray(events) && !events.some((event: any) => event.type === 'user_message' && event.turnId === firstTurn.id),
@@ -525,6 +555,17 @@ async function runTests() {
 
     // 9. Conversation and workspace deletion
     {
+      const protectedMissionRes = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Active conversation cannot be deleted' }),
+      });
+      const protectedMission = await protectedMissionRes.json();
+      const protectedDeleteRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`, { method: 'DELETE' });
+      assert(protectedDeleteRes.status === 409, 'DELETE /api/missions/:id rejects nonterminal conversations');
+      const preservedMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`);
+      assert(preservedMissionRes.status === 200, 'Rejected conversation deletion preserves the mission');
+
       const cancelRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/cancel`, { method: 'POST' });
       const cancelBody = await cancelRes.json();
       assert(cancelRes.status === 200 && cancelBody.status === 'cancelled', 'POST /api/missions/:id/cancel makes a conversation deletable');

@@ -8,7 +8,7 @@
   "scripts": {
     "start": "tsx src/entry.ts",
     "dev": "tsx src/entry.ts",
-    "test": "npx tsx src/api-gateway.test.ts && npx tsx src/auth.test.ts && npx tsx src/auth-avatar.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/entry-auth.test.ts && npx tsx src/runtime-protocol.test.ts && npx tsx src/runtime-lifecycle.test.ts && npx tsx src/project-memory.test.ts && npx tsx src/project-memory-lifecycle.test.ts && npx tsx src/memory-export-policy.test.ts",
+    "test": "npx tsx src/api-gateway.test.ts && npx tsx src/approval-outbox.test.ts && npx tsx src/auth.test.ts && npx tsx src/auth-avatar.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/entry-auth.test.ts && npx tsx src/runtime-protocol.test.ts && npx tsx src/runtime-lifecycle.test.ts && npx tsx src/project-memory.test.ts && npx tsx src/project-memory-lifecycle.test.ts && npx tsx src/memory-export-policy.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -17,6 +17,7 @@
     "@atris-agent-code/event-bus": "*",
     "@atris-agent-code/event-schema": "*",
     "@atris-agent-code/orchestration-core": "*",
+    "@atris-agent-code/policy-engine": "*",
     "@atris-agent-code/runtime-host": "*",
     "@atris-agent-code/workspace-manager": "*",
     "@atris-agent-code/merge-coordinator": "*",

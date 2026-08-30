@@ -24,6 +24,7 @@ interface WorkspaceState {
   addWorkspace: (workspace: Workspace) => void;
   setActiveWorkspace: (id: string) => void;
   rememberMission: (workspaceId: string, missionId: string) => void;
+  forgetMission: (workspaceId: string, missionId: string) => void;
   removeWorkspace: (id: string) => Promise<boolean>;
   clearError: () => void;
 }
@@ -96,6 +97,11 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       rememberMission: (workspaceId, missionId) => set((state) => ({
         lastMissionByWorkspace: { ...state.lastMissionByWorkspace, [workspaceId]: missionId },
       })),
+      forgetMission: (workspaceId, missionId) => set((state) => {
+        if (state.lastMissionByWorkspace[workspaceId] !== missionId) return state;
+        const { [workspaceId]: _removed, ...lastMissionByWorkspace } = state.lastMissionByWorkspace;
+        return { lastMissionByWorkspace };
+      }),
 
       removeWorkspace: async (id) => {
         set({ loading: true, error: null });

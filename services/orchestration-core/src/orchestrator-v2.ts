@@ -5,10 +5,12 @@ import {
   missionEvents,
   missionRuns,
   type AtrisDatabase,
+  type MissionSelect,
   type TaskSelect,
 } from '@atris-agent-code/database';
 import {
   getSupervisorTurnRunner,
+  redactSensitiveValue,
   type LocalEventBus,
 } from '@atris-agent-code/event-bus';
 import type { AgentEvent, TaskCompleted } from '@atris-agent-code/event-schema';
@@ -31,14 +33,108 @@ import {
   parseSupervisorDecision,
   type SupervisorTurnContext,
 } from './supervisor-turn';
+import { allocateWorkerBatch, DEFAULT_CORE_WORKER_POOL } from './worker-pool';
 
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const NON_PROGRESSING_MISSION_STATUSES = new Set(['blocked', ...TERMINAL_MISSION_STATUSES]);
 const TERMINAL_TASK_STATUSES = new Set(['done', 'superseded']);
+const TASK_COMPLETION_FENCE_STATUSES = new Set(['cancelled', 'rejected', 'superseded', 'done']);
 const FAILED_TASK_STATUSES = new Set(['rejected']);
 const ACTIVE_TASK_STATUSES = new Set(['claimed', 'running', 'review', 'revision_requested', 'verified', 'applied']);
-const SCHEDULABLE_MISSION_STATUSES = new Set(['ready', 'running', 'revising']);
+const SCHEDULABLE_MISSION_STATUSES = new Set(['ready', 'running', 'revising', 'reviewing', 'verifying']);
+const RECONCILABLE_MISSION_STATUSES = new Set([...SCHEDULABLE_MISSION_STATUSES, 'reviewing', 'verifying']);
 const MAX_CONTEXT_EVENTS = 24;
 const MAX_CONTEXT_CHARS = 18_000;
+const MAX_QUALITY_SUMMARY_CHARS = 4_000;
+
+interface QualityVerdict {
+  passed: boolean;
+  summary: string;
+  findingCount: number;
+  reason: 'approved' | 'failed' | 'ambiguous';
+}
+
+interface QualityEmissionResult {
+  verdict: QualityVerdict;
+  emitted: boolean;
+}
+
+type SchedulableWorkerRole = 'researcher' | 'builder' | 'reviewer' | 'qa';
+
+function isSchedulableWorkerRole(role: TaskSelect['assignedRole']): role is SchedulableWorkerRole {
+  return role === 'researcher' || role === 'builder' || role === 'reviewer' || role === 'qa';
+}
+
+function clearNegatedQualitySignals(text: string): string {
+  return text
+    // Remove ordinary negated failure lists before scanning individual words;
+    // e.g. "no test failures or errors" is a passing report, not a failure.
+    .replace(/\b(?:no|without|zero|none)\s+(?:(?:any|all|the|test|tests|check|checks|build|builds|lint|validation|validations|blocking|major|critical)\s+)*(?:failures?|errors?|issues?|defects?|problems?|concerns?|blockers?)(?:\s+(?:and|or)\s+(?:failures?|errors?|issues?|defects?|problems?|concerns?|blockers?))*/gi, ' ')
+    .replace(/\b(?:no|without|zero)\s+(?:any\s+)?(?:blocking|major|critical)(?:\s*(?:[,/]\s*(?:and|or)?\s*|\b(?:and|or)\b\s*)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
+    .replace(/\b(?:0|no|without|zero)\s+(?:failed|failing)\s+(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\b/gi, ' ')
+    .replace(/\b(?:0|no|without|zero)\s+(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\s+(?:failed|failing)\b/gi, ' ')
+    .replace(/\b(?:no|without|zero)\s+(?:revision|revisions|change|changes)\s+(?:is\s+|are\s+|was\s+|were\s+)?(?:requested|required|needed)\b/gi, ' ')
+    .replace(/\b(?:no|without|zero)\s+(?:(?:test|tests|check|checks|build|builds|command|commands|lint|validation|validations)\s+)?(?:failures?|errors?)(?:\s+(?:or|and|[/,])\s+(?:failures?|errors?))?\b/gi, ' ')
+    .replace(/\b(?:no|without|zero)\s+(?:blocking|blocked|blockers?|major|critical|failure|failures|error|errors|pending)\b/gi, ' ')
+    .replace(/\b(?:0|none)\s+(?:blocking|major|critical)(?:\s*(?:[,/]\s*(?:and|or)?\s*|\b(?:and|or)\b\s*)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
+    .replace(/\b(?:blocking|major|critical)\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\s*(?:[:=(]\s*)?(?:0|none)\b/gi, ' ')
+    .replace(/\b(?:0|none)\s+(?:failed|failing|failure|failures|error|errors|pending)\b/gi, ' ')
+    .replace(/\b(?:blocking|major|critical)\s*[:=-]\s*(?:none|no)\b/gi, ' ');
+}
+
+function hasQualityFailureSignal(text: string): boolean {
+  const evaluableText = clearNegatedQualitySignals(text);
+  return [
+    /\b(?:revision|revisions|change|changes)\s+(?:is\s+|are\s+)?(?:requested|required|needed)\b/i,
+    /\brequest(?:ed)?\s+(?:a\s+)?(?:revision|revisions|change|changes)\b/i,
+    /\b(?:cannot|can't|can not|unable to|not enough evidence to|not able to)\s+(?:recommend\s+)?(?:approve|approval|pass|passing)\b/i,
+    /\b(?:not|never)\s+(?:approve|approved|approval|pass|passed|passing)\b/i,
+    /\b(?:approval|verdict|recommendation)\s*[:=-]?\s*(?:pending|unclear|unknown|none|not available)\b/i,
+    /\b(?:no|without|zero)\s+pass(?:ed|es|ing)?\s+(?:was\s+)?(?:reported|provided|given|verdict|result|recommendation)\b/i,
+    /\b(?:pass|approval|verdict)\s*[:=-]\s*(?:no|false|fail(?:ed)?|rejected|blocked|pending)\b/i,
+    /\b(?:reject(?:ed|s|ion)?|denied|declined|unapproved)\b/i,
+    /\b(?:fail(?:ed|s|ure|ures|ing)?)\b/i,
+    /\berrors?\b/i,
+    /\b(?:did not|didn't|does not|doesn't|not)\s+pass(?:ed|es|ing)?\b/i,
+    /\b(?:no|none of the|zero)\s+(?:(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\s+)?pass(?:ed|es|ing)?\b/i,
+    /\b(?:blocked|blocking|blockers?)\b/i,
+    /\b(?:major|critical)\s+(?:finding|findings|issue|issues|defect|defects|problem|problems|concern|concerns|severity)\b/i,
+    /\b(?:finding|findings|issue|issues|defect|defects|problem|problems|concern|concerns)\s+(?:with\s+)?(?:major|critical)\b/i,
+    /\bseverity\s*[:=-]?\s*(?:major|critical)\b/i,
+    /\b(?:unclear|ambiguous|unknown|indeterminate|inconclusive|pending)\b/i,
+    /\b(?:insufficient|not enough)\s+(?:evidence|information)\b/i,
+    /\b(?:pass|passed|approve|approved)\s*[?/]\b/i,
+    /\bpass\s*(?:\/|or)\s*fail\b/i,
+  ].some((pattern) => pattern.test(evaluableText));
+}
+
+function inferQualityVerdict(
+  role: TaskSelect['assignedRole'],
+  rawResult: unknown,
+): QualityVerdict | null {
+  if (role !== 'reviewer' && role !== 'qa') return null;
+
+  const rawText = typeof rawResult === 'string' ? rawResult.trim() : '';
+  const safeResult = rawText ? String(redactSensitiveValue(rawText)).slice(0, MAX_QUALITY_SUMMARY_CHARS) : '';
+  const hasFailure = hasQualityFailureSignal(rawText);
+  const hasNegatedExplicitPass = /\b(?:no|without|zero)\s+explicit\s+(?:approve|approval|pass|verdict)\b/i.test(rawText);
+  const hasExplicitPass = !hasNegatedExplicitPass && (
+    /\b(?:approve|approved|approves|pass|passed|passes|passing)\b/i.test(rawText)
+    || /\bapproval\s*(?:status\s*)?[:=-]\s*(?:yes|true|granted|approved)\b/i.test(rawText)
+  );
+  const passed = !hasFailure && hasExplicitPass;
+  const reason: QualityVerdict['reason'] = passed ? 'approved' : hasFailure ? 'failed' : 'ambiguous';
+  const summary = safeResult || (role === 'reviewer'
+    ? 'No explicit review approval or revision verdict was reported.'
+    : 'No explicit QA pass or failure verdict was reported.');
+
+  return {
+    passed,
+    summary,
+    findingCount: passed || !rawText ? 0 : 1,
+    reason,
+  };
+}
 
 interface StartMissionOptionsV2 {
   modelCatalogId?: string;
@@ -65,15 +161,17 @@ interface StartMissionOptionsV2 {
  */
 export class OrchestratorV2 extends LegacyOrchestrator {
   private readonly v2WorkspaceManager?: WorkspaceManager;
-  private readonly v2EventBus?: LocalEventBus;
-  private readonly v2Db?: AtrisDatabase;
-  private readonly v2WorkspacePath: string;
+   private readonly v2EventBus?: LocalEventBus;
+   private readonly v2Db?: AtrisDatabase;
+   private readonly v2WorkspacePath: string;
+   private readonly v2ApplyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
   private readonly missionQueues = new Map<string, Promise<void>>();
   private readonly planActions = new Map<string, OrchestratorTurnAction>();
   private readonly synthesizedPlans = new Set<string>();
   private readonly deferredCompletionMissions = new Set<string>();
   private readonly deferredCompletions = new Map<string, { summary: string; tasksCompleted: number; totalTasks: number }>();
   private readonly lifecycleByMission = new Map<string, { turnId?: string; runId?: string }>();
+  private readonly suppressedLegacyReviewEvents = new Set<string>();
   private readonly pendingSteers = new Map<string, string[]>();
   private readonly emittedUserMessageTurns = new Set<string>();
   private readonly cancelledRunIds = new Set<string>();
@@ -88,13 +186,34 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     this.v2EventBus = eventBus ?? config.eventBus;
     this.v2Db = db ?? config.db;
     this.v2WorkspacePath = config.workspacePath;
+    this.v2ApplyTaskChanges = config.applyTaskChanges;
     this.v2WorkspaceManager = workspaceManager
       ?? config.workspaceManager
       ?? (this.v2Db ? new WorkspaceManager(this.v2Db, this.v2EventBus) : undefined);
   }
 
   private trace(stage: string, details: Record<string, unknown>): void {
-    console.info(`[OrchestratorV2][Scheduler] ${stage} ${JSON.stringify(details)}`);
+    console.info(`[OrchestratorV2][Scheduler] ${stage} ${JSON.stringify(redactSensitiveValue(details))}`);
+  }
+
+  private taskTraceDetails(task: TaskSelect): Record<string, unknown> {
+    return {
+      taskId: task.id,
+      role: task.assignedRole || null,
+      status: task.status,
+      dependsOnTaskIds: Array.isArray(task.dependsOn)
+        ? task.dependsOn.filter((dependencyId): dependencyId is string => typeof dependencyId === 'string')
+        : [],
+      agentInstanceId: task.assignedAgentId || null,
+    };
+  }
+
+  private planTraceDetails(tasks: StructuredTaskPlan[]): Array<Record<string, unknown>> {
+    return tasks.map((task, index) => ({
+      index,
+      role: task.role,
+      dependsOnIndices: [...(task.dependsOnIndices || [])],
+    }));
   }
 
   private completionKey(missionId: string, planId: string): string {
@@ -102,6 +221,15 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   }
 
   override emitEvent(event: AgentEvent): void {
+    if (event.type === 'review_completed' && this.suppressedLegacyReviewEvents.has(event.missionId)) {
+      this.trace('legacy-review-event-suppressed', {
+        missionId: event.missionId,
+        turnId: event.turnId,
+        taskId: event.taskId,
+        reviewerAgentId: event.reviewerAgentId,
+      });
+      return;
+    }
     const lifecycle = this.lifecycleByMission.get(event.missionId);
     if (lifecycle?.runId && this.cancelledRunIds.has(lifecycle.runId)) {
       this.trace('cancelled-run-event-ignored', { missionId: event.missionId, runId: lifecycle.runId, type: event.type });
@@ -115,6 +243,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         event = { ...event, turnId };
       }
     }
+    if (lifecycle?.turnId && !event.turnId) event = { ...event, turnId: lifecycle.turnId };
+    if (lifecycle?.runId && !event.runId) event = { ...event, runId: lifecycle.runId };
     super.emitEvent(event);
   }
 
@@ -130,6 +260,30 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!mission || mission.status === 'cancelled' || (mission.activeRunId && mission.activeRunId !== runId)) {
       throw new Error('The supervisor decision belongs to a cancelled or stale run.');
     }
+  }
+
+  private async assertMissionActionCurrent(missionId: string, runId?: string): Promise<MissionSelect> {
+    if (runId && this.cancelledRunIds.has(runId)) throw new Error('The orchestration run was cancelled.');
+    const manager = this.v2WorkspaceManager;
+    const mission = manager ? await manager.getMission(missionId) : null;
+    if (!mission) throw new Error('The orchestration mission no longer exists.');
+    if (mission.status === 'cancelled' || mission.status === 'failed' || mission.status === 'blocked') {
+      throw new Error(`Mission '${missionId}' is ${mission.status} and cannot continue this action.`);
+    }
+    if (runId && mission.activeRunId && mission.activeRunId !== runId) {
+      throw new Error('The orchestration action belongs to a stale run.');
+    }
+    return mission;
+  }
+
+  protected override async assertTaskCompletionCurrent(event: TaskCompleted): Promise<void> {
+    const lifecycle = this.lifecycleByMission.get(event.missionId);
+    await this.assertMissionActionCurrent(event.missionId, event.runId || lifecycle?.runId);
+  }
+
+  private async canPublishCompletion(missionId: string): Promise<boolean> {
+    const mission = this.v2WorkspaceManager ? await this.v2WorkspaceManager.getMission(missionId) : null;
+    return !mission || !['failed', 'cancelled', 'blocked'].includes(String(mission.status));
   }
 
   private async preserveCancelledRunFence(missionId: string, runId: string | undefined): Promise<void> {
@@ -163,7 +317,37 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (lifecycle?.runId && this.cancelledRunIds.has(lifecycle.runId)) {
       throw new Error('The orchestration run was cancelled.');
     }
-    return super.assignTask(taskId, agentRole);
+    const assignedTask = await super.assignTask(taskId, agentRole);
+    const role = assignedTask.assignedRole || agentRole || 'builder';
+    const assignedLifecycle = this.lifecycleByMission.get(assignedTask.missionId);
+    const traceDetails = {
+      missionId: assignedTask.missionId,
+      turnId: assignedLifecycle?.turnId,
+      runId: assignedLifecycle?.runId,
+      planId: assignedTask.planId || undefined,
+      ...this.taskTraceDetails(assignedTask),
+    };
+
+    if (role === 'reviewer') {
+      if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(assignedTask.missionId, { status: 'reviewing' });
+      this.trace('review-dispatched', traceDetails);
+    } else if (role === 'qa') {
+      if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(assignedTask.missionId, { status: 'verifying' });
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'verification_started',
+        missionId: assignedTask.missionId,
+        ...assignedLifecycle,
+        taskId: assignedTask.id,
+        reviewerAgentId: assignedTask.assignedAgentId || undefined,
+        timestamp: new Date().toISOString(),
+      });
+      this.trace('qa-dispatched', traceDetails);
+    } else {
+      this.trace('task-dispatched', traceDetails);
+    }
+
+    return assignedTask;
   }
 
   override emitMissionCompleted(params: { missionId?: string; summary: string; tasksCompleted: number; totalTasks: number }): void {
@@ -244,8 +428,12 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       })
         .where(and(
           eq(missionCompletions.missionId, params.missionId),
-          eq(missionCompletions.planId, params.planId),
-        ));
+         eq(missionCompletions.planId, params.planId),
+       ));
+    }
+    if (!(await this.canPublishCompletion(params.missionId))) {
+      this.trace('completion-suppressed-before-event', { missionId: params.missionId, planId: params.planId });
+      return;
     }
     this.emitDurableCompletion(params);
     if (this.v2Db) await this.v2Db.update(missionCompletions).set({ status: 'completed', completedAt: new Date().toISOString() })
@@ -257,13 +445,22 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   }
 
   private async completeWithSynthesis(params: { missionId: string; planId: string; tasksCompleted: number;
-    totalTasks: number; latestResult?: string }): Promise<void> {
+    totalTasks: number; latestResult?: string }, beforePublish?: () => Promise<void>): Promise<void> {
+    if (!(await this.canPublishCompletion(params.missionId))) {
+      this.trace('completion-suppressed-for-terminal-mission', { missionId: params.missionId, planId: params.planId });
+      return;
+    }
     const existing = await this.ensureSynthesisIntent(params);
     if (existing?.status === 'completed') {
       this.synthesizedPlans.add(this.completionKey(params.missionId, params.planId));
       return;
     }
     const summary = existing?.summary || await this.synthesizePlanResult(params.missionId, params.planId, params.latestResult);
+    if (!(await this.canPublishCompletion(params.missionId))) {
+      this.trace('completion-suppressed-after-synthesis', { missionId: params.missionId, planId: params.planId });
+      return;
+    }
+    await beforePublish?.();
     await this.completeDurably({ missionId: params.missionId, planId: params.planId, summary,
       tasksCompleted: params.tasksCompleted, totalTasks: params.totalTasks });
   }
@@ -273,6 +470,15 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const pending = await this.v2Db.select().from(missionCompletions);
     for (const completion of pending.filter((row) => row.status !== 'completed')) {
       try {
+        const mission = this.v2WorkspaceManager ? await this.v2WorkspaceManager.getMission(completion.missionId) : null;
+        if (mission && ['failed', 'cancelled', 'blocked'].includes(String(mission.status))) {
+          this.trace('completion-recovery-skipped-for-terminal-mission', {
+            missionId: completion.missionId,
+            planId: completion.planId,
+            status: mission.status,
+          });
+          continue;
+        }
         if (completion.runId || completion.turnId) {
           this.lifecycleByMission.set(completion.missionId, {
             runId: completion.runId || undefined,
@@ -508,7 +714,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
             hasPriorConversation: loaded.hasPriorConversation,
           };
         }
-        this.trace('supervisor-invalid-json', { missionId, turnId, raw: raw.slice(0, 600) });
+        this.trace('supervisor-invalid-json', { missionId, turnId, rawLength: raw.length });
       } catch (error) {
         if (error instanceof Error && error.message === 'Supervisor turn cancelled.') throw error;
         this.trace('supervisor-runtime-fallback', {
@@ -591,6 +797,16 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       questions: params.decision.clarifyingQuestions || [],
       tasks: taskSpecs,
     };
+    const lifecycle = this.lifecycleByMission.get(params.missionId);
+    this.trace('plan-normalized', {
+      missionId: params.missionId,
+      turnId: params.turnId,
+      runId: lifecycle?.runId,
+      planId,
+      action: 'plan_only',
+      taskCount: taskSpecs.length,
+      tasks: this.planTraceDetails(taskSpecs),
+    });
     const createdTasks: TaskSelect[] = [];
     const idsByIndex = new Map<number, string>();
 
@@ -614,6 +830,14 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         dependsOn: dependencies,
       }));
     }
+
+    this.trace('plan-materialized', {
+      missionId: params.missionId,
+      turnId: params.turnId,
+      runId: lifecycle?.runId,
+      planId,
+      tasks: createdTasks.map((task) => this.taskTraceDetails(task)),
+    });
 
     await manager.updateMission(params.missionId, {
       planId,
@@ -655,9 +879,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!initialMission) return super.startMission(missionId, request, options);
     const initialPlanId = initialMission.planId || null;
     const turnId = options?.turnId || crypto.randomUUID();
+    // Validate a supplied run before replacing the mission's current
+    // correlation. A stale request must not make later events inherit its IDs.
+    await this.ensureRunIsCurrent(missionId, options?.runId);
     this.lifecycleByMission.set(missionId, { turnId, runId: options?.runId });
     await this.ensureTurnUserMessage(missionId, turnId, request, initialPlanId);
-    await this.ensureRunIsCurrent(missionId, options?.runId);
     if (initialPlanId && SCHEDULABLE_MISSION_STATUSES.has(String(initialMission.status))) {
       await this.reconcileMissionPlan(missionId, initialPlanId);
     }
@@ -712,8 +938,19 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     const taskPlan = decisionToTaskPlan(decision);
+    const normalizedPlanId = crypto.randomUUID();
+    const lifecycle = this.lifecycleByMission.get(missionId);
+    this.trace('plan-normalized', {
+      missionId,
+      turnId,
+      runId: lifecycle?.runId,
+      planId: normalizedPlanId,
+      action: decision.action,
+      taskCount: taskPlan.length,
+      tasks: this.planTraceDetails(taskPlan),
+    });
     const rawModelPlanOutput = JSON.stringify({
-      planId: crypto.randomUUID(),
+      planId: normalizedPlanId,
       assumptions: [
         `Persistent Orchestrator decision: ${decision.action}.`,
         decision.response || 'Delegations were generated from the current conversation context.',
@@ -734,7 +971,128 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       throw error;
     }
     this.planActions.set(result.planId, decision.action);
+    const materializedTasks = (await manager.listTasks(missionId)).filter((task) => task.planId === result.planId);
+    this.trace('plan-materialized', {
+      missionId,
+      turnId,
+      runId: lifecycle?.runId,
+      planId: result.planId,
+      action: decision.action,
+      tasks: (materializedTasks.length > 0 ? materializedTasks : result.tasks).map((task) => this.taskTraceDetails(task)),
+    });
     return result;
+  }
+
+  private async emitQualityTaskCompleted(
+    event: TaskCompleted,
+    task: TaskSelect,
+    wasTerminal: boolean,
+    verdict = inferQualityVerdict(task.assignedRole, event.result),
+  ): Promise<QualityVerdict | null> {
+    if (wasTerminal || !verdict) return null;
+
+    const lifecycle = this.lifecycleByMission.get(event.missionId);
+    const correlation = {
+      turnId: event.turnId || lifecycle?.turnId,
+      runId: event.runId || lifecycle?.runId,
+    };
+    const agentInstanceId = event.agentInstanceId || task.assignedAgentId || undefined;
+
+    if (task.assignedRole === 'reviewer') {
+      await this.assertMissionActionCurrent(event.missionId, correlation.runId);
+      if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(event.missionId, { status: 'reviewing' });
+      await this.assertMissionActionCurrent(event.missionId, correlation.runId);
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'review_completed',
+        missionId: event.missionId,
+        ...correlation,
+        taskId: task.id,
+        reviewerAgentId: agentInstanceId || 'reviewer',
+        approved: verdict.passed,
+        findings: verdict.summary,
+        timestamp: new Date().toISOString(),
+      });
+      this.trace('review-completed', {
+        missionId: event.missionId,
+        turnId: correlation.turnId,
+        runId: correlation.runId,
+        planId: task.planId,
+        taskId: task.id,
+        agentInstanceId: agentInstanceId || null,
+        approved: verdict.passed,
+        verdict: verdict.reason,
+      });
+      return verdict;
+    }
+
+    if (task.assignedRole === 'qa') {
+      await this.assertMissionActionCurrent(event.missionId, correlation.runId);
+      if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(event.missionId, { status: 'verifying' });
+      await this.assertMissionActionCurrent(event.missionId, correlation.runId);
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'verification_completed',
+        missionId: event.missionId,
+        ...correlation,
+        taskId: task.id,
+        reviewerAgentId: agentInstanceId,
+        passed: verdict.passed,
+        findingCount: verdict.findingCount,
+        summary: verdict.summary,
+        timestamp: new Date().toISOString(),
+      });
+      this.trace('qa-completed', {
+        missionId: event.missionId,
+        turnId: correlation.turnId,
+        runId: correlation.runId,
+        planId: task.planId,
+        taskId: task.id,
+        agentInstanceId: agentInstanceId || null,
+        passed: verdict.passed,
+        verdict: verdict.reason,
+      });
+      return verdict;
+    }
+
+    return null;
+  }
+
+  private async stopAfterQualityFailure(
+    event: TaskCompleted,
+    task: TaskSelect,
+    verdict: QualityVerdict,
+  ): Promise<void> {
+    if (this.v2WorkspaceManager) {
+      await this.v2WorkspaceManager.updateMission(event.missionId, { status: 'blocked' });
+      const now = new Date().toISOString();
+      const planTasks = await this.v2WorkspaceManager.listTasks(event.missionId);
+      const cancelledTaskIds: string[] = [];
+      for (const planTask of planTasks.filter((candidate) => candidate.planId === task.planId)) {
+        if (TASK_COMPLETION_FENCE_STATUSES.has(String(planTask.status))) continue;
+        await this.v2WorkspaceManager.updateTask(planTask.id, { status: 'cancelled', completedAt: now });
+        cancelledTaskIds.push(planTask.id);
+      }
+      this.trace('quality-gate-cancelled-siblings', {
+        missionId: event.missionId,
+        planId: task.planId,
+        taskIds: cancelledTaskIds,
+      });
+    }
+    this.emitMissionFailed({
+      missionId: event.missionId,
+      reason: `${task.assignedRole === 'reviewer' ? 'Reviewer' : 'QA'} quality gate failed: ${verdict.summary}`,
+      failedTaskId: task.id,
+    });
+    this.trace('quality-gate-failed', {
+      missionId: event.missionId,
+      turnId: event.turnId || this.lifecycleByMission.get(event.missionId)?.turnId,
+      runId: event.runId || this.lifecycleByMission.get(event.missionId)?.runId,
+      planId: task.planId,
+      taskId: task.id,
+      role: task.assignedRole,
+      verdict: verdict.reason,
+    });
   }
 
   private async resolveCompletionTask(event: TaskCompleted): Promise<TaskSelect | null> {
@@ -812,11 +1170,26 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       });
       return;
     }
-    if (!TERMINAL_TASK_STATUSES.has(String(task.status))) {
-      await manager.updateTask(task.id, {
-        status: 'done',
-        completedAt: new Date().toISOString(),
+    if (TASK_COMPLETION_FENCE_STATUSES.has(String(task.status))) {
+      this.trace('late-task-completion-ignored', {
+        missionId: event.missionId,
+        taskId: task.id,
+        status: task.status,
+        eventRunId: event.runId,
       });
+      return;
+    }
+    const verdict = inferQualityVerdict(task.assignedRole, event.result);
+    await this.assertTaskCompletionCurrent(event);
+    await manager.updateTask(task.id, {
+      status: verdict && !verdict.passed ? 'rejected' : 'done',
+      completedAt: new Date().toISOString(),
+    });
+    await this.assertTaskCompletionCurrent(event);
+    const emittedVerdict = await this.emitQualityTaskCompleted(event, task, false, verdict);
+    if (emittedVerdict && !emittedVerdict.passed) {
+      await this.stopAfterQualityFailure(event, task, emittedVerdict);
+      return;
     }
     const latestTasks = (await manager.listTasks(event.missionId)).filter((item) => item.planId === task.planId);
     const allTerminal = latestTasks.length > 0 && latestTasks.every((item) => TERMINAL_TASK_STATUSES.has(String(item.status)));
@@ -826,6 +1199,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     if (this.synthesizedPlans.has(this.completionKey(event.missionId, task.planId))) return;
+    await this.assertTaskCompletionCurrent(event);
     await manager.updateMission(event.missionId, {
       status: 'completed',
       completedAt: new Date().toISOString(),
@@ -852,6 +1226,31 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         this.trace('terminal-mission-completion-ignored', { missionId: event.missionId, status: currentMission?.status || 'missing', taskId: event.taskId });
         return;
       }
+      if (currentMission.status === 'blocked') {
+        this.trace('blocked-mission-completion-ignored', { missionId: event.missionId, taskId: event.taskId });
+        return;
+      }
+      const lifecycle = this.lifecycleByMission.get(event.missionId);
+      const currentRunId = lifecycle?.runId || currentMission.activeRunId || undefined;
+      if ((event.runId && this.cancelledRunIds.has(event.runId))
+        || (currentRunId && this.cancelledRunIds.has(currentRunId))) {
+        this.trace('cancelled-run-completion-ignored', {
+          missionId: event.missionId,
+          taskId: event.taskId,
+          eventRunId: event.runId,
+          currentRunId,
+        });
+        return;
+      }
+      if (event.runId && currentRunId && event.runId !== currentRunId) {
+        this.trace('stale-run-completion-ignored', {
+          missionId: event.missionId,
+          taskId: event.taskId,
+          eventRunId: event.runId,
+          currentRunId,
+        });
+        return;
+      }
       const task = await this.resolveCompletionTask(event);
       if (!task) {
         this.trace('completion-task-missing', {
@@ -860,6 +1259,17 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           agentInstanceId: event.agentInstanceId,
         });
         await super.handleTaskCompleted(event);
+        return;
+      }
+
+      if (TASK_COMPLETION_FENCE_STATUSES.has(String(task.status))) {
+        this.trace('late-task-completion-ignored', {
+          missionId: event.missionId,
+          taskId: task.id,
+          status: task.status,
+          eventRunId: event.runId,
+          currentRunId,
+        });
         return;
       }
 
@@ -887,16 +1297,25 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       }
 
       const canonicalEvent: TaskCompleted = task.id === event.taskId ? event : { ...event, taskId: task.id };
-      if (!TERMINAL_TASK_STATUSES.has(String(task.status))) {
-        await manager.updateTask(task.id, {
-          status: 'done',
-          completedAt: new Date().toISOString(),
-        });
+      const verdict = inferQualityVerdict(task.assignedRole, event.result);
+      await this.assertTaskCompletionCurrent(event);
+      await manager.updateTask(task.id, {
+        status: verdict && !verdict.passed ? 'rejected' : 'done',
+        completedAt: new Date().toISOString(),
+      });
+      await this.assertTaskCompletionCurrent(event);
+      const emittedVerdict = await this.emitQualityTaskCompleted(event, task, false, verdict);
+      if (emittedVerdict && !emittedVerdict.passed) {
+        await this.stopAfterQualityFailure(event, task, emittedVerdict);
+        return;
       }
 
       let legacyError: unknown;
+      const suppressLegacyReview = task.assignedRole === 'reviewer' || task.assignedRole === 'qa';
       this.deferredCompletionMissions.add(event.missionId);
+      if (suppressLegacyReview) this.suppressedLegacyReviewEvents.add(event.missionId);
       try {
+        await this.assertTaskCompletionCurrent(event);
         await super.handleTaskCompleted(canonicalEvent);
       } catch (error) {
         legacyError = error;
@@ -907,9 +1326,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         });
       } finally {
         this.deferredCompletionMissions.delete(event.missionId);
+        if (suppressLegacyReview) this.suppressedLegacyReviewEvents.delete(event.missionId);
       }
 
       const latestTask = await manager.getTask(task.id);
+      if (!(await this.canPublishCompletion(event.missionId))) return;
       await this.reconcileMissionPlanUnlocked(event.missionId, latestTask?.planId || task.planId || null);
 
       const mission = await manager.getMission(event.missionId);
@@ -929,34 +1350,87 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     });
   }
 
+  private async applyApprovedChanges(
+    missionId: string,
+    options?: { operationId?: string; idempotencyKey?: string },
+  ): Promise<void> {
+    const manager = this.v2WorkspaceManager;
+    const applyTaskChanges = this.v2ApplyTaskChanges;
+    if (!manager || !applyTaskChanges) throw new Error('No deterministic apply coordinator is configured.');
+
+    const lifecycle = this.lifecycleByMission.get(missionId);
+    const runId = lifecycle?.runId;
+    const mission = await this.assertMissionActionCurrent(missionId, runId);
+    if (!mission.planId) throw new Error('Changes cannot be applied without an active plan.');
+
+    const tasks = (await manager.listTasks(missionId)).filter((task) => task.planId === mission.planId);
+    const incomplete = tasks.filter((task) => task.status !== 'done');
+    if (incomplete.length > 0) throw new Error('Changes cannot be applied while mission tasks are incomplete.');
+    const reviewerDone = tasks.some((task) => task.assignedRole === 'reviewer' && task.status === 'done');
+    const qaTasks = tasks.filter((task) => task.assignedRole === 'qa');
+    if (!reviewerDone || !qaTasks.every((task) => task.status === 'done')) {
+      throw new Error('Reviewer and configured QA quality gates must pass before apply.');
+    }
+
+    await this.assertMissionActionCurrent(missionId, runId);
+    await manager.updateMission(missionId, { status: 'applying' });
+    for (const task of tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
+      await this.assertMissionActionCurrent(missionId, runId);
+      const operation = options?.operationId || options?.idempotencyKey
+        ? {
+          operationId: options.operationId,
+          idempotencyKey: options.idempotencyKey
+            ? `${options.idempotencyKey}:task:${task.id}`
+            : undefined,
+        }
+        : undefined;
+      const result = await applyTaskChanges(task.id, operation);
+      await this.assertMissionActionCurrent(missionId, runId);
+      if (!result.success) {
+        await manager.updateMission(missionId, { status: 'blocked' });
+        throw new Error(result.output || `Applying task ${task.id} failed.`);
+      }
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'changes_applied',
+        missionId,
+        taskId: task.id,
+        filesChanged: result.filesChanged || 0,
+        checkpointId: result.checkpointId || '',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    await this.assertMissionActionCurrent(missionId, runId);
+    await manager.updateMission(missionId, { status: 'verifying' });
+    await this.completeWithSynthesis({
+      missionId,
+      planId: mission.planId,
+      tasksCompleted: tasks.length,
+      totalTasks: tasks.length,
+    }, async () => {
+      await this.assertMissionActionCurrent(missionId, runId);
+      await manager.updateMission(missionId, { status: 'completed', completedAt: new Date().toISOString() });
+    });
+  }
+
   override async handleApprovalDecision(
     missionId: string,
     approvalType: string,
     approved: boolean,
-    options?: { selectedCandidateId?: string; reason?: string },
+    options?: {
+      selectedCandidateId?: string;
+      reason?: string;
+      operationId?: string;
+      idempotencyKey?: string;
+    },
   ): Promise<void> {
     if (approvalType !== 'apply' || !approved) {
       await super.handleApprovalDecision(missionId, approvalType, approved, options);
       return;
     }
 
-    this.deferredCompletionMissions.add(missionId);
-    try {
-      await super.handleApprovalDecision(missionId, approvalType, approved, options);
-    } finally {
-      this.deferredCompletionMissions.delete(missionId);
-    }
-    const manager = this.v2WorkspaceManager;
-    const mission = manager ? await manager.getMission(missionId) : null;
-    if (!manager || !mission?.planId || mission.status !== 'completed') return;
-    const deferred = this.deferredCompletions.get(missionId);
-    this.deferredCompletions.delete(missionId);
-    await this.completeWithSynthesis({
-      missionId,
-      planId: mission.planId,
-      tasksCompleted: deferred?.tasksCompleted ?? 0,
-      totalTasks: deferred?.totalTasks ?? 0,
-    });
+    await this.enqueueMission(missionId, () => this.applyApprovedChanges(missionId, options));
   }
 
   private async recoverNonProgressingPlan(
@@ -1087,10 +1561,14 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         }),
       }));
 
+    const lifecycle = this.lifecycleByMission.get(missionId);
     this.trace('plan-reconciled', {
       missionId,
+      turnId: lifecycle?.turnId,
+      runId: lifecycle?.runId,
       planId,
       missionStatus: mission.status,
+      tasks: planTasks.map((task) => this.taskTraceDetails(task)),
       readyTaskIds: ready.map((task) => task.id),
       blocked,
     });
@@ -1124,19 +1602,45 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       return;
     }
 
+    const completedTaskIds = planTasks
+      .filter((task) => TERMINAL_TASK_STATUSES.has(String(task.status)))
+      .map((task) => task.id);
+    const runningWorkers = planTasks
+      .filter((task) => ACTIVE_TASK_STATUSES.has(String(task.status)) && task.assignedRole)
+      .map((task) => ({ role: task.assignedRole!, delegationId: task.id }));
+    const allocation = allocateWorkerBatch({
+      delegations: ready
+        .flatMap((task) => isSchedulableWorkerRole(task.assignedRole)
+          ? [{
+            id: task.id,
+            role: task.assignedRole,
+            objective: task.description,
+            requiredCapabilities: task.requiredCapabilities || [],
+            dependsOnDelegationIds: ((task.dependsOn as string[]) || []),
+          }]
+          : []),
+      completedDelegationIds: completedTaskIds,
+      runningWorkers,
+      policy: DEFAULT_CORE_WORKER_POOL,
+    });
+    const dispatchableTaskIds = new Set(allocation.dispatchable.map((delegation) => delegation.id));
+    if (allocation.deferred.length > 0) {
+      this.trace('worker-capacity-deferred', {
+        missionId,
+        planId,
+        readyTaskIds: ready.map((task) => task.id),
+        deferred: allocation.deferred.map((item) => ({ taskId: item.delegation.id, reason: item.reason })),
+      });
+    }
+
     for (const task of ready) {
+      if (!dispatchableTaskIds.has(task.id)) continue;
       const latest = await manager.getTask(task.id);
       if (!latest || (latest.status !== 'planned' && latest.status !== 'ready')) continue;
       if (latest.status === 'planned') {
         await manager.updateTask(latest.id, { status: 'ready' });
       }
       await this.assignTask(latest.id, latest.assignedRole ?? undefined);
-      this.trace('task-dispatched', {
-        missionId,
-        planId,
-        taskId: latest.id,
-        role: latest.assignedRole,
-      });
     }
   }
 }

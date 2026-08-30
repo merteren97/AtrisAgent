@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from '@atris-agent-code/database';
+import { LocalEventBus } from '@atris-agent-code/event-bus';
+import { OrchestratorV2 } from '@atris-agent-code/orchestration-core';
 import { CoordinationMCP } from './coordination';
 import { resolveControlPlaneBridgeScriptPath } from './index';
 import { ResourceLeaseManager } from './resource-lease-manager';
@@ -54,6 +59,71 @@ async function runTests() {
 
     const resB = await leaseManager.reserveLease('db_migration', 'agent-builder-2', 'main_db', 60);
     assert(typeof resB.leaseId === 'string', 'Agent B can reserve db_migration lease after Agent A releases');
+  }
+
+  // Test 1b: SQLite is the authority shared by separate manager instances.
+  {
+    const sqlite = new Database(':memory:');
+    sqlite.exec(`
+      CREATE TABLE missions (id TEXT PRIMARY KEY);
+      CREATE TABLE resource_leases (
+        id TEXT PRIMARY KEY, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+        held_by_agent_id TEXT NOT NULL, expires_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL,
+        status TEXT DEFAULT 'active', metadata TEXT
+      );
+      CREATE UNIQUE INDEX idx_resource_leases_active_resource
+        ON resource_leases(resource_type, resource_id) WHERE status = 'active';
+      CREATE TABLE agent_instances (
+        id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, role TEXT NOT NULL,
+        model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '',
+        session_id TEXT, status TEXT DEFAULT 'idle', task_id TEXT, parent_agent_id TEXT,
+        display_name TEXT, specialty TEXT, spawn_reason TEXT, status_message TEXT, progress INTEGER,
+        workspace_mode TEXT, started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL
+      );
+      CREATE TABLE agent_messages (
+        id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        from_agent_id TEXT NOT NULL, to_agent_id TEXT NOT NULL, content TEXT NOT NULL,
+        created_at TEXT NOT NULL, read_at TEXT, kind TEXT NOT NULL DEFAULT 'message', reply_to_message_id TEXT
+      );
+    `);
+    sqlite.prepare('INSERT INTO missions (id) VALUES (?)').run('durable-mission');
+    const db = drizzle(sqlite, { schema }) as any;
+    const managerA = new ResourceLeaseManager();
+    const managerB = new ResourceLeaseManager();
+    const sharedLease = await managerA.reserveLease('workspace', 'agent-a', 'main', 60, undefined, db);
+    assert(typeof sharedLease.leaseId === 'string', 'SQLite-backed manager persists the lease claim');
+
+    let crossProcessConflict = false;
+    try {
+      await managerB.reserveLease('workspace', 'agent-b', 'main', 60, undefined, db);
+    } catch (error: any) {
+      crossProcessConflict = String(error?.message).includes('locked by agent "agent-a"');
+    }
+    assert(crossProcessConflict, 'a separate manager cannot claim an active SQLite lease');
+
+    const resumed = await managerB.heartbeatLease(sharedLease.leaseId, 120, db);
+    assert(resumed.expiresAt > new Date().toISOString(), 'heartbeat resolves the lease from SQLite after a manager restart');
+
+    sqlite.prepare("UPDATE resource_leases SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(sharedLease.leaseId);
+    const replacement = await managerB.reserveLease('workspace', 'agent-b', 'main', 60, undefined, db);
+    assert(replacement.leaseId !== sharedLease.leaseId, 'expired SQLite leases are reclaimed without invalidating live leases');
+
+    const durableBus = new LocalEventBus();
+    const firstCoordination = new CoordinationMCP({ db, eventBus: durableBus, workspacePath: os.tmpdir() });
+    durableBus.emit({
+      id: crypto.randomUUID(), type: 'agent_spawned', missionId: 'durable-mission',
+      agentInstanceId: 'durable-agent', parentAgentId: null, role: 'researcher',
+      displayName: 'Durable Researcher', specialty: 'Recovery', spawnReason: 'Verify restart state',
+      taskId: null, model: 'research-model', workspaceMode: 'read_only', timestamp: new Date().toISOString(),
+    } as any);
+    await firstCoordination.sendAgentMessage({
+      missionId: 'durable-mission', fromAgentId: 'durable-agent', toAgentId: 'durable-agent',
+      content: 'Persist this handoff.', kind: 'handoff',
+    });
+    const restartedCoordination = new CoordinationMCP({ db, workspacePath: os.tmpdir() });
+    assert(restartedCoordination.listAgents('durable-mission')[0]?.displayName === 'Durable Researcher', 'agent registry survives a CoordinationMCP restart');
+    assert(restartedCoordination.readAgentMessages('durable-agent', true, false)[0]?.kind === 'handoff', 'agent mailbox survives a CoordinationMCP restart');
+    sqlite.close();
   }
 
   // Test 2: CoordinationMCP current task contract + Runtime V2 agent operations
@@ -122,7 +192,11 @@ async function runTests() {
       },
     };
 
-    const coordination = new CoordinationMCP({ workspacePath: path.join(os.tmpdir(), 'atris-packaged-runtime-data'), workspaceManager });
+    const eventBus = new LocalEventBus();
+    const terminalEvents: any[] = [];
+    eventBus.on('task_completed', (event) => { terminalEvents.push(event); });
+    eventBus.on('task_failed', (event) => { terminalEvents.push(event); });
+    const coordination = new CoordinationMCP({ workspacePath: path.join(os.tmpdir(), 'atris-packaged-runtime-data'), workspaceManager, eventBus });
 
     const ctx = await coordination.getWorkspaceContext(undefined, 'm-100');
     assert(ctx.workspacePath === path.join(os.tmpdir(), 'atris-registered-workspace'), 'getWorkspaceContext resolves the persisted mission workspace instead of the packaged runtime cwd');
@@ -134,6 +208,14 @@ async function runTests() {
     assert(tasks[0].assignedAgentId === 'builder-agent-1' && tasks[0].status === 'running', 'claimTask persists assignee and running state');
 
     await coordination.reportProgress('t-100', 'Compiling TypeScript bundle', 50);
+
+    await coordination.submitResult('t-100', 'Implementation complete');
+    assert(tasks[0].status === 'running', 'submitResult leaves successful terminal-state persistence to the orchestrator');
+    assert(terminalEvents[0]?.type === 'task_completed' && terminalEvents[0]?.result === 'Implementation complete', 'submitResult publishes the successful result for orchestration');
+
+    await coordination.submitResult('t-100', 'Build failed', undefined, undefined, 'failed');
+    assert(tasks[0].status === 'running', 'submitResult leaves failed terminal-state persistence to the orchestrator');
+    assert(terminalEvents[1]?.type === 'task_failed' && terminalEvents[1]?.error === 'Build failed', 'submitResult publishes failed results without pre-rejecting the task');
 
     const changed = await coordination.getChangedFiles('t-100');
     assert(changed.worktreePath === '/virtual/worktree/t-100', 'getChangedFiles stays scoped to the task worktree');
@@ -175,6 +257,58 @@ async function runTests() {
     const rules = await coordination.getWorkspaceRules();
     assert(Array.isArray(rules.commandPrefixAllowlist), 'getWorkspaceRules returns command allowlist');
     assert((rules.agentLimits as any)?.maxDepth === 2, 'getWorkspaceRules exposes sub-agent safety limits');
+  }
+
+  // task_submit_result publishes the transition intent; V2 owns the terminal
+  // write so its completion handler can release DAG dependents exactly once.
+  {
+    const now = new Date().toISOString();
+    const mission: any = {
+      id: 'mission-submit-result', workspaceId: 'workspace-submit-result', planId: 'plan-submit-result',
+      title: 'Submit result', description: '', status: 'running', executionMode: 'balanced',
+      teamTemplateId: null, automationPolicy: null, activeRunId: null, createdAt: now, updatedAt: now, completedAt: null,
+    };
+    const tasks = new Map<string, any>([
+      ['research', {
+        id: 'research', missionId: mission.id, planId: mission.planId, title: 'Research', description: '', status: 'running',
+        priority: 'medium', assignedAgentId: 'agent-research', assignedRole: 'researcher', requiredCapabilities: [],
+        dependsOn: [], worktreeId: null, createdAt: now, updatedAt: now, completedAt: null,
+      }],
+      ['builder', {
+        id: 'builder', missionId: mission.id, planId: mission.planId, title: 'Build', description: '', status: 'planned',
+        priority: 'medium', assignedAgentId: null, assignedRole: 'builder', requiredCapabilities: [],
+        dependsOn: ['research'], worktreeId: null, createdAt: now, updatedAt: now, completedAt: null,
+      }],
+    ]);
+    const manager: any = {
+      async getMission(id: string) { return id === mission.id ? mission : null; },
+      async updateMission(_id: string, updates: Record<string, unknown>) { Object.assign(mission, updates); return mission; },
+      async getTask(id: string) { return tasks.get(id) || null; },
+      async listTasks(id: string) { return [...tasks.values()].filter((task) => task.missionId === id); },
+      async updateTask(id: string, updates: Record<string, unknown>) {
+        const current = tasks.get(id);
+        if (!current) throw new Error('Task not found');
+        Object.assign(current, updates);
+        return current;
+      },
+    };
+    const eventBus = new LocalEventBus();
+    const completions: any[] = [];
+    const spawnedTaskIds: string[] = [];
+    eventBus.on('task_completed', (event) => { completions.push(event); });
+    eventBus.on('task_created', (event) => { spawnedTaskIds.push(event.taskId); });
+    const coordination = new CoordinationMCP({ workspacePath: 'test', workspaceManager: manager, eventBus });
+    const orchestrator = new OrchestratorV2({ workspacePath: 'test', workspaceManager: manager }, eventBus, undefined, manager);
+
+    await coordination.submitResult('research', 'Research complete');
+    assert(tasks.get('research').status === 'running', 'Researcher submitResult does not pre-mark the task done');
+    await orchestrator.handleTaskCompleted(completions[0]);
+    await orchestrator.handleTaskCompleted({ ...completions[0], id: crypto.randomUUID() });
+
+    assert(tasks.get('research').status === 'done' && tasks.get('builder').status === 'running',
+      'Researcher submitResult completion releases the dependent Builder');
+    assert(spawnedTaskIds.filter((id) => id === 'builder').length === 1,
+      'Duplicate completion is fenced and dispatches the Builder exactly once');
   }
 
   console.log(`\nTest Results: ${passed} passed, ${failed} failed.`);

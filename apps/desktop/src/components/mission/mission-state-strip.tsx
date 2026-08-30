@@ -11,6 +11,14 @@ const STAGES: Array<{ id: MissionStage; label: string }> = [
   { id: 'outcome', label: 'Outcome' },
 ];
 
+const TRANSPORT_LABEL = {
+  idle: 'Offline',
+  connecting: 'Connecting',
+  connected: 'Live',
+  reconnecting: 'Reconnecting',
+  error: 'Live error',
+} as const;
+
 export function MissionStateStrip() {
   const { missions, activeMissionId, activeTasks, commandQueue, transportStatus } = useMissionStore();
   const mission = missions.find((item) => item.id === activeMissionId);
@@ -35,7 +43,7 @@ export function MissionStateStrip() {
       <div className="flex shrink-0 items-center gap-2 text-[10px] text-muted-foreground">
         <span className="tabular-nums">{completedTasks}/{activeTasks.length} tasks</span>
         {missionQueueCount > 0 && <Badge variant="secondary" className="text-[9px]">{missionQueueCount} queued</Badge>}
-        <span className="hidden lg:inline">{transportStatus === 'connected' ? 'Live' : 'Reconnecting'}</span>
+        <span className="hidden lg:inline">{TRANSPORT_LABEL[transportStatus]}</span>
         <Badge variant={mission.status === 'failed' || mission.status === 'blocked' ? 'destructive' : 'outline'} className="text-[9px]">
           {missionStatusLabel(mission.status)}
         </Badge>

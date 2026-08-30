@@ -1,6 +1,7 @@
-import { LocalEventBus } from '@atris-agent-code/event-bus';
+import { LocalEventBus, registerSupervisorTurnRunner } from '@atris-agent-code/event-bus';
 import type { MissionSelect, TaskSelect } from '@atris-agent-code/database';
 import type { MemoryNode, OrchestratorDelegation } from '@atris-agent-code/domain';
+import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { OrchestratorV2 } from './orchestrator-v2';
 import { allocateWorkerBatch, DEFAULT_CORE_WORKER_POOL } from './worker-pool';
@@ -378,6 +379,581 @@ async function runTests() {
     assert(db.completions[0]?.status === 'completed', 'plan-only completion fence closes after event emission');
   }
 
+  // Execute plans must expose each quality boundary in order. The legacy
+  // aggregate review event is not allowed to duplicate the explicit Reviewer
+  // completion or misattribute the final QA transition.
+  {
+    const missionId = 'mission-quality-lifecycle';
+    const turnId = 'turn-quality-lifecycle';
+    const runId = 'run-quality-lifecycle';
+    const logSafeMarker = 'TRACE_SECRET_4f8c2d';
+    const manager = new FakeWorkspaceManager(missionId, 'old-plan');
+    manager.mission = { ...manager.mission, planId: null };
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    const traces: string[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'execute',
+      response: 'Build the requested change.',
+      delegations: [{
+        id: 'builder-lane',
+        role: 'builder',
+        objective: `Implement the lifecycle path without logging ${logSafeMarker}`,
+        requiredCapabilities: ['implementation'],
+      }],
+    }));
+
+    const originalInfo = console.info;
+    console.info = (...args: any[]) => { traces.push(args.map(String).join(' ')); };
+    try {
+      const orchestrator = new OrchestratorV2(
+        { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+        eventBus,
+        undefined,
+        manager as unknown as WorkspaceManager,
+      );
+      const result = await orchestrator.startMission(
+        missionId,
+        `Implement the lifecycle path with token=${logSafeMarker}`,
+        { turnId, runId },
+      );
+      const builder = result.tasks.find((task) => task.assignedRole === 'builder');
+      const reviewer = result.tasks.find((task) => task.assignedRole === 'reviewer');
+      const qa = result.tasks.find((task) => task.assignedRole === 'qa');
+      const taskCreatedIds = () => events
+        .filter((event): event is Extract<AgentEvent, { type: 'task_created' }> => event.type === 'task_created')
+        .map((event) => event.taskId);
+      const eventIndex = (type: AgentEvent['type'], taskId: string) => events.findIndex(
+        (event) => event.type === type && 'taskId' in event && event.taskId === taskId,
+      );
+
+      assert(Boolean(builder && reviewer && qa), 'execute plan contains Builder, Reviewer, and QA quality stages');
+      assert(taskCreatedIds().length === 1 && taskCreatedIds()[0] === builder?.id,
+        'only the dependency-free Builder is initially visible through task_created');
+
+      const builderAgentId = (await manager.getTask(builder!.id))?.assignedAgentId || undefined;
+      await orchestrator.handleTaskCompleted({
+        id: crypto.randomUUID(),
+        type: 'task_completed',
+        missionId,
+        taskId: builder!.id,
+        agentInstanceId: builderAgentId,
+        result: 'Builder completed the implementation.',
+        timestamp: new Date().toISOString(),
+      });
+
+      const reviewerAfterBuilder = await manager.getTask(reviewer!.id);
+      assert(reviewerAfterBuilder?.status === 'running', 'Reviewer dispatch follows Builder completion');
+      assert(taskCreatedIds().length === 2 && taskCreatedIds()[1] === reviewer!.id,
+        'Reviewer dispatch is visible through the existing task_created event flow');
+      const reviewerCreatedEvent = events.find(
+        (event): event is Extract<AgentEvent, { type: 'task_created' }> => event.type === 'task_created' && event.taskId === reviewer!.id,
+      );
+      assert(reviewerCreatedEvent?.turnId === turnId && reviewerCreatedEvent?.runId === runId,
+        'Reviewer task_created carries the active turn/run correlation');
+      assert(!events.some((event) => event.type === 'review_completed'), 'Reviewer completion is not emitted before Reviewer runs');
+      assert(!events.some((event) => event.type === 'verification_started'), 'QA verification does not start before Reviewer completion');
+
+      const reviewerAgentId = reviewerAfterBuilder?.assignedAgentId || undefined;
+      await orchestrator.handleTaskCompleted({
+        id: crypto.randomUUID(),
+        type: 'task_completed',
+        missionId,
+        taskId: reviewer!.id,
+        agentInstanceId: reviewerAgentId,
+        result: 'All tests passed; no test failures or errors were found. Approved.',
+        timestamp: new Date().toISOString(),
+      });
+
+      const reviewEvents = events.filter(
+        (event): event is Extract<AgentEvent, { type: 'review_completed' }> => event.type === 'review_completed',
+      );
+      const verificationStartedEvents = events.filter(
+        (event): event is Extract<AgentEvent, { type: 'verification_started' }> => event.type === 'verification_started',
+      );
+      const qaAfterReview = await manager.getTask(qa!.id);
+      assert(reviewEvents.length === 1
+        && reviewEvents[0]?.taskId === reviewer!.id
+        && reviewEvents[0]?.reviewerAgentId === reviewerAgentId
+        && reviewEvents[0]?.turnId === turnId
+        && reviewEvents[0]?.runId === runId
+        && reviewEvents[0]?.approved === true,
+      'Reviewer completion emits one correlated review_completed event');
+      assert(qaAfterReview?.status === 'running', 'QA dispatch follows Reviewer completion');
+      assert(taskCreatedIds().length === 3 && taskCreatedIds()[2] === qa!.id,
+        'QA dispatch is visible through the existing task_created event flow');
+      assert(verificationStartedEvents.length === 1
+        && verificationStartedEvents[0]?.taskId === qa!.id
+        && verificationStartedEvents[0]?.reviewerAgentId === qaAfterReview?.assignedAgentId,
+      'QA dispatch emits one correlated verification_started event');
+      assert(verificationStartedEvents[0]?.turnId === turnId && verificationStartedEvents[0]?.runId === runId,
+        'verification_started carries the active turn/run correlation');
+      assert(eventIndex('review_completed', reviewer!.id) < eventIndex('verification_started', qa!.id),
+        'review_completed precedes verification_started');
+
+      const qaAgentId = qaAfterReview?.assignedAgentId || undefined;
+      await orchestrator.handleTaskCompleted({
+        id: crypto.randomUUID(),
+        type: 'task_completed',
+        missionId,
+        taskId: qa!.id,
+        agentInstanceId: qaAgentId,
+        result: 'QA checks passed.',
+        timestamp: new Date().toISOString(),
+      });
+
+      const verificationCompletedEvents = events.filter(
+        (event): event is Extract<AgentEvent, { type: 'verification_completed' }> => event.type === 'verification_completed',
+      );
+      const missionCompletedEvents = events.filter(
+        (event): event is Extract<AgentEvent, { type: 'mission_completed' }> => event.type === 'mission_completed',
+      );
+      assert(verificationCompletedEvents.length === 1
+        && verificationCompletedEvents[0]?.taskId === qa!.id
+        && verificationCompletedEvents[0]?.reviewerAgentId === qaAgentId
+        && verificationCompletedEvents[0]?.turnId === turnId
+        && verificationCompletedEvents[0]?.runId === runId
+        && verificationCompletedEvents[0]?.passed === true,
+      'QA completion emits one correlated verification_completed event');
+      assert(missionCompletedEvents.length === 0 && manager.mission.status === 'waiting_for_approval',
+        'QA completion does not prematurely complete the mission before apply approval');
+
+      const traceText = traces.join('\n');
+      assert(traceText.includes('plan-normalized')
+        && traceText.includes('"role":"builder"')
+        && traceText.includes('"role":"reviewer"')
+        && traceText.includes('"role":"qa"')
+        && traceText.includes('"dependsOnIndices":[0]')
+        && traceText.includes('"dependsOnIndices":[1]'),
+      'normalized-plan trace records quality roles and dependency indices');
+      assert(traceText.includes(`"missionId":"${missionId}"`)
+        && traceText.includes(`"turnId":"${turnId}"`)
+        && traceText.includes(`"planId":"${result.planId}"`)
+        && traceText.includes(`"taskId":"${reviewer!.id}"`)
+        && traceText.includes(`"taskId":"${qa!.id}"`)
+        && traceText.includes(`"agentInstanceId":"${reviewerAgentId}"`)
+        && traceText.includes(`"agentInstanceId":"${qaAgentId}"`),
+      'quality traces carry mission, turn, plan, task, and agent correlations');
+      assert(!traceText.includes(logSafeMarker), 'OrchestratorV2 traces omit task/request text and remain log-safe');
+    } finally {
+      console.info = originalInfo;
+      registerSupervisorTurnRunner(null);
+    }
+  }
+
+  // Quality workers must provide an explicit positive recommendation. Reviewer
+  // findings, revision requests, and ambiguous output block the lane before QA
+  // can be dispatched and remain ineligible for apply.
+  {
+    const missionId = 'mission-review-quality-negative';
+    const planId = 'plan-review-quality-negative';
+    const turnId = 'turn-review-quality-negative';
+    const runId = 'run-review-quality-negative';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, activeRunId: runId };
+    manager.tasks.set('builder', task({
+      id: 'builder', missionId, planId, role: 'builder', status: 'done', assignedAgentId: 'agent-builder',
+    }));
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'running', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'planned', dependsOn: ['reviewer'],
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    let applyCalls = 0;
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      {
+        workspacePath: 'test',
+        workspaceManager: manager as unknown as WorkspaceManager,
+        applyTaskChanges: async () => {
+          applyCalls += 1;
+          return { success: true };
+        },
+      },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+    const longSecretResult = `Revision requested: blocking finding remains. Authorization: Bearer secret-quality-token ${'x'.repeat(5_000)}`;
+
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'reviewer',
+      agentInstanceId: 'agent-reviewer',
+      turnId,
+      runId,
+      result: longSecretResult,
+      timestamp: new Date().toISOString(),
+    });
+
+    const reviewEvent = events.find(
+      (event): event is Extract<AgentEvent, { type: 'review_completed' }> => event.type === 'review_completed',
+    );
+    const applyErrors: unknown[] = [];
+    try {
+      await orchestrator.handleApprovalDecision(missionId, 'apply', true);
+    } catch (error) {
+      applyErrors.push(error);
+    }
+    assert(reviewEvent?.approved === false
+      && reviewEvent.turnId === turnId
+      && reviewEvent.runId === runId
+      && reviewEvent.findings.length <= 4_000
+      && !reviewEvent.findings.includes('secret-quality-token'),
+    'Reviewer rejection emits a bounded, redacted, correlated review_completed verdict');
+    assert(manager.tasks.get('reviewer')?.status === 'rejected' && manager.mission.status === 'blocked',
+      'Reviewer rejection persists a rejected task and blocks the mission');
+    assert(manager.tasks.get('qa')?.status === 'cancelled'
+      && !events.some((event) => event.type === 'verification_started')
+      && !events.some((event) => event.type === 'mission_completed'),
+    'Reviewer rejection cancels the pending QA lane and cannot complete the mission');
+    assert(applyErrors.length === 1 && applyCalls === 0 && manager.mission.status === 'blocked',
+      'Reviewer rejection remains ineligible for apply');
+  }
+
+  // A Reviewer that omits the required recommendation is also ambiguous and
+  // must not unlock QA.
+  {
+    const missionId = 'mission-review-quality-ambiguous';
+    const planId = 'plan-review-quality-ambiguous';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('builder', task({
+      id: 'builder', missionId, planId, role: 'builder', status: 'done', assignedAgentId: 'agent-builder',
+    }));
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'running', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'planned', dependsOn: ['reviewer'],
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'reviewer',
+      agentInstanceId: 'agent-reviewer',
+      result: 'Review complete. No explicit pass or approval recommendation was provided.',
+      timestamp: new Date().toISOString(),
+    });
+
+    const reviewEvent = events.find(
+      (event): event is Extract<AgentEvent, { type: 'review_completed' }> => event.type === 'review_completed',
+    );
+    assert(reviewEvent?.approved === false
+      && reviewEvent.findings.includes('No explicit pass')
+      && manager.tasks.get('reviewer')?.status === 'rejected'
+      && manager.mission.status === 'blocked',
+    'Ambiguous Reviewer output is emitted as a non-approval and blocks the mission');
+    assert(manager.tasks.get('qa')?.status === 'cancelled'
+      && !events.some((event) => event.type === 'verification_started'),
+    'Ambiguous Reviewer output cancels the pending QA lane');
+  }
+
+  // Explicitly failed QA checks are a failed gate, not an apply approval.
+  {
+    const missionId = 'mission-qa-quality-negative';
+    const planId = 'plan-qa-quality-negative';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, activeRunId: 'run-qa-quality-negative' };
+    manager.tasks.set('builder', task({
+      id: 'builder', missionId, planId, role: 'builder', status: 'done', assignedAgentId: 'agent-builder',
+    }));
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'done', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'running', assignedAgentId: 'agent-qa',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    let applyCalls = 0;
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      {
+        workspacePath: 'test',
+        workspaceManager: manager as unknown as WorkspaceManager,
+        applyTaskChanges: async () => {
+          applyCalls += 1;
+          return { success: true };
+        },
+      },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'qa',
+      agentInstanceId: 'agent-qa',
+      runId: 'run-qa-quality-negative',
+      result: 'QA checks failed: the test command failed with a blocking error.',
+      timestamp: new Date().toISOString(),
+    });
+
+    const verificationEvent = events.find(
+      (event): event is Extract<AgentEvent, { type: 'verification_completed' }> => event.type === 'verification_completed',
+    );
+    assert(verificationEvent?.passed === false
+      && verificationEvent.findingCount > 0
+      && manager.tasks.get('qa')?.status === 'rejected'
+      && manager.mission.status === 'blocked',
+    'Failed QA checks emit a failed verification_completed verdict and block the mission');
+    assert(!events.some((event) => event.type === 'mission_completed') && applyCalls === 0,
+      'Failed QA checks cannot reach mission completion or apply');
+  }
+
+  // Empty or non-committal quality output is a failed gate, not an implicit
+  // approval. Exercise the empty QA path separately because it owns the apply gate.
+  {
+    const missionId = 'mission-qa-quality-ambiguous';
+    const planId = 'plan-qa-quality-ambiguous';
+    const turnId = 'turn-qa-quality-ambiguous';
+    const runId = 'run-qa-quality-ambiguous';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, activeRunId: runId };
+    manager.tasks.set('builder', task({
+      id: 'builder', missionId, planId, role: 'builder', status: 'done', assignedAgentId: 'agent-builder',
+    }));
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'done', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'running', assignedAgentId: 'agent-qa',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    let applyCalls = 0;
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      {
+        workspacePath: 'test',
+        workspaceManager: manager as unknown as WorkspaceManager,
+        applyTaskChanges: async () => {
+          applyCalls += 1;
+          return { success: true };
+        },
+      },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'qa',
+      agentInstanceId: 'agent-qa',
+      turnId,
+      runId,
+      result: '',
+      timestamp: new Date().toISOString(),
+    });
+
+    const verificationEvent = events.find(
+      (event): event is Extract<AgentEvent, { type: 'verification_completed' }> => event.type === 'verification_completed',
+    );
+    assert(verificationEvent?.passed === false
+      && verificationEvent.findingCount === 0
+      && verificationEvent.turnId === turnId
+      && verificationEvent.runId === runId
+      && verificationEvent.summary.includes('No explicit QA pass'),
+    'Empty QA output emits an ambiguous, correlated verification_completed failure');
+    assert(manager.tasks.get('qa')?.status === 'rejected' && manager.mission.status === 'blocked',
+      'Ambiguous QA output persists a rejected task and blocks the mission');
+    assert(!events.some((event) => event.type === 'mission_completed') && applyCalls === 0,
+      'Ambiguous QA output cannot reach mission completion or apply');
+  }
+
+  // A failed quality gate fences every sibling lane so already-running workers
+  // cannot finish into a blocked mission or dispatch more downstream work.
+  {
+    const missionId = 'mission-quality-sibling-fence';
+    const planId = 'plan-quality-sibling-fence';
+    const runId = 'run-quality-sibling-fence';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, activeRunId: runId };
+    manager.tasks.set('builder', task({
+      id: 'builder', missionId, planId, role: 'builder', status: 'running', assignedAgentId: 'agent-builder',
+    }));
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'running', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'running', assignedAgentId: 'agent-qa',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'reviewer',
+      agentInstanceId: 'agent-reviewer',
+      runId,
+      result: 'Review failed: blocking issue remains.',
+      timestamp: new Date().toISOString(),
+    });
+
+    assert(manager.mission.status === 'blocked'
+      && manager.tasks.get('reviewer')?.status === 'rejected'
+      && manager.tasks.get('builder')?.status === 'cancelled'
+      && manager.tasks.get('qa')?.status === 'cancelled',
+    'Failed quality gates cancel running sibling lanes and preserve the rejected gate');
+    assert(!events.some((event) => event.type === 'task_created' || event.type === 'mission_completed'),
+      'Quality failure emits no downstream dispatch or completion event');
+  }
+
+  // Applying an approved plan must re-check the mission after each external
+  // apply call so cancellation cannot be followed by a completed event.
+  {
+    const missionId = 'mission-apply-cancellation-fence';
+    const planId = 'plan-apply-cancellation-fence';
+    const runId = 'run-apply-cancellation-fence';
+    const turnId = 'turn-apply-cancellation-fence';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, status: 'waiting_for_approval', activeRunId: runId };
+    manager.tasks.set('builder', task({
+      id: 'builder', missionId, planId, role: 'builder', status: 'done', assignedAgentId: 'agent-builder',
+    }));
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'done', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({
+      id: 'qa', missionId, planId, role: 'qa', status: 'done', assignedAgentId: 'agent-qa',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    let applyCalls = 0;
+    let operationContext: { operationId?: string; idempotencyKey?: string } | undefined;
+    const orchestrator = new OrchestratorV2(
+      {
+        workspacePath: 'test',
+        workspaceManager: manager as unknown as WorkspaceManager,
+        applyTaskChanges: async (_taskId, operation) => {
+          applyCalls += 1;
+          operationContext = operation;
+          manager.mission = { ...manager.mission, status: 'cancelled' };
+          return { success: true };
+        },
+      },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+    (orchestrator as any).lifecycleByMission.set(missionId, { turnId, runId });
+
+    let rejected = false;
+    try {
+      await orchestrator.handleApprovalDecision(missionId, 'apply', true, {
+        operationId: 'approval-apply-cancellation-fence',
+        idempotencyKey: 'approval:approval-apply-cancellation-fence:1',
+      });
+    } catch {
+      rejected = true;
+    }
+
+    assert(rejected && applyCalls === 1 && manager.mission.status === 'cancelled',
+      'Cancellation during apply rejects the stale apply operation');
+    assert(operationContext?.operationId === 'approval-apply-cancellation-fence'
+      && operationContext.idempotencyKey === 'approval:approval-apply-cancellation-fence:1:task:builder',
+    'Approval idempotency context reaches the deterministic apply callback');
+    assert(!events.some((event) => event.type === 'changes_applied' || event.type === 'mission_completed'),
+      'Cancellation during apply emits no stale apply or completion event');
+  }
+
+  // A task terminal state and the current lifecycle run both fence late worker
+  // completions before any task mutation or legacy transition can occur.
+  {
+    const missionId = 'mission-late-task-status-completions';
+    const planId = 'plan-late-task-status-completions';
+    const currentRunId = 'run-current-late-fence';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, activeRunId: currentRunId };
+    const terminalStatuses: Array<TaskSelect['status']> = ['cancelled', 'rejected', 'superseded', 'done'];
+    for (const status of terminalStatuses) {
+      manager.tasks.set(`task-${status}`, task({
+        id: `task-${status}`,
+        missionId,
+        planId,
+        role: 'builder',
+        status,
+        assignedAgentId: `agent-${status}`,
+      }));
+    }
+    manager.tasks.set('stale-run', task({
+      id: 'stale-run', missionId, planId, role: 'builder', status: 'running', assignedAgentId: 'agent-stale',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+    (orchestrator as any).lifecycleByMission.set(missionId, { turnId: 'turn-current-late-fence', runId: currentRunId });
+
+    for (const status of terminalStatuses) {
+      await orchestrator.handleTaskCompleted({
+        id: crypto.randomUUID(),
+        type: 'task_completed',
+        missionId,
+        taskId: `task-${status}`,
+        agentInstanceId: `agent-${status}`,
+        runId: currentRunId,
+        result: 'late completion',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'stale-run',
+      agentInstanceId: 'agent-stale',
+      runId: 'run-old-late-fence',
+      result: 'stale completion',
+      timestamp: new Date().toISOString(),
+    });
+
+    assert(terminalStatuses.every((status) => manager.tasks.get(`task-${status}`)?.status === status)
+      && manager.tasks.get('stale-run')?.status === 'running',
+    'Late cancelled/rejected/superseded/done and stale-run completions preserve task state');
+    assert(manager.mission.status === 'running'
+      && !events.some((event) => event.type === 'task_created' || event.type === 'mission_completed'),
+    'Late task completions are fenced before legacy handling or downstream dispatch');
+  }
+
   // Recovery: if read-only workers are already durably done but the final
   // completion event was lost during a restart, reconciliation must synthesize
   // once and return the conversation to the user instead of leaving it Running.
@@ -463,6 +1039,40 @@ async function runTests() {
     assert(manager.mission.status === 'failed', 'scheduler deadlock moves the mission out of Running');
     assert(missionFailedReason.includes('no active or dispatchable tasks'), 'deadlock failure explains that the plan cannot make progress');
     assert(spawned === 0, 'deadlock recovery does not invent or duplicate worker dispatches');
+  }
+
+  // Reconciliation uses the global worker pool instead of assigning every ready
+  // task in one burst.
+  {
+    const missionId = 'mission-global-worker-capacity';
+    const planId = 'plan-global-worker-capacity';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    const roles: Array<TaskSelect['assignedRole']> = ['researcher', 'researcher', 'builder', 'builder', 'qa'];
+    for (const [index, role] of roles.entries()) {
+      manager.tasks.set(`task-${index}`, task({
+        id: `task-${index}`,
+        missionId,
+        planId,
+        role,
+        status: 'planned',
+      }));
+    }
+    const eventBus = new LocalEventBus();
+    const spawned: string[] = [];
+    eventBus.on('task_created', (event) => { spawned.push(event.taskId); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    const running = [...manager.tasks.values()].filter((item) => item.status === 'running');
+    assert(running.length === 4 && manager.tasks.get('task-4')?.status === 'planned',
+      'Reconciliation respects the four-worker global capacity');
+    assert(spawned.length === 4 && !spawned.includes('task-4'),
+      'Capacity-deferred tasks remain undispatched for a later reconciliation');
   }
 
   // Candidate mode recovery must surface the candidate-selection approval rather

@@ -51,6 +51,11 @@ if (failure.kind === 'result') {
 }
 
 assert.equal(parseAntigravityStreamLine('not-json').kind, 'malformed');
+assert.equal(parseAntigravityStreamLine('null').kind, 'malformed');
+assert.equal(parseAntigravityStreamLine('[]').kind, 'malformed');
+assert.equal(parseAntigravityStreamLine('"event"').kind, 'malformed');
+assert.equal(parseAntigravityStreamLine(JSON.stringify({ type: 'result', result: { response: 'missing outcome' } })).kind, 'malformed');
+assert.equal(parseAntigravityStreamLine(JSON.stringify({ type: 'result', success: 'true', response: 'string outcome' })).kind, 'malformed');
 assert.equal(parseAntigravityStreamLine(JSON.stringify({ event: 'checkpoint' })).kind, 'unknown');
 
 console.log('Antigravity stream protocol tests passed');

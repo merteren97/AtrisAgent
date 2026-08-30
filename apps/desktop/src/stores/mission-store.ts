@@ -197,6 +197,12 @@ function eventLabel(event: Record<string, any>): string {
     case 'agent_context_compacted': return `Context compacted${event.beforeTokens && event.afterTokens ? `: ${event.beforeTokens} → ${event.afterTokens} tokens` : '.'}`;
     case 'agent_thought': return event.thought || 'Agent is reasoning.';
     case 'text_delta': return event.content || '';
+    case 'process_started': return `${event.role || 'Process'} started${event.model ? ` with ${event.model}` : ''}.`;
+    case 'process_output_delta': return event.content || '';
+    case 'process_tool_started': return `Tool started: ${event.toolName || 'tool'}`;
+    case 'process_tool_completed': return `${event.toolName || 'Tool'} ${event.success ? 'completed' : 'failed'}.`;
+    case 'process_completed': return event.summary || 'Process completed.';
+    case 'process_failed': return `Process failed: ${event.error || 'Unknown runtime error'}`;
     case 'tool_call_started': case 'agent_tool_call': return `Tool started: ${event.toolName || 'tool'}`;
     case 'tool_call_completed': return `${event.toolName || 'Tool'} ${event.success ? 'completed' : 'failed'}.`;
     case 'file_changed': return `${event.changeType || 'Modified'} ${event.path}`;
@@ -245,6 +251,17 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
         || (event.type?.includes('verification') || event.type?.includes('review') ? 'reviewer' : event.type?.includes('check') ? 'qa' : undefined),
     metadata: event,
   };
+}
+
+export function restoreMissionTimeline(mission: Mission | undefined, events: Array<Record<string, any>>): TimelineItem[] {
+  const restored = reconcileApprovalTimeline(events.map(timelineFromEvent));
+  if (!mission || events.some((event) => event.type === 'user_message')) return restored;
+  return [{
+    id: `request-${mission.id}`,
+    type: 'user_message',
+    content: mission.description || mission.title,
+    timestamp: new Date(mission.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  }, ...restored];
 }
 
 export type ApprovalDecision = 'approved' | 'rejected';
@@ -371,7 +388,7 @@ export function reconcileApprovalTimeline(items: TimelineItem[]): TimelineItem[]
   });
 }
 
-function requestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions): Record<string, unknown> {
+function requestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions, clientMessageId?: string): Record<string, unknown> {
   return {
     request,
     title: request,
@@ -386,6 +403,7 @@ function requestBody(request: string, workspaceId: string | undefined, options?:
     routeScope: options?.routeScope,
     command: options?.command,
     automationSettings: options?.automationSettings,
+    clientMessageId,
   };
 }
 
@@ -460,16 +478,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         fetchMissionEvents(missionId),
       ]);
 
-      const restoredTimeline: TimelineItem[] = [];
-      if (state.mission) {
-        restoredTimeline.push({
-          id: `request-${state.mission.id}`,
-          type: 'user_message',
-          content: state.mission.description || state.mission.title,
-          timestamp: new Date(state.mission.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        });
-      }
-      restoredTimeline.push(...reconcileApprovalTimeline(events.map(timelineFromEvent)));
+      const restoredTimeline = restoreMissionTimeline(state.mission, events);
 
       useAgentStore.getState().hydrateMissionFromEvents(missionId, events);
 
@@ -519,8 +528,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     if (!trimmed) return;
     set({ loading: true, error: null });
 
+    const clientMessageId = crypto.randomUUID();
     const userMessage: TimelineItem = {
-      id: crypto.randomUUID(),
+      id: clientMessageId,
       type: 'user_message',
       content: trimmed,
       timestamp: nowLabel(),
@@ -531,6 +541,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
+        clientMessageId,
       },
     };
     useAgentStore.getState().setSelectedAgent(null);
@@ -539,7 +550,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const data = await apiRequest<{ missionId: string; planId: string; tasks: TaskItem[]; status?: MissionStatus }>('/missions/start', {
         method: 'POST',
-        body: JSON.stringify(requestBody(trimmed, workspaceId, options)),
+        body: JSON.stringify(requestBody(trimmed, workspaceId, options, clientMessageId)),
       });
 
       const newMission: Mission = {
@@ -593,8 +604,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       return;
     }
 
+    const clientMessageId = crypto.randomUUID();
     const userMessage: TimelineItem = {
-      id: crypto.randomUUID(),
+      id: clientMessageId,
       type: 'user_message',
       content: trimmed,
       timestamp: nowLabel(),
@@ -605,6 +617,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
+        clientMessageId,
       },
     };
 
@@ -619,7 +632,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const data = await apiRequest<{ missionId: string; planId: string; tasks: TaskItem[] }>(`/missions/${missionId}/start`, {
         method: 'POST',
-        body: JSON.stringify(requestBody(trimmed, mission.workspaceId, options)),
+        body: JSON.stringify(requestBody(trimmed, mission.workspaceId, options, clientMessageId)),
       });
 
       set((state) => ({
@@ -732,6 +745,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         return {
           missions: state.missions.filter((mission) => mission.id !== id),
           queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
+          commandQueue: state.commandQueue.filter((command) => command.missionId !== id),
           error: null,
           ...(wasActive ? {
             activeMissionId: null,

@@ -12,6 +12,7 @@ import { ModelCatalogService } from './model-catalog-service';
 import { AccountProfileManager } from './account-profile-manager';
 import { runtimeProfileEnv } from './runtime-utils';
 import { isReadOnlyAgentRole } from './adapters/base-adapter';
+import { RuntimeHost } from './runtime-host';
 
 async function runTests() {
   console.log('--- Starting RuntimeHost & Adapters Tests ---');
@@ -418,6 +419,199 @@ async function runTests() {
     assert(!(antigravityAdapter as any).softTerminalTimers.has('test-session-6'), 'A subsequent Antigravity step cancels the soft completion candidate');
     assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-6'), 'Follow-on tool activity cannot be prematurely completed by an earlier DONE response');
     (antigravityAdapter as any).activeProcesses.delete('test-session-6');
+
+    const unknownAfterDoneContext = { missionId: 'm-6', taskId: 'research-unknown-after-done' };
+    let unknownStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-7', unknownAfterDoneContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-7', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { unknownStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-7', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final answer before an unknown event',
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-7'), 'Unknown-event regression starts with a pending DONE soft candidate');
+    (antigravityAdapter as any).handleStreamLine('test-session-7', JSON.stringify({ type: 'checkpoint' }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-7'), 'An unknown Antigravity event re-arms the bounded DONE fallback');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-7'), 'An unknown Antigravity event does not complete the task immediately');
+    const unknownCandidateResult = (antigravityAdapter as any).softTerminalResultsBySession.get('test-session-7');
+    assert(unknownCandidateResult === 'Final answer before an unknown event', 'Unknown-event fallback retains the original DONE result');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-7', unknownCandidateResult);
+    const unknownOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-7');
+    assert(unknownOutcome?.kind === 'completed' && unknownOutcome.result === 'Final answer before an unknown event', 'Unknown-event fallback eventually completes with the retained result');
+    assert(unknownStdinEnded, 'Unknown-event fallback starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-7');
+
+    const malformedAfterDoneContext = { missionId: 'm-6', taskId: 'research-malformed-after-done' };
+    let malformedStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-8', malformedAfterDoneContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-8', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { malformedStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-8', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final answer before a malformed event',
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-8'), 'Malformed-event regression starts with a pending DONE soft candidate');
+    (antigravityAdapter as any).handleStreamLine('test-session-8', 'not-json');
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-8'), 'A malformed Antigravity event re-arms the bounded DONE fallback');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-8'), 'A malformed Antigravity event does not complete the task immediately');
+    const malformedCandidateResult = (antigravityAdapter as any).softTerminalResultsBySession.get('test-session-8');
+    assert(malformedCandidateResult === 'Final answer before a malformed event', 'Malformed-event fallback retains the original DONE result');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-8', malformedCandidateResult);
+    const malformedOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-8');
+    assert(malformedOutcome?.kind === 'completed' && malformedOutcome.result === 'Final answer before a malformed event', 'Malformed-event fallback eventually completes with the retained result');
+    assert(malformedStdinEnded, 'Malformed-event fallback starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-8');
+
+    const malformedResultContext = { missionId: 'm-6', taskId: 'research-malformed-result' };
+    let malformedResultStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-9', malformedResultContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-9', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { malformedResultStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-9', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final answer before a malformed result',
+    }));
+    (antigravityAdapter as any).handleStreamLine('test-session-9', JSON.stringify({
+      type: 'result',
+      result: { response: 'Result without authoritative success' },
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-9'), 'A malformed result re-arms the bounded DONE fallback');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-9'), 'A malformed result does not complete the task immediately');
+    const malformedResultCandidate = (antigravityAdapter as any).softTerminalResultsBySession.get('test-session-9');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-9', malformedResultCandidate);
+    const malformedResultOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-9');
+    assert(malformedResultOutcome?.kind === 'completed' && malformedResultOutcome.result === 'Final answer before a malformed result', 'Malformed result fallback eventually preserves the DONE result');
+    assert(malformedResultStdinEnded, 'Malformed result fallback starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-9');
+
+    const cancelCleanupSession = 'cancel-cleanup-session';
+    let cancelCleanupKilled = false;
+    (antigravityAdapter as any).sessionContext.set(cancelCleanupSession, { missionId: 'm-7', taskId: 'cancel-cleanup' });
+    (antigravityAdapter as any).activeProcesses.set(cancelCleanupSession, {
+      killed: false,
+      kill() { cancelCleanupKilled = true; this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine(cancelCleanupSession, JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Cancelled candidate',
+    }));
+    (antigravityAdapter as any).scheduleTerminalRelease(cancelCleanupSession);
+    (antigravityAdapter as any).terminalSessions.add(cancelCleanupSession);
+    (antigravityAdapter as any).publishedTerminalSessions.add(cancelCleanupSession);
+    (antigravityAdapter as any).pendingTerminalBySession.set(cancelCleanupSession, { kind: 'completed', result: 'late' });
+    (antigravityAdapter as any).stdoutBuffers.set(cancelCleanupSession, 'stdout');
+    (antigravityAdapter as any).stderrBuffers.set(cancelCleanupSession, 'stderr');
+    await antigravityAdapter.cancel(cancelCleanupSession);
+    assert(cancelCleanupKilled, 'Antigravity cancel terminates the native process');
+    assert(!(antigravityAdapter as any).activeProcesses.has(cancelCleanupSession), 'Antigravity cancel removes the native process reference');
+    assert(!(antigravityAdapter as any).sessionContext.has(cancelCleanupSession), 'Antigravity cancel removes session context');
+    assert(!(antigravityAdapter as any).softTerminalTimers.has(cancelCleanupSession) && !(antigravityAdapter as any).softTerminalResultsBySession.has(cancelCleanupSession), 'Antigravity cancel clears soft-terminal timers and results');
+    assert(!(antigravityAdapter as any).terminalReleaseTimers.has(cancelCleanupSession) && !(antigravityAdapter as any).pendingTerminalBySession.has(cancelCleanupSession), 'Antigravity cancel clears terminal release and pending outcome state');
+
+    const shutdownCleanupSession = 'shutdown-cleanup-session';
+    let shutdownCleanupKilled = false;
+    (antigravityAdapter as any).sessionContext.set(shutdownCleanupSession, { missionId: 'm-7', taskId: 'shutdown-cleanup' });
+    (antigravityAdapter as any).activeProcesses.set(shutdownCleanupSession, {
+      killed: false,
+      kill() { shutdownCleanupKilled = true; this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine(shutdownCleanupSession, JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Shutdown candidate',
+    }));
+    (antigravityAdapter as any).scheduleTerminalRelease(shutdownCleanupSession);
+    await antigravityAdapter.shutdown();
+    assert(shutdownCleanupKilled, 'Antigravity shutdown terminates active native processes');
+    assert(
+      (antigravityAdapter as any).activeProcesses.size === 0
+        && (antigravityAdapter as any).activeSessions.size === 0
+        && (antigravityAdapter as any).sessionContext.size === 0
+        && (antigravityAdapter as any).terminalSessions.size === 0
+        && (antigravityAdapter as any).publishedTerminalSessions.size === 0
+        && (antigravityAdapter as any).pendingTerminalBySession.size === 0
+        && (antigravityAdapter as any).lastOutputBySession.size === 0
+        && (antigravityAdapter as any).softTerminalTimers.size === 0
+        && (antigravityAdapter as any).softTerminalResultsBySession.size === 0
+        && (antigravityAdapter as any).terminalReleaseTimers.size === 0
+        && (antigravityAdapter as any).stdoutBuffers.size === 0
+        && (antigravityAdapter as any).stderrBuffers.size === 0,
+      'Antigravity shutdown clears session maps and timers',
+    );
+  }
+
+  // Persisted leases, not the in-memory session map, fence timeout delivery.
+  {
+    const eventBus = new LocalEventBus();
+    const failures: AgentEvent[] = [];
+    eventBus.on('task_failed', (event) => { failures.push(event); });
+    const staleAttempt = {
+      id: 'attempt-stale', taskId: 'task-stale', missionId: 'mission-stale',
+      agentInstanceId: 'agent-stale', runtimeSessionId: 'session-stale',
+      error: 'Runtime session lease expired before completion was confirmed',
+    };
+    let expiryCalls = 0;
+    const manager: any = {
+      async expireStaleTaskAttempts() {
+        expiryCalls += 1;
+        return expiryCalls === 1 ? [staleAttempt] : [];
+      },
+    };
+    const host = new RuntimeHost(eventBus, { workspaceManager: manager, sessionTimeout: 100, watchdogInterval: 0 });
+    const first = await host.runSessionWatchdog(new Date('2026-01-01T00:00:00.000Z'));
+    const second = await host.runSessionWatchdog(new Date('2026-01-01T00:00:01.000Z'));
+    assert(first === 1 && second === 0, 'watchdog expires a persisted stale attempt exactly once');
+    assert(failures.length === 1 && (failures[0] as any).taskId === 'task-stale', 'watchdog emits one correlated terminal task failure');
+    await host.stopAll();
+  }
+
+  {
+    const manager: any = {
+      async expireOrphanedTaskAttempts(completedAt: string) {
+        return completedAt === '2026-01-02T00:00:00.000Z'
+          ? [{ id: 'orphan', runtimeSessionId: 'lost-session' }]
+          : [];
+      },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    assert(await host.reconcileStartup(new Date('2026-01-02T00:00:00.000Z')) === 1, 'startup reconciliation deterministically expires persisted orphan attempts');
+    await host.stopAll();
   }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);

@@ -1,6 +1,6 @@
 import { CoordinationMCP, getControlPlaneBridgeScriptPath } from '@atris-agent-code/coordination-mcp';
 import { configureRuntimeControlPlaneBridge } from '@atris-agent-code/runtime-host';
-import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator } from './index';
+import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, db } from './index';
 import { ControlPlaneGrantRegistry } from './control-plane-grants';
 import { installControlPlaneRoutes } from './control-plane-router';
 import { installProjectMemoryRoutes } from './project-memory-routes';
@@ -20,6 +20,7 @@ const coordination = new CoordinationMCP({
   workspaceManager,
   orchestrator,
   eventBus,
+  db,
   workspacePath: process.cwd(),
 });
 const grants = new ControlPlaneGrantRegistry();

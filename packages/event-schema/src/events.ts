@@ -251,6 +251,66 @@ export interface ApprovalRequested extends BaseEvent {
   args?: Record<string, unknown>;
 }
 
+export interface ProcessStarted extends BaseEvent {
+  type: 'process_started';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  model?: string;
+  phase: 'decision' | 'synthesis' | 'task' | 'turn';
+  parentProcessId?: string;
+  taskId?: string;
+}
+
+export interface ProcessOutputDelta extends BaseEvent {
+  type: 'process_output_delta';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  content: string;
+  taskId?: string;
+}
+
+export interface ProcessToolStarted extends BaseEvent {
+  type: 'process_tool_started';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  toolName: string;
+  toolCallId?: string;
+  taskId?: string;
+}
+
+export interface ProcessToolCompleted extends BaseEvent {
+  type: 'process_tool_completed';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  toolName: string;
+  toolCallId?: string;
+  success: boolean;
+  result?: string;
+  taskId?: string;
+}
+
+export interface ProcessCompleted extends BaseEvent {
+  type: 'process_completed';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  summary?: string;
+  taskId?: string;
+}
+
+export interface ProcessFailed extends BaseEvent {
+  type: 'process_failed';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  error: string;
+  taskId?: string;
+}
+
 export interface ApprovalResponded extends BaseEvent {
   type: 'approval_responded';
   approvalId: string;
@@ -429,6 +489,12 @@ export type AgentEvent =
   | AgentError
   | RuntimeTelemetry
   | TextDelta
+  | ProcessStarted
+  | ProcessOutputDelta
+  | ProcessToolStarted
+  | ProcessToolCompleted
+  | ProcessCompleted
+  | ProcessFailed
   | ToolCallStarted
   | ToolCallCompleted
   | FileChanged

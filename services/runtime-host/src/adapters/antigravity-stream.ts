@@ -17,12 +17,14 @@ function recordValue(value: unknown): Record<string, any> {
 }
 
 export function parseAntigravityStreamLine(line: string): AntigravityParsedEvent {
-  let envelope: Record<string, any>;
+  let parsed: unknown;
   try {
-    envelope = JSON.parse(line);
+    parsed = JSON.parse(line);
   } catch {
     return { kind: 'malformed', rawLine: line };
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { kind: 'malformed', rawLine: line };
+  const envelope = parsed as Record<string, any>;
 
   const eventName = stringValue(envelope.event, envelope.type);
   if (eventName === 'init') {
@@ -66,11 +68,16 @@ export function parseAntigravityStreamLine(line: string): AntigravityParsedEvent
       : envelope;
     const status = stringValue(result.status, envelope.status);
     const error = stringValue(result.error?.message, result.error, envelope.error?.message, envelope.error);
-    const explicitFailure = result.success === false || /^(?:error|failed|failure|cancelled|canceled)$/i.test(status);
-    const explicitSuccess = result.success === true || /^(?:success|succeeded|completed|done)$/i.test(status);
+    const booleanSuccess = typeof result.success === 'boolean'
+      ? result.success
+      : typeof envelope.success === 'boolean' ? envelope.success : undefined;
+    const explicitFailure = /^(?:error|failed|failure|cancelled|canceled)$/i.test(status);
+    const explicitSuccess = /^(?:success|succeeded|completed|done)$/i.test(status);
+    const success = booleanSuccess ?? (explicitSuccess ? true : explicitFailure || Boolean(error) ? false : undefined);
+    if (success === undefined) return { kind: 'malformed', rawLine: line };
     return {
       kind: 'result',
-      success: explicitSuccess || (!explicitFailure && !error),
+      success,
       content: stringValue(result.response, result.text, result.output, typeof result.result === 'string' ? result.result : undefined),
       error: error || undefined,
       status: status || undefined,

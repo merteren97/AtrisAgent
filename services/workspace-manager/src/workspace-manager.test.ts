@@ -2,8 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execFileSync } from 'child_process';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from '@atris-agent-code/database';
+import type { AtrisDatabase } from '@atris-agent-code/database';
 import { WorktreeManager } from './worktree-manager';
 import { CheckpointManager, isSafeCheckpointId, isValidGitCommitSha } from './checkpoint-manager';
+import { WorkspaceManager } from './workspace-manager';
 
 async function runTests() {
   console.log('--- Starting WorkspaceManager & Worktree & Checkpoint Tests ---');
@@ -38,6 +43,52 @@ async function runTests() {
 
     const worktreeManager = new WorktreeManager();
     const checkpointManager = new CheckpointManager();
+    const durableAttemptApi = WorkspaceManager.prototype;
+    assert(
+      typeof durableAttemptApi.claimTaskAttempt === 'function'
+        && typeof durableAttemptApi.markTaskAttemptRunning === 'function'
+        && typeof durableAttemptApi.heartbeatTaskAttempt === 'function'
+        && typeof durableAttemptApi.finishTaskAttempt === 'function'
+        && typeof durableAttemptApi.expireStaleTaskAttempts === 'function'
+        && typeof durableAttemptApi.expireOrphanedTaskAttempts === 'function',
+      'WorkspaceManager exposes the durable task-attempt lifecycle API',
+    );
+
+    const sqlite = new Database(':memory:');
+    sqlite.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, git_initialized INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT, last_team_template_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', team_template_id TEXT NOT NULL DEFAULT '', plan_id TEXT, execution_mode TEXT NOT NULL DEFAULT 'balanced', automation_policy TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
+      CREATE UNIQUE INDEX idx_task_attempts_task_number ON task_attempts(task_id, attempt_number);
+    `);
+    const attemptManager = new WorkspaceManager(drizzle(sqlite, { schema }) as unknown as AtrisDatabase);
+    const attemptWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
+    const attemptMission = await attemptManager.createMission({ id: 'attempt-mission', workspaceId: attemptWorkspace.id, title: 'Parallel research' });
+    const attemptTasks = await Promise.all([0, 1, 2].map((index) => attemptManager.createTask({
+      id: `attempt-task-${index}`,
+      missionId: attemptMission.id,
+      title: `Research ${index}`,
+      assignedRole: 'researcher',
+    })));
+    const claimedAttempts = await Promise.all(attemptTasks.map((task, index) => attemptManager.claimTaskAttempt({
+      taskId: task.id,
+      missionId: attemptMission.id,
+      agentInstanceId: `researcher-${index}`,
+      leaseExpiresAt: '2026-08-30T01:05:00.000Z',
+      now: '2026-08-30T01:00:00.000Z',
+    })));
+    assert(claimedAttempts.length === 3 && claimedAttempts.every((attempt) => attempt.attemptNumber === 1), 'parallel task attempts are claimed through a synchronous SQLite transaction');
+    const retryAttempt = await attemptManager.claimTaskAttempt({
+      taskId: attemptTasks[0].id,
+      missionId: attemptMission.id,
+      agentInstanceId: 'researcher-retry',
+      leaseExpiresAt: '2026-08-30T01:10:00.000Z',
+      now: '2026-08-30T01:05:00.000Z',
+    });
+    assert(retryAttempt.attemptNumber === 2, 'task attempt numbering remains atomic across retries');
+    sqlite.close();
 
     assert(isValidGitCommitSha('0123456789abcdef0123456789abcdef01234567'), '40-character Git commit SHA is accepted');
     assert(!isValidGitCommitSha('0123456789abcdef0123456789abcdef0123456'), 'Short Git commit ref is rejected');
@@ -337,6 +388,53 @@ async function runTests() {
     assert(nestedMerge.success, 'Nested Builder result merges back to the owning project');
     assert(fs.readFileSync(path.join(atrisTracker, 'tracker.ts'), 'utf8').includes('fixed'), 'AtrisTracker receives the Builder change');
     assert(fs.readFileSync(path.join(siblingProject, 'sibling.ts'), 'utf8').includes('untouched'), 'Sibling project remains untouched by Builder apply');
+
+    // An interrupted request must be safe to retry after the owning Git merge
+    // committed but before the approval outbox was finalized.
+    const operationRepo = path.join(tmpDir, 'operation-repo');
+    fs.mkdirSync(operationRepo, { recursive: true });
+    runGit(operationRepo, ['init', '--quiet']);
+    fs.writeFileSync(path.join(operationRepo, 'operation.ts'), 'export const applied = false;\n');
+    commitAll(operationRepo, 'Operation baseline');
+    const operationWorktree = await worktreeManager.createWorktree(
+      operationRepo,
+      'atris/mission-operation/task-merge',
+    );
+    fs.writeFileSync(path.join(operationWorktree, 'operation.ts'), 'export const applied = true;\n');
+    const operationKey = 'approval:operation-retry:1:task:merge';
+    const firstOperationMerge = await worktreeManager.merge(
+      operationWorktree,
+      undefined,
+      operationRepo,
+      { idempotencyKey: operationKey },
+    );
+    const firstOperationHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: operationRepo,
+      windowsHide: true,
+      encoding: 'utf-8',
+    }).trim();
+    assert(firstOperationMerge.success, 'Operation-aware Git merge succeeds');
+    assert(execFileSync('git', ['log', '-1', '--format=%B'], {
+      cwd: operationRepo,
+      windowsHide: true,
+      encoding: 'utf-8',
+    }).includes(`AtrisAgent-Operation: ${operationKey}`), 'Git merge commit records the operation idempotency marker');
+
+    await worktreeManager.removeWorktree(operationWorktree, true, operationRepo);
+    const secondOperationMerge = await worktreeManager.merge(
+      operationWorktree,
+      undefined,
+      operationRepo,
+      { idempotencyKey: operationKey },
+    );
+    const secondOperationHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: operationRepo,
+      windowsHide: true,
+      encoding: 'utf-8',
+    }).trim();
+    assert(secondOperationMerge.success && secondOperationMerge.output.includes('already applied'), 'Retry detects an already-applied Git operation');
+    assert(firstOperationHead === secondOperationHead, 'Idempotent merge retry does not create a second merge commit');
+    assert(!fs.existsSync(operationWorktree), 'Operation-aware worktree is cleaned up successfully');
 
     await worktreeManager.removeWorktree(nestedTaskWorktree, true, projectContainer);
     assert(!fs.existsSync(nestedTaskWorktree), 'Nested linked worktree is cleaned up from its owning repository');

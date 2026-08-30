@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, real, primaryKey, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
 import type {
   MissionStatus,
   ExecutionMode,
@@ -144,14 +145,21 @@ export const taskAttempts = sqliteTable('task_attempts', {
     .references(() => missions.id, { onDelete: 'cascade' }),
   agentInstanceId: text('agent_instance_id').notNull(),
   attemptNumber: integer('attempt_number').notNull().default(1),
-  status: text('status').notNull().default('running'),
+  status: text('status').$type<import('@atris-agent-code/domain').TaskAttempt['status']>().notNull().default('running'),
   worktreePath: text('worktree_path'),
+  runtimeSessionId: text('runtime_session_id'),
+  heartbeatAt: text('heartbeat_at'),
+  leaseExpiresAt: text('lease_expires_at'),
+  retryable: integer('retryable', { mode: 'boolean' }).notNull().default(false),
+  claimedAt: text('claimed_at').notNull(),
   startedAt: text('started_at').notNull(),
   completedAt: text('completed_at'),
   error: text('error'),
   resultSummary: text('result_summary'),
   reviewPack: text('review_pack', { mode: 'json' }).$type<Record<string, unknown>>(),
-});
+}, (table) => ({
+  taskAttemptNumber: uniqueIndex('idx_task_attempts_task_number').on(table.taskId, table.attemptNumber),
+}));
 
 export const accountProfiles = sqliteTable('account_profiles', {
   id: text('id').primaryKey(),
@@ -192,7 +200,31 @@ export const agentInstances = sqliteTable('agent_instances', {
   runtimeAdapterId: text('runtime_adapter_id').default(''),
   sessionId: text('session_id'),
   status: text('status').default('idle'),
+  taskId: text('task_id'),
+  parentAgentId: text('parent_agent_id'),
+  displayName: text('display_name'),
+  specialty: text('specialty'),
+  spawnReason: text('spawn_reason'),
+  statusMessage: text('status_message'),
+  progress: integer('progress'),
+  workspaceMode: text('workspace_mode'),
+  startedAt: text('started_at'),
+  completedAt: text('completed_at'),
   createdAt: text('created_at').notNull(),
+});
+
+export const agentMessages = sqliteTable('agent_messages', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id')
+    .notNull()
+    .references(() => missions.id, { onDelete: 'cascade' }),
+  fromAgentId: text('from_agent_id').notNull(),
+  toAgentId: text('to_agent_id').notNull(),
+  content: text('content').notNull(),
+  createdAt: text('created_at').notNull(),
+  readAt: text('read_at'),
+  kind: text('kind').$type<'message' | 'handoff' | 'review_request' | 'summary'>().notNull().default('message'),
+  replyToMessageId: text('reply_to_message_id'),
 });
 
 export const teamTemplates = sqliteTable('team_templates', {
@@ -224,7 +256,11 @@ export const resourceLeases = sqliteTable('resource_leases', {
   heartbeatAt: text('heartbeat_at').notNull(),
   status: text('status').default('active'),
   metadata: text('metadata', { mode: 'json' }).$type<Record<string, unknown>>(),
-});
+}, (table) => ({
+  activeResource: uniqueIndex('idx_resource_leases_active_resource')
+    .on(table.resourceType, table.resourceId)
+    .where(sql`${table.status} = 'active'`),
+}));
 
 export const approvals = sqliteTable('approvals', {
   id: text('id').primaryKey(),
@@ -375,6 +411,8 @@ export type TaskAttemptInsert = typeof taskAttempts.$inferInsert;
 
 export type AgentInstanceSelect = typeof agentInstances.$inferSelect;
 export type AgentInstanceInsert = typeof agentInstances.$inferInsert;
+export type AgentMessageSelect = typeof agentMessages.$inferSelect;
+export type AgentMessageInsert = typeof agentMessages.$inferInsert;
 
 export type AccountProfileSelect = typeof accountProfiles.$inferSelect;
 export type AccountProfileInsert = typeof accountProfiles.$inferInsert;

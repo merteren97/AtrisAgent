@@ -168,8 +168,9 @@ export function Sidebar() {
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
   const [deletingMissionId, setDeletingMissionId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
-  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
+  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, forgetMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
   const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput, deleteMission } = useMissionStore();
   const agents = useAgentStore((state) => state.agents);
   const selectedAgentId = useAgentStore((state) => state.selectedAgentId);
@@ -280,10 +281,15 @@ export function Sidebar() {
   const handleDeleteConversation = async () => {
     const mission = pendingDeleteMission;
     if (!mission || !canDeleteConversation(mission)) return;
+    setDeleteError(null);
     setDeletingMissionId(mission.id);
     const deleted = await deleteMission(mission.id);
     setDeletingMissionId(null);
-    if (!deleted) return;
+    if (!deleted) {
+      setDeleteError(useMissionStore.getState().error || 'Conversation deletion failed.');
+      return;
+    }
+    forgetMission(mission.workspaceId, mission.id);
     setPendingDeleteMission(null);
     if (mission.id === activeMissionId) {
       setComposerInput('');
@@ -466,8 +472,9 @@ export function Sidebar() {
                             <DropdownMenuTrigger asChild>
                               <button
                                 type="button"
-                                className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-0 transition-opacity hover:bg-sidebar hover:text-sidebar-foreground focus:opacity-100 focus:outline-none group-hover/conversation:opacity-100 data-[state=open]:opacity-100"
+                                className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted transition-colors hover:bg-sidebar hover:text-sidebar-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground"
                                 aria-label={`Conversation actions for ${mission.title}`}
+                                title="Conversation actions"
                               >
                                 <MoreHorizontal className="h-3.5 w-3.5" />
                               </button>
@@ -476,7 +483,11 @@ export function Sidebar() {
                               <DropdownMenuItem
                                 variant={deletable ? 'destructive' : 'default'}
                                 disabled={!deletable}
-                                onSelect={() => deletable && setPendingDeleteMission(mission)}
+                                onSelect={() => {
+                                  if (!deletable) return;
+                                  setDeleteError(null);
+                                  setPendingDeleteMission(mission);
+                                }}
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
                                 {deletable ? 'Delete conversation' : 'Stop before deleting'}
@@ -575,7 +586,12 @@ export function Sidebar() {
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
 
-      <Dialog open={Boolean(pendingDeleteMission)} onOpenChange={(open) => !open && !deletingMissionId && setPendingDeleteMission(null)}>
+      <Dialog open={Boolean(pendingDeleteMission)} onOpenChange={(open) => {
+        if (!open && !deletingMissionId) {
+          setDeleteError(null);
+          setPendingDeleteMission(null);
+        }
+      }}>
         <DialogContent className="sm:max-w-[440px]">
           <DialogHeader>
             <div className="mb-1 flex h-9 w-9 items-center justify-center rounded-lg border border-destructive/25 bg-destructive/10 text-destructive">
@@ -594,8 +610,14 @@ export function Sidebar() {
             </div>
           )}
 
+          {deleteError && (
+            <div role="alert" className="rounded-lg border border-destructive/25 bg-destructive/10 px-3 py-2.5 text-xs leading-relaxed text-destructive">
+              {deleteError}
+            </div>
+          )}
+
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingDeleteMission(null)} disabled={Boolean(deletingMissionId)}>Cancel</Button>
+            <Button variant="outline" onClick={() => { setDeleteError(null); setPendingDeleteMission(null); }} disabled={Boolean(deletingMissionId)}>Cancel</Button>
             <Button variant="destructive" onClick={() => void handleDeleteConversation()} disabled={!pendingDeleteMission || Boolean(deletingMissionId)}>
               {deletingMissionId ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Trash2 className="mr-2 h-3.5 w-3.5" />}
               Delete conversation

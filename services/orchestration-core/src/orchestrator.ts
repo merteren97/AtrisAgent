@@ -1,6 +1,6 @@
 import type { LocalEventBus, Unsubscribe } from '@atris-agent-code/event-bus';
-import type { AtrisDatabase, TaskSelect, MissionSelect, TaskAttemptInsert } from '@atris-agent-code/database';
-import { approvals as approvalsTable, taskAttempts as taskAttemptsTable } from '@atris-agent-code/database';
+import type { AtrisDatabase, TaskSelect, MissionSelect } from '@atris-agent-code/database';
+import { approvals as approvalsTable } from '@atris-agent-code/database';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import type {
   AgentEvent,
@@ -19,7 +19,7 @@ export interface OrchestratorConfig {
   db?: AtrisDatabase;
   workspaceManager?: WorkspaceManager;
   maxTaskRetries?: number;
-  applyTaskChanges?: (taskId: string) => Promise<{ success: boolean; output?: string; filesChanged?: number; checkpointId?: string }>;
+  applyTaskChanges?: (taskId: string, operation?: ApplyTaskChangesContext) => Promise<{ success: boolean; output?: string; filesChanged?: number; checkpointId?: string }>;
 }
 
 export interface StructuredTaskPlan {
@@ -64,6 +64,12 @@ export const StructuredPlanJSONSchema = {
 };
 
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+export interface ApplyTaskChangesContext {
+  operationId?: string;
+  idempotencyKey?: string;
+}
+const TERMINAL_TASK_STATUSES = new Set(['done', 'superseded', 'cancelled', 'rejected']);
+const ACTIVE_TASK_STATUSES = new Set(['claimed', 'running', 'review', 'revision_requested', 'verified', 'applied']);
 
 /**
  * Generate default rule-based task template.
@@ -186,7 +192,14 @@ export function validateAndRepairPlan(rawPlan: any, userRequest: string): Struct
 
       let dependsOnIndices: number[] = [];
       if (Array.isArray(task?.dependsOnIndices)) {
-        dependsOnIndices = task.dependsOnIndices.filter((i: unknown) => typeof i === 'number' && i >= 0 && i < index);
+        // Keep forward and self references visible so malformed cycles cannot
+        // be repaired into an accidental dependency-free root.
+        dependsOnIndices = task.dependsOnIndices.filter((i: unknown) => (
+          typeof i === 'number'
+          && Number.isInteger(i)
+          && i >= 0
+          && i < rawPlan.tasks.length
+        ));
       } else if (index > 0 && (!task?.dependsOn || task.dependsOn.length === 0)) {
         dependsOnIndices = [index - 1];
       }
@@ -233,6 +246,7 @@ export class Orchestrator {
   private inMemoryTasks: Map<string, TaskSelect> = new Map();
   private inMemoryMissions: Map<string, MissionSelect> = new Map();
   private handledRuntimeTerminalSessions = new Set<string>();
+  private reconciledRejectedTaskFailures = new Set<string>();
   private unsubscribeEvents?: Unsubscribe;
   private applyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
 
@@ -279,6 +293,14 @@ export class Orchestrator {
 
   setWorkspaceManager(wm: WorkspaceManager): void {
     this.workspaceManager = wm;
+  }
+
+  /**
+   * V2 overrides this hook to fence durable task transitions against a
+   * cancelled or superseded run. Legacy orchestration has no additional fence.
+   */
+  protected async assertTaskCompletionCurrent(_event: TaskCompleted): Promise<void> {
+    // Intentionally empty for the legacy orchestrator.
   }
 
   private subscribeToEvents(): void {
@@ -467,6 +489,70 @@ export class Orchestrator {
     return planId ? tasks.filter((task) => task.planId === planId) : tasks;
   }
 
+  private dependencyFreeRoots(tasks: TaskSelect[]): TaskSelect[] {
+    return tasks.filter((task) => (
+      (task.status === 'planned' || task.status === 'ready')
+      && (!task.dependsOn || (task.dependsOn as string[]).length === 0)
+    ));
+  }
+
+  private async failBlockedPlan(missionId: string, planId: string | null, tasks: TaskSelect[]): Promise<void> {
+    const now = new Date().toISOString();
+    const blockers = tasks.map((task) => {
+      const dependencies = (task.dependsOn as string[]) || [];
+      return `${task.id} waits for ${dependencies.length > 0 ? dependencies.join(', ') : 'no-runnable-transition'}`;
+    }).join('; ');
+    const reason = `Plan ${planId || 'unknown'} has no active or dispatchable tasks and no dependency-free root tasks. Dependency graph is blocked: ${blockers}.`;
+
+    if (this.workspaceManager) {
+      await this.workspaceManager.updateMission(missionId, { status: 'failed', completedAt: now });
+    }
+    const cachedMission = this.inMemoryMissions.get(missionId);
+    if (cachedMission) {
+      this.inMemoryMissions.set(missionId, {
+        ...cachedMission,
+        status: 'failed',
+        completedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    console.warn(`[Orchestrator] Mission ${missionId} plan ${planId || 'unknown'} failed: no dependency-free roots; no tasks dispatched.`);
+    this.emitMissionFailed({ missionId, reason, failedTaskId: tasks[0]?.id ?? null });
+  }
+
+  private async failRejectedTaskMission(missionId: string, taskId: string, error: string): Promise<void> {
+    const mission = this.workspaceManager
+      ? await this.workspaceManager.getMission(missionId)
+      : this.inMemoryMissions.get(missionId);
+    if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status))) return;
+
+    const now = new Date().toISOString();
+    if (this.workspaceManager) {
+      await this.workspaceManager.updateMission(missionId, { status: 'failed', completedAt: now });
+    }
+
+    const cachedTask = this.inMemoryTasks.get(taskId);
+    if (cachedTask && cachedTask.status !== 'rejected') {
+      this.inMemoryTasks.set(taskId, { ...cachedTask, status: 'rejected', updatedAt: now });
+    }
+    const cachedMission = this.inMemoryMissions.get(missionId);
+    if (cachedMission) {
+      this.inMemoryMissions.set(missionId, {
+        ...cachedMission,
+        status: 'failed',
+        completedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    this.emitMissionFailed({
+      missionId,
+      reason: `Task ${taskId} was rejected by the runtime and failed before execution could continue: ${error}`,
+      failedTaskId: taskId,
+    });
+  }
+
   /**
    * Generate structured plan and repair if invalid.
    */
@@ -633,11 +719,21 @@ export class Orchestrator {
     const createdTasks: TaskSelect[] = [];
     const taskIndexToIds: Map<number, string[]> = new Map();
 
+    // Allocate every task ID before resolving dependencies so forward edges
+    // remain attached to their eventual task records.
+    for (let i = 0; i < structuredPlan.tasks.length; i++) {
+      const taskSpec = structuredPlan.tasks[i];
+      const isCandidate = currentExecutionMode === 'candidate' && taskSpec.role === 'builder';
+      const tasksToCreateCount = isCandidate ? 2 : 1;
+      taskIndexToIds.set(i, Array.from({ length: tasksToCreateCount }, () => crypto.randomUUID()));
+    }
+
     // Build tasks (and candidate worktrees if candidate mode)
     for (let i = 0; i < structuredPlan.tasks.length; i++) {
       const taskSpec = structuredPlan.tasks[i];
       const isCandidate = currentExecutionMode === 'candidate' && taskSpec.role === 'builder';
       const tasksToCreateCount = isCandidate ? 2 : 1;
+      const taskIdsForIndex = taskIndexToIds.get(i) ?? [];
 
       // Resolve dependency task IDs from indices
       const dependsOnTaskIds: string[] = [];
@@ -647,10 +743,8 @@ export class Orchestrator {
         dependsOnTaskIds.push(...parentIds);
       }
 
-      const currentTaskIdsForIndex: string[] = [];
-
       for (let j = 0; j < tasksToCreateCount; j++) {
-        const taskId = crypto.randomUUID();
+        const taskId = taskIdsForIndex[j];
         const candidateSuffix = isCandidate ? (j === 0 ? ' (Candidate A)' : ' (Candidate B)') : '';
         const title = taskSpec.title + candidateSuffix;
         const worktreeId = isCandidate ? (j === 0 ? `candidate-a-${taskId}` : `candidate-b-${taskId}`) : null;
@@ -693,10 +787,7 @@ export class Orchestrator {
 
         this.inMemoryTasks.set(taskId, taskRecord);
         createdTasks.push(taskRecord);
-        currentTaskIdsForIndex.push(taskId);
       }
-
-      taskIndexToIds.set(i, currentTaskIdsForIndex);
     }
 
     // STATE: Planning -> Ready (Plan Generated)
@@ -727,6 +818,17 @@ export class Orchestrator {
         changedTaskIds: createdTasks.map((task) => task.id),
         timestamp: new Date().toISOString(),
       });
+    }
+
+    const firstTasks = this.dependencyFreeRoots(createdTasks);
+    if (createdTasks.length > 0 && firstTasks.length === 0) {
+      await this.failBlockedPlan(missionId, planId, createdTasks);
+      return {
+        missionId,
+        planId,
+        tasks: createdTasks,
+        structuredPlan,
+      };
     }
 
     // 4. Policy Engine check for Plan Approval
@@ -781,13 +883,10 @@ export class Orchestrator {
       });
     }
 
-    // Start first ready task(s)
-    if (createdTasks.length > 0) {
-      const firstTasks = createdTasks.filter(
-        (t) => !t.dependsOn || (t.dependsOn as string[]).length === 0
-      );
-      const startTasks = firstTasks.length > 0 ? firstTasks : [createdTasks[0]];
-      for (const taskToStart of startTasks) {
+    // Start first ready task(s); a plan without roots was failed before Running.
+    if (firstTasks.length > 0) {
+      console.info(`[Orchestrator] Mission ${missionId} plan ${planId} dispatching root task(s): ${firstTasks.map((task) => task.id).join(', ')}`);
+      for (const taskToStart of firstTasks) {
         await this.assignTask(taskToStart.id, taskToStart.assignedRole ?? 'researcher');
       }
     }
@@ -899,11 +998,34 @@ export class Orchestrator {
     const task = this.workspaceManager
       ? await this.workspaceManager.getTask(event.taskId)
       : this.inMemoryTasks.get(event.taskId);
+    // A higher-level reconciler may persist the current completion before
+    // delegating this event; only that matching in-flight handoff may proceed.
+    // ISO timestamps have millisecond precision, so equal values are possible.
+    const isCurrentCompletionFence = task?.status === 'done'
+      && event.type === 'task_completed'
+      && Boolean(event.agentInstanceId)
+      && task.assignedAgentId === event.agentInstanceId
+      && ((task.completedAt !== null && task.completedAt >= event.timestamp)
+        || task.updatedAt >= event.timestamp);
     const agentInstanceId = event.agentInstanceId;
-    if (!agentInstanceId) return false;
+    if (agentInstanceId && this.handledRuntimeTerminalSessions.has(agentInstanceId)) return true;
+    if (agentInstanceId && task?.assignedAgentId && task.assignedAgentId !== agentInstanceId) return true;
 
-    if (this.handledRuntimeTerminalSessions.has(agentInstanceId)) return true;
-    if (task?.assignedAgentId && task.assignedAgentId !== agentInstanceId) return true;
+    if (task?.status === 'rejected' && event.type === 'task_failed') {
+      const failureKey = `${event.missionId}:${event.taskId}`;
+      if (this.reconciledRejectedTaskFailures.has(failureKey)) return true;
+      this.reconciledRejectedTaskFailures.add(failureKey);
+      try {
+        await this.failRejectedTaskMission(event.missionId, event.taskId, event.error);
+      } catch (error) {
+        this.reconciledRejectedTaskFailures.delete(failureKey);
+        throw error;
+      }
+      return true;
+    }
+
+    if (task && TERMINAL_TASK_STATUSES.has(String(task.status)) && !isCurrentCompletionFence) return true;
+    if (!agentInstanceId) return false;
 
     // Fence this runtime attempt before the state transition awaits. Runtime
     // adapters may report both an explicit turn failure and a non-zero process
@@ -919,6 +1041,8 @@ export class Orchestrator {
    */
   async handleTaskCompleted(event: TaskCompleted): Promise<void> {
     if (await this.shouldIgnoreRuntimeTerminalEvent(event)) return;
+
+    await this.assertTaskCompletionCurrent(event);
 
     const { taskId, missionId } = event;
     const now = new Date().toISOString();
@@ -958,6 +1082,7 @@ export class Orchestrator {
     }
 
     if (allTasks.length === 0) {
+      await this.assertTaskCompletionCurrent(event);
       this.emitMissionCompleted({
         missionId,
         summary: `Task ${taskId} completed successfully`,
@@ -973,6 +1098,7 @@ export class Orchestrator {
 
     // 3. All execution tasks are finished. Review and apply are separate, auditable stages.
     if (terminalTasksCount === allTasks.length) {
+      await this.assertTaskCompletionCurrent(event);
       const mission = this.workspaceManager
         ? await this.workspaceManager.getMission(missionId)
         : this.inMemoryMissions.get(missionId);
@@ -983,6 +1109,7 @@ export class Orchestrator {
       const qaTasks = allTasks.filter((task) => task.assignedRole === 'qa');
       const qaDone = qaTasks.length === 0 || qaTasks.every((task) => task.status === 'done');
 
+      await this.assertTaskCompletionCurrent(event);
       if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'reviewing' });
       const cachedMission = this.inMemoryMissions.get(missionId);
       if (cachedMission) this.inMemoryMissions.set(missionId, { ...cachedMission, status: 'reviewing', updatedAt: now });
@@ -1039,7 +1166,9 @@ export class Orchestrator {
       if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'applying' });
       const builderTasks = allTasks.filter((task) => task.assignedRole === 'builder' && task.status === 'done');
       for (const builderTask of builderTasks) {
+        await this.assertTaskCompletionCurrent(event);
         const result = await this.applyTaskChanges(builderTask.id);
+        await this.assertTaskCompletionCurrent(event);
         if (!result.success) {
           if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'blocked' });
           this.emitMissionFailed({
@@ -1061,7 +1190,9 @@ export class Orchestrator {
       }
 
       if (this.workspaceManager) {
+        await this.assertTaskCompletionCurrent(event);
         await this.workspaceManager.updateMission(missionId, { status: 'verifying' });
+        await this.assertTaskCompletionCurrent(event);
         await this.workspaceManager.updateMission(missionId, { status: 'completed', completedAt: new Date().toISOString() });
       }
       this.emitMissionCompleted({
@@ -1087,6 +1218,12 @@ export class Orchestrator {
       ? await this.workspaceManager.getMission(missionId)
       : this.inMemoryMissions.get(missionId);
     if (currentMission && TERMINAL_MISSION_STATUSES.has(String(currentMission.status))) return;
+    const pendingTasks = allTasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
+    const hasActiveTasks = allTasks.some((task) => ACTIVE_TASK_STATUSES.has(String(task.status)));
+    if (nextTasks.length === 0 && pendingTasks.length > 0 && !hasActiveTasks) {
+      await this.failBlockedPlan(missionId, activePlanId, pendingTasks);
+      return;
+    }
     const candidateBuilders = allTasks.filter((task) => task.assignedRole === 'builder' && task.title.includes('(Candidate'));
     const candidateResolved = candidateBuilders.length > 1 && candidateBuilders.some((task) => task.status === 'superseded');
     if (currentMission?.executionMode === 'candidate' && candidateBuilders.length > 1 && !candidateResolved && nextTasks.some((task) => task.assignedRole === 'qa')) {
@@ -1192,26 +1329,6 @@ export class Orchestrator {
 
     this.taskAttempts.set(taskId, currentAttempts);
 
-    // Save TaskAttempt record if DB is available
-    if (this.db) {
-      try {
-        const newAttempt: TaskAttemptInsert = {
-          id: crypto.randomUUID(),
-          taskId,
-          missionId,
-          agentInstanceId: task?.assignedAgentId ?? 'builder-session',
-          attemptNumber: currentAttempts,
-          status: 'running',
-          worktreePath: task?.worktreeId ?? null,
-          startedAt: now,
-          error: reason,
-        };
-        await this.db.insert(taskAttemptsTable).values(newAttempt);
-      } catch (err) {
-        console.warn('[Orchestrator] Failed to insert taskAttempt record:', err);
-      }
-    }
-
     const updatedDescription = (task?.description ?? '') + `\n\n[Revision Attempt ${currentAttempts}]: ${reason}`;
 
     if (this.workspaceManager) {
@@ -1244,7 +1361,12 @@ export class Orchestrator {
     missionId: string,
     approvalType: string,
     approved: boolean,
-    options?: { selectedCandidateId?: string; reason?: string },
+    options?: {
+      selectedCandidateId?: string;
+      reason?: string;
+      operationId?: string;
+      idempotencyKey?: string;
+    },
   ): Promise<void> {
     if (!this.workspaceManager) {
       throw new Error('Approval decisions require a WorkspaceManager.');
@@ -1268,13 +1390,15 @@ export class Orchestrator {
 
     if (approvalType === 'plan') {
       const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission?.planId);
+      const pending = tasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
+      const roots = this.dependencyFreeRoots(pending);
+      if (pending.length > 0 && roots.length === 0) {
+        await this.failBlockedPlan(missionId, mission?.planId || tasks[0]?.planId || null, pending);
+        return;
+      }
       await this.workspaceManager.updateMission(missionId, { status: 'running' });
-      const ready = tasks.filter((task) => {
-        if (task.status !== 'planned' && task.status !== 'ready') return false;
-        const dependencies = (task.dependsOn as string[]) || [];
-        return dependencies.length === 0;
-      });
-      for (const task of ready) {
+      console.info(`[Orchestrator] Mission ${missionId} plan ${mission?.planId || tasks[0]?.planId || 'unknown'} dispatching root task(s): ${roots.map((task) => task.id).join(', ') || 'none'}`);
+      for (const task of roots) {
         await this.assignTask(task.id, task.assignedRole ?? undefined);
       }
       return;
@@ -1297,7 +1421,15 @@ export class Orchestrator {
 
       await this.workspaceManager.updateMission(missionId, { status: 'applying' });
       for (const task of tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
-        const result = await this.applyTaskChanges(task.id);
+        const operation = options?.operationId || options?.idempotencyKey
+          ? {
+            operationId: options.operationId,
+            idempotencyKey: options.idempotencyKey
+              ? `${options.idempotencyKey}:task:${task.id}`
+              : undefined,
+          }
+          : undefined;
+        const result = await this.applyTaskChanges(task.id, operation);
         if (!result.success) {
           await this.workspaceManager.updateMission(missionId, { status: 'blocked' });
           throw new Error(result.output || `Applying task ${task.id} failed.`);

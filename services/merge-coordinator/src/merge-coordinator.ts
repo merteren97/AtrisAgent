@@ -26,6 +26,11 @@ export interface RollbackContext {
   missionId: string;
 }
 
+export interface ApplyOperationContext {
+  operationId?: string;
+  idempotencyKey?: string;
+}
+
 export class MergeCoordinator {
   private generator: ReviewPackGenerator;
 
@@ -48,6 +53,7 @@ export class MergeCoordinator {
   async applyWorktree(
     taskId: string,
     targetBranch?: string,
+    operation?: ApplyOperationContext,
   ): Promise<MergeResult> {
     const task = await this.workspaceManager.getTask(taskId);
     if (!task) throw new Error(`Task with ID "${taskId}" not found`);
@@ -62,9 +68,12 @@ export class MergeCoordinator {
     const basePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, workspace.path);
 
     const checkpointManager = this.workspaceManager.getCheckpointManager();
+    const checkpointLabel = operation?.idempotencyKey
+      ? `pre-merge-task-${taskId}-${operation.idempotencyKey}`
+      : `pre-merge-task-${taskId}`;
     const checkpointId = await checkpointManager.createCheckpoint(
       basePath,
-      `pre-merge-task-${taskId}`,
+      checkpointLabel,
       {
         missionId: task.missionId,
         workspaceId: mission.workspaceId,
@@ -72,7 +81,7 @@ export class MergeCoordinator {
       },
     );
 
-    const mergeOutput = await worktreeManager.merge(task.worktreeId, targetBranch, basePath);
+    const mergeOutput = await worktreeManager.merge(task.worktreeId, targetBranch, basePath, operation);
     const isConflict = !mergeOutput.success && (
       mergeOutput.output.includes('CONFLICT')
       || mergeOutput.output.includes('Automatic merge failed')

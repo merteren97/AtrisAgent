@@ -36,6 +36,7 @@ async function runTests() {
     fs.writeFileSync(path.join(wtPath, 'package.json'), JSON.stringify({ name: 'test', dependencies: { 'express': '^4.18.2' } }));
     fs.writeFileSync(path.join(wtPath, 'new-file.ts'), 'console.log("new file");');
 
+    let checkpointLabel = '';
     const mockWorkspaceManager = {
       getTask: async (id: string) => ({
         id,
@@ -48,7 +49,10 @@ async function runTests() {
       getWorkspace: async (id: string) => ({ id, path: wsPath }),
       getWorktreeManager: () => worktreeManager,
       getCheckpointManager: () => ({
-        createCheckpoint: async () => 'chk-mock-123',
+        createCheckpoint: async (_workspacePath: string, label: string) => {
+          checkpointLabel = label;
+          return 'chk-mock-123';
+        },
         restoreCheckpoint: async () => {},
       }),
     } as unknown as WorkspaceManager;
@@ -69,10 +73,14 @@ async function runTests() {
     assert(pack.buildResult?.passed === true, 'Build result attached correctly');
 
     // Test 2: Apply Worktree & Pre-Merge Checkpoint
-    const mergeResult = await coordinator.applyWorktree('t1');
+    const mergeResult = await coordinator.applyWorktree('t1', undefined, {
+      operationId: 'approval-1',
+      idempotencyKey: 'approval:approval-1:1:task:t1',
+    });
     assert(mergeResult.success === true, 'Apply worktree succeeds');
     assert(mergeResult.status === 'Merged', 'Status is Merged');
     assert(mergeResult.checkpointId === 'chk-mock-123', 'Pre-merge checkpoint ID returned');
+    assert(checkpointLabel.includes('approval:approval-1:1:task:t1'), 'Apply operation idempotency key is carried into the durable checkpoint label');
     assert(fs.existsSync(path.join(wsPath, 'new-file.ts')), 'Merged files reflected in main workspace');
 
   } finally {

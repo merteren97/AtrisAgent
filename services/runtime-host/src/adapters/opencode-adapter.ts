@@ -455,7 +455,10 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       });
       this.emitEvent({ id: crypto.randomUUID(), type: 'agent_started', missionId: options.missionId, agentInstanceId, role: String(options.role || 'builder'), model: options.model || 'OpenCode default', timestamp: new Date().toISOString() });
 
-      this.startEventStream(agentInstanceId, server).catch((error) => this.emitFailure(agentInstanceId, error.message));
+      this.startEventStream(agentInstanceId, server).catch((error) => {
+        this.emitFailure(agentInstanceId, error.message);
+        this.cleanupSession(agentInstanceId);
+      });
       const model = this.parseModelRoute(options.model);
       const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
       const response = await this.fetchServer(server, `/session/${encodeURIComponent(runtimeSessionId)}/prompt_async`, {
@@ -542,7 +545,14 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       process: child,
       dedicated: Boolean(controlPlane),
     };
-    child.on('close', () => { if (this.servers.get(key)?.process === child) this.servers.delete(key); });
+    child.on('close', () => {
+      if (this.servers.get(key)?.process === child) this.servers.delete(key);
+      for (const [sessionId, context] of this.sessionContext.entries()) {
+        if (context.serverKey !== key) continue;
+        this.emitFailure(sessionId, 'OpenCode server exited before the session reported a terminal result.');
+        this.cleanupSession(sessionId);
+      }
+    });
     this.servers.set(key, instance);
     const health = await Promise.race([
       waitForHttp(`${instance.url}/global/health`, { headers: { Authorization: basicAuthHeader(username, password) } }, 15_000),
@@ -591,6 +601,9 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         if (!data) continue;
         try { this.handleServerEvent(sessionId, JSON.parse(data)); } catch { /* ignore malformed SSE */ }
       }
+    }
+    if (!controller.signal.aborted && this.activeSessions.has(sessionId)) {
+      throw new Error('OpenCode event stream ended before the session reported a terminal result.');
     }
   }
 

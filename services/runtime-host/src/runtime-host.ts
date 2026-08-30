@@ -45,6 +45,7 @@ export interface MissionRoutingPreference {
 export interface RuntimeHostConfig {
   maxConcurrentSessions?: number;
   sessionTimeout?: number;
+  watchdogInterval?: number;
   defaultAdapterId?: string;
   workspacePath?: string;
   workspaceManager?: WorkspaceManager;
@@ -64,6 +65,7 @@ export class RuntimeHost {
     queuedAt: number;
     startedAt: number;
     retryCount: number;
+    attemptId?: string;
     role?: AgentRole | string;
   }>();
   private scheduler: Scheduler;
@@ -73,8 +75,11 @@ export class RuntimeHost {
   private unsubscribeRuntimeApproval?: Unsubscribe;
   private unsubscribeMissionTerminal?: Unsubscribe;
   private unsubscribeTaskTerminal?: Unsubscribe;
+  private unsubscribeRuntimeActivity?: Unsubscribe;
   private missionRouting = new Map<string, MissionRoutingPreference>();
-  private taskAttemptCounts = new Map<string, number>();
+  private watchdog?: ReturnType<typeof setInterval>;
+  private watchdogRunning = false;
+  private finishingSessions = new Set<string>();
   private pendingRuntimeApprovals = new Map<string, {
     missionId: string;
     taskId?: string;
@@ -98,6 +103,11 @@ export class RuntimeHost {
     this.registerAdapter(new OpenCodeAdapter(this.eventBus));
     this.scheduler = new Scheduler({ availableAdapters: [...this.adapters.keys()] });
     if (this.eventBus) this.subscribeToEventBus(this.eventBus);
+    const interval = this.config.watchdogInterval ?? Math.min(this.sessionTimeoutMs(), 30_000);
+    if (interval > 0) {
+      this.watchdog = setInterval(() => { void this.runSessionWatchdog(); }, interval);
+      this.watchdog.unref?.();
+    }
   }
 
   setEventBus(eventBus: LocalEventBus): void {
@@ -167,40 +177,59 @@ export class RuntimeHost {
     const failed = eventBus.on('mission_failed', clearRouting);
     this.unsubscribeMissionTerminal = () => { completed(); failed(); };
 
-    const taskCompleted = eventBus.on('task_completed', (event) => {
+    const taskCompleted = eventBus.on('task_completed', async (event) => {
       for (const [sessionId, active] of this.activeSessions.entries()) {
         if (active.missionId !== event.missionId || active.taskId !== event.taskId) continue;
         if (!this.isCorrelatedTerminalEvent(event, sessionId, active)) continue;
-        eventBus.emit({
-          id: crypto.randomUUID(),
-          type: 'agent_completed',
-          missionId: event.missionId,
-          agentInstanceId: sessionId,
-           summary: event.result,
-           timestamp: new Date().toISOString(),
-         });
-        void this.emitRuntimeTelemetry(event, active, 'completed');
-        this.activeSessions.delete(sessionId);
+        if (this.finishingSessions.has(sessionId)) continue;
+        this.finishingSessions.add(sessionId);
+        try {
+          await this.finishAttempt(active, 'completed', { resultSummary: event.result });
+          eventBus.emit({
+            id: crypto.randomUUID(),
+            type: 'agent_completed',
+            missionId: event.missionId,
+            agentInstanceId: sessionId,
+            summary: event.result,
+            timestamp: new Date().toISOString(),
+          });
+          void this.emitRuntimeTelemetry(event, active, 'completed');
+          this.activeSessions.delete(sessionId);
+        } finally {
+          this.finishingSessions.delete(sessionId);
+        }
       }
     });
-    const taskFailed = eventBus.on('task_failed', (event) => {
+    const taskFailed = eventBus.on('task_failed', async (event) => {
       for (const [sessionId, active] of this.activeSessions.entries()) {
         if (active.missionId !== event.missionId || active.taskId !== event.taskId) continue;
         if (!this.isCorrelatedTerminalEvent(event, sessionId, active)) continue;
-        eventBus.emit({
-          id: crypto.randomUUID(),
-          type: 'agent_error',
-          missionId: event.missionId,
-          taskId: event.taskId,
-          agentInstanceId: sessionId,
-           error: event.error,
-           timestamp: new Date().toISOString(),
-         });
-        void this.emitRuntimeTelemetry(event, active, 'failed');
-        this.activeSessions.delete(sessionId);
+        if (this.finishingSessions.has(sessionId)) continue;
+        this.finishingSessions.add(sessionId);
+        try {
+          await this.finishAttempt(active, 'failed', { error: event.error, retryable: true });
+          eventBus.emit({
+            id: crypto.randomUUID(),
+            type: 'agent_error',
+            missionId: event.missionId,
+            taskId: event.taskId,
+            agentInstanceId: sessionId,
+            error: event.error,
+            timestamp: new Date().toISOString(),
+          });
+          void this.emitRuntimeTelemetry(event, active, 'failed');
+          this.activeSessions.delete(sessionId);
+        } finally {
+          this.finishingSessions.delete(sessionId);
+        }
       }
     });
     this.unsubscribeTaskTerminal = () => { taskCompleted(); taskFailed(); };
+    this.unsubscribeRuntimeActivity = eventBus.on('*', (event) => {
+      if (!('agentInstanceId' in event) || typeof event.agentInstanceId !== 'string') return;
+      if (!this.activeSessions.has(event.agentInstanceId)) return;
+      void this.heartbeatSession(event.agentInstanceId);
+    });
   }
 
   private unsubscribeToEventBus(): void {
@@ -212,6 +241,8 @@ export class RuntimeHost {
     this.unsubscribeMissionTerminal = undefined;
     this.unsubscribeTaskTerminal?.();
     this.unsubscribeTaskTerminal = undefined;
+    this.unsubscribeRuntimeActivity?.();
+    this.unsubscribeRuntimeActivity = undefined;
   }
 
   private isCorrelatedTerminalEvent(
@@ -464,8 +495,6 @@ export class RuntimeHost {
     const missionPreference = this.missionRouting.get(event.missionId);
     const role = (event.assignedRole || missionPreference?.targetRole || 'builder') as AgentRole;
     const task = this.workspaceManager ? await this.workspaceManager.getTask(event.taskId) : null;
-    const retryCount = (this.taskAttemptCounts.get(event.taskId) || 0) + 1;
-    this.taskAttemptCounts.set(event.taskId, retryCount);
     const queuedAt = Date.parse(event.timestamp);
     const queuedAtMs = Number.isFinite(queuedAt) ? queuedAt : Date.now();
     const eventPreference: EffectiveRoutingPreference | undefined = Boolean(
@@ -561,7 +590,18 @@ export class RuntimeHost {
               : 'Investigate and report evidence. Do not modify source files.',
     ].filter(Boolean).join('\n\n');
 
-    const session = await adapter.spawnAgent({
+    const claimedAt = new Date().toISOString();
+    const attempt = this.workspaceManager ? await this.workspaceManager.claimTaskAttempt({
+      taskId: event.taskId,
+      missionId: event.missionId,
+      agentInstanceId: event.agentInstanceId || event.taskId,
+      worktreePath: execution.worktreePath ?? null,
+      leaseExpiresAt: new Date(Date.parse(claimedAt) + this.sessionTimeoutMs()).toISOString(),
+      now: claimedAt,
+    }) : undefined;
+    let session: AgentSession;
+    try {
+      session = await adapter.spawnAgent({
       sessionId: event.agentInstanceId,
       taskId: event.taskId,
       missionId: event.missionId,
@@ -573,7 +613,26 @@ export class RuntimeHost {
       isolated: role === 'builder',
       worktreePath: execution.worktreePath,
       cwd: execution.cwd,
-    });
+      });
+    } catch (error) {
+      if (attempt && this.workspaceManager) {
+        await this.workspaceManager.finishTaskAttempt(attempt.id, 'failed', {
+          error: error instanceof Error ? error.message : String(error), retryable: true,
+        }).catch(() => undefined);
+      }
+      throw error;
+    }
+    const startedAt = Date.now();
+    if (attempt && this.workspaceManager) {
+      const heartbeatAt = new Date(startedAt).toISOString();
+      const attemptStarted = await this.workspaceManager.markTaskAttemptRunning(
+        attempt.id, session.id, heartbeatAt, new Date(startedAt + this.sessionTimeoutMs()).toISOString(),
+      );
+      if (!attemptStarted) {
+        await adapter.cancel(session.id).catch(() => undefined);
+        throw new Error(`Task attempt ${attempt.id} expired before runtime startup completed.`);
+      }
+    }
       this.activeSessions.set(session.id, {
       adapterId: adapter.id,
       session,
@@ -581,8 +640,9 @@ export class RuntimeHost {
       taskId: event.taskId,
       accountProfileId: route.profile?.id,
       queuedAt: queuedAtMs,
-      startedAt: Date.now(),
-        retryCount,
+      startedAt,
+        retryCount: attempt?.attemptNumber ?? 1,
+        attemptId: attempt?.id,
         role,
     });
     if (this.workspaceManager && task?.assignedAgentId !== session.id) {
@@ -730,7 +790,52 @@ export class RuntimeHost {
     const active = this.activeSessions.get(sessionId);
     if (!active) return;
     await this.adapters.get(active.adapterId)?.cancel(sessionId);
+    await this.finishAttempt(active, 'cancelled');
     this.activeSessions.delete(sessionId);
+  }
+
+  async heartbeatSession(sessionId: string, now = new Date()): Promise<boolean> {
+    const active = this.activeSessions.get(sessionId);
+    if (!active?.attemptId || !this.workspaceManager) return false;
+    return this.workspaceManager.heartbeatTaskAttempt(
+      active.attemptId,
+      now.toISOString(),
+      new Date(now.getTime() + this.sessionTimeoutMs()).toISOString(),
+    );
+  }
+
+  async reconcileStartup(now = new Date()): Promise<number> {
+    if (!this.workspaceManager) return 0;
+    const expired = await this.workspaceManager.expireOrphanedTaskAttempts(now.toISOString());
+    for (const attempt of expired) {
+      if (attempt.runtimeSessionId) this.activeSessions.delete(attempt.runtimeSessionId);
+    }
+    return expired.length;
+  }
+
+  async runSessionWatchdog(now = new Date()): Promise<number> {
+    if (!this.workspaceManager) return 0;
+    if (this.watchdogRunning) return 0;
+    this.watchdogRunning = true;
+    try {
+      const expired = await this.workspaceManager.expireStaleTaskAttempts(now.toISOString(), now.toISOString());
+      for (const attempt of expired) {
+        const sessionId = attempt.runtimeSessionId;
+        const active = sessionId ? this.activeSessions.get(sessionId) : undefined;
+        if (active) {
+          await this.adapters.get(active.adapterId)?.cancel(sessionId!).catch(() => undefined);
+          this.activeSessions.delete(sessionId!);
+        }
+        this.eventBus?.emit({
+          id: crypto.randomUUID(), type: 'task_failed', missionId: attempt.missionId,
+          taskId: attempt.taskId, agentInstanceId: attempt.agentInstanceId,
+          error: attempt.error || 'Runtime session timed out', timestamp: now.toISOString(),
+        });
+      }
+      return expired.length;
+    } finally {
+      this.watchdogRunning = false;
+    }
   }
 
   async respondToRuntimeApproval(requestId: string, decision: 'approved' | 'rejected'): Promise<void> {
@@ -791,6 +896,8 @@ export class RuntimeHost {
   }
 
   async stopAll(): Promise<void> {
+    if (this.watchdog) clearInterval(this.watchdog);
+    this.watchdog = undefined;
     for (const sessionId of [...this.activeSessions.keys()]) await this.stopSession(sessionId);
     for (const adapter of this.adapters.values()) await adapter.shutdown();
   }
@@ -818,6 +925,19 @@ export class RuntimeHost {
     if (runtimeType === 'claude_code') return 'Structured CLI stream-json';
     if (runtimeType === 'antigravity') return capabilities?.structuredEventStreaming ? 'Print mode stream-json' : 'TUI only (update required)';
     return 'Local HTTP server + SSE';
+  }
+
+  private sessionTimeoutMs(): number {
+    return Math.max(1, this.config.sessionTimeout ?? 5 * 60_000);
+  }
+
+  private async finishAttempt(
+    active: { attemptId?: string },
+    status: 'completed' | 'failed' | 'cancelled' | 'expired',
+    options: { error?: string | null; resultSummary?: string | null; retryable?: boolean } = {},
+  ): Promise<boolean> {
+    if (!active.attemptId || !this.workspaceManager) return false;
+    return this.workspaceManager.finishTaskAttempt(active.attemptId, status, options);
   }
 }
 

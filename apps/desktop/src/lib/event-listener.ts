@@ -1,5 +1,6 @@
 import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useAgentStore } from '@/stores/agent-store';
+import { useAccountStore } from '@/stores/account-store';
 import { getApiOrigin, runtimeHeaders } from '@/lib/api-client';
 import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 import { consumeSseFrames } from '@/lib/sse-parser';
@@ -69,9 +70,13 @@ export function handleIncomingEvent(eventData: any): void {
       const content = String(eventData.content || '').trim();
       if (!content) break;
       const optimisticId = optionalString(eventData.clientMessageId);
-      const optimistic = optimisticId && missions.timeline.some((item) => item.metadata?.queueId === optimisticId && item.type === 'user_message');
+      const optimistic = optimisticId && missions.timeline.some((item) => (
+        item.type === 'user_message'
+        && (item.metadata?.queueId === optimisticId || item.metadata?.clientMessageId === optimisticId)
+      ));
       if (optimistic) {
-        useMissionStore.setState((state) => ({ timeline: state.timeline.map((item) => item.metadata?.queueId === optimisticId && item.type === 'user_message'
+        useMissionStore.setState((state) => ({ timeline: state.timeline.map((item) => item.type === 'user_message'
+          && (item.metadata?.queueId === optimisticId || item.metadata?.clientMessageId === optimisticId)
           ? { ...item, id: eventData.id, metadata: { ...item.metadata, ...eventData, durable: true, turnId: eventData.turnId } }
           : item) }));
       } else if (!missions.timeline.some((item) => item.id === eventData.id)) append(eventData, content, { type: 'user_message' });
@@ -431,6 +436,25 @@ export function handleIncomingEvent(eventData: any): void {
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'failed');
       break;
 
+    case 'process_started':
+      append(eventData, `${eventData.role || 'Process'} started${eventData.model ? ` with ${eventData.model}` : ''}.`, { agentRole: eventData.role || 'orchestrator' });
+      break;
+    case 'process_output_delta':
+      append(eventData, eventData.content || '', { agentRole: eventData.role || 'orchestrator' });
+      break;
+    case 'process_tool_started':
+      append(eventData, `Tool started: ${eventData.toolName || 'tool'}`, { agentRole: eventData.role || 'orchestrator' });
+      break;
+    case 'process_tool_completed':
+      append(eventData, `${eventData.toolName || 'Tool'} ${eventData.success ? 'completed' : 'failed'}.`, { agentRole: eventData.role || 'orchestrator' });
+      break;
+    case 'process_completed':
+      append(eventData, eventData.summary || 'Process completed.', { agentRole: eventData.role || 'orchestrator' });
+      break;
+    case 'process_failed':
+      append(eventData, `Process failed: ${eventData.error || 'Unknown runtime error'}`, { agentRole: eventData.role || 'orchestrator' });
+      break;
+
     default:
       append(eventData, `Event: ${eventData.type}`);
   }
@@ -517,6 +541,7 @@ async function connectSse(): Promise<void> {
       return;
     }
     if (!response.ok || !response.body) throw new Error(`SSE connection failed with ${response.status}`);
+    useAccountStore.getState().setServiceOnline(true);
     useMissionStore.getState().setTransportStatus('connected');
     reconcileAfterGap();
     const reader = response.body.getReader();

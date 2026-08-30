@@ -14,6 +14,7 @@ import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator } from '@atris-agent-code/orchestration-core';
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { MergeCoordinator } from '@atris-agent-code/merge-coordinator';
+import { ActionBroker } from '@atris-agent-code/policy-engine';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AtrisAuthService, extractBearerHeader, installAuthRoutes } from './auth';
 import {
@@ -31,7 +32,9 @@ import {
   installRuntimeShutdownRoute,
 } from './runtime-lifecycle';
 import { cursorFromQuery, encodeEventCursor } from './event-cursor';
+import { decodeMissionCommandCursor, encodeMissionCommandCursor } from './command-cursor';
 import { persistRuntimeTelemetry } from './runtime-telemetry-store';
+import { ApprovalOutbox, type ApprovalDecision } from './approval-outbox';
 
 import path from 'path';
 import fs from 'fs';
@@ -297,6 +300,7 @@ sqlite.exec(`
 migrateDatabase(sqlite as any);
 
 const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
+const approvalOutbox = new ApprovalOutbox(sqlite);
 
 // Seed default team template
 try {
@@ -341,11 +345,12 @@ try {
 const eventBus = new LocalEventBus();
 const workspaceManager = new WorkspaceManager(db, eventBus);
 const mergeCoordinator = new MergeCoordinator(workspaceManager);
+const actionBroker = new ActionBroker();
 const orchestrator = new Orchestrator(
   {
     workspacePath: process.cwd(),
-    applyTaskChanges: async (taskId) => {
-      const result = await mergeCoordinator.applyWorktree(taskId);
+    applyTaskChanges: async (taskId, operation) => {
+      const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
       return { success: result.success, output: result.output, checkpointId: result.checkpointId };
     },
   },
@@ -668,7 +673,7 @@ async function startMissionWithDurability(missionId: string, content: string, op
       sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, missionId);
     })();
     emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
-      content, timestamp: now });
+      clientMessageId: options.clientMessageId, content, timestamp: now });
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
       content, delivery: 'queue', timestamp: now });
     const result = await orchestrator.startMission(missionId, content, { ...options, turnId, runId });
@@ -841,15 +846,33 @@ app.get('/api/mission-commands', (req: Request, res: Response) => {
     if (!workspaceId) return void res.status(400).json({ error: 'workspaceId is required' });
     const requestedLimit = Number(req.query.limit);
     const limit = Number.isInteger(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 50;
+    const cursorValue = typeof req.query.cursor === 'string' ? req.query.cursor : '';
+    const cursor = cursorValue ? decodeMissionCommandCursor(cursorValue) : null;
+    if (cursorValue && !cursor) return void res.status(400).json({ error: 'cursor is invalid' });
+    const cursorClause = cursor
+      ? ` AND (command.priority < ? OR (command.priority = ? AND (command.created_at > ?
+          OR (command.created_at = ? AND command.id > ?))))`
+      : '';
+    const queryParams: Array<string | number> = [workspaceId];
+    if (cursor) queryParams.push(cursor.priority, cursor.priority, cursor.createdAt, cursor.createdAt, cursor.commandId);
+    queryParams.push(limit + 1);
     const rows = sqlite.prepare(`SELECT command.id, command.mission_id, command.type, command.status, command.priority,
         command.created_at, command.claimed_at, command.attempt_count, turn.content, turn.delivery, mission.title AS mission_title
       FROM mission_commands command
       JOIN conversation_turns turn ON turn.id = command.turn_id
       JOIN missions mission ON mission.id = command.mission_id
       WHERE mission.workspace_id = ? AND command.status IN ('pending', 'processing')
-      ORDER BY command.priority DESC, command.created_at, command.id LIMIT ?`).all(workspaceId, limit) as any[];
+      ${cursorClause}
+      ORDER BY command.priority DESC, command.created_at, command.id LIMIT ?`).all(...queryParams) as any[];
+    const hasNext = rows.length > limit;
+    const pageRows = hasNext ? rows.slice(0, limit) : rows;
+    const last = pageRows[pageRows.length - 1];
+    const nextCursor = hasNext && last
+      ? encodeMissionCommandCursor({ priority: Number(last.priority), createdAt: last.created_at, commandId: last.id })
+      : null;
+    if (nextCursor) res.setHeader('X-Next-Cursor', nextCursor);
     res.json({
-      items: rows.map((row) => ({
+      items: pageRows.map((row) => ({
         id: row.id,
         missionId: row.mission_id,
         missionTitle: row.mission_title,
@@ -862,6 +885,7 @@ app.get('/api/mission-commands', (req: Request, res: Response) => {
         preview: String(row.content || '').slice(0, 240),
         createdAt: row.created_at,
       })),
+      nextCursor,
     });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to list queued mission commands' });
@@ -1053,6 +1077,7 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
       reasoningLevel: req.body?.reasoningLevel,
       targetRole: req.body?.targetRole,
       command: req.body?.command,
+      clientMessageId: req.body?.clientMessageId,
     })));
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
@@ -1122,6 +1147,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       targetRole,
       command,
       automationPolicy,
+      clientMessageId: req.body?.clientMessageId,
     }));
     res.status(201).json({
       missionId: result.missionId,
@@ -1163,8 +1189,16 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
     if (!task) return void res.status(404).json({ error: 'Task not found' });
     const mission = await workspaceManager.getMission(task.missionId);
     const policy = mission?.automationPolicy as any;
-    const workspaceApply = policy?.overrides?.workspaceApply || (policy?.profile === 'auto' ? 'auto' : policy?.profile === 'review' ? 'review' : 'ask');
-    if (workspaceApply !== 'auto') {
+    const profile = policy?.profile === 'auto' || policy?.profile === 'review' || policy?.profile === 'ask'
+      ? policy.profile
+      : 'ask';
+    const decision = actionBroker.authorize({
+      action: 'workspaceApply',
+      profile,
+      overrides: policy?.overrides,
+      boundary: 'workspace',
+    });
+    if (!decision.allowed || decision.requiresApproval) {
       return void res.status(409).json({ code: 'APPROVAL_REQUIRED', error: 'Workspace apply must continue through the mission approval flow.' });
     }
     const result = await mergeCoordinator.applyWorktree(taskId);
@@ -1611,92 +1645,20 @@ app.post('/api/tasks/:id/retry', async (req, res) => {
   catch (error: any) { res.status(400).json({ error: error?.message || 'Failed to retry task' }); }
 });
 
-function claimApproval(approvalId: string, decision: 'approved' | 'rejected'): any | null {
-  return sqlite.transaction(() => {
-    const approval = sqlite.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as any;
-    if (!approval || approval.status !== 'pending') return null;
-    const claimedAt = new Date().toISOString();
-    const result = sqlite.prepare(`UPDATE approvals SET status = 'processing', requested_decision = ?, claimed_at = ?,
-      attempt_count = attempt_count + 1, execution_error = NULL WHERE id = ? AND status = 'pending'`)
-      .run(decision, claimedAt, approvalId) as { changes: number };
-    if (result.changes === 1) {
-      const attempt = Number(approval.attempt_count || 0) + 1;
-      const idempotencyKey = `approval:${approvalId}:${attempt}`;
-      sqlite.prepare(`INSERT INTO approval_operations
-        (approval_id, decision, status, operation_type, resource_id, idempotency_key, result, started_at,
-         completed_at, reconciled_at, reconcile_attempts, error)
-        VALUES (?, ?, 'applying', ?, ?, ?, NULL, ?, NULL, NULL, 0, NULL)
-        ON CONFLICT(approval_id) DO UPDATE SET decision = excluded.decision, status = 'applying',
-          operation_type = excluded.operation_type, resource_id = excluded.resource_id,
-          idempotency_key = excluded.idempotency_key, result = NULL, started_at = excluded.started_at,
-          completed_at = NULL, reconciled_at = NULL, error = NULL`)
-        .run(approvalId, decision, approvalId.includes(':') ? 'runtime_approval' : 'orchestrator_approval',
-          approval.task_id || approval.mission_id, idempotencyKey, claimedAt);
-    }
-    return result.changes === 1 ? {
-      id: approval.id,
-      missionId: approval.mission_id,
-      taskId: approval.task_id,
-      runId: approval.run_id,
-      type: approval.type,
-      description: approval.description,
-      status: 'processing',
-      requestedDecision: decision,
-      claimedAt,
-    } : null;
-  })();
+function claimApproval(approvalId: string, decision: ApprovalDecision): any | null {
+  return approvalOutbox.claim(approvalId, decision);
 }
 
-function finalizeApproval(approvalId: string, decision: 'approved' | 'rejected'): boolean {
-  return sqlite.transaction(() => {
-    const completedAt = new Date().toISOString();
-    const operation = sqlite.prepare(`UPDATE approval_operations SET status = 'completed', completed_at = ?, error = NULL
-      , result = ?
-      WHERE approval_id = ? AND decision = ? AND status = 'applying'`)
-      .run(completedAt, JSON.stringify({ outcome: 'applied', decision }), approvalId, decision) as { changes: number };
-    if (operation.changes !== 1) return false;
-    const approval = sqlite.prepare(`UPDATE approvals SET status = ?, decided_by = 'user', decided_at = ?, execution_error = NULL
-      WHERE id = ? AND status = 'processing' AND requested_decision = ?`)
-      .run(decision, completedAt, approvalId, decision) as { changes: number };
-    if (approval.changes !== 1) throw new Error('Approval finalization lost its claim.');
-    return true;
-  })();
+function finalizeApproval(approvalId: string, decision: ApprovalDecision): boolean {
+  return approvalOutbox.finalize(approvalId, decision);
 }
 
 function failApproval(approvalId: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  sqlite.transaction(() => {
-    sqlite.prepare(`UPDATE approval_operations SET status = 'reconcile_required', error = ?, reconciled_at = NULL,
-      reconcile_attempts = reconcile_attempts + 1
-      WHERE approval_id = ? AND status = 'applying'`).run(message, approvalId);
-    sqlite.prepare(`UPDATE approvals SET status = 'reconcile_required', execution_error = ?, decided_at = NULL
-      WHERE id = ? AND status = 'processing'`).run(message, approvalId);
-  })();
+  approvalOutbox.fail(approvalId, error);
 }
 
 function reconcileApproval(approvalId: string, outcome: 'applied' | 'not_applied'): any | null {
-  return sqlite.transaction(() => {
-    const approval = sqlite.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as any;
-    const operation = sqlite.prepare('SELECT * FROM approval_operations WHERE approval_id = ? AND status = \'reconcile_required\'')
-      .get(approvalId) as any;
-    if (!approval || !operation) return null;
-    const reconciledAt = new Date().toISOString();
-    const result = JSON.stringify({ outcome, decision: operation.decision, reconciledManually: true });
-    const operationUpdate = sqlite.prepare(`UPDATE approval_operations SET status = 'completed', result = ?,
-      reconciled_at = ?, completed_at = COALESCE(completed_at, ?), error = NULL
-      WHERE approval_id = ? AND status = 'reconcile_required'`).run(result, reconciledAt, reconciledAt, approvalId) as { changes: number };
-    if (operationUpdate.changes !== 1) return null;
-    if (outcome === 'not_applied') {
-      sqlite.prepare(`UPDATE approvals SET status = 'pending', requested_decision = NULL, claimed_at = NULL,
-        execution_error = NULL, decided_at = NULL WHERE id = ? AND status = 'reconcile_required'`).run(approvalId);
-    } else {
-      const status = operation.decision === 'approved' ? 'approved' : 'rejected';
-      sqlite.prepare(`UPDATE approvals SET status = ?, decided_by = 'user', decided_at = ?,
-        execution_error = NULL WHERE id = ? AND status = 'reconcile_required'`).run(status, reconciledAt, approvalId);
-    }
-    const updated = sqlite.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as any;
-    return { approval: updated, operation: { ...operation, status: 'completed', result, reconciledAt } };
-  })();
+  return approvalOutbox.reconcile(approvalId, outcome);
 }
 
 app.post('/api/missions/:id/candidates/:taskId/select', async (req, res) => {
@@ -1761,6 +1723,8 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
       await orchestrator.handleApprovalDecision(approval.missionId, approval.type, approved, {
         selectedCandidateId: typeof req.body?.selectedCandidateId === 'string' ? req.body.selectedCandidateId : undefined,
         reason: typeof req.body?.reason === 'string' ? req.body.reason : undefined,
+        operationId: approval.operationId,
+        idempotencyKey: approval.idempotencyKey,
       });
     }
 
@@ -1990,29 +1954,35 @@ wss.on('connection', (ws: WebSocket) => {
 const isMain = shouldAutoStartGateway();
 setImmediate(async () => {
   const recoveredAt = new Date().toISOString();
-  const pendingCompletionMissions = (sqlite.prepare("SELECT DISTINCT mission_id FROM mission_completions WHERE status IN ('synthesis_pending', 'event_pending')")
-    .all() as Array<{ mission_id: string }>).map((row) => row.mission_id);
-  const pendingMissionPlaceholders = pendingCompletionMissions.map(() => '?').join(', ');
-  const pendingRunGuard = pendingMissionPlaceholders ? ` AND mission_id NOT IN (${pendingMissionPlaceholders})` : '';
-  const pendingMissionGuard = pendingMissionPlaceholders ? ` AND id NOT IN (${pendingMissionPlaceholders})` : '';
+  await runtimeHost.reconcileStartup(new Date(recoveredAt));
   sqlite.transaction(() => {
     sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = COALESCE(error, 'Gateway restarted while command was starting') WHERE status = 'processing'")
       .run(recoveredAt);
-    sqlite.prepare(`UPDATE mission_runs SET status = 'failed', completed_at = ?, error = COALESCE(error, 'Gateway restarted before completion was confirmed')
-      WHERE status IN ('starting', 'running', 'stopping')${pendingRunGuard}`)
-      .run(recoveredAt, ...pendingCompletionMissions);
-    sqlite.prepare(`UPDATE conversation_turns SET status = 'failed', completed_at = ?
-      WHERE status IN ('starting', 'running')${pendingRunGuard}`).run(recoveredAt, ...pendingCompletionMissions);
-    sqlite.prepare(`UPDATE missions SET status = 'failed', completed_at = ?, active_run_id = NULL
-      WHERE active_run_id IS NOT NULL${pendingMissionGuard}`).run(recoveredAt, ...pendingCompletionMissions);
-    sqlite.prepare(`UPDATE approval_operations SET status = 'reconcile_required',
-      error = COALESCE(error, 'Gateway restarted before approval side effect could be confirmed'),
-      reconcile_attempts = reconcile_attempts + 1 WHERE status = 'applying'`).run();
-    sqlite.prepare(`UPDATE approvals SET status = 'reconcile_required', decided_at = NULL,
-      execution_error = COALESCE(execution_error, 'Approval outcome requires reconciliation after restart')
-      WHERE id IN (SELECT approval_id FROM approval_operations WHERE status = 'reconcile_required')`).run();
+    sqlite.prepare("UPDATE mission_runs SET heartbeat_at = ? WHERE status IN ('starting', 'running')").run(recoveredAt);
   })();
+  const expiredAttempts = sqlite.prepare(`SELECT id, mission_id, task_id, agent_instance_id, error
+    FROM task_attempts WHERE status = 'expired' AND completed_at = ?`).all(recoveredAt) as Array<{
+      id: string; mission_id: string; task_id: string; agent_instance_id: string; error: string | null;
+    }>;
+  for (const attempt of expiredAttempts) {
+    const failure = {
+      id: `restart-${attempt.id}`,
+      type: 'task_failed' as const,
+      missionId: attempt.mission_id,
+      taskId: attempt.task_id,
+      agentInstanceId: attempt.agent_instance_id,
+      error: attempt.error || 'Runtime host restarted before session completion was confirmed',
+      timestamp: recoveredAt,
+    };
+    await orchestrator.handleTaskFailed(failure);
+    eventBus.emit(failure);
+  }
+  approvalOutbox.recoverInterrupted();
   await orchestrator.recoverPendingCompletions();
+  const activePlans = sqlite.prepare(`SELECT id, plan_id FROM missions
+    WHERE status IN ('planning', 'ready', 'running', 'reviewing', 'revising', 'verifying') AND plan_id IS NOT NULL`)
+    .all() as Array<{ id: string; plan_id: string }>;
+  for (const mission of activePlans) await orchestrator.reconcileMissionPlan(mission.id, mission.plan_id);
   const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
   for (const row of pending) void drainMissionCommands(row.mission_id);
 });
@@ -2026,4 +1996,4 @@ if (isMain && process.env.NODE_ENV !== 'test' && !server.listening) {
   });
 }
 
-export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator };
+export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator, db };

@@ -15,6 +15,15 @@ const ROLE_LIMITS: Record<OrchestratorDelegation['role'], number> = {
 };
 const MAX_INITIAL_PARALLEL_DELEGATIONS = 4;
 
+function isRetainedDelegationRole(
+  role: OrchestratorDelegation['role'],
+  action: OrchestratorTurnAction,
+): boolean {
+  if (action === 'delegate') return role !== 'builder';
+  if (action === 'execute' || action === 'plan_only') return role !== 'reviewer' && role !== 'qa';
+  return true;
+}
+
 export interface SupervisorTurnContext {
   turnId: string;
   userMessage: string;
@@ -43,7 +52,7 @@ function extractJsonObject(raw: string): Record<string, unknown> | null {
   return null;
 }
 
-function normalizeDelegations(value: unknown): OrchestratorDelegation[] {
+function normalizeDelegations(value: unknown, action: OrchestratorTurnAction): OrchestratorDelegation[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
   const roleCounts = new Map<OrchestratorDelegation['role'], number>();
@@ -66,7 +75,7 @@ function normalizeDelegations(value: unknown): OrchestratorDelegation[] {
       ? record.requiredCapabilities.map(String).map((item) => item.trim()).filter(Boolean).slice(0, 12)
       : [];
     const dependsOnDelegationIds = Array.isArray(record.dependsOnDelegationIds)
-      ? record.dependsOnDelegationIds.map(String).map((item) => item.trim()).filter(Boolean)
+      ? record.dependsOnDelegationIds.map(String).map((item) => item.trim())
       : [];
     result.push({
       id,
@@ -79,19 +88,15 @@ function normalizeDelegations(value: unknown): OrchestratorDelegation[] {
     roleCounts.set(role, currentRoleCount + 1);
   }
 
-  const validIds = new Set(result.map((item) => item.id));
-  const normalized = result.map((item) => ({
-    ...item,
-    dependsOnDelegationIds: (item.dependsOnDelegationIds || []).filter((id) => id !== item.id && validIds.has(id)),
-  }));
-
   // The Phase 1 pool has a global parallel ceiling of four. The legacy execution
   // engine dispatches every zero-dependency root immediately, so encode only the
   // overflow capacity as a scheduler dependency until the V2 allocator fully owns
   // initial dispatch. Semantic dependencies from the model are preserved.
   const initialRoots: string[] = [];
   let overflowIndex = 0;
-  return normalized.map((item) => {
+  return result.map((item) => {
+    // Do not point a capacity gate at a delegation that decisionToTaskPlan will remove.
+    if (!isRetainedDelegationRole(item.role, action)) return item;
     const dependencies = item.dependsOnDelegationIds || [];
     if (dependencies.length > 0) return item;
     if (initialRoots.length < MAX_INITIAL_PARALLEL_DELEGATIONS) {
@@ -117,7 +122,7 @@ export function parseSupervisorDecision(raw: string, turnId: string): Orchestrat
     action,
     response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined,
     clarifyingQuestions: questions,
-    delegations: normalizeDelegations(parsed.delegations),
+    delegations: normalizeDelegations(parsed.delegations, action),
     needsUserApproval: Boolean(parsed.needsUserApproval),
   };
 }
@@ -227,6 +232,86 @@ export function fallbackSupervisorDecision(context: SupervisorTurnContext): Orch
   };
 }
 
+function topologicallyOrderDelegations(delegations: OrchestratorDelegation[]): OrchestratorDelegation[] {
+  const idToInputIndex = new Map<string, number>();
+  for (const [index, delegation] of delegations.entries()) {
+    if (idToInputIndex.has(delegation.id)) {
+      throw new Error(`Invalid delegation dependency graph: duplicate delegation id "${delegation.id}".`);
+    }
+    idToInputIndex.set(delegation.id, index);
+  }
+
+  const remainingDependencyCounts = delegations.map(() => 0);
+  const dependentsByInputIndex = delegations.map(() => [] as number[]);
+  for (const [index, delegation] of delegations.entries()) {
+    const dependencyIds = new Set(delegation.dependsOnDelegationIds || []);
+    remainingDependencyCounts[index] = dependencyIds.size;
+    for (const dependencyId of dependencyIds) {
+      if (dependencyId === delegation.id) {
+        throw new Error(`Invalid delegation dependency graph: delegation "${delegation.id}" cannot depend on itself.`);
+      }
+      const dependencyIndex = idToInputIndex.get(dependencyId);
+      if (dependencyIndex === undefined) {
+        throw new Error(`Invalid delegation dependency graph: delegation "${delegation.id}" depends on missing delegation "${dependencyId}".`);
+      }
+      dependentsByInputIndex[dependencyIndex].push(index);
+    }
+  }
+
+  // Prefer the original input order whenever multiple delegations are ready.
+  const ready = delegations
+    .map((_, index) => index)
+    .filter((index) => remainingDependencyCounts[index] === 0);
+  const orderedInputIndices: number[] = [];
+  const orderedInputIndexSet = new Set<number>();
+  while (ready.length > 0) {
+    const currentIndex = ready.shift() as number;
+    orderedInputIndices.push(currentIndex);
+    orderedInputIndexSet.add(currentIndex);
+    for (const dependentIndex of dependentsByInputIndex[currentIndex]) {
+      remainingDependencyCounts[dependentIndex] -= 1;
+      if (remainingDependencyCounts[dependentIndex] === 0) {
+        ready.push(dependentIndex);
+        ready.sort((left, right) => left - right);
+      }
+    }
+  }
+
+  if (orderedInputIndices.length !== delegations.length) {
+    const unresolvedIds = delegations
+      .filter((_, index) => !orderedInputIndexSet.has(index))
+      .map((delegation) => delegation.id)
+      .join(', ');
+    throw new Error(`Invalid delegation dependency graph: cyclic dependencies prevent ordering (unresolved delegations: ${unresolvedIds}).`);
+  }
+
+  return orderedInputIndices.map((index) => delegations[index]);
+}
+
+function toStructuredTaskPlan(delegations: OrchestratorDelegation[]): StructuredTaskPlan[] {
+  const orderedDelegations = topologicallyOrderDelegations(delegations);
+  const idToIndex = new Map(orderedDelegations.map((item, index) => [item.id, index]));
+
+  return orderedDelegations.map((item) => ({
+    title: `${item.role.charAt(0).toUpperCase() + item.role.slice(1)}: ${item.objective}`,
+    description: item.objective,
+    role: item.role,
+    priority: item.role === 'builder' || item.role === 'reviewer' || item.role === 'qa' ? 'high' : 'medium',
+    requiredCapabilities: item.requiredCapabilities.length
+      ? item.requiredCapabilities
+      : item.role === 'builder'
+        ? ['write_to_file', 'replace_file_content', 'run_command']
+        : ['read_file', 'grep_search', 'view_file'],
+    dependsOnIndices: (item.dependsOnDelegationIds || []).map((id) => {
+      const index = idToIndex.get(id);
+      if (index === undefined) {
+        throw new Error(`Invalid delegation dependency graph: delegation "${item.id}" depends on missing delegation "${id}".`);
+      }
+      return index;
+    }),
+  }));
+}
+
 /**
  * Normalizes model delegations into a runtime-safe task graph.
  * Builder lanes are isolated. Each lane gets its own Reviewer and QA dependency,
@@ -234,17 +319,31 @@ export function fallbackSupervisorDecision(context: SupervisorTurnContext): Orch
  */
 export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTaskPlan[] {
   let delegations = [...(decision.delegations || [])];
+  // Validate before action-specific role normalization so malformed references in
+  // discarded quality roles cannot silently disappear.
+  topologicallyOrderDelegations(delegations);
+  const usedDelegationIds = new Set(delegations.map((item) => item.id));
+  const allocateGeneratedDelegationId = (baseId: string): string => {
+    let candidate = baseId;
+    let suffix = 2;
+    while (usedDelegationIds.has(candidate)) {
+      candidate = `${baseId}-${suffix}`;
+      suffix += 1;
+    }
+    usedDelegationIds.add(candidate);
+    return candidate;
+  };
   if (decision.action === 'delegate') {
-    delegations = delegations.filter((item) => item.role !== 'builder');
+    delegations = delegations.filter((item) => isRetainedDelegationRole(item.role, decision.action));
   }
 
   if (decision.action === 'execute' || decision.action === 'plan_only') {
     const builders = delegations.filter((item) => item.role === 'builder');
-    const nonQuality = delegations.filter((item) => item.role !== 'reviewer' && item.role !== 'qa');
+    const nonQuality = delegations.filter((item) => isRetainedDelegationRole(item.role, decision.action));
     delegations = [...nonQuality];
     for (const builder of builders) {
-      const reviewerId = `review-${builder.id}`;
-      const qaId = `qa-${builder.id}`;
+      const reviewerId = allocateGeneratedDelegationId(`review-${builder.id}`);
+      const qaId = allocateGeneratedDelegationId(`qa-${builder.id}`);
       delegations.push({
         id: reviewerId,
         role: 'reviewer',
@@ -262,19 +361,5 @@ export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTa
     }
   }
 
-  const idToIndex = new Map(delegations.map((item, index) => [item.id, index]));
-  return delegations.map((item) => ({
-    title: `${item.role.charAt(0).toUpperCase() + item.role.slice(1)}: ${item.objective}`,
-    description: item.objective,
-    role: item.role,
-    priority: item.role === 'builder' || item.role === 'reviewer' || item.role === 'qa' ? 'high' : 'medium',
-    requiredCapabilities: item.requiredCapabilities.length
-      ? item.requiredCapabilities
-      : item.role === 'builder'
-        ? ['write_to_file', 'replace_file_content', 'run_command']
-        : ['read_file', 'grep_search', 'view_file'],
-    dependsOnIndices: (item.dependsOnDelegationIds || [])
-      .map((id) => idToIndex.get(id))
-      .filter((index): index is number => index !== undefined),
-  }));
+  return toStructuredTaskPlan(delegations);
 }

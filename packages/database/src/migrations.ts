@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 8;
+export const DATABASE_SCHEMA_VERSION = 11;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -106,21 +106,21 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
         approval_id TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
         decision TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL,
         completed_at TEXT, error TEXT);
-      CREATE TABLE IF NOT EXISTS mission_completions (
-        mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-        plan_id TEXT NOT NULL, status TEXT NOT NULL, summary TEXT,
-        tasks_completed INTEGER NOT NULL, total_tasks INTEGER NOT NULL,
-        created_at TEXT NOT NULL, completed_at TEXT,
-        PRIMARY KEY (mission_id, plan_id));
-      UPDATE approval_operations SET status = 'reconcile_required',
-        error = COALESCE(error, 'Gateway restarted before approval side effect could be confirmed')
-        WHERE status = 'applying';
-       UPDATE approvals SET status = 'reconcile_required',
-         execution_error = COALESCE(execution_error, 'Approval outcome requires reconciliation after restart')
-        WHERE id IN (SELECT approval_id FROM approval_operations WHERE status = 'reconcile_required');
-      PRAGMA user_version = 4;
-    `);
-  })();
+       CREATE TABLE IF NOT EXISTS mission_completions (
+         mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+         plan_id TEXT NOT NULL, status TEXT NOT NULL, summary TEXT,
+         tasks_completed INTEGER NOT NULL, total_tasks INTEGER NOT NULL,
+         created_at TEXT NOT NULL, completed_at TEXT,
+         PRIMARY KEY (mission_id, plan_id));
+       UPDATE approval_operations SET status = 'reconcile_required',
+         error = COALESCE(error, 'Gateway restarted before approval side effect could be confirmed')
+         WHERE status = 'applying';
+       PRAGMA user_version = 4;
+     `);
+     if (hasTable(sqlite, 'approvals')) sqlite.exec(`UPDATE approvals SET status = 'reconcile_required',
+       execution_error = COALESCE(execution_error, 'Approval outcome requires reconciliation after restart')
+       WHERE id IN (SELECT approval_id FROM approval_operations WHERE status = 'reconcile_required')`);
+   })();
   current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
   if (current < 5) sqlite.transaction(() => {
     sqlite.exec(`
@@ -181,5 +181,99 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
         )`);
     }
     sqlite.exec('PRAGMA user_version = 8');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 9) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'resource_leases')) {
+      // Keep one active owner for legacy databases before adding the
+      // cross-process uniqueness fence.
+      sqlite.exec(`UPDATE resource_leases SET status = 'expired'
+        WHERE status = 'active' AND rowid NOT IN (
+          SELECT MAX(rowid) FROM resource_leases WHERE status = 'active'
+          GROUP BY resource_type, resource_id
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_resource_leases_active_resource
+          ON resource_leases(resource_type, resource_id) WHERE status = 'active';`);
+    }
+    sqlite.exec('PRAGMA user_version = 9');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 10) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'agent_instances')) {
+      const columns: Array<[string, string]> = [
+        ['task_id', 'TEXT'],
+        ['parent_agent_id', 'TEXT'],
+        ['display_name', 'TEXT'],
+        ['specialty', 'TEXT'],
+        ['spawn_reason', 'TEXT'],
+        ['status_message', 'TEXT'],
+        ['progress', 'INTEGER'],
+        ['workspace_mode', 'TEXT'],
+        ['started_at', 'TEXT'],
+        ['completed_at', 'TEXT'],
+      ];
+      for (const [name, definition] of columns) {
+        if (!hasColumn(sqlite, 'agent_instances', name)) {
+          sqlite.exec(`ALTER TABLE agent_instances ADD COLUMN ${name} ${definition}`);
+        }
+      }
+    }
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS agent_messages (
+        id TEXT PRIMARY KEY,
+        mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        from_agent_id TEXT NOT NULL,
+        to_agent_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        read_at TEXT,
+        kind TEXT NOT NULL DEFAULT 'message',
+        reply_to_message_id TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_messages_mailbox
+        ON agent_messages(mission_id, to_agent_id, read_at, created_at, id);
+      PRAGMA user_version = 10;
+    `);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 11) sqlite.transaction(() => {
+    if (!hasTable(sqlite, 'task_attempts')) {
+      sqlite.exec(`CREATE TABLE task_attempts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        agent_instance_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'claimed',
+        worktree_path TEXT,
+        runtime_session_id TEXT,
+        heartbeat_at TEXT,
+        lease_expires_at TEXT,
+        retryable INTEGER NOT NULL DEFAULT 0,
+        claimed_at TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        error TEXT,
+        result_summary TEXT,
+        review_pack TEXT
+      )`);
+    } else {
+      const columns: Array<[string, string]> = [
+        ['runtime_session_id', 'TEXT'],
+        ['heartbeat_at', 'TEXT'],
+        ['lease_expires_at', 'TEXT'],
+        ['retryable', 'INTEGER NOT NULL DEFAULT 0'],
+        ['claimed_at', 'TEXT'],
+      ];
+      for (const [name, definition] of columns) {
+        if (!hasColumn(sqlite, 'task_attempts', name)) sqlite.exec(`ALTER TABLE task_attempts ADD COLUMN ${name} ${definition}`);
+      }
+      sqlite.exec(`UPDATE task_attempts SET claimed_at = COALESCE(claimed_at, started_at)`);
+    }
+    sqlite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_task_number
+      ON task_attempts(task_id, attempt_number);
+      CREATE INDEX IF NOT EXISTS idx_task_attempts_active_lease
+      ON task_attempts(status, lease_expires_at);
+      PRAGMA user_version = 11;`);
   })();
 }

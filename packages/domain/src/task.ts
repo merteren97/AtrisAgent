@@ -46,8 +46,13 @@ export interface TaskAttempt {
   missionId: string;
   agentInstanceId: string;
   attemptNumber: number;
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'reviewing' | 'verified' | 'applied';
+  status: 'claimed' | 'running' | 'completed' | 'failed' | 'cancelled' | 'expired' | 'reviewing' | 'verified' | 'applied';
   worktreePath?: string | null;
+  runtimeSessionId?: string | null;
+  heartbeatAt?: string | null;
+  leaseExpiresAt?: string | null;
+  retryable: boolean;
+  claimedAt: string;
   startedAt: string;
   completedAt?: string | null;
   error?: string | null;

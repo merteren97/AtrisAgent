@@ -3,7 +3,8 @@ import type { Orchestrator } from '@atris-agent-code/orchestration-core';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { AgentMessage, AgentRole, AgentSpawnRequest, AgentStatus, AgentWorkspaceMode } from '@atris-agent-code/domain';
-import { approvals, artifacts, type AtrisDatabase } from '@atris-agent-code/database';
+import { agentInstances, agentMessages, approvals, artifacts, type AtrisDatabase } from '@atris-agent-code/database';
+import { eq } from 'drizzle-orm';
 import { ResourceLeaseManager } from './resource-lease-manager';
 
 export interface CoordinationOptions {
@@ -60,7 +61,100 @@ export class CoordinationMCP {
     this.eventBus = options.eventBus;
     this.db = options.db;
     this.workspacePath = options.workspacePath || process.cwd();
+    this.hydrateDurableState();
     this.eventBus?.on('*', (event) => this.syncAgentEvent(event));
+  }
+
+  private hydrateDurableState(): void {
+    if (!this.db) return;
+    try {
+      const rows = (this.db.select().from(agentInstances) as any).all() as Array<Record<string, any>>;
+      for (const row of rows) {
+        this.agentRegistry.set(row.id, {
+          id: row.id,
+          missionId: row.missionId,
+          role: row.role,
+          displayName: row.displayName || this.defaultAgentName(row.role),
+          specialty: row.specialty || undefined,
+          parentAgentId: row.parentAgentId || null,
+          taskId: row.taskId || null,
+          model: row.modelProfileId || undefined,
+          status: row.status || 'idle',
+          statusMessage: row.statusMessage || undefined,
+          progress: row.progress ?? undefined,
+          workspaceMode: row.workspaceMode || undefined,
+          spawnReason: row.spawnReason || undefined,
+          createdAt: row.createdAt,
+          startedAt: row.startedAt || null,
+          completedAt: row.completedAt || null,
+        });
+      }
+      const messages = (this.db.select().from(agentMessages) as any).all() as Array<Record<string, any>>;
+      for (const row of messages) {
+        const message: AgentMessage = {
+          id: row.id,
+          missionId: row.missionId,
+          fromAgentId: row.fromAgentId,
+          toAgentId: row.toAgentId,
+          content: row.content,
+          createdAt: row.createdAt,
+          readAt: row.readAt || null,
+          kind: row.kind || 'message',
+          replyToMessageId: row.replyToMessageId || null,
+        };
+        const mailbox = this.mailboxes.get(message.toAgentId) || [];
+        mailbox.push(message);
+        this.mailboxes.set(message.toAgentId, mailbox);
+      }
+    } catch (error) {
+      // Optional coordination tables may not exist for an older standalone
+      // MCP database; migrations will hydrate them on the next startup.
+      console.warn('[CoordinationMCP] Durable agent state could not be hydrated:', error);
+    }
+  }
+
+  private saveAgentState(agent: RuntimeAgentState): void {
+    this.agentRegistry.set(agent.id, agent);
+    if (!this.db) return;
+    (this.db.insert(agentInstances).values({
+      id: agent.id,
+      missionId: agent.missionId,
+      role: agent.role as any,
+      modelProfileId: agent.model || '',
+      accountProfileId: '',
+      runtimeAdapterId: '',
+      sessionId: null,
+      status: agent.status,
+      taskId: agent.taskId || null,
+      parentAgentId: agent.parentAgentId || null,
+      displayName: agent.displayName,
+      specialty: agent.specialty || null,
+      spawnReason: agent.spawnReason || null,
+      statusMessage: agent.statusMessage || null,
+      progress: agent.progress ?? null,
+      workspaceMode: agent.workspaceMode || null,
+      startedAt: agent.startedAt || null,
+      completedAt: agent.completedAt || null,
+      createdAt: agent.createdAt,
+    }).onConflictDoUpdate({
+      target: agentInstances.id,
+      set: {
+        missionId: agent.missionId,
+        role: agent.role as any,
+        modelProfileId: agent.model || '',
+        status: agent.status,
+        taskId: agent.taskId || null,
+        parentAgentId: agent.parentAgentId || null,
+        displayName: agent.displayName,
+        specialty: agent.specialty || null,
+        spawnReason: agent.spawnReason || null,
+        statusMessage: agent.statusMessage || null,
+        progress: agent.progress ?? null,
+        workspaceMode: agent.workspaceMode || null,
+        startedAt: agent.startedAt || null,
+        completedAt: agent.completedAt || null,
+      },
+    }) as any).run();
   }
 
   private syncAgentEvent(event: AgentEvent): void {
@@ -69,7 +163,7 @@ export class CoordinationMCP {
       : undefined;
 
     if (event.type === 'agent_spawned') {
-      this.agentRegistry.set(event.agentInstanceId, {
+      this.saveAgentState({
         id: event.agentInstanceId,
         missionId: event.missionId,
         role: event.role,
@@ -77,7 +171,7 @@ export class CoordinationMCP {
         specialty: event.specialty,
         parentAgentId: event.parentAgentId,
         taskId: event.taskId,
-        model: event.model,
+        model: event.model === 'scheduler-selected' ? existing?.model || event.model : event.model || existing?.model,
         status: 'idle',
         workspaceMode: event.workspaceMode,
         spawnReason: event.spawnReason,
@@ -87,7 +181,7 @@ export class CoordinationMCP {
     }
 
     if (event.type === 'agent_started') {
-      this.agentRegistry.set(event.agentInstanceId, {
+      this.saveAgentState({
         id: event.agentInstanceId,
         missionId: event.missionId,
         role: event.role,
@@ -107,20 +201,20 @@ export class CoordinationMCP {
 
     if (!existing) return;
     if (event.type === 'agent_progressed') {
-      this.agentRegistry.set(existing.id, {
+      this.saveAgentState({
         ...existing,
         status: 'running',
         statusMessage: event.progress,
         progress: event.percentage ?? existing.progress,
       });
     } else if (event.type === 'agent_waiting') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'waiting', statusMessage: event.reason });
+      this.saveAgentState({ ...existing, status: 'waiting', statusMessage: event.reason });
     } else if (event.type === 'agent_resumed') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'running', statusMessage: event.reason });
+      this.saveAgentState({ ...existing, status: 'running', statusMessage: event.reason });
     } else if (event.type === 'agent_completed') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'completed', statusMessage: event.summary, progress: 100, completedAt: event.timestamp });
+      this.saveAgentState({ ...existing, status: 'completed', statusMessage: event.summary, progress: 100, completedAt: event.timestamp });
     } else if (event.type === 'agent_error' || event.type === 'task_failed') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'failed', statusMessage: event.error, completedAt: event.timestamp });
+      this.saveAgentState({ ...existing, status: 'failed', statusMessage: event.error, completedAt: event.timestamp });
     }
   }
 
@@ -200,7 +294,7 @@ export class CoordinationMCP {
     }
 
     const timestamp = new Date().toISOString();
-    this.agentRegistry.set(agentInstanceId, {
+    this.saveAgentState({
       id: agentInstanceId,
       missionId: request.missionId,
       role,
@@ -290,6 +384,19 @@ export class CoordinationMCP {
       createdAt: new Date().toISOString(),
       readAt: null,
     };
+    if (this.db) {
+      await this.db.insert(agentMessages).values({
+        id: message.id,
+        missionId: message.missionId,
+        fromAgentId: message.fromAgentId,
+        toAgentId: message.toAgentId,
+        content: message.content,
+        createdAt: message.createdAt,
+        readAt: null,
+        kind: message.kind || 'message',
+        replyToMessageId: message.replyToMessageId || null,
+      });
+    }
     const mailbox = this.mailboxes.get(input.toAgentId) || [];
     mailbox.push(message);
     this.mailboxes.set(input.toAgentId, mailbox);
@@ -314,6 +421,11 @@ export class CoordinationMCP {
     if (!markRead || selected.length === 0) return selected;
     const readIds = new Set(selected.map((message) => message.id));
     const readAt = new Date().toISOString();
+    if (this.db) {
+      for (const message of selected) {
+        (this.db.update(agentMessages).set({ readAt }).where(eq(agentMessages.id, message.id)) as any).run();
+      }
+    }
     this.mailboxes.set(agentId, mailbox.map((message) => readIds.has(message.id) ? { ...message, readAt } : message));
     for (const message of selected) {
       this.eventBus?.emit({
@@ -413,7 +525,6 @@ export class CoordinationMCP {
 
   async submitResult(taskId: string, resultSummary: string, _reviewPack?: unknown, _artifactsList?: string[], status: 'done' | 'failed' = 'done'): Promise<void> {
     const task = await this.requireTask(taskId);
-    await this.workspaceManager!.updateTask(taskId, { status: status === 'done' ? 'done' : 'rejected' });
     if (status === 'done') {
       this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_completed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, result: resultSummary, timestamp: new Date().toISOString() });
     } else {
