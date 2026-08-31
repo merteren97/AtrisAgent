@@ -1,4 +1,4 @@
-import { decisionToTaskPlan, parseSupervisorDecision } from './supervisor-turn';
+import { decisionToTaskPlan, inferExplicitBuilderTarget, isPriorResearchImplementationFollowUp, normalizeSupervisorDecision, parseSupervisorDecision } from './supervisor-turn';
 
 function runTests() {
   let passed = 0;
@@ -93,6 +93,151 @@ function runTests() {
     ],
   });
   assert(!builderOnlyExecute.some((task) => task.role === 'researcher'), 'execute keeps Researcher optional when it is not delegated');
+
+  const misclassifiedImplementation = normalizeSupervisorDecision({
+    turnId: 'turn-misclassified-implementation',
+    action: 'delegate',
+    delegations: [{ id: 'inspect', role: 'researcher', objective: 'Inspect the affected code', requiredCapabilities: ['research'] }],
+  }, {
+    turnId: 'turn-misclassified-implementation',
+    userMessage: 'Implement the fix and update the tests.',
+    conversationContext: '',
+    workspaceContext: '',
+  });
+  assert(misclassifiedImplementation.action === 'execute', 'explicit implementation intent cannot terminate as a read-only delegate turn');
+  assert(
+    misclassifiedImplementation.delegations?.map((item) => item.role).join(',') === 'researcher,builder'
+      && misclassifiedImplementation.delegations[1]?.dependsOnDelegationIds?.[0] === 'inspect',
+    'delegate normalization retains Researcher evidence and injects a dependent Builder',
+  );
+
+  const researchOnly = normalizeSupervisorDecision({
+    turnId: 'turn-research-only',
+    action: 'delegate',
+    delegations: [{ id: 'research', role: 'researcher', objective: 'Research implementation options', requiredCapabilities: ['research'] }],
+  }, {
+    turnId: 'turn-research-only',
+    userMessage: 'Research only how we could implement this; do not implement it.',
+    conversationContext: '',
+    workspaceContext: '',
+  });
+  assert(researchOnly.action === 'delegate', 'genuine research-only intent remains read-only delegation');
+
+  const explicitResearchAgent = normalizeSupervisorDecision({
+    turnId: 'turn-explicit-research-agent',
+    action: 'delegate',
+    delegations: [{ id: 'research', role: 'researcher', objective: 'Research the options', requiredCapabilities: ['research'] }],
+  }, {
+    turnId: 'turn-explicit-research-agent',
+    userMessage: 'Research the available options.',
+    conversationContext: '',
+    workspaceContext: '',
+    explicitCommand: 'agent',
+    explicitTargetRole: 'researcher',
+  });
+  assert(explicitResearchAgent.action === 'delegate' && explicitResearchAgent.delegations?.every((item) => item.role !== 'builder') === true,
+    'agent command with an explicit Researcher target remains read-only delegation');
+
+  const implementationResearchAgent = normalizeSupervisorDecision({
+    turnId: 'turn-implementation-research-agent', action: 'delegate',
+    delegations: [{ id: 'research', role: 'researcher', objective: 'Research implementation options', requiredCapabilities: ['research'] }],
+  }, {
+    turnId: 'turn-implementation-research-agent', userMessage: 'Research how to implement cache invalidation in this code.',
+    conversationContext: '', workspaceContext: '', explicitCommand: 'agent', explicitTargetRole: 'researcher',
+  });
+  assert(implementationResearchAgent.action === 'delegate' && implementationResearchAgent.delegations?.every((item) => item.role !== 'builder') === true,
+    'research wording about implementation and code does not independently request writes');
+
+  const explicitNonBuilderAgent = normalizeSupervisorDecision({
+    turnId: 'turn-explicit-reviewer-agent',
+    action: 'delegate',
+    delegations: [{ id: 'review', role: 'reviewer', objective: 'Review the proposed behavior', requiredCapabilities: ['review'] }],
+  }, {
+    turnId: 'turn-explicit-reviewer-agent',
+    userMessage: 'Review only the proposed behavior; do not change code.',
+    conversationContext: '',
+    workspaceContext: '',
+    explicitCommand: 'agent',
+    explicitTargetRole: 'reviewer',
+  });
+  assert(explicitNonBuilderAgent.action === 'delegate' && explicitNonBuilderAgent.delegations?.every((item) => item.role !== 'builder') === true,
+    'agent command with an explicit non-Builder target does not imply implementation');
+
+  const explicitResearchWrite = normalizeSupervisorDecision({
+    turnId: 'turn-explicit-research-write',
+    action: 'delegate',
+    delegations: [{ id: 'research', role: 'researcher', objective: 'Inspect the defect', requiredCapabilities: ['research'] }],
+  }, {
+    turnId: 'turn-explicit-research-write',
+    userMessage: 'Inspect the defect, then fix the code and update the tests.',
+    conversationContext: '',
+    workspaceContext: '',
+    explicitCommand: 'agent',
+    explicitTargetRole: 'researcher',
+  });
+  assert(explicitResearchWrite.action === 'execute' && explicitResearchWrite.delegations?.some((item) => item.role === 'builder') === true,
+    'independent textual write intent can promote an explicit non-Builder agent request');
+
+  const explicitBuilderResearchWording = normalizeSupervisorDecision({
+    turnId: 'turn-explicit-builder', action: 'delegate',
+    delegations: [{ id: 'research', role: 'researcher', objective: 'Research the options', requiredCapabilities: ['research'] }],
+  }, {
+    turnId: 'turn-explicit-builder', userMessage: 'Research the options.', conversationContext: '', workspaceContext: '',
+    explicitCommand: 'agent', explicitTargetRole: 'builder',
+  });
+  assert(explicitBuilderResearchWording.action === 'execute' && explicitBuilderResearchWording.delegations?.some((item) => item.role === 'builder') === true,
+    'explicit Builder target takes precedence for implementation');
+
+  const reusedResearch = normalizeSupervisorDecision({
+    turnId: 'turn-build-follow-up',
+    action: 'execute',
+    delegations: [{ id: 'build', role: 'builder', objective: 'Build the researched option', requiredCapabilities: ['implementation'] }],
+  }, {
+    turnId: 'turn-build-follow-up',
+    userMessage: 'Build this.',
+    conversationContext: 'Durable prior research context is available.',
+    workspaceContext: '',
+  }, { reusePriorResearch: true });
+  assert(reusedResearch.delegations?.every((item) => item.role !== 'researcher') === true,
+    'completed-research build follow-up does not inject a redundant Researcher');
+  assert(isPriorResearchImplementationFollowUp({ userMessage: 'Build this.', explicitTargetRole: 'builder' }),
+    'deictic implementation follow-up selects durable prior research');
+  assert(!isPriorResearchImplementationFollowUp({ userMessage: 'Implement an unrelated billing export.', explicitTargetRole: 'builder' }),
+    'unrelated later implementation does not suppress fresh research');
+
+  const parsedTarget = parseSupervisorDecision(JSON.stringify({
+    action: 'execute',
+    delegations: [{ id: 'builder-target', role: 'builder', objective: 'Create the project', requiredCapabilities: [], targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' } }],
+  }), 'turn-target');
+  const targetPlan = parsedTarget ? decisionToTaskPlan(parsedTarget) : [];
+  const plannedTarget = targetPlan[0]?.targetDescriptor;
+  const targetRoundTrip = plannedTarget?.kind === 'new_sibling_project'
+    ? plannedTarget.projectName === 'AtrisTask'
+    : false;
+  assert(targetRoundTrip, 'planner target metadata round-trips through parser and structured task planning');
+  const unsafeParsedTarget = parseSupervisorDecision(JSON.stringify({
+    action: 'execute',
+    delegations: [{ id: 'builder-unsafe', role: 'builder', objective: 'Escape', requiredCapabilities: [], targetDescriptor: { kind: 'new_sibling_project', projectName: '../escape' } }],
+  }), 'turn-unsafe-target');
+  assert(unsafeParsedTarget?.delegations?.[0]?.targetDescriptor === undefined, 'unsafe model target metadata is discarded instead of becoming a path');
+  assert(inferExplicitBuilderTarget('Create a brand-new AtrisTask project under this workspace')?.projectName === 'AtrisTask', 'explicit new sibling wording deterministically extracts AtrisTask');
+  let unsafeExplicitTargetError = '';
+  try {
+    normalizeSupervisorDecision({
+      turnId: 'turn-explicit-unsafe', action: 'execute',
+      delegations: [{ id: 'builder-explicit-unsafe', role: 'builder', objective: 'Create unsafe project', requiredCapabilities: [] }],
+    }, { turnId: 'turn-explicit-unsafe', userMessage: 'Create a new ../escape project under this workspace', conversationContext: '', workspaceContext: '' }, { reusePriorResearch: true });
+  } catch (error) {
+    unsafeExplicitTargetError = error instanceof Error ? error.message : String(error);
+  }
+  assert(unsafeExplicitTargetError.includes('missing or unsafe'), 'explicit unsafe new sibling wording fails before Builder dispatch');
+  const duplicateTarget = normalizeSupervisorDecision({
+    turnId: 'turn-duplicate-target', action: 'execute', delegations: [
+      { id: 'build-a', role: 'builder', objective: 'Create A', requiredCapabilities: [] },
+      { id: 'build-b', role: 'builder', objective: 'Create B', requiredCapabilities: [] },
+    ],
+  }, { turnId: 'turn-duplicate-target', userMessage: 'Create a new AtrisTask folder under this workspace', conversationContext: '', workspaceContext: '' }, { reusePriorResearch: true });
+  assert(duplicateTarget.delegations?.filter((item) => item.role === 'builder').length === 1, 'duplicate Builder lanes for one explicit new sibling target collapse before dispatch');
 
   const reordered = decisionToTaskPlan({
     turnId: 'turn-dependencies',

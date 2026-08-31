@@ -78,6 +78,10 @@ export interface TaskCreated extends BaseEvent {
   reasoningLevel?: string;
   fallbackCatalogIds?: string[];
   routeSelectionMode?: 'auto' | 'prefer' | 'fixed';
+  targetDescriptor?:
+    | { kind: 'workspace_root' }
+    | { kind: 'existing_project'; projectName: string }
+    | { kind: 'new_sibling_project'; projectName: string };
 }
 
 export interface TaskAssigned extends BaseEvent {

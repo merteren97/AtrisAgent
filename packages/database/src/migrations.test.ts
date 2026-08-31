@@ -23,6 +23,8 @@ sqlite.exec(`
     model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '',
     session_id TEXT, status TEXT DEFAULT 'idle', created_at TEXT NOT NULL);
   CREATE TABLE team_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', is_default INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+  CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id), title TEXT NOT NULL);
+  CREATE TABLE worktrees (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id), task_id TEXT NOT NULL, branch_name TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
   INSERT INTO workspaces (id) VALUES ('workspace-1');
   INSERT INTO missions (id, workspace_id) VALUES ('mission-1', 'workspace-1');
   INSERT INTO mission_events (id, mission_id, type, payload, created_at) VALUES
@@ -58,6 +60,8 @@ assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('t
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name IN ('idx_task_attempts_task_number', 'idx_task_attempts_active_lease')").get() as { count: number }).count, 2);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'deletion_operations'").get() as { count: number }).count, 1);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('deletion_operations') WHERE name IN ('target_type', 'target_id', 'remove_memory', 'phase', 'manifest', 'progress', 'error', 'owner_token', 'lease_expires_at', 'created_at', 'updated_at', 'completed_at')").get() as { count: number }).count, 12);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('tasks') WHERE name = 'target_descriptor'").get() as { count: number }).count, 1);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('worktrees') WHERE name IN ('isolation_kind', 'canonical_container', 'target_name', 'target_path', 'applied_operation_key', 'target_descriptor')").get() as { count: number }).count, 6);
 sqlite.prepare(`INSERT INTO resource_leases
   (id, resource_type, resource_id, held_by_agent_id, expires_at, heartbeat_at, status)
   VALUES ('lease-1', 'workspace', 'main', 'agent-1', '2099-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'active')`).run();

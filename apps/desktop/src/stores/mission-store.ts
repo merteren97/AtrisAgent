@@ -41,6 +41,11 @@ export interface TaskItem {
   assignedRole?: string | null;
   assignedAgentId?: string | null;
   worktreeId?: string | null;
+  targetDescriptor?:
+    | { kind: 'workspace_root' }
+    | { kind: 'existing_project'; projectName: string }
+    | { kind: 'new_sibling_project'; projectName: string }
+    | null;
   /** Effective persisted attempt route, when supplied by the mission-state API. */
   effectiveRoute?: EffectiveAttemptRoute | null;
 }
@@ -192,7 +197,7 @@ function eventLabel(event: Record<string, any>): string {
     case 'turn_cancelled': return `Conversation turn cancelled${event.reason ? `: ${event.reason}` : '.'}`;
     case 'mission_started': return `Mission started: ${event.title || event.missionId}`;
     case 'plan_generated': return event.summary || `Generated ${event.taskCount || 0} tasks.`;
-    case 'plan_revised': return `Plan revised: ${event.reason || 'Execution evidence changed the plan.'}`;
+    case 'plan_revised': return `Same conversation, new plan: ${event.reason || 'Execution evidence changed the plan.'}`;
     case 'task_created': return `Task ready: ${event.title || event.taskId}`;
     case 'task_assigned': return `Task assigned to ${event.role}: ${event.taskId}`;
     case 'task_claimed': return `Execution context prepared for ${event.taskId}.`;

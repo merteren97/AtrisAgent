@@ -27,3 +27,4 @@ export type {
   ProjectMemorySnapshot,
   ManualMemoryInput,
 } from './project-memory';
+export { hasExplicitImplementationIntent } from './supervisor-turn';

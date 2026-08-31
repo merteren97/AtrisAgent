@@ -19,6 +19,40 @@ export type TaskStatus =
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
+export type BuilderTargetDescriptor =
+  | { kind: 'workspace_root' }
+  | { kind: 'existing_project'; projectName: string }
+  | { kind: 'new_sibling_project'; projectName: string };
+
+const WINDOWS_RESERVED_NAMES = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+
+export function validateDirectChildProjectName(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0) throw new Error('Project target name is required.');
+  if (value !== value.trim()) throw new Error('Project target name cannot have leading or trailing whitespace.');
+  if (value === '.' || value === '..') throw new Error('Project target name must be one direct child.');
+  if (value.includes('\0') || /[\/\\:]/.test(value) || /^[a-zA-Z]:/.test(value)) {
+    throw new Error('Project target name must not contain a path, drive, UNC, or alternate data stream.');
+  }
+  if (/[\x00-\x1f]/.test(value)) throw new Error('Project target name contains control characters.');
+  if (/[. ]$/.test(value)) throw new Error('Project target name cannot end with a dot or space.');
+  if (WINDOWS_RESERVED_NAMES.test(value)) throw new Error('Project target name is reserved by Windows.');
+  return value;
+}
+
+export function parseBuilderTargetDescriptor(value: unknown): BuilderTargetDescriptor | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.kind === 'workspace_root') return { kind: 'workspace_root' };
+  if (record.kind === 'existing_project' || record.kind === 'new_sibling_project') {
+    try {
+      return { kind: record.kind, projectName: validateDirectChildProjectName(record.projectName) };
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 export interface Task {
   id: string;
   missionId: string;
@@ -32,6 +66,7 @@ export interface Task {
   requiredCapabilities: string[];
   dependsOn: string[]; // task IDs
   worktreeId: string | null;
+  targetDescriptor?: BuilderTargetDescriptor | null;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;

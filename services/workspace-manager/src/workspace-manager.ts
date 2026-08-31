@@ -41,6 +41,7 @@ import type {
   RouteSelectionMode,
   EffectiveAttemptRoute,
   EffectiveWorkerPoolPolicy,
+  BuilderTargetDescriptor,
 } from '@atris-agent-code/domain';
 import { resolveWorkerPoolPolicy } from '@atris-agent-code/domain';
 
@@ -77,6 +78,7 @@ export interface CreateTaskInput {
   requiredCapabilities?: string[];
   dependsOn?: string[];
   worktreeId?: string | null;
+  targetDescriptor?: BuilderTargetDescriptor | null;
   id?: string;
 }
 
@@ -389,6 +391,7 @@ export class WorkspaceManager {
       requiredCapabilities: input.requiredCapabilities ?? [],
       dependsOn: input.dependsOn ?? [],
       worktreeId: input.worktreeId ?? null,
+      targetDescriptor: input.targetDescriptor ?? null,
       createdAt: now,
       updatedAt: now,
     };
@@ -560,6 +563,64 @@ export class WorkspaceManager {
     return this.db.select().from(taskAttempts).where(eq(taskAttempts.taskId, taskId));
   }
 
+  async getWorktreeForTask(taskId: string): Promise<WorktreeSelect | null> {
+    const rows = await this.db.select().from(worktrees).where(eq(worktrees.taskId, taskId));
+    return rows[0] ?? null;
+  }
+
+  async resolveAppliedTargetPath(taskId: string): Promise<string | null> {
+    const task = await this.getTask(taskId);
+    const mission = task ? await this.getMission(task.missionId) : null;
+    const workspace = mission ? await this.getWorkspace(mission.workspaceId) : null;
+    if (!task || !workspace?.path) return null;
+
+    const worktree = await this.getWorktreeForTask(taskId);
+    if (!worktree) return workspace.path;
+    if (worktree.isolationKind === 'new-sibling') return worktree.targetPath || null;
+    if (worktree.targetPath) return worktree.targetPath;
+    if (worktree.isolationKind === 'nested-git') {
+      return (await this.worktreeManager.resolveMergeBasePath(worktree.path, '')) || null;
+    }
+    if (worktree.targetDescriptor?.kind === 'existing_project') {
+      const resolved = await this.worktreeManager.resolveBuilderTarget(workspace.path, worktree.targetDescriptor);
+      return resolved.path;
+    }
+    if (worktree.isolationKind === 'workspace-git' || worktree.isolationKind === 'mirror') return workspace.path;
+
+    // Legacy rows predate isolation metadata; prefer live Git ownership before the historical root fallback.
+    return this.worktreeManager.resolveMergeBasePath(worktree.path, workspace.path);
+  }
+
+  async markNewSiblingApplied(taskId: string, operationKey: string, targetPath: string): Promise<void> {
+    const updated = await this.db.update(worktrees).set({
+      appliedOperationKey: operationKey,
+      targetPath,
+      status: 'merged',
+    }).where(eq(worktrees.taskId, taskId)).returning({ id: worktrees.id });
+    if (updated.length !== 1) throw new Error(`Could not persist new sibling ownership for task "${taskId}".`);
+  }
+
+  async preflightTaskTarget(taskId: string): Promise<void> {
+    const task = await this.getTask(taskId);
+    if (!task || task.assignedRole !== 'builder') return;
+    const mission = await this.getMission(task.missionId);
+    const workspace = mission ? await this.getWorkspace(mission.workspaceId) : null;
+    if (!workspace?.path) throw new Error(`Workspace for Builder task "${taskId}" could not be resolved.`);
+    await this.worktreeManager.resolveBuilderTarget(workspace.path, task.targetDescriptor, `${task.title}\n${task.description}`);
+    if (task.targetDescriptor?.kind !== 'new_sibling_project') return;
+
+    const targetKey = task.targetDescriptor.projectName.toLocaleLowerCase('en-US');
+    const duplicates = (await this.listTasks(task.missionId))
+      .filter((candidate) => candidate.assignedRole === 'builder'
+        && candidate.targetDescriptor?.kind === 'new_sibling_project'
+        && candidate.targetDescriptor.projectName.toLocaleLowerCase('en-US') === targetKey
+        && !['cancelled', 'rejected', 'superseded'].includes(String(candidate.status)))
+      .sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)) || left.id.localeCompare(right.id));
+    if (duplicates[0]?.id !== taskId) {
+      throw new Error(`Duplicate Builder target "${task.targetDescriptor.projectName}" is already owned by task ${duplicates[0]?.id}.`);
+    }
+  }
+
   /**
    * Create a project-aware isolated worktree for a task.
    * Parent workspaces can contain several repositories; task title/description is
@@ -577,7 +638,7 @@ export class WorkspaceManager {
     }
 
     const projectHint = `${task.title}\n${task.description}`;
-    const isolationBase = await this.worktreeManager.resolveIsolationBase(workspacePath, projectHint);
+    const isolationBase = await this.worktreeManager.resolveBuilderTarget(workspacePath, task.targetDescriptor, projectHint);
     const projectBasePath = isolationBase.path;
     const branchName = candidateSuffix
       ? `atris/mission-${task.missionId}/task-${taskId}-${candidateSuffix}`
@@ -585,13 +646,16 @@ export class WorkspaceManager {
     const worktreeSubDir = candidateSuffix ? `task-${taskId}-${candidateSuffix}` : `task-${taskId}`;
     const worktreeDir = path.join(projectBasePath, '.atris-worktrees', `mission-${task.missionId}`, worktreeSubDir);
 
-    const createdPath = await this.worktreeManager.createWorktree(
-      projectBasePath,
-      branchName,
-      worktreeDir,
-      baseBranch,
-      projectHint,
-    );
+    const createdPath = isolationBase.kind === 'new-sibling'
+      ? await this.worktreeManager.createEmptyManagedStaging(worktreeDir, isolationBase.canonicalContainer!)
+      : await this.worktreeManager.createWorktree(
+          projectBasePath,
+          branchName,
+          worktreeDir,
+          baseBranch,
+          projectHint,
+          isolationBase,
+        );
 
     const now = new Date().toISOString();
     const worktreeRecord: WorktreeInsert = {
@@ -601,6 +665,12 @@ export class WorkspaceManager {
       branchName,
       path: createdPath,
       status: 'active',
+      isolationKind: isolationBase.kind,
+      canonicalContainer: isolationBase.canonicalContainer ?? null,
+      targetName: isolationBase.targetName ?? null,
+      targetPath: isolationBase.targetPath ?? null,
+      appliedOperationKey: null,
+      targetDescriptor: task.targetDescriptor ?? null,
       createdAt: now,
     };
 

@@ -2,7 +2,9 @@ import type {
   OrchestratorDecision,
   OrchestratorDelegation,
   OrchestratorTurnAction,
+  BuilderTargetDescriptor,
 } from '@atris-agent-code/domain';
+import { parseBuilderTargetDescriptor, validateDirectChildProjectName } from '@atris-agent-code/domain';
 import type { StructuredTaskPlan } from './orchestrator';
 
 const ACTIONS = new Set<OrchestratorTurnAction>(['respond', 'clarify', 'delegate', 'execute', 'plan_only']);
@@ -14,6 +16,54 @@ const ROLE_LIMITS: Record<OrchestratorDelegation['role'], number> = {
   qa: 2,
 };
 const MAX_INITIAL_PARALLEL_DELEGATIONS = 4;
+
+export function inferExplicitBuilderTarget(message: string): Extract<BuilderTargetDescriptor, { kind: 'new_sibling_project' }> | undefined {
+  if (!/\b(?:under|inside|in)\s+(?:this\s+|the\s+)?workspace\b/i.test(message)) return undefined;
+  const patterns = [
+    /\b(?:brand[- ]new|new)\s+[`"']?([a-z0-9][a-z0-9._-]*)[`"']?\s+(?:folder|project|directory)\b/i,
+    /\b(?:brand[- ]new|new)\s+(?:folder|project|directory)\s+(?:named|called)\s+[`"']?([a-z0-9][a-z0-9._-]*)[`"']?/i,
+  ];
+  for (const pattern of patterns) {
+    const candidate = message.match(pattern)?.[1];
+    if (!candidate) continue;
+    try {
+      return { kind: 'new_sibling_project', projectName: validateDirectChildProjectName(candidate) };
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function normalizeBuilderTargets(delegations: OrchestratorDelegation[], userMessage: string): OrchestratorDelegation[] {
+  const explicitTarget = inferExplicitBuilderTarget(userMessage);
+  if (!explicitTarget
+    && delegations.some((item) => item.role === 'builder')
+    && /\b(?:brand[- ]new|new)\s+(?:[`"']?\S+[`"']?\s+)?(?:folder|project|directory)\b/i.test(userMessage)
+    && /\b(?:under|inside|in)\s+(?:this\s+|the\s+)?workspace\b/i.test(userMessage)) {
+    throw new Error('New sibling project target is missing or unsafe; provide one direct-child project name.');
+  }
+  const targeted = explicitTarget
+    ? delegations.map((item) => item.role === 'builder' ? { ...item, targetDescriptor: explicitTarget } : item)
+    : delegations;
+  const retainedByTarget = new Map<string, string>();
+  const replacements = new Map<string, string>();
+  for (const item of targeted) {
+    if (item.role !== 'builder' || item.targetDescriptor?.kind !== 'new_sibling_project') continue;
+    const key = item.targetDescriptor.projectName.toLocaleLowerCase('en-US');
+    const retainedId = retainedByTarget.get(key);
+    if (!retainedId) {
+      retainedByTarget.set(key, item.id);
+      continue;
+    }
+    replacements.set(item.id, retainedId);
+  }
+  const retained = targeted.filter((item) => !replacements.has(item.id));
+  return retained.map((item) => ({
+    ...item,
+    dependsOnDelegationIds: (item.dependsOnDelegationIds || []).map((id) => replacements.get(id) || id),
+  }));
+}
 
 function isRetainedDelegationRole(
   role: OrchestratorDelegation['role'],
@@ -31,6 +81,66 @@ export interface SupervisorTurnContext {
   workspaceContext: string;
   explicitCommand?: string;
   explicitTargetRole?: string;
+}
+
+export function hasExplicitImplementationIntent(context: Pick<SupervisorTurnContext, 'userMessage' | 'explicitCommand' | 'explicitTargetRole'>): boolean {
+  const text = context.userMessage.toLocaleLowerCase('tr-TR');
+  const command = String(context.explicitCommand || '').toLowerCase();
+  const targetRole = String(context.explicitTargetRole || '').toLowerCase();
+  if (targetRole === 'builder') return true;
+  if (command === 'plan') return false;
+  if (/\b(?:research|analysis|analyze|investigate|review)\s+only\b|\b(?:only|just)\s+(?:research|analyze|investigate|review)\b|(?:sadece|yalnızca)\s+(?:araştır|analiz|incele)|(?:do not|don't)\s+(?:implement|build|change|code)|(?:uygulama yapma|uygulamayın|değişiklik yapma|kod yazma)/i.test(text)) {
+    return false;
+  }
+  const directWriteRequest = /^(?:please\s+)?(?:implement|build|create|add|fix|change|modify|refactor|write|update|remove|delete|wire|ship)\b|\b(?:then|and then|and also|also|please|must|should|can you|could you|i need you to)\s+(?:implement|build|create|add|fix|change|modify|refactor|write|update|remove|delete|wire|ship)\b|^(?:lütfen\s+)?(?:uygula|oluştur|ekle|düzelt|değiştir|geliştir|yeniden düzenle|kodla|yaz|güncelle|kaldır|sil)\b/i.test(text);
+  const explicitNonBuilder = Boolean(targetRole && targetRole !== 'builder');
+  const researchDirected = /^(?:please\s+)?(?:research|analyze|investigate|review|compare|find out|look into)\b|^(?:lütfen\s+)?(?:araştır|analiz et|incele|karşılaştır)\b/i.test(text);
+  if (explicitNonBuilder || researchDirected) return directWriteRequest;
+  return /\b(?:implement|build|create|add|fix|change|modify|refactor|write|update|remove|delete|wire|ship)\b|(?:uygula|oluştur|ekle|düzelt|değiştir|geliştir|yeniden düzenle|kodla|yaz|güncelle|kaldır|sil)/i.test(text);
+}
+
+export function isPriorResearchImplementationFollowUp(context: Pick<SupervisorTurnContext, 'userMessage' | 'explicitCommand' | 'explicitTargetRole'>): boolean {
+  if (!hasExplicitImplementationIntent(context)) return false;
+  return /\b(?:this|that|it|above|previous|prior|research(?:ed)?|finding|findings|approach|option|recommendation)\b|(?:bunu|şunu|onu|yukarıdaki|önceki|araştırılan|araştırdığımız|bulgu|yaklaşım|seçenek|öneri)/i.test(context.userMessage);
+}
+
+export function normalizeSupervisorDecision(
+  decision: OrchestratorDecision,
+  context: SupervisorTurnContext,
+  options?: { reusePriorResearch?: boolean },
+): OrchestratorDecision {
+  const normalized = decision.action === 'delegate' && hasExplicitImplementationIntent(context)
+    ? { ...decision, action: 'execute' as const }
+    : decision;
+  let delegations = [...(normalized.delegations || [])];
+
+  if (normalized.action === 'delegate' && delegations.length === 0) {
+    delegations = [{ id: 'research-1', role: 'researcher', objective: context.userMessage, requiredCapabilities: ['research', 'codebase-analysis'] }];
+  }
+  if (normalized.action !== 'execute') {
+    return { ...normalized, delegations: normalizeBuilderTargets(delegations, context.userMessage) };
+  }
+
+  const researchers = delegations.filter((item) => item.role === 'researcher');
+  if (!delegations.some((item) => item.role === 'builder')) {
+    delegations.push({
+      id: 'builder-1',
+      role: 'builder',
+      objective: context.userMessage,
+      requiredCapabilities: ['implementation', 'workspace-write'],
+      dependsOnDelegationIds: researchers.map((item) => item.id),
+    });
+  }
+  if (researchers.length === 0 && !options?.reusePriorResearch) {
+    const researchId = delegations.some((item) => item.id === 'research-1') ? 'research-implementation' : 'research-1';
+    delegations = [
+      { id: researchId, role: 'researcher', objective: `Inspect the codebase and constraints needed to implement: ${context.userMessage}`, requiredCapabilities: ['research', 'codebase-analysis'] },
+      ...delegations.map((item) => item.role === 'builder'
+        ? { ...item, dependsOnDelegationIds: [...new Set([...(item.dependsOnDelegationIds || []), researchId])] }
+        : item),
+    ];
+  }
+  return { ...normalized, delegations: normalizeBuilderTargets(delegations, context.userMessage) };
 }
 
 function extractJsonObject(raw: string): Record<string, unknown> | null {
@@ -84,6 +194,7 @@ function normalizeDelegations(value: unknown, action: OrchestratorTurnAction): O
       requiredCapabilities,
       dependsOnDelegationIds,
       preferredParallelGroup: typeof record.preferredParallelGroup === 'string' ? record.preferredParallelGroup : undefined,
+      targetDescriptor: role === 'builder' ? parseBuilderTargetDescriptor(record.targetDescriptor) : undefined,
     });
     roleCounts.set(role, currentRoleCount + 1);
   }
@@ -164,7 +275,8 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '      "objective": "focused objective",',
     '      "requiredCapabilities": ["..."],',
     '      "dependsOnDelegationIds": ["..."],',
-    '      "preferredParallelGroup": "optional-group"',
+    '      "preferredParallelGroup": "optional-group",',
+    '      "targetDescriptor": { "kind": "workspace_root|existing_project|new_sibling_project", "projectName": "direct-child name except for workspace_root" }',
     '    }',
     '  ]',
     '}',
@@ -189,9 +301,7 @@ export function fallbackSupervisorDecision(context: SupervisorTurnContext): Orch
   const command = String(context.explicitCommand || '').toLowerCase();
   const targetRole = String(context.explicitTargetRole || '').toLowerCase();
   const planRequested = command === 'plan' || /\b(plan|planla|planlama|plan oluştur|plan yap)\b/i.test(text);
-  const implementationRequested = targetRole === 'builder'
-    || command === 'agent'
-    || /(uygula|implement|düzelt|fix|geliştir|ekle|değiştir|refactor|build|oluştur|kodla)/i.test(text);
+  const implementationRequested = hasExplicitImplementationIntent(context);
   const researchRequested = targetRole === 'researcher'
     || /(araştır|research|analiz|incele|investigate|karşılaştır|compare)/i.test(text);
 
@@ -312,6 +422,7 @@ function toStructuredTaskPlan(delegations: OrchestratorDelegation[]): Structured
       }
       return index;
     }),
+    targetDescriptor: item.role === 'builder' ? item.targetDescriptor : undefined,
   }));
 }
 

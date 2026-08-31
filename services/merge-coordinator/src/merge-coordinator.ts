@@ -71,7 +71,28 @@ export class MergeCoordinator {
     if (!workspace?.path) throw new Error(`Workspace with ID "${mission.workspaceId}" not found for mission "${mission.id}"`);
 
     const worktreeManager = this.workspaceManager.getWorktreeManager();
-    const basePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, workspace.path);
+    const worktree = await this.workspaceManager.getWorktreeForTask(taskId);
+    if (worktree?.isolationKind === 'new-sibling') {
+      if (!worktree.canonicalContainer || !worktree.targetName || !operation?.idempotencyKey) {
+        return { success: false, status: 'Failed', output: 'New sibling apply metadata or idempotency key is missing.' };
+      }
+      const applied = await worktreeManager.applyNewSibling(
+        task.worktreeId,
+        worktree.canonicalContainer,
+        worktree.targetName,
+        operation.idempotencyKey,
+        worktree.appliedOperationKey,
+      );
+      if (!applied.success) return { success: false, status: 'Failed', output: applied.output };
+      await this.workspaceManager.markNewSiblingApplied(taskId, operation.idempotencyKey, applied.targetPath);
+      await worktreeManager.finalizeNewSiblingApply(
+        worktree.canonicalContainer,
+        worktree.targetName,
+        operation.idempotencyKey,
+      );
+      return { success: true, status: 'Merged', output: applied.output };
+    }
+    const basePath = await worktreeManager.resolveMergeBasePath(task.worktreeId, worktree?.targetPath || workspace.path);
 
     const checkpointManager = this.workspaceManager.getCheckpointManager();
     const checkpointLabel = operation?.idempotencyKey
@@ -122,7 +143,7 @@ export class MergeCoordinator {
     return { success: true, status: 'Merged', output: mergeOutput.output, checkpointId };
   }
 
-  /** Runs verification against the resolved base repository, never the candidate worktree. */
+  /** Runs verification against the applied target, never the candidate worktree. */
   async verifyAppliedWorkspace(
     taskId: string,
     verifier: (basePath: string) => Promise<AppliedWorkspaceVerification>,
@@ -134,8 +155,10 @@ export class MergeCoordinator {
     if (!mission) throw new Error(`Mission with ID "${task.missionId}" not found for task "${taskId}"`);
     const workspace = await this.workspaceManager.getWorkspace(mission.workspaceId);
     if (!workspace?.path) throw new Error(`Workspace with ID "${mission.workspaceId}" not found for mission "${mission.id}"`);
-    const basePath = await this.workspaceManager.getWorktreeManager()
-      .resolveMergeBasePath(task.worktreeId, workspace.path);
+    const worktree = await this.workspaceManager.getWorktreeForTask(taskId);
+    const basePath = worktree?.isolationKind === 'new-sibling' && worktree.targetPath
+      ? worktree.targetPath
+      : await this.workspaceManager.getWorktreeManager().resolveMergeBasePath(task.worktreeId, workspace.path);
     return verifier(basePath);
   }
 

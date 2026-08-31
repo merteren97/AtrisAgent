@@ -3,9 +3,22 @@ import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
 import { isGeneratedWorkspaceDirectory, isGitWorktree } from './git-utils';
+import type { BuilderTargetDescriptor } from '@atris-agent-code/domain';
+import { validateDirectChildProjectName } from '@atris-agent-code/domain';
 
 const execFileAsync = promisify(execFile);
 const GIT_COMMAND_TIMEOUT_MS = 45_000;
+const NEW_SIBLING_BASELINE = '.atris-baseline';
+const NEW_SIBLING_OPERATION_MARKER = '.atris-operation.json';
+
+interface NewSiblingOperationMarker {
+  version: 1;
+  operationKey: string;
+  canonicalContainer: string;
+  targetName: string;
+  targetPath: string;
+  published: boolean;
+}
 
 async function git(args: string[], cwd: string): Promise<{ stdout: string; stderr: string }> {
   const result = await execFileAsync('git', args, {
@@ -49,7 +62,13 @@ export interface ChangedFile {
 
 export interface IsolationBase {
   path: string;
-  kind: 'workspace-git' | 'nested-git' | 'mirror';
+  kind: 'workspace-git' | 'nested-git' | 'mirror' | 'new-sibling';
+}
+
+export interface ResolvedBuilderTarget extends IsolationBase {
+  canonicalContainer?: string;
+  targetName?: string;
+  targetPath?: string;
 }
 
 export type WorktreeInspectResult = {
@@ -66,7 +85,8 @@ const DEFAULT_IGNORED_DIRS = new Set([
   'dist',
   '.next',
   'build',
-  '.atris-baseline',
+  NEW_SIBLING_BASELINE,
+  NEW_SIBLING_OPERATION_MARKER,
 ]);
 
 function shouldIgnoreEntry(name: string, ignoreList: Set<string>): boolean {
@@ -112,7 +132,232 @@ function normalizeProjectHint(value: string): string {
   return value.toLocaleLowerCase('en-US').replace(/[^a-z0-9]+/g, '');
 }
 
+async function syncDirectory(directoryPath: string): Promise<void> {
+  let handle: fs.promises.FileHandle | undefined;
+  try {
+    handle = await fs.promises.open(directoryPath, 'r');
+    await handle.sync();
+  } catch (error: any) {
+    if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes(error?.code)) throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
 export class WorktreeManager {
+  private isContainedDirectChild(container: string, candidate: string): boolean {
+    return path.dirname(candidate) === container && path.relative(container, candidate) === path.basename(candidate);
+  }
+
+  async validateNewSiblingTarget(workspacePath: string, projectName: string): Promise<ResolvedBuilderTarget> {
+    const targetName = validateDirectChildProjectName(projectName);
+    const canonicalContainer = await fs.promises.realpath(workspacePath);
+    const stat = await fs.promises.lstat(canonicalContainer);
+    if (!stat.isDirectory()) throw new Error('Registered workspace container is not a directory.');
+    const entries = await fs.promises.readdir(canonicalContainer);
+    if (entries.some((entry) => entry.toLocaleLowerCase('en-US') === targetName.toLocaleLowerCase('en-US'))) {
+      throw new Error(`Cannot create new sibling project "${targetName}": a workspace entry already uses that name.`);
+    }
+    const targetPath = path.join(canonicalContainer, targetName);
+    if (!this.isContainedDirectChild(canonicalContainer, targetPath)) throw new Error('New sibling target escapes the workspace container.');
+    return { path: canonicalContainer, kind: 'new-sibling', canonicalContainer, targetName, targetPath };
+  }
+
+  async resolveBuilderTarget(
+    workspacePath: string,
+    descriptor: BuilderTargetDescriptor | null | undefined,
+    projectHint = '',
+  ): Promise<ResolvedBuilderTarget> {
+    if (!descriptor) return this.resolveIsolationBase(workspacePath, projectHint);
+    if (descriptor.kind === 'new_sibling_project') {
+      const target = await this.validateNewSiblingTarget(workspacePath, descriptor.projectName);
+      return target;
+    }
+    if (descriptor.kind === 'workspace_root') {
+      const canonical = await fs.promises.realpath(workspacePath);
+      return { path: canonical, kind: await this.isGitRepository(canonical) ? 'workspace-git' : 'mirror' };
+    }
+
+    const projectName = validateDirectChildProjectName(descriptor.projectName);
+    const canonicalContainer = await fs.promises.realpath(workspacePath);
+    const entries = await fs.promises.readdir(canonicalContainer, { withFileTypes: true });
+    const matches = entries.filter((entry) => entry.name.toLocaleLowerCase('en-US') === projectName.toLocaleLowerCase('en-US'));
+    if (matches.length !== 1 || !matches[0].isDirectory() || matches[0].isSymbolicLink()) {
+      throw new Error(`Existing project target "${projectName}" is not one direct child directory of the workspace.`);
+    }
+    const candidate = await fs.promises.realpath(path.join(canonicalContainer, matches[0].name));
+    if (!this.isContainedDirectChild(canonicalContainer, candidate)) throw new Error('Existing project target escapes the workspace container.');
+    return {
+      path: candidate,
+      kind: await this.isGitRepository(candidate) ? 'nested-git' : 'mirror',
+      canonicalContainer,
+      targetName: matches[0].name,
+      targetPath: candidate,
+    };
+  }
+
+  async createEmptyManagedStaging(stagingPath: string, canonicalContainer: string): Promise<string> {
+    const parent = path.dirname(stagingPath);
+    await fs.promises.mkdir(parent, { recursive: true });
+    const canonicalParent = await fs.promises.realpath(parent);
+    const relativeParent = path.relative(canonicalContainer, canonicalParent);
+    if (relativeParent.startsWith('..') || path.isAbsolute(relativeParent)) throw new Error('Managed staging path escapes the workspace container.');
+    await fs.promises.mkdir(stagingPath, { recursive: false });
+    if ((await fs.promises.readdir(stagingPath)).length !== 0) throw new Error('New sibling staging directory was not empty.');
+    await fs.promises.mkdir(path.join(stagingPath, NEW_SIBLING_BASELINE));
+    return stagingPath;
+  }
+
+  private newSiblingMarker(
+    canonicalContainer: string,
+    targetName: string,
+    operationKey: string,
+    published = true,
+  ): NewSiblingOperationMarker {
+    return {
+      version: 1,
+      operationKey,
+      canonicalContainer,
+      targetName,
+      targetPath: path.join(canonicalContainer, targetName),
+      published,
+    };
+  }
+
+  private markerMatches(actual: NewSiblingOperationMarker, expected: NewSiblingOperationMarker): boolean {
+    return actual.version === expected.version
+      && actual.operationKey === expected.operationKey
+      && actual.canonicalContainer === expected.canonicalContainer
+      && actual.targetName === expected.targetName
+      && actual.targetPath === expected.targetPath;
+  }
+
+  private async readNewSiblingMarker(targetPath: string): Promise<NewSiblingOperationMarker | null> {
+    const markerPath = path.join(targetPath, NEW_SIBLING_OPERATION_MARKER);
+    try {
+      const raw = await fs.promises.readFile(markerPath, 'utf8');
+      const marker = JSON.parse(raw) as Partial<NewSiblingOperationMarker>;
+      if (marker.version !== 1
+        || typeof marker.operationKey !== 'string'
+        || typeof marker.canonicalContainer !== 'string'
+        || typeof marker.targetName !== 'string'
+        || typeof marker.targetPath !== 'string'
+        || typeof marker.published !== 'boolean') {
+        throw new Error('Operation marker metadata is invalid.');
+      }
+      return marker as NewSiblingOperationMarker;
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async finalizeNewSiblingApply(canonicalContainer: string, targetName: string, operationKey: string): Promise<void> {
+    validateDirectChildProjectName(targetName);
+    const currentContainer = await fs.promises.realpath(canonicalContainer);
+    if (currentContainer !== canonicalContainer) throw new Error('Workspace container canonical path changed before apply finalization.');
+    const expected = this.newSiblingMarker(canonicalContainer, targetName, operationKey);
+    if (!this.isContainedDirectChild(canonicalContainer, expected.targetPath)) throw new Error('New sibling target escapes the workspace container.');
+    const targetStat = await fs.promises.lstat(expected.targetPath);
+    if (!targetStat.isDirectory() || targetStat.isSymbolicLink()) throw new Error('Applied new sibling target is not a direct project directory.');
+    const marker = await this.readNewSiblingMarker(expected.targetPath);
+    if (!marker) return;
+    if (!this.markerMatches(marker, expected)) throw new Error('Refusing to remove a mismatched new sibling operation marker.');
+    await fs.promises.unlink(path.join(expected.targetPath, NEW_SIBLING_OPERATION_MARKER));
+    await syncDirectory(expected.targetPath);
+  }
+
+  async applyNewSibling(
+    stagingPath: string,
+    canonicalContainer: string,
+    targetName: string,
+    operationKey: string,
+    appliedOperationKey?: string | null,
+  ): Promise<{ success: boolean; output: string; targetPath: string }> {
+    validateDirectChildProjectName(targetName);
+    if (!operationKey) throw new Error('New sibling apply operation key is required.');
+    const currentContainer = await fs.promises.realpath(canonicalContainer);
+    if (currentContainer !== canonicalContainer) throw new Error('Workspace container canonical path changed before apply.');
+    const targetPath = path.join(canonicalContainer, targetName);
+    if (!this.isContainedDirectChild(canonicalContainer, targetPath)) throw new Error('New sibling target escapes the workspace container.');
+    if (fs.existsSync(targetPath)) {
+      try {
+        const targetStat = await fs.promises.lstat(targetPath);
+        if (!targetStat.isDirectory() || targetStat.isSymbolicLink()) throw new Error('Destination is not a direct project directory.');
+        const expected = this.newSiblingMarker(canonicalContainer, targetName, operationKey);
+        const marker = await this.readNewSiblingMarker(targetPath);
+        if (marker) {
+          if (!this.markerMatches(marker, expected)) throw new Error('Destination operation marker does not match this apply operation.');
+          if (!marker.published) {
+            const canonicalStaging = await fs.promises.realpath(stagingPath);
+            const stagingRelative = path.relative(canonicalContainer, canonicalStaging);
+            if (stagingRelative.startsWith('..') || path.isAbsolute(stagingRelative)) throw new Error('New sibling staging directory escapes the workspace container.');
+            await copyDirRecursive(canonicalStaging, targetPath);
+            await fs.promises.writeFile(
+              path.join(targetPath, NEW_SIBLING_OPERATION_MARKER),
+              `${JSON.stringify(expected)}\n`,
+              { encoding: 'utf8', flag: 'w' },
+            );
+            await syncDirectory(targetPath);
+            await syncDirectory(canonicalContainer);
+          }
+          return { success: true, output: `Recovered new sibling project ${targetName} from this Atris operation.`, targetPath };
+        }
+        if (appliedOperationKey === operationKey) {
+          return { success: true, output: `New sibling project ${targetName} was already applied by this Atris operation.`, targetPath };
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { success: false, output: `Destination ${targetPath} is not owned by this Atris apply operation: ${message}`, targetPath };
+      }
+      return { success: false, output: `Destination ${targetPath} already exists and is not owned by this Atris apply operation.`, targetPath };
+    }
+    const canonicalStaging = await fs.promises.realpath(stagingPath);
+    const stagingRelative = path.relative(canonicalContainer, canonicalStaging);
+    if (stagingRelative.startsWith('..') || path.isAbsolute(stagingRelative)) throw new Error('New sibling staging directory escapes the workspace container.');
+    const temporaryPath = path.join(canonicalContainer, `.atris-apply-${crypto.randomUUID()}`);
+    try {
+      await copyDirRecursive(canonicalStaging, temporaryPath);
+      const markerPath = path.join(temporaryPath, NEW_SIBLING_OPERATION_MARKER);
+      const markerHandle = await fs.promises.open(markerPath, 'wx');
+      try {
+        await markerHandle.writeFile(`${JSON.stringify(this.newSiblingMarker(canonicalContainer, targetName, operationKey))}\n`, 'utf8');
+        await markerHandle.sync();
+      } finally {
+        await markerHandle.close();
+      }
+      await syncDirectory(temporaryPath);
+      try {
+        await fs.promises.mkdir(targetPath, { recursive: false });
+      } catch (error: any) {
+        if (error?.code === 'EEXIST') {
+          return { success: false, output: `Destination ${targetPath} appeared during apply; no files were overwritten.`, targetPath };
+        }
+        throw error;
+      }
+      const targetMarkerPath = path.join(targetPath, NEW_SIBLING_OPERATION_MARKER);
+      await fs.promises.writeFile(
+        targetMarkerPath,
+        `${JSON.stringify(this.newSiblingMarker(canonicalContainer, targetName, operationKey, false))}\n`,
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      await syncDirectory(targetPath);
+      await copyDirRecursive(temporaryPath, targetPath);
+      await fs.promises.writeFile(
+        targetMarkerPath,
+        `${JSON.stringify(this.newSiblingMarker(canonicalContainer, targetName, operationKey))}\n`,
+        { encoding: 'utf8', flag: 'w' },
+      );
+      await syncDirectory(targetPath);
+      await syncDirectory(canonicalContainer);
+      return { success: true, output: `Created new sibling project ${targetPath} without replacing an existing destination.`, targetPath };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { success: false, output: `Could not safely create new sibling project: ${message}`, targetPath };
+    } finally {
+      if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { recursive: true, force: true });
+    }
+  }
   async inspectEntry(worktreePath: string, requestedPath = ''): Promise<WorktreeInspectResult> {
     if (requestedPath.includes('\0') || path.isAbsolute(requestedPath) || /^[a-zA-Z]:[\\/]/.test(requestedPath) || /^[/\\]{2}/.test(requestedPath)) {
       throw new Error('Worktree preview path must be relative.');
@@ -239,8 +484,9 @@ export class WorktreeManager {
     worktreePath?: string,
     baseBranch: string = 'HEAD',
     projectHint: string = '',
+    resolvedBase?: IsolationBase,
   ): Promise<string> {
-    const isolationBase = await this.resolveIsolationBase(basePath, projectHint);
+    const isolationBase = resolvedBase ?? await this.resolveIsolationBase(basePath, projectHint);
     const sourcePath = isolationBase.path;
     const targetPath = worktreePath
       || path.join(sourcePath, '.atris-worktrees', branchName.replace(/[\/\\:]/g, '_'));

@@ -19,6 +19,7 @@ import type {
   AuthInitiationResult,
   AuthPollResult,
 } from '@atris-agent-code/domain';
+import { terminateProcessTree } from '../runtime-utils';
 
 export interface SpawnAgentOptions {
   sessionId?: string;
@@ -192,7 +193,7 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
     this.markSessionCancelled(sessionId);
     const process = this.activeProcesses.get(sessionId);
     if (process && !process.killed) {
-      try { process.kill('SIGTERM'); } catch { /* the process may have exited between lookup and kill */ }
+      await terminateProcessTree(process);
       this.activeProcesses.delete(sessionId);
     }
     this.activeSessions.delete(sessionId);
@@ -206,7 +207,7 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
     for (const [sessionId, child] of this.activeProcesses.entries()) {
       this.markSessionCancelled(sessionId);
       if (!child.killed) {
-        try { child.kill('SIGKILL'); } catch { /* process already exited */ }
+        await terminateProcessTree(child, true);
       }
     }
     this.activeProcesses.clear();

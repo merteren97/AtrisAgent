@@ -129,6 +129,7 @@ function repositoryFingerprint(workspacePath: string): string {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2_000,
+      windowsHide: true,
     }).trim();
     const normalizedRemote = normalizeRemote(remote);
     if (normalizedRemote) return sha256(`git-origin:${normalizedRemote}`);

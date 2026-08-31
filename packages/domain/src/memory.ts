@@ -169,6 +169,7 @@ export interface OrchestratorDelegation {
   requiredCapabilities: string[];
   dependsOnDelegationIds?: string[];
   preferredParallelGroup?: string | null;
+  targetDescriptor?: import('./task').BuilderTargetDescriptor;
 }
 
 export interface OrchestratorDecision {

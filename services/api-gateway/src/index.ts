@@ -11,7 +11,7 @@ import type { AtrisDatabase } from '@atris-agent-code/database';
 import { migrateDatabase } from '@atris-agent-code/database';
 import { BoundedEventQueue, LocalEventBus } from '@atris-agent-code/event-bus';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
-import { Orchestrator } from '@atris-agent-code/orchestration-core';
+import { hasExplicitImplementationIntent, Orchestrator } from '@atris-agent-code/orchestration-core';
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { MergeCoordinator } from '@atris-agent-code/merge-coordinator';
 import { ActionBroker } from '@atris-agent-code/policy-engine';
@@ -600,6 +600,16 @@ function emitTurnEvent(event: AgentEvent): void {
   eventBus.emit(event);
 }
 
+function activeRunIsResearchOnly(missionId: string): boolean {
+  const rows = sqlite.prepare(`SELECT r.status, r.plan_id, t.assigned_role AS role
+    FROM mission_runs r
+    LEFT JOIN tasks t ON t.mission_id = r.mission_id AND t.plan_id = r.plan_id
+    WHERE r.mission_id = ? AND r.status IN ('starting', 'running', 'stopping')`).all(missionId) as Array<{ status: string; plan_id: string | null; role: string | null }>;
+  if (rows.length === 0) return false;
+  if (rows.some((row) => row.status === 'starting' || row.plan_id === null)) return true;
+  return rows.every((row) => row.role === 'researcher');
+}
+
 async function startDurableTurn(command: any, turn: any): Promise<void> {
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
@@ -683,6 +693,12 @@ async function startMissionWithDurability(missionId: string, content: string, op
   const runId = crypto.randomUUID();
   try {
     sqlite.transaction(() => {
+      const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
+      if (activeRun) {
+        const error = new Error('The current conversation turn is still running. Queue a follow-up instead.');
+        Object.assign(error, { code: 'TURN_ALREADY_RUNNING' });
+        throw error;
+      }
       sqlite.prepare(`INSERT INTO conversation_turns
         (id, mission_id, content, delivery, options, status, created_at, started_at)
         VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
@@ -936,10 +952,11 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
-    const delivery = String(req.body?.delivery || '');
+    let delivery = String(req.body?.delivery || '');
     if (!content || !['steer', 'queue', 'stop_and_replan'].includes(delivery)) {
       return void res.status(400).json({ error: "content and delivery ('steer', 'queue', or 'stop_and_replan') are required" });
     }
+    const requestedDelivery = delivery;
     const idempotencyKey = typeof req.header('Idempotency-Key') === 'string' ? req.header('Idempotency-Key')!.trim() : '';
     const active = ACTIVE_MISSION_STATUSES.has(String(mission.status));
     const turnId = crypto.randomUUID();
@@ -951,7 +968,14 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       modelCatalogId: requestedOptions.modelCatalogId || requestedOptions.model || undefined,
     };
     delete turnOptions.model;
-    const requestHash = turnRequestHash(missionId, content, delivery, turnOptions);
+    const queuedImplementationFollowUp = active && delivery === 'steer' && activeRunIsResearchOnly(missionId)
+      && hasExplicitImplementationIntent({
+        userMessage: content,
+        explicitCommand: turnOptions.command,
+        explicitTargetRole: turnOptions.targetRole,
+      });
+    if (queuedImplementationFollowUp) delivery = 'queue';
+    const requestHash = turnRequestHash(missionId, content, requestedDelivery, turnOptions);
     if (idempotencyKey) {
       const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?')
         .get(missionId, idempotencyKey) as any;
@@ -1051,7 +1075,10 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     } else if (!active) {
       void drainMissionCommands(missionId);
     }
-    res.status(202).json(turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }));
+    res.status(202).json({
+      ...turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }),
+      ...(queuedImplementationFollowUp ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
+    });
   } catch (error: any) {
     if (String(error?.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
       const missionId = routeParam(req.params.id);
@@ -1090,6 +1117,9 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     })));
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
+    if (error?.code === 'TURN_ALREADY_RUNNING') {
+      return void res.status(409).json({ code: 'TURN_ALREADY_RUNNING', error: message });
+    }
     res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
   }
 });
@@ -1211,7 +1241,10 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
     if (!decision.allowed || decision.requiresApproval) {
       return void res.status(409).json({ code: 'APPROVAL_REQUIRED', error: 'Workspace apply must continue through the mission approval flow.' });
     }
-    const result = await mergeCoordinator.applyWorktree(taskId);
+    const result = await mergeCoordinator.applyWorktree(taskId, undefined, {
+      operationId: `direct-task-merge:${task.missionId}:${taskId}`,
+      idempotencyKey: `direct-task-merge:${task.missionId}:${taskId}`,
+    });
     if (!result.success) return void res.status(400).json({ error: result.output });
     res.json(result);
   } catch (error: any) {

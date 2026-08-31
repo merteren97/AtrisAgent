@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import type { PostApplyVerificationContext, PostApplyVerificationResult } from '@atris-agent-code/domain';
 import { runCommand } from '@atris-agent-code/runtime-host';
 
@@ -9,6 +10,8 @@ const MAX_EVIDENCE_BYTES = 16 * 1024;
 interface WorkspaceLookup {
   getMission(id: string): Promise<{ workspaceId: string } | null>;
   getWorkspace(id: string): Promise<{ path: string } | null>;
+  getWorktreeForTask?(id: string): Promise<{ isolationKind?: string | null; targetPath?: string | null } | null>;
+  resolveAppliedTargetPath?(taskId: string): Promise<string | null>;
 }
 
 type VerificationRunner = (
@@ -54,80 +57,122 @@ async function deterministicChecks(workspacePath: string): Promise<VerificationC
   return checks;
 }
 
-/** Verify the applied result in the mission's registered base workspace. */
+/** Verify every distinct project changed by the mission's applied Builder tasks. */
 export async function verifyAppliedMission(
   context: PostApplyVerificationContext,
   workspaceManager: WorkspaceLookup,
   runner: VerificationRunner = runCommand,
 ): Promise<PostApplyVerificationResult> {
+  const startedAt = Date.now();
   const mission = await workspaceManager.getMission(context.missionId);
   if (!mission) return { passed: false, summary: 'Mission workspace could not be resolved.', evidence: ['Mission record is missing.'] };
   const workspace = await workspaceManager.getWorkspace(mission.workspaceId);
   if (!workspace?.path) return { passed: false, summary: 'Mission workspace could not be resolved.', evidence: ['Registered workspace is missing.'] };
 
-  let stat: fs.Stats;
-  try {
-    stat = await fs.promises.stat(workspace.path);
-  } catch (error) {
-    return { passed: false, summary: 'Registered workspace is unavailable.', evidence: [failureEvidence(error)] };
-  }
-  if (!stat.isDirectory()) {
-    return { passed: false, summary: 'Registered workspace is not a directory.', evidence: [bounded(workspace.path)] };
-  }
-
-  let checks: VerificationCommand[];
-  try {
-    checks = await deterministicChecks(workspace.path);
-  } catch (error) {
-    return { passed: false, summary: 'Workspace verification manifests are invalid.', evidence: [failureEvidence(error)] };
-  }
-  try {
-    const probe = await runner('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: workspace.path, timeoutMs: Math.min(COMMAND_TIMEOUT_MS, TOTAL_TIMEOUT_MS), maxOutputBytes: MAX_EVIDENCE_BYTES,
-    });
-    if (probe.stdout.trim() === 'true') checks.unshift({ command: 'git', args: ['diff', '--check'], label: 'git diff --check' });
-  } catch {
-    // A recognized manifest is sufficient for non-Git workspaces.
-  }
-  if (checks.length === 0) {
-    return {
-      passed: false,
-      summary: 'No trusted deterministic workspace checks are available.',
-      evidence: ['Expected package.json scripts (check, or typecheck/test), Cargo.toml, or a Git worktree.'],
-    };
-  }
-
-  const startedAt = Date.now();
   const evidence: string[] = [];
-  for (const check of checks) {
-    const remainingMs = TOTAL_TIMEOUT_MS - (Date.now() - startedAt);
-    if (remainingMs <= 0) {
-      return { passed: false, summary: 'Workspace verification timed out.', evidence: [...evidence, 'Total verification deadline exceeded.'] };
+  const targets = new Map<string, { path: string; taskIds: string[] }>();
+  let failed = false;
+  for (const taskId of context.builderTaskIds) {
+    let appliedPath: string | null = null;
+    try {
+      if (workspaceManager.resolveAppliedTargetPath) {
+        appliedPath = await workspaceManager.resolveAppliedTargetPath(taskId);
+      } else {
+        const record = await workspaceManager.getWorktreeForTask?.(taskId);
+        if (record?.isolationKind === 'new-sibling') appliedPath = record.targetPath || null;
+        else if (record?.isolationKind === 'nested-git') appliedPath = record.targetPath || null;
+        else appliedPath = workspace.path;
+      }
+      if (!appliedPath) throw new Error('No canonical applied target path is available.');
+
+      const canonicalPath = await fs.promises.realpath(path.resolve(appliedPath));
+      const stat = await fs.promises.stat(canonicalPath);
+      if (!stat.isDirectory()) throw new Error('Applied target is not a directory.');
+      const key = process.platform === 'win32' ? canonicalPath.toLocaleLowerCase('en-US') : canonicalPath;
+      const target = targets.get(key);
+      if (target) target.taskIds.push(taskId);
+      else targets.set(key, { path: canonicalPath, taskIds: [taskId] });
+    } catch (error) {
+      failed = true;
+      evidence.push(bounded(`[Builder ${taskId}] target resolution failed\n${failureEvidence(error)}`));
+    }
+  }
+
+  let timedOut = false;
+  for (const target of targets.values()) {
+    const targetLabel = `[Target ${target.path}; Builders ${target.taskIds.join(', ')}]`;
+    if (TOTAL_TIMEOUT_MS - (Date.now() - startedAt) <= 0) {
+      failed = true;
+      timedOut = true;
+      evidence.push(`${targetLabel} Total verification deadline exceeded.`);
+      break;
+    }
+
+    let checks: VerificationCommand[];
+    try {
+      checks = await deterministicChecks(target.path);
+    } catch (error) {
+      failed = true;
+      evidence.push(bounded(`${targetLabel} manifest inspection failed\n${failureEvidence(error)}`));
+      continue;
+    }
+    const probeRemainingMs = TOTAL_TIMEOUT_MS - (Date.now() - startedAt);
+    if (probeRemainingMs <= 0) {
+      failed = true;
+      timedOut = true;
+      evidence.push(`${targetLabel} Total verification deadline exceeded.`);
+      break;
     }
     try {
-      const result = await runner(check.command, check.args, {
-        cwd: workspace.path,
-        timeoutMs: Math.min(COMMAND_TIMEOUT_MS, remainingMs),
-        maxOutputBytes: MAX_EVIDENCE_BYTES,
+      const probe = await runner('git', ['rev-parse', '--is-inside-work-tree'], {
+        cwd: target.path, timeoutMs: Math.min(COMMAND_TIMEOUT_MS, probeRemainingMs), maxOutputBytes: MAX_EVIDENCE_BYTES,
       });
-      const output = bounded([result.stdout, result.stderr].filter(Boolean).join('\n'));
-      evidence.push(bounded(`${check.label}: passed${output ? `\n${output}` : ''}`));
-    } catch (error) {
-      const detail = failureEvidence(error);
-      return {
-        passed: false,
-        summary: /timed out|deadline/i.test(detail) ? 'Workspace verification timed out.' : 'Workspace deterministic checks failed.',
-        evidence: [...evidence, bounded(`${check.label}: failed\n${detail}`)],
-      };
+      if (probe.stdout.trim() === 'true') checks.unshift({ command: 'git', args: ['diff', '--check'], label: 'git diff --check' });
+    } catch {
+      // A recognized manifest is sufficient for non-Git workspaces.
     }
+    if (checks.length === 0) {
+      failed = true;
+      evidence.push(`${targetLabel} No trusted deterministic checks are available.`);
+      continue;
+    }
+
+    for (const check of checks) {
+      const checkRemainingMs = TOTAL_TIMEOUT_MS - (Date.now() - startedAt);
+      if (checkRemainingMs <= 0) {
+        failed = true;
+        timedOut = true;
+        evidence.push(`${targetLabel} Total verification deadline exceeded.`);
+        break;
+      }
+      try {
+        const result = await runner(check.command, check.args, {
+          cwd: target.path,
+          timeoutMs: Math.min(COMMAND_TIMEOUT_MS, checkRemainingMs),
+          maxOutputBytes: MAX_EVIDENCE_BYTES,
+        });
+        const output = bounded([result.stdout, result.stderr].filter(Boolean).join('\n'));
+        evidence.push(bounded(`${targetLabel} ${check.label}: passed${output ? `\n${output}` : ''}`));
+      } catch (error) {
+        failed = true;
+        const detail = failureEvidence(error);
+        if (/timed out|deadline/i.test(detail)) timedOut = true;
+        evidence.push(bounded(`${targetLabel} ${check.label}: failed\n${detail}`));
+      }
+    }
+    if (timedOut && TOTAL_TIMEOUT_MS - (Date.now() - startedAt) <= 0) break;
   }
-  try {
+
+  if (failed) {
     return {
-      passed: true,
-      summary: 'Trusted deterministic workspace checks passed.',
+      passed: false,
+      summary: timedOut ? 'Workspace verification timed out.' : 'One or more applied targets are unavailable or failed deterministic verification.',
       evidence,
     };
-  } catch (error) {
-    return { passed: false, summary: 'Workspace verification failed.', evidence: [failureEvidence(error)] };
   }
+  return {
+    passed: true,
+    summary: 'Trusted deterministic checks passed for every applied target.',
+    evidence,
+  };
 }

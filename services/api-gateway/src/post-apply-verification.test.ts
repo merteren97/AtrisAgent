@@ -63,6 +63,76 @@ async function main(): Promise<void> {
     const missing = await verifyAppliedMission(context, lookup(path.join(root, 'missing')), passingRunner);
     assert.equal(missing.passed, false);
     assert.match(missing.summary, /unavailable/);
+
+    const atrisTask = path.join(root, 'AtrisTask');
+    await fs.promises.mkdir(atrisTask);
+    await fs.promises.writeFile(path.join(atrisTask, 'package.json'), JSON.stringify({ scripts: { check: 'verify new project' } }));
+    const siblingCalls: string[] = [];
+    const siblingLookup = {
+      ...lookup(actualWorkspace),
+      getWorktreeForTask: async () => ({ isolationKind: 'new-sibling', targetPath: atrisTask }),
+    };
+    const siblingResult = await verifyAppliedMission(context, siblingLookup, async (_command, _args, options) => {
+      siblingCalls.push(options.cwd);
+      return { stdout: 'false\n', stderr: '', exitCode: 0 };
+    });
+    assert.equal(siblingResult.passed, true);
+    assert(siblingCalls.length > 0 && siblingCalls.every((cwd) => cwd === atrisTask), 'new sibling verification cwd resolves to AtrisTask rather than its parent container');
+
+    const nestedProject = path.join(root, 'nested-project');
+    const siblingTwo = path.join(root, 'SiblingTwo');
+    for (const target of [nestedProject, siblingTwo]) {
+      await fs.promises.mkdir(target);
+      await fs.promises.writeFile(path.join(target, 'package.json'), JSON.stringify({ scripts: { check: 'verify target' } }));
+    }
+    const mixedContext = {
+      ...context,
+      builderTaskIds: ['root-builder', 'nested-builder', 'sibling-builder', 'sibling-two-builder'],
+    };
+    const appliedTargets = new Map([
+      ['root-builder', actualWorkspace],
+      ['nested-builder', nestedProject],
+      ['sibling-builder', atrisTask],
+      ['sibling-two-builder', siblingTwo],
+    ]);
+    const mixedCalls: string[] = [];
+    const mixedResult = await verifyAppliedMission(mixedContext, {
+      ...lookup(actualWorkspace),
+      resolveAppliedTargetPath: async (taskId: string) => appliedTargets.get(taskId) || null,
+    }, async (_command, args, options) => {
+      mixedCalls.push(options.cwd);
+      return { stdout: args[0] === 'rev-parse' ? 'true\n' : '', stderr: '', exitCode: 0 };
+    });
+    assert.equal(mixedResult.passed, true);
+    assert.deepEqual(new Set(mixedCalls), new Set([actualWorkspace, nestedProject, atrisTask, siblingTwo]));
+    assert.equal(mixedCalls.length, 12, 'each root, existing project, and sibling target runs all deterministic checks');
+    for (const target of appliedTargets.values()) assert(mixedResult.evidence.some((item) => item.includes(target)), `evidence labels target ${target}`);
+
+    const deduplicatedCalls: string[] = [];
+    const deduplicated = await verifyAppliedMission({ ...context, builderTaskIds: ['builder-1', 'builder-2'] }, {
+      ...lookup(actualWorkspace),
+      resolveAppliedTargetPath: async () => actualWorkspace,
+    }, async (_command, args, options) => {
+      deduplicatedCalls.push(options.cwd);
+      return { stdout: args[0] === 'rev-parse' ? 'true\n' : '', stderr: '', exitCode: 0 };
+    });
+    assert.equal(deduplicated.passed, true);
+    assert.equal(deduplicatedCalls.length, 3, 'duplicate applied paths are verified once');
+    assert.match(deduplicated.evidence.join('\n'), /Builders builder-1, builder-2/);
+
+    const failureCalls: string[] = [];
+    const oneTargetFailed = await verifyAppliedMission({ ...context, builderTaskIds: ['failing-builder', 'passing-builder'] }, {
+      ...lookup(actualWorkspace),
+      resolveAppliedTargetPath: async (taskId: string) => taskId === 'failing-builder' ? nestedProject : siblingTwo,
+    }, async (command, args, options) => {
+      failureCalls.push(options.cwd);
+      if (command === 'npm' && options.cwd === nestedProject) throw new Error('nested target check failed');
+      return { stdout: args[0] === 'rev-parse' ? 'true\n' : '', stderr: '', exitCode: 0 };
+    });
+    assert.equal(oneTargetFailed.passed, false);
+    assert(failureCalls.includes(siblingTwo), 'verification continues to later targets after one target fails');
+    assert(oneTargetFailed.evidence.some((item) => item.includes(nestedProject) && item.includes('failed')));
+    assert(oneTargetFailed.evidence.some((item) => item.includes(siblingTwo) && item.includes('passed')));
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
   }

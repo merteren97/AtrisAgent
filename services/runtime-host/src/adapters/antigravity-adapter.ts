@@ -43,6 +43,7 @@ import {
   runCommand,
   spawnHidden,
   spawnHiddenChecked,
+  terminateProcessTree,
 } from '../runtime-utils';
 
 interface PendingAuth {
@@ -70,6 +71,50 @@ const TERMINAL_FORCE_KILL_MS = 3_000;
 const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
 const FINAL_RESPONSE_QUIET_GRACE_MS = 2_500;
 const TERMINAL_RELEASE_GRACE_MS = TERMINAL_EXIT_GRACE_MS + TERMINAL_FORCE_KILL_MS + 500;
+
+export function resolveAntigravityPassiveAuthCommand(help: string): string[] | null {
+  if (/\bauth\s+status\b/i.test(help)) return ['auth', 'status'];
+  if (/^\s*status\b[^\r\n]*\b(?:auth|login|account|credential)/im.test(help)) return ['status'];
+  return null;
+}
+
+function classifyAntigravityAuthStatus(output: string): AccountProfileStatus {
+  const authBooleans: boolean[] = [];
+  const authStatuses: string[] = [];
+  const visit = (value: unknown, depth = 0): void => {
+    if (!value || depth > 5) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      const normalizedKey = key.toLowerCase().replace(/[^a-z]/g, '');
+      if (['authenticated', 'connected', 'loggedin', 'signedin'].includes(normalizedKey) && typeof nested === 'boolean') {
+        authBooleans.push(nested);
+      }
+      if (['status', 'authstatus', 'authenticationstatus', 'connectionstatus', 'sessionstatus'].includes(normalizedKey) && typeof nested === 'string') {
+        authStatuses.push(nested.toLowerCase());
+      }
+      visit(nested, depth + 1);
+    }
+  };
+  for (const line of [output, ...output.split(/\r?\n/)]) {
+    try { visit(JSON.parse(line)); } catch { /* Status commands may return plain text. */ }
+  }
+
+  const text = output.toLowerCase();
+  const structuredNegative = authBooleans.includes(false)
+    || authStatuses.some((status) => /^(?:false|disconnected|expired|invalid|revoked|unauthenticated|unauthorized|logged[_ -]?out|signed[_ -]?out|login[_ -]?required)$/.test(status));
+  const explicitNegative = /\b(?:authenticated|connected|logged[_ -]?in|signed[_ -]?in)\s*[=:]\s*false\b|not\s+(?:authenticated|connected|logged\s+in|signed\s+in)|unauthenticated|unauthorized|disconnected|logged\s+out|signed\s+out|(?:login|sign\s+in|authentication)\s+required|credential[^\r\n]*missing|(?:session|token|credential|authentication)\s+(?:(?:is|has|was)\s+)?(?:expired|invalid|revoked|no\s+longer\s+valid)|(?:expired|invalid|revoked)\s+(?:session|token|credential)/.test(text);
+  if (structuredNegative || explicitNegative) {
+    return 'login_required';
+  }
+  const structuredPositive = authBooleans.includes(true)
+    || authStatuses.some((status) => /^(?:true|connected|authenticated|valid|active|logged[_ -]?in|signed[_ -]?in)$/.test(status));
+  if (structuredPositive || /^(?:\s*(?:authenticated|connected|logged\s+in|signed\s+in)\s*[.!]?\s*)$/i.test(output)) return 'connected';
+  return 'error';
+}
 
 // Last-resort fallback only. `agy models` is authoritative when the installed CLI exposes it.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
@@ -99,7 +144,13 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private liveModelFamilies: AntigravityCliModelFamily[] = [];
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
-  constructor(eventBus?: LocalEventBus) {
+  constructor(
+    eventBus?: LocalEventBus,
+    private readonly passiveAuthCommands: {
+      getHelpText: typeof getHelpText;
+      runCommand: typeof runCommand;
+    } = { getHelpText, runCommand },
+  ) {
     super(eventBus);
   }
 
@@ -202,7 +253,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         status,
         message: verification?.activeModel
           ? `Antigravity is connected. Active model detected: ${verification.activeModel}.`
-          : 'Antigravity is connected and print mode is reachable.',
+          : 'Antigravity authentication is connected.',
       };
     }
     if (status === 'rate_limited') {
@@ -222,43 +273,41 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
 
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) return 'not_installed';
-    const capabilities = await this.probeCapabilities();
-    if (!capabilities.structuredEventStreaming) {
+    const help = await this.passiveAuthCommands.getHelpText(install.path);
+    const statusCommand = resolveAntigravityPassiveAuthCommand(help);
+    if (!statusCommand) {
       this.lastVerification = {
-        status: 'error',
+        status: 'login_required',
         checkedAt: Date.now(),
-        message: 'Antigravity print mode with structured output is unavailable. Update Antigravity CLI to 1.1.8 or newer.',
+        message: 'Passive verification requires interactive setup because this Antigravity CLI does not advertise a non-interactive authentication status command. Start sign-in to open the visible setup terminal.',
       };
-      return 'error';
+      return 'login_required';
     }
 
     try {
-      const result = await runCommand(install.path, [
-        '--print',
-        'Reply with exactly ATRIS_AUTH_OK. Do not use tools and do not modify files.',
-        '--output-format',
-        'json',
-        '--sandbox',
-      ], { timeoutMs: 75_000, cwd: os.homedir() });
-      const activeModel = this.extractModelId(result.stdout);
-      this.lastVerification = { status: 'connected', checkedAt: Date.now(), activeModel };
-      return 'connected';
+      const result = await this.passiveAuthCommands.runCommand(install.path, statusCommand, { timeoutMs: 8_000, cwd: os.homedir() });
+      const status = classifyAntigravityAuthStatus(`${result.stdout}\n${result.stderr}`);
+      const commandFailed = result.exitCode !== 0;
+      const finalStatus = commandFailed && status === 'connected' ? 'error' : status;
+      this.lastVerification = {
+        status: finalStatus,
+        checkedAt: Date.now(),
+        message: finalStatus === 'error'
+          ? 'Antigravity returned an unrecognized authentication status. Use the visible sign-in terminal to verify setup.'
+          : undefined,
+      };
+      return finalStatus;
     } catch (error: any) {
       const raw = `${error?.stdout || ''}\n${error?.stderr || ''}\n${error?.message || ''}`;
-      const text = raw.toLowerCase();
       const message = redactSecrets(raw).trim().slice(-1_500);
-      const needsOnboarding = /first.?launch|onboarding|workspace trust|trust this|select.*theme|rendering mode/.test(text);
-      const status: AccountProfileStatus = /rate.?limit|quota|resource exhausted|too many requests/.test(text)
-        ? 'rate_limited'
-        : /auth|login|sign.?in|credential|keyring|unauthorized|forbidden|account/.test(text)
-          ? 'login_required'
-          : 'error';
+      const classified = classifyAntigravityAuthStatus(raw);
+      const status = classified === 'login_required' ? 'login_required' : 'error';
       this.lastVerification = {
         status,
         checkedAt: Date.now(),
-        message: needsOnboarding
-          ? 'Antigravity still requires first-launch setup or workspace trust. Finish the prompts in the opened Antigravity terminal, then check the connection again.'
-          : message,
+        message: status === 'login_required'
+          ? 'Antigravity requires interactive setup. Start sign-in and finish setup in the visible terminal, then check the connection again.'
+          : message || 'Antigravity authentication status could not be determined non-interactively.',
       };
       return status;
     }
@@ -271,7 +320,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     await new Promise((resolve) => setTimeout(resolve, 800));
     child.stdin?.write('/logout\n');
     await new Promise((resolve) => setTimeout(resolve, 1_200));
-    child.kill('SIGTERM');
+    await terminateProcessTree(child);
     this.lastVerification = undefined;
     this.liveModelFamilies = [];
   }
@@ -392,29 +441,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       });
     }
     return models;
-  }
-
-  private extractModelId(stdout: string): string | undefined {
-    const candidates: unknown[] = [];
-    for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
-      try { candidates.push(JSON.parse(line)); } catch { /* Text output is allowed. */ }
-    }
-    const visit = (value: unknown, depth = 0): string | undefined => {
-      if (!value || depth > 5) return undefined;
-      if (Array.isArray(value)) {
-        for (const item of value) { const found = visit(item, depth + 1); if (found) return found; }
-        return undefined;
-      }
-      if (typeof value !== 'object') return undefined;
-      const record = value as Record<string, unknown>;
-      for (const key of ['model_id', 'modelId', 'model', 'reasoning_model']) {
-        if (typeof record[key] === 'string' && record[key]) return record[key] as string;
-      }
-      for (const nested of Object.values(record)) { const found = visit(nested, depth + 1); if (found) return found; }
-      return undefined;
-    };
-    for (const candidate of candidates) { const found = visit(candidate); if (found) return found; }
-    return undefined;
   }
 
   private normalizeModelId(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, ''); }
@@ -822,12 +848,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const terminate = setTimeout(() => {
       const active = this.activeProcesses.get(sessionId);
       if (!active || active.exitCode !== null || active.signalCode !== null) return;
-      active.kill('SIGTERM');
+      void terminateProcessTree(active);
 
       const forceKill = setTimeout(() => {
         const stillActive = this.activeProcesses.get(sessionId);
         if (!stillActive || stillActive.exitCode !== null || stillActive.signalCode !== null) return;
-        stillActive.kill('SIGKILL');
+        void terminateProcessTree(stillActive, true);
       }, TERMINAL_FORCE_KILL_MS);
       forceKill.unref?.();
     }, TERMINAL_EXIT_GRACE_MS);

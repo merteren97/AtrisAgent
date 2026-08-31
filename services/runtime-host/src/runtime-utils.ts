@@ -88,6 +88,18 @@ export interface PreparedRuntimeCommand {
   usesPowerShellBridge?: boolean;
 }
 
+export function prepareBackgroundSpawnOptions(
+  options: SpawnOptions = {},
+  platform: NodeJS.Platform = process.platform,
+): SpawnOptions {
+  return {
+    ...options,
+    windowsHide: true,
+    shell: false,
+    detached: platform === 'win32' ? false : true,
+  };
+}
+
 export function resolveAtrisDataDir(
   environment: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
@@ -391,7 +403,7 @@ export async function runCommand(
     };
 
     const failForOutputLimit = (stream: 'stdout' | 'stderr') => {
-      if (!child.killed) child.kill('SIGKILL');
+      void terminateProcessTree(child, true);
       finish(() => {
         const failure = Object.assign(
           new Error(`Command ${stream} exceeded the ${maxOutputBytes}-byte capture limit: ${command}`),
@@ -408,7 +420,7 @@ export async function runCommand(
     };
 
     const timer = setTimeout(() => {
-      if (!child.killed) child.kill('SIGKILL');
+      void terminateProcessTree(child, true);
       finish(() => {
         const failure = Object.assign(new Error(`Command timed out after ${options.timeoutMs ?? 15_000}ms: ${command}`), {
           stdout,
@@ -509,7 +521,7 @@ export async function waitForHttp(
 }
 
 export async function terminateProcessTree(child: ChildProcess, force = false): Promise<void> {
-  if (child.exitCode !== null || child.killed) return;
+  if (child.exitCode != null || child.signalCode != null) return;
   if (process.platform !== 'win32' && child.pid && detachedProcessGroups.has(child)) {
     try { process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process group already exited */ }
     return;
@@ -527,7 +539,7 @@ export async function terminateProcessTree(child: ChildProcess, force = false): 
     killer.once('error', () => resolve());
     killer.once('close', () => resolve());
   });
-  if (child.exitCode === null && !child.killed) {
+  if (child.exitCode === null && child.signalCode === null) {
     try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process already exited */ }
   }
 }
@@ -605,13 +617,10 @@ export function spawnHidden(command: string, args: string[], options: SpawnOptio
   const prepared = prepareRuntimeCommand(command, args, process.platform, environment);
   const bridgeContext = applyWindowsBridgeContext(prepared, environment, cwd);
   const child = spawn(prepared.command, prepared.args, {
-    ...options,
+    ...prepareBackgroundSpawnOptions(options),
     cwd: bridgeContext.cwd,
-    windowsHide: true,
     windowsVerbatimArguments: prepared.windowsVerbatimArguments ?? options.windowsVerbatimArguments,
-    shell: false,
     env: bridgeContext.env,
-    detached: process.platform === 'win32' ? options.detached : true,
   });
   if (process.platform !== 'win32') detachedProcessGroups.add(child);
   // Node treats an unobserved child-process `error` event as fatal. Runtime

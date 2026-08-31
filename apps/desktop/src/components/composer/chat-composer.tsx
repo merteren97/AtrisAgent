@@ -11,7 +11,7 @@ import { ChatComposer as StandardChatComposer } from './chat-composer-base';
 
 function QueuedTurnComposer() {
   const [message, setMessage] = useState('');
-  const [delivery, setDelivery] = useState<TurnDelivery>('steer');
+  const [delivery, setDelivery] = useState<TurnDelivery>('queue');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const sendMissionCommand = useMissionStore((state) => state.sendMissionCommand);
@@ -90,7 +90,7 @@ function QueuedTurnComposer() {
           <div className="flex min-w-0 items-center gap-2">
             <Clock3 className="h-3.5 w-3.5 shrink-0 text-primary" />
             <span className="font-medium text-foreground">Current turn is still running</span>
-            <span className="truncate text-muted-foreground">Steer at the next safe boundary, queue a follow-up, or stop and replan.</span>
+            <span className="truncate text-muted-foreground">Queue starts a new turn in this conversation. Steer only guides the active turn at its next safe boundary.</span>
           </div>
           {queuedCount > 0 ? <span className="shrink-0 rounded-full border border-border bg-background px-2 py-0.5 text-[9px] text-muted-foreground">{queuedCount} queued</span> : null}
         </div>
@@ -134,7 +134,7 @@ function QueuedTurnComposer() {
         </div>
 
         <div className="mt-1.5 flex items-center justify-between px-1 text-[9px] text-muted-foreground/70">
-          <span>Enter to send · Shift+Enter for a new line · Steer never mutates an already-running worker</span>
+          <span>Enter to send · Shift+Enter for a new line · Queue is the safe default; Steer does not start implementation</span>
           {message.length > 0 ? <span>~{Math.ceil(message.length / 4)} tokens</span> : null}
         </div>
       </div>

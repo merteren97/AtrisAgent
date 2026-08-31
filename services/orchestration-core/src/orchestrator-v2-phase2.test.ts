@@ -72,6 +72,7 @@ class FakeWorkspaceManager {
       requiredCapabilities: input.requiredCapabilities || [],
       dependsOn: input.dependsOn || [],
       worktreeId: input.worktreeId || null,
+      targetDescriptor: input.targetDescriptor || null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,
@@ -236,6 +237,57 @@ async function runTests() {
     let staleSteerRejected = false;
     try { await orchestrator.steerActiveTurn({ missionId, targetTurnId: 'older-turn', content: 'stale' }); } catch { staleSteerRejected = true; }
     assert(staleSteerRejected, 'Steer rejects stale target-turn correlation');
+  }
+
+  // A completed research turn continues in the same mission with a fresh plan,
+  // using durable research provenance instead of scheduling duplicate research.
+  {
+    const missionId = 'conversation-research-build-follow-up';
+    const manager = new FakeWorkspaceManager({
+      missionId,
+      description: 'Research the safest cache invalidation approach.',
+      status: 'completed',
+      planId: 'completed-research-plan',
+    });
+    const eventBus = new LocalEventBus();
+    const revisions: any[] = [];
+    eventBus.on('plan_revised', (event) => { revisions.push(event); });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'execute',
+      response: 'Build the researched approach.',
+      delegations: [{ id: 'builder', role: 'builder', objective: 'Implement the researched cache invalidation approach.', requiredCapabilities: ['implementation'] }],
+    }));
+    class PriorResearchOrchestrator extends OrchestratorV2 {
+      protected override async getLatestResearchBundle(): Promise<any> {
+        return {
+          version: 1,
+          missionId,
+          planId: 'completed-research-plan',
+          sourceTaskIds: ['completed-research-task'],
+          sources: [{ taskId: 'completed-research-task', result: 'Use generation-based invalidation.', uncertain: false }],
+          findings: ['Use generation-based invalidation.'],
+          evidence: [{ taskId: 'completed-research-task' }],
+          conflicts: [],
+          uncertainties: [],
+          truncated: false,
+        };
+      }
+    }
+    const orchestrator = new PriorResearchOrchestrator(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    const result = await orchestrator.startMission(missionId, 'Build this.', { turnId: 'build-follow-up-turn', runId: 'build-follow-up-run' });
+    const builder = result.tasks.find((task) => task.assignedRole === 'builder');
+    assert(result.missionId === missionId && result.planId !== 'completed-research-plan',
+      'completed research follow-up keeps the mission and creates a new turn plan');
+    assert(result.tasks.every((task) => task.assignedRole !== 'researcher') && Boolean(builder?.description.includes('completed-research-plan')),
+      'build follow-up reuses durable prior research without a redundant Researcher');
+    assert(revisions[0]?.previousPlanId === 'completed-research-plan' && String(revisions[0]?.reason).includes('reused completed research'),
+      'plan lineage links prior research and describes same-conversation reuse');
   }
 
   // Explicit plan requests produce a graph but do not start execution.

@@ -14,7 +14,9 @@ import type {
   PostApplyVerificationContext,
   PostApplyVerificationResult,
   ApplyVerificationOperationResult,
+  BuilderTargetDescriptor,
 } from '@atris-agent-code/domain';
+import { parseBuilderTargetDescriptor } from '@atris-agent-code/domain';
 import { PolicyEngine, resolveAutomationAction } from '@atris-agent-code/policy-engine';
 import { allocateWorkerBatch } from './worker-pool';
 
@@ -40,6 +42,7 @@ export interface StructuredTaskPlan {
   requiredCapabilities: string[];
   dependsOnIndices?: number[];
   dependsOn?: string[];
+  targetDescriptor?: BuilderTargetDescriptor;
 }
 
 export interface StructuredPlan {
@@ -65,6 +68,7 @@ export const StructuredPlanJSONSchema = {
           priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
           requiredCapabilities: { type: 'array', items: { type: 'string' } },
           dependsOnIndices: { type: 'array', items: { type: 'number' } },
+          targetDescriptor: { type: 'object' },
         },
         required: ['title', 'description', 'role', 'priority', 'requiredCapabilities'],
       },
@@ -221,6 +225,7 @@ export function validateAndRepairPlan(rawPlan: any, userRequest: string): Struct
         priority,
         requiredCapabilities,
         dependsOnIndices,
+        targetDescriptor: role === 'builder' ? parseBuilderTargetDescriptor(task?.targetDescriptor) : undefined,
       };
     });
   }
@@ -351,6 +356,7 @@ export class Orchestrator {
     title: string;
     assignedRole?: string | null;
     agentInstanceId?: string;
+    targetDescriptor?: BuilderTargetDescriptor;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
     this.emitEvent({
@@ -361,6 +367,7 @@ export class Orchestrator {
       title: params.title,
       assignedRole: params.assignedRole ?? null,
       agentInstanceId: params.agentInstanceId,
+      targetDescriptor: params.targetDescriptor,
       timestamp: new Date().toISOString(),
     });
   }
@@ -615,6 +622,7 @@ export class Orchestrator {
       targetRole?: string;
       command?: string;
       rawModelPlanOutput?: string;
+      researchContextPlanId?: string;
     }
   ): Promise<{
     missionId: string;
@@ -753,7 +761,9 @@ export class Orchestrator {
     // remain attached to their eventual task records.
     for (let i = 0; i < structuredPlan.tasks.length; i++) {
       const taskSpec = structuredPlan.tasks[i];
-      const isCandidate = currentExecutionMode === 'candidate' && taskSpec.role === 'builder';
+      const isCandidate = currentExecutionMode === 'candidate'
+        && taskSpec.role === 'builder'
+        && taskSpec.targetDescriptor?.kind !== 'new_sibling_project';
       const tasksToCreateCount = isCandidate ? 2 : 1;
       taskIndexToIds.set(i, Array.from({ length: tasksToCreateCount }, () => crypto.randomUUID()));
     }
@@ -761,7 +771,9 @@ export class Orchestrator {
     // Build tasks (and candidate worktrees if candidate mode)
     for (let i = 0; i < structuredPlan.tasks.length; i++) {
       const taskSpec = structuredPlan.tasks[i];
-      const isCandidate = currentExecutionMode === 'candidate' && taskSpec.role === 'builder';
+      const isCandidate = currentExecutionMode === 'candidate'
+        && taskSpec.role === 'builder'
+        && taskSpec.targetDescriptor?.kind !== 'new_sibling_project';
       const tasksToCreateCount = isCandidate ? 2 : 1;
       const taskIdsForIndex = taskIndexToIds.get(i) ?? [];
 
@@ -794,6 +806,7 @@ export class Orchestrator {
             requiredCapabilities: taskSpec.requiredCapabilities,
             dependsOn: dependsOnTaskIds,
             worktreeId,
+            targetDescriptor: taskSpec.targetDescriptor,
           });
         } else {
           taskRecord = {
@@ -809,6 +822,7 @@ export class Orchestrator {
             requiredCapabilities: taskSpec.requiredCapabilities,
             dependsOn: dependsOnTaskIds,
             worktreeId,
+            targetDescriptor: taskSpec.targetDescriptor ?? null,
             createdAt: now,
             updatedAt: now,
             completedAt: null,
@@ -844,7 +858,9 @@ export class Orchestrator {
         missionId,
         planId,
         previousPlanId,
-        reason: 'New user turn received in the existing conversation. A fresh execution plan was created without mixing prior-turn tasks.',
+        reason: options?.researchContextPlanId
+          ? `Same-conversation follow-up created a new plan and reused completed research from prior plan ${options.researchContextPlanId}; completed plans were not mutated.`
+          : 'Same-conversation follow-up created a fresh execution plan without mixing or mutating prior-turn tasks.',
         changedTaskIds: createdTasks.map((task) => task.id),
         timestamp: new Date().toISOString(),
       });
@@ -944,6 +960,9 @@ export class Orchestrator {
     }
 
     const roleToAssign = agentRole ?? task?.assignedRole ?? 'builder';
+    if (this.workspaceManager && task && roleToAssign === 'builder') {
+      await this.workspaceManager.preflightTaskTarget?.(taskId);
+    }
     const agentInstanceId = crypto.randomUUID();
 
     if (this.workspaceManager && task) {
@@ -994,6 +1013,7 @@ export class Orchestrator {
       title,
       assignedRole: roleToAssign,
       agentInstanceId,
+      targetDescriptor: task?.targetDescriptor ?? undefined,
     });
 
     if (task) return task;
@@ -1012,6 +1032,7 @@ export class Orchestrator {
       requiredCapabilities: [],
       dependsOn: [],
       worktreeId: null,
+      targetDescriptor: null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,

@@ -59,7 +59,7 @@ async function runTests() {
       PRAGMA foreign_keys = ON;
       CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, git_initialized INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT, last_team_template_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', team_template_id TEXT NOT NULL DEFAULT '', plan_id TEXT, execution_mode TEXT NOT NULL DEFAULT 'balanced', automation_policy TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
-      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, target_descriptor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
       CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, route_adapter_id TEXT, route_provider TEXT, route_account_profile_id TEXT, route_model_catalog_id TEXT, route_runtime_model_id TEXT, route_reasoning_level TEXT, route_source TEXT, route_selection_mode TEXT, provider_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
       CREATE UNIQUE INDEX idx_task_attempts_task_number ON task_attempts(task_id, attempt_number);
       CREATE TABLE team_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', max_parallel_agents INTEGER, worker_pools TEXT, is_default INTEGER DEFAULT 0, created_at TEXT NOT NULL);
@@ -424,6 +424,82 @@ async function runTests() {
       ambiguousError = error instanceof Error ? error.message : String(error);
     }
     assert(ambiguousError.includes('multiple Git projects'), 'Multiple child repositories fail safely when the task does not identify a project');
+
+    const eightRepoContainer = path.join(tmpDir, 'eight-repo-container');
+    fs.mkdirSync(eightRepoContainer, { recursive: true });
+    for (let index = 1; index <= 8; index += 1) {
+      const repo = path.join(eightRepoContainer, `Sibling${index}`);
+      fs.mkdirSync(repo);
+      runGit(repo, ['init', '--quiet']);
+      fs.writeFileSync(path.join(repo, 'untouched.txt'), `sibling-${index}`);
+    }
+    const newTarget = await worktreeManager.resolveBuilderTarget(
+      eightRepoContainer,
+      { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+      'Create AtrisTask',
+    );
+    assert(newTarget.kind === 'new-sibling' && newTarget.targetName === 'AtrisTask', 'Absent AtrisTask resolves as a new sibling without selecting one of eight repositories');
+    const newStaging = path.join(eightRepoContainer, '.atris-worktrees', 'mission-new', 'task-new');
+    await worktreeManager.createEmptyManagedStaging(newStaging, newTarget.canonicalContainer!);
+    assert((await fs.promises.readdir(newStaging)).join(',') === '.atris-baseline', 'New sibling Builder staging starts with only an empty baseline');
+    assert(Array.from({ length: 8 }, (_, index) => fs.readFileSync(path.join(eightRepoContainer, `Sibling${index + 1}`, 'untouched.txt'), 'utf8')).every((value, index) => value === `sibling-${index + 1}`), 'New sibling staging does not copy or modify existing repositories');
+
+    for (const unsafeName of ['.', '..', '../escape', 'nested/project', 'nested\\project', 'C:\\escape', '\\\\server\\share', 'name:stream', 'NUL', 'con.txt', 'trail.', 'trail ', '\0bad']) {
+      let rejected = false;
+      try { await worktreeManager.validateNewSiblingTarget(eightRepoContainer, unsafeName); } catch { rejected = true; }
+      assert(rejected, `Unsafe new sibling target is rejected: ${JSON.stringify(unsafeName)}`);
+    }
+    fs.mkdirSync(path.join(eightRepoContainer, 'Collision'));
+    let collisionRejected = false;
+    try { await worktreeManager.validateNewSiblingTarget(eightRepoContainer, 'collision'); } catch { collisionRejected = true; }
+    assert(collisionRejected, 'New sibling target rejects case-insensitive collisions with existing entries');
+
+    fs.writeFileSync(path.join(newStaging, 'package.json'), JSON.stringify({ name: 'atris-task' }));
+    fs.mkdirSync(path.join(newStaging, 'src'));
+    fs.writeFileSync(path.join(newStaging, 'src', 'index.ts'), 'export const ready = true;\n');
+    const newSiblingChanges = await worktreeManager.getChangedFiles(newStaging);
+    assert(newSiblingChanges.length === 2 && newSiblingChanges.every((file) => file.status === 'added'), 'Every new sibling project file is reported as added');
+    const newSiblingDiff = await worktreeManager.getDiff(newStaging);
+    assert(newSiblingDiff.includes('+++ b/package.json') && newSiblingDiff.includes('+++ b/src/index.ts'), 'New sibling diff includes every added project file');
+    assert(!newSiblingChanges.some((file) => file.path.includes('.atris-')) && !newSiblingDiff.includes('.atris-baseline'), 'New sibling review data excludes Atris metadata');
+    const firstSiblingApply = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'operation-new');
+    assert(firstSiblingApply.success && fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', 'package.json')), 'New sibling apply safely publishes staged content into AtrisTask');
+    assert(fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', '.atris-operation.json')), 'Atomic apply moves its durable ownership marker with the project');
+    const recoveredRetry = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'operation-new');
+    assert(recoveredRetry.success && recoveredRetry.output.includes('Recovered'), 'Retry reconciles a matching marker after rename and before database ownership');
+    const foreignRetry = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'other-operation');
+    assert(!foreignRetry.success && foreignRetry.output.includes('not owned'), 'Atomic apply never overwrites an existing foreign destination');
+    await worktreeManager.finalizeNewSiblingApply(newTarget.canonicalContainer!, 'AtrisTask', 'operation-new');
+    assert(!fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', '.atris-operation.json')) && !fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', '.atris-baseline')), 'Applied project contains no Atris baseline or operation marker after ownership is durable');
+    const ownedRetry = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'operation-new', 'operation-new');
+    assert(ownedRetry.success && ownedRetry.output.includes('already applied'), 'Persisted Atris ownership remains idempotent after marker cleanup');
+
+    const nonGitContainer = path.join(tmpDir, 'non-git-child-container');
+    const nonGitChild = path.join(nonGitContainer, 'PlainProject');
+    const nestedChildRepo = path.join(nonGitChild, 'vendor', 'NestedRepo');
+    fs.mkdirSync(nestedChildRepo, { recursive: true });
+    fs.writeFileSync(path.join(nonGitChild, 'root.txt'), 'before\n');
+    fs.writeFileSync(path.join(nonGitContainer, 'untouched.txt'), 'container\n');
+    runGit(nestedChildRepo, ['init', '--quiet']);
+    fs.writeFileSync(path.join(nestedChildRepo, 'nested.txt'), 'nested\n');
+    commitAll(nestedChildRepo, 'Nested baseline');
+    const explicitNonGit = await worktreeManager.resolveBuilderTarget(
+      nonGitContainer,
+      { kind: 'existing_project', projectName: 'PlainProject' },
+    );
+    assert(explicitNonGit.kind === 'mirror' && path.resolve(explicitNonGit.targetPath!) === path.resolve(nonGitChild), 'Explicit non-Git child persists its canonical apply target');
+    const nonGitWorktree = await worktreeManager.createWorktree(
+      explicitNonGit.path,
+      'atris/non-git-child',
+      undefined,
+      'HEAD',
+      '',
+      explicitNonGit,
+    );
+    fs.writeFileSync(path.join(nonGitWorktree, 'root.txt'), 'after\n');
+    const nonGitMerge = await worktreeManager.merge(nonGitWorktree, undefined, explicitNonGit.targetPath);
+    assert(nonGitMerge.success && fs.readFileSync(path.join(nonGitChild, 'root.txt'), 'utf8') === 'after\n', 'Explicit non-Git child applies back to the selected child');
+    assert(fs.readFileSync(path.join(nonGitContainer, 'untouched.txt'), 'utf8') === 'container\n', 'Explicit non-Git child apply leaves the parent container untouched');
 
     const nestedTaskWorktree = await worktreeManager.createWorktree(
       projectContainer,

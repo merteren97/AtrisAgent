@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 16;
+export const DATABASE_SCHEMA_VERSION = 17;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -373,5 +373,25 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
       sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_telemetry_attempt ON runtime_telemetry(attempt_id) WHERE attempt_id IS NOT NULL');
     }
     sqlite.exec('PRAGMA user_version = 16');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 17) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'tasks') && !hasColumn(sqlite, 'tasks', 'target_descriptor')) {
+      sqlite.exec('ALTER TABLE tasks ADD COLUMN target_descriptor TEXT');
+    }
+    if (hasTable(sqlite, 'worktrees')) {
+      const columns: Array<[string, string]> = [
+        ['isolation_kind', 'TEXT'],
+        ['canonical_container', 'TEXT'],
+        ['target_name', 'TEXT'],
+        ['target_path', 'TEXT'],
+        ['applied_operation_key', 'TEXT'],
+        ['target_descriptor', 'TEXT'],
+      ];
+      for (const [name, definition] of columns) {
+        if (!hasColumn(sqlite, 'worktrees', name)) sqlite.exec(`ALTER TABLE worktrees ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    sqlite.exec('PRAGMA user_version = 17');
   })();
 }

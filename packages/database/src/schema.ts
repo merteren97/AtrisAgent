@@ -120,6 +120,7 @@ export const tasks = sqliteTable('tasks', {
   requiredCapabilities: text('required_capabilities', { mode: 'json' }).$type<string[]>().notNull(),
   dependsOn: text('depends_on', { mode: 'json' }).$type<string[]>().notNull(),
   worktreeId: text('worktree_id'),
+  targetDescriptor: text('target_descriptor', { mode: 'json' }).$type<import('@atris-agent-code/domain').BuilderTargetDescriptor>(),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
   completedAt: text('completed_at'),
@@ -422,6 +423,12 @@ export const worktrees = sqliteTable('worktrees', {
   branchName: text('branch_name').notNull(),
   path: text('path').notNull(),
   status: text('status').notNull().default('active'),
+  isolationKind: text('isolation_kind').$type<'workspace-git' | 'nested-git' | 'mirror' | 'new-sibling'>(),
+  canonicalContainer: text('canonical_container'),
+  targetName: text('target_name'),
+  targetPath: text('target_path'),
+  appliedOperationKey: text('applied_operation_key'),
+  targetDescriptor: text('target_descriptor', { mode: 'json' }).$type<import('@atris-agent-code/domain').BuilderTargetDescriptor>(),
   createdAt: text('created_at').notNull(),
 });
 

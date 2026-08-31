@@ -774,6 +774,25 @@ async function runTests() {
     }
   }
 
+  const siblingStagingPath = path.join(os.tmpdir(), 'atris-runtime-target', '.atris-worktrees', 'mission-new', 'task-new');
+  let dispatchedTarget: unknown;
+  const targetAwareManager = {
+    getTask: async () => ({
+      id: 'task-new', missionId: 'mission-new', worktreeId: null,
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+    }),
+    getMission: async () => ({ id: 'mission-new', workspaceId: 'workspace-container' }),
+    getWorkspace: async () => ({ id: 'workspace-container', path: path.dirname(path.dirname(siblingStagingPath)) }),
+    createWorktreeForTask: async () => {
+      dispatchedTarget = (await targetAwareManager.getTask()).targetDescriptor;
+      return siblingStagingPath;
+    },
+  } as any;
+  const targetAwareHost = new RuntimeHost(undefined, { workspaceManager: targetAwareManager, watchdogInterval: 0 });
+  const targetExecution = await (targetAwareHost as any).resolveTaskExecutionContext({ taskId: 'task-new', missionId: 'mission-new' }, 'builder');
+  assert((dispatchedTarget as any)?.kind === 'new_sibling_project' && (dispatchedTarget as any)?.projectName === 'AtrisTask', 'RuntimeHost dispatch preserves the persisted structured new sibling target');
+  assert(targetExecution.cwd === siblingStagingPath && targetExecution.worktreePath === siblingStagingPath, 'RuntimeHost runs the Builder in the managed new sibling staging directory');
+
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) process.exit(1);
 }

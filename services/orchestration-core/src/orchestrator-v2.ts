@@ -34,6 +34,8 @@ import {
   buildSupervisorDecisionPrompt,
   decisionToTaskPlan,
   fallbackSupervisorDecision,
+  isPriorResearchImplementationFollowUp,
+  normalizeSupervisorDecision,
   parseSupervisorDecision,
   type SupervisorTurnContext,
 } from './supervisor-turn';
@@ -94,6 +96,7 @@ interface ResearchContextBundle {
   version: 1;
   missionId: string;
   planId: string;
+  complete: boolean;
   sourceTaskIds: string[];
   sources: Array<{ taskId: string; attemptId?: string; result: string; uncertain: boolean }>;
   findings: string[];
@@ -204,6 +207,7 @@ interface StartMissionOptionsV2 {
   rawModelPlanOutput?: string;
   turnId?: string;
   runId?: string;
+  researchContextPlanId?: string;
 }
 
 /**
@@ -615,6 +619,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     conversationContext: string;
     workspaceContext: string;
     hasPriorConversation: boolean;
+    priorResearchBundle: ResearchContextBundle | null;
   }> {
     const manager = this.v2WorkspaceManager;
     const mission = manager ? await manager.getMission(missionId) : null;
@@ -686,6 +691,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       }
     }
 
+    const priorResearchBundle = await this.getLatestResearchBundle(missionId);
+    if (priorResearchBundle) {
+      lines.push(`Durable prior research context (plan ${priorResearchBundle.planId}): ${JSON.stringify(priorResearchBundle)}`);
+    }
     let conversationContext = lines.join('\n\n');
     if (conversationContext.length > MAX_CONTEXT_CHARS) {
       conversationContext = conversationContext.slice(conversationContext.length - MAX_CONTEXT_CHARS);
@@ -707,51 +716,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       conversationContext,
       workspaceContext,
       hasPriorConversation: lines.length > 1 || completedTurnIds.size > 0 || Boolean(mission?.completedAt),
+      priorResearchBundle,
     };
-  }
-
-  private ensureExecutableDecision(decision: OrchestratorDecision, userRequest: string): OrchestratorDecision {
-    if (decision.action === 'delegate' && !(decision.delegations || []).length) {
-      return {
-        ...decision,
-        delegations: [{
-          id: 'research-1',
-          role: 'researcher',
-          objective: userRequest,
-          requiredCapabilities: ['research', 'codebase-analysis'],
-        }],
-      };
-    }
-    if (decision.action === 'execute' && !(decision.delegations || []).some((item) => item.role === 'builder')) {
-      return {
-        ...decision,
-        delegations: [
-          ...(decision.delegations || []).filter((item) => item.role === 'researcher'),
-          {
-            id: 'builder-1',
-            role: 'builder',
-            objective: userRequest,
-            requiredCapabilities: ['implementation', 'workspace-write'],
-            dependsOnDelegationIds: (decision.delegations || [])
-              .filter((item) => item.role === 'researcher')
-              .map((item) => item.id),
-          },
-        ],
-      };
-    }
-    if (decision.action === 'execute' && !(decision.delegations || []).some((item) => item.role === 'researcher')) {
-      const researchId = 'research-1';
-      return {
-        ...decision,
-        delegations: [
-          { id: researchId, role: 'researcher', objective: `Inspect the codebase and constraints needed to implement: ${userRequest}`, requiredCapabilities: ['research', 'codebase-analysis'] },
-          ...(decision.delegations || []).map((item) => item.role === 'builder'
-            ? { ...item, dependsOnDelegationIds: [...new Set([...(item.dependsOnDelegationIds || []), researchId])] }
-            : item),
-        ],
-      };
-    }
-    return decision;
   }
 
   private async decideTurn(
@@ -759,7 +725,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     turnId: string,
     request: string,
     options?: StartMissionOptionsV2,
-  ): Promise<{ decision: OrchestratorDecision; context: SupervisorTurnContext; hasPriorConversation: boolean }> {
+  ): Promise<{ decision: OrchestratorDecision; context: SupervisorTurnContext; hasPriorConversation: boolean; priorResearchBundle: ResearchContextBundle | null }> {
     const loaded = await this.loadConversationContext(missionId);
     const context: SupervisorTurnContext = {
       turnId,
@@ -769,6 +735,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       explicitCommand: options?.command,
       explicitTargetRole: options?.targetRole,
     };
+    const reusableResearchBundle = loaded.priorResearchBundle && isPriorResearchImplementationFollowUp(context)
+      ? loaded.priorResearchBundle
+      : null;
     const runner = getSupervisorTurnRunner();
     if (runner) {
       try {
@@ -785,9 +754,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         const parsed = parseSupervisorDecision(raw, turnId);
         if (parsed) {
           return {
-            decision: this.ensureExecutableDecision(parsed, request),
+            decision: normalizeSupervisorDecision(parsed, context, { reusePriorResearch: Boolean(reusableResearchBundle) }),
             context,
             hasPriorConversation: loaded.hasPriorConversation,
+            priorResearchBundle: reusableResearchBundle,
           };
         }
         this.trace('supervisor-invalid-json', { missionId, turnId, rawLength: raw.length });
@@ -801,9 +771,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       }
     }
     return {
-      decision: this.ensureExecutableDecision(fallbackSupervisorDecision(context), request),
+      decision: normalizeSupervisorDecision(fallbackSupervisorDecision(context), context, { reusePriorResearch: Boolean(reusableResearchBundle) }),
       context,
       hasPriorConversation: loaded.hasPriorConversation,
+      priorResearchBundle: reusableResearchBundle,
     };
   }
 
@@ -904,6 +875,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         assignedRole: spec.role,
         requiredCapabilities: spec.requiredCapabilities,
         dependsOn: dependencies,
+        targetDescriptor: spec.targetDescriptor,
       }));
     }
 
@@ -977,7 +949,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       throw new Error('The current conversation turn is still executing. Finish or stop it before starting another turn.');
     }
 
-    const { decision, hasPriorConversation } = await this.decideTurn(missionId, turnId, request, options);
+    const { decision, hasPriorConversation, priorResearchBundle } = await this.decideTurn(missionId, turnId, request, options);
     await this.ensureRunIsCurrent(missionId, options?.runId);
     this.trace('turn-decision', {
       missionId,
@@ -1013,7 +985,12 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       });
     }
 
-    const taskPlan = decisionToTaskPlan(decision);
+    const taskPlan = decisionToTaskPlan(decision).map((task) => task.role === 'builder' && priorResearchBundle
+      ? {
+          ...task,
+          description: `${task.description}\n\n${RESEARCH_CONTEXT_START}\nReuse this completed research from prior plan ${priorResearchBundle.planId}. Preserve provenance and verify conflicts/uncertainty:\n${JSON.stringify(priorResearchBundle)}\n${RESEARCH_CONTEXT_END}`,
+        }
+      : task);
     const normalizedPlanId = crypto.randomUUID();
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.trace('plan-normalized', {
@@ -1030,6 +1007,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       assumptions: [
         `Persistent Orchestrator decision: ${decision.action}.`,
         decision.response || 'Delegations were generated from the current conversation context.',
+        ...(priorResearchBundle ? [`Plan lineage: reuse completed research from prior plan ${priorResearchBundle.planId} in this same-conversation follow-up.`] : []),
       ],
       questions: decision.clarifyingQuestions || [],
       tasks: taskPlan,
@@ -1040,6 +1018,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       result = await super.startMission(missionId, request, {
         ...options,
         rawModelPlanOutput,
+        researchContextPlanId: priorResearchBundle?.planId,
       });
       await this.ensureRunIsCurrent(missionId, options?.runId);
     } catch (error) {
@@ -1458,6 +1437,31 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
   }
 
+  protected async getLatestResearchBundle(missionId: string): Promise<ResearchContextBundle | null> {
+    if (!this.v2Db || !this.v2WorkspaceManager) return null;
+    const rows = await this.v2Db.select({ content: artifacts.content, createdAt: artifacts.createdAt }).from(artifacts)
+      .where(and(eq(artifacts.missionId, missionId), eq(artifacts.type, 'research')));
+    const missionTasks = await this.v2WorkspaceManager.listTasks(missionId);
+    const runs = await this.v2Db.select({ planId: missionRuns.planId, status: missionRuns.status }).from(missionRuns)
+      .where(eq(missionRuns.missionId, missionId));
+    rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    for (const row of rows) {
+      if (!row.content) continue;
+      try {
+        const bundle = JSON.parse(row.content) as ResearchContextBundle;
+        const researchers = missionTasks.filter((task) => task.planId === bundle.planId && task.assignedRole === 'researcher');
+        const runCompleted = runs.some((run) => run.planId === bundle.planId && run.status === 'completed');
+        const runFailed = runs.some((run) => run.planId === bundle.planId && (run.status === 'failed' || run.status === 'cancelled'));
+        if (bundle.missionId === missionId && bundle.complete === true && bundle.sources?.length
+          && researchers.length > 0 && researchers.every((task) => task.status === 'done' && bundle.sourceTaskIds.includes(task.id))
+          && runCompleted && !runFailed) return bundle;
+      } catch {
+        // Ignore malformed or incomplete artifacts and continue to the next durable bundle.
+      }
+    }
+    return null;
+  }
+
   private async refreshResearchBundle(
     missionId: string,
     planId: string,
@@ -1496,12 +1500,16 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       });
     }
     const sources = [...byTask.values()].sort((a, b) => a.taskId.localeCompare(b.taskId));
+    const requiredResearchers = planTasks.filter((task) => task.assignedRole === 'researcher');
+    const complete = requiredResearchers.length > 0
+      && requiredResearchers.every((task) => task.status === 'done' && byTask.has(task.id));
     const positive = sources.filter((source) => /\b(?:yes|supported|exists|confirmed|verified)\b/i.test(source.result));
     const negative = sources.filter((source) => /\b(?:no|not supported|does not exist|absent|disproved)\b/i.test(source.result));
     const bundle: ResearchContextBundle = {
       version: 1,
       missionId,
       planId,
+      complete,
       sourceTaskIds: sources.map((source) => source.taskId),
       sources,
       findings: sources.map((source) => source.result),

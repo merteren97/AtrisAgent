@@ -48,6 +48,7 @@ async function runTests() {
       getMission: async (id: string) => ({ id, workspaceId: 'w1' }),
       getWorkspace: async (id: string) => ({ id, path: wsPath }),
       getWorktreeManager: () => worktreeManager,
+      getWorktreeForTask: async () => null,
       getCheckpointManager: () => ({
         createCheckpoint: async (_workspacePath: string, label: string) => {
           checkpointLabel = label;
@@ -90,6 +91,58 @@ async function runTests() {
     });
     assert(path.resolve(verifiedPath) === path.resolve(wsPath), 'Post-apply verifier runs against the actual base workspace');
     assert(verification.passed && verification.evidence.length === 1, 'Post-apply verification evidence is preserved');
+
+    const siblingContainer = path.join(tmpDir, 'container');
+    const siblingStaging = path.join(siblingContainer, '.atris-worktrees', 'mission-m2', 'task-t2');
+    fs.mkdirSync(siblingContainer);
+    await worktreeManager.createEmptyManagedStaging(siblingStaging, siblingContainer);
+    fs.writeFileSync(path.join(siblingStaging, 'package.json'), JSON.stringify({ name: 'AtrisTask' }));
+    fs.mkdirSync(path.join(siblingStaging, 'src'));
+    fs.writeFileSync(path.join(siblingStaging, 'src', 'index.ts'), 'export const task = true;\n');
+    let siblingCheckpointed = false;
+    let persistedOperation = '';
+    let persistedTargetPath = '';
+    let failOwnershipPersistence = true;
+    const siblingManager = {
+      getTask: async () => ({ id: 't2', missionId: 'm2', title: 'Create AtrisTask', description: 'New sibling', worktreeId: siblingStaging }),
+      getMission: async () => ({ id: 'm2', workspaceId: 'w2' }),
+      getWorkspace: async () => ({ id: 'w2', path: siblingContainer }),
+      getWorktreeManager: () => worktreeManager,
+      getWorktreeForTask: async () => ({
+        isolationKind: 'new-sibling', canonicalContainer: siblingContainer, targetName: 'AtrisTask',
+        targetPath: path.join(siblingContainer, 'AtrisTask'), appliedOperationKey: null,
+      }),
+      markNewSiblingApplied: async (_taskId: string, operationKey: string, targetPath: string) => {
+        if (failOwnershipPersistence) throw new Error('injected database failure after rename');
+        persistedOperation = operationKey;
+        persistedTargetPath = targetPath;
+      },
+      getCheckpointManager: () => ({ createCheckpoint: async () => { siblingCheckpointed = true; return 'unexpected'; } }),
+    } as unknown as WorkspaceManager;
+    const siblingCoordinator = new MergeCoordinator(siblingManager);
+    const siblingPack = await siblingCoordinator.generateReviewPack('t2');
+    assert(siblingPack.changedFiles.length === 2 && siblingPack.changedFiles.every((file) => file.status === 'added'), 'New sibling review pack reports every project file as added');
+    assert(siblingPack.unifiedDiff.includes('+++ b/package.json') && siblingPack.unifiedDiff.includes('+++ b/src/index.ts'), 'New sibling review pack diff includes every project file');
+    assert(!siblingPack.changedFiles.some((file) => file.path.includes('.atris-')) && !siblingPack.unifiedDiff.includes('.atris-baseline') && !siblingPack.unifiedDiff.includes('.atris-operation'), 'New sibling review pack excludes Atris metadata');
+    let injectedFailure = '';
+    try {
+      await siblingCoordinator.applyWorktree('t2', undefined, { idempotencyKey: 'approval:new-sibling:t2' });
+    } catch (error) {
+      injectedFailure = error instanceof Error ? error.message : String(error);
+    }
+    assert(injectedFailure.includes('injected database failure') && fs.existsSync(path.join(siblingContainer, 'AtrisTask', '.atris-operation.json')), 'Fault injection approximates a crash after rename while durable marker remains');
+    failOwnershipPersistence = false;
+    const siblingApply = await siblingCoordinator.applyWorktree('t2', undefined, { idempotencyKey: 'approval:new-sibling:t2' });
+    assert(siblingApply.success && siblingApply.output.includes('Recovered') && fs.existsSync(path.join(siblingContainer, 'AtrisTask', 'package.json')), 'MergeCoordinator retry reconciles the Atris-owned destination');
+    assert(!siblingCheckpointed, 'New sibling apply does not checkpoint or merge an existing repository');
+    assert(persistedOperation === 'approval:new-sibling:t2' && persistedTargetPath === path.join(siblingContainer, 'AtrisTask'), 'New sibling apply persists Atris ownership and final target path');
+    assert(!fs.existsSync(path.join(siblingContainer, 'AtrisTask', '.atris-operation.json')) && !fs.existsSync(path.join(siblingContainer, 'AtrisTask', '.atris-baseline')), 'Marker cleanup occurs only after durable ownership and no Atris metadata remains applied');
+    let siblingVerificationPath = '';
+    await siblingCoordinator.verifyAppliedWorkspace('t2', async (basePath) => {
+      siblingVerificationPath = basePath;
+      return { passed: true, summary: 'ok', evidence: [] };
+    });
+    assert(siblingVerificationPath === path.join(siblingContainer, 'AtrisTask'), 'MergeCoordinator verification resolves the created AtrisTask project');
 
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

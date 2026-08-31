@@ -1,12 +1,15 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import type { ChildProcess } from 'child_process';
 import {
   assertRuntimeLaunchPreconditions,
   normalizeExecutablePath,
+  prepareBackgroundSpawnOptions,
   prepareRuntimeCommand,
   runCommand,
   spawnHiddenChecked,
+  terminateProcessTree,
   waitForHttp,
 } from './runtime-utils';
 
@@ -26,6 +29,45 @@ async function runTests() {
   }
 
   const decodeBase64 = (value: string | undefined) => Buffer.from(value || '', 'base64').toString('utf8');
+
+  const windowsBackgroundOptions = prepareBackgroundSpawnOptions({
+    shell: true,
+    windowsHide: false,
+    detached: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }, 'win32');
+  assert(windowsBackgroundOptions.shell === false, 'forces background runtime launches to bypass the shell');
+  assert(windowsBackgroundOptions.windowsHide === true, 'forces background runtime launches to hide Windows consoles');
+  assert(windowsBackgroundOptions.detached === false, 'keeps Windows background children attached for reliable tree cancellation');
+  assert(
+    JSON.stringify(windowsBackgroundOptions.stdio) === JSON.stringify(['pipe', 'pipe', 'pipe']),
+    'preserves background runtime streaming and stdin/stdout configuration',
+  );
+  assert(
+    prepareBackgroundSpawnOptions({ detached: false }, 'linux').detached === true,
+    'preserves detached process-group behavior on non-Windows platforms',
+  );
+
+  const escalationSignals: Array<NodeJS.Signals | number | undefined> = [];
+  let confirmedSignal: NodeJS.Signals | null = null;
+  const signaledChild = {
+    exitCode: null,
+    get signalCode() { return confirmedSignal; },
+    killed: true,
+    pid: undefined,
+    kill(signal?: NodeJS.Signals | number) {
+      escalationSignals.push(signal);
+      confirmedSignal = typeof signal === 'string' ? signal : null;
+      return true;
+    },
+  } as unknown as ChildProcess;
+  await terminateProcessTree(signaledChild, true);
+  assert(
+    escalationSignals.length === 1 && escalationSignals[0] === 'SIGKILL',
+    'force-escalates after a prior signal set killed=true without confirming process exit',
+  );
+  await terminateProcessTree(signaledChild, true);
+  assert(escalationSignals.length === 1, 'keeps repeated termination safe after signal exit is confirmed');
 
   const quotedOpenCode = '"C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd"';
   assert(
@@ -213,6 +255,24 @@ async function runTests() {
         JSON.stringify(genericReceived) === JSON.stringify(genericArguments),
         'forwards arguments to a non-Node .cmd wrapper without relying on NODE_OPTIONS',
       );
+
+      const cancellationMarker = path.join(root, 'descendant-survived.txt');
+      const cancellationWorker = path.join(root, 'cancellation-worker.cjs');
+      const cancellationWrapper = path.join(root, 'cancellation-wrapper.cmd');
+      fs.writeFileSync(
+        cancellationWorker,
+        `const fs = require('node:fs'); setTimeout(() => fs.writeFileSync(${JSON.stringify(cancellationMarker)}, 'alive'), 800); setInterval(() => {}, 1000);`,
+        'utf8',
+      );
+      fs.writeFileSync(cancellationWrapper, '@echo off\r\nnode "%~dp0cancellation-worker.cjs"\r\n', 'utf8');
+      try {
+        await runCommand(cancellationWrapper, [], { cwd: root, timeoutMs: 100 });
+        assert(false, 'times out a Windows wrapper command');
+      } catch (error: any) {
+        assert(String(error?.message || error).includes('timed out'), 'times out a Windows wrapper command');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(!fs.existsSync(cancellationMarker), 'kills Windows wrapper descendants when a background command times out');
     } catch (error: any) {
       console.error('[FAIL] securely executes a quoted .cmd path containing spaces through the static bridge');
       console.error(error?.message || error);

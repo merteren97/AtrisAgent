@@ -105,7 +105,7 @@ export function handleIncomingEvent(eventData: any): void {
       break;
 
     case 'plan_revised':
-      append(eventData, `Plan revised: ${eventData.reason || 'Execution evidence changed the plan.'}`, {
+      append(eventData, `Same conversation, new plan: ${eventData.reason || 'Execution evidence changed the plan.'}`, {
         agentRole: 'orchestrator', metadata: { planId: eventData.planId, previousPlanId: eventData.previousPlanId, changedTaskIds: eventData.changedTaskIds },
       });
       break;

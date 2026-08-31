@@ -159,6 +159,80 @@ async function runTests() {
       'continuation persists one new turn-correlated user_message without duplicating history');
     }
 
+    // Direct start is fenced atomically while a research turn is active, and an
+    // implementation follow-up sent as steer is durably queued as a new turn.
+    {
+      const createRes = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Active research turn fence test' }),
+      });
+      const mission = await createRes.json();
+      const missionId = mission.id as string;
+      const db = (gateway.workspaceManager as any).db;
+      const { conversationTurns, missionRuns, tasks } = await import('@atris-agent-code/database');
+      const now = new Date().toISOString();
+      const activeTurnId = `research-turn-${Date.now()}`;
+      const activeRunId = `research-run-${Date.now()}`;
+      const activePlanId = `research-plan-${Date.now()}`;
+      db.insert(conversationTurns).values({
+        id: activeTurnId, missionId, content: 'Research the options', delivery: 'queue', options: {}, status: 'running', createdAt: now, startedAt: now,
+      }).run();
+      db.insert(missionRuns).values({
+        id: activeRunId, missionId, turnId: activeTurnId, status: 'running', planId: activePlanId, startedAt: now, heartbeatAt: now,
+      }).run();
+      db.insert(tasks).values({
+        id: `research-task-${Date.now()}`, missionId, planId: activePlanId, title: 'Research', description: 'Research only', status: 'running',
+        priority: 'medium', assignedRole: 'researcher', requiredCapabilities: ['research'], dependsOn: [], createdAt: now, updatedAt: now,
+      }).run();
+      await gateway.workspaceManager.updateMission(missionId, { status: 'running', activeRunId, planId: activePlanId });
+
+      const turnsBefore = db.select().from(conversationTurns).all().filter((row: any) => row.missionId === missionId).length;
+      const runsBefore = db.select().from(missionRuns).all().filter((row: any) => row.missionId === missionId).length;
+      const rejectedStart = await authorizedFetch(`${baseUrl}/api/missions/${missionId}/start`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request: 'Build this now' }),
+      });
+      const rejectedBody = await rejectedStart.json();
+      const turnsAfter = db.select().from(conversationTurns).all().filter((row: any) => row.missionId === missionId).length;
+      const runsAfter = db.select().from(missionRuns).all().filter((row: any) => row.missionId === missionId).length;
+      assert(rejectedStart.status === 409 && rejectedBody.code === 'TURN_ALREADY_RUNNING' && turnsAfter === turnsBefore && runsAfter === runsBefore,
+        'direct start atomically rejects an active run before creating a turn or run');
+
+      const followUp = await authorizedFetch(`${baseUrl}/api/missions/${missionId}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Implement the researched approach and update the tests.', delivery: 'steer', options: { targetRole: 'builder' } }),
+      });
+      const followUpBody = await followUp.json();
+      assert(followUp.status === 202 && followUpBody.delivery === 'queue' && followUpBody.status === 'queued'
+        && followUpBody.requiresNewTurn === true && followUpBody.disposition === 'queued_new_turn',
+      'implementation intent during active research is durably queued for a new same-conversation turn instead of consumed by steer');
+
+      const planningCreateRes = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Planning window steer test' }),
+      });
+      const planningMission = await planningCreateRes.json();
+      const planningMissionId = planningMission.id as string;
+      const planningTurnId = `planning-turn-${Date.now()}`;
+      const planningRunId = `planning-run-${Date.now()}`;
+      db.insert(conversationTurns).values({
+        id: planningTurnId, missionId: planningMissionId, content: 'Research the options', delivery: 'queue', options: {}, status: 'starting', createdAt: now, startedAt: now,
+      }).run();
+      db.insert(missionRuns).values({
+        id: planningRunId, missionId: planningMissionId, turnId: planningTurnId, status: 'starting', planId: null, startedAt: now, heartbeatAt: now,
+      }).run();
+      await gateway.workspaceManager.updateMission(planningMissionId, { status: 'planning', activeRunId: planningRunId, planId: null });
+
+      const planningFollowUp = await authorizedFetch(`${baseUrl}/api/missions/${planningMissionId}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Implement the selected approach.', delivery: 'steer', options: { targetRole: 'builder' } }),
+      });
+      const planningFollowUpBody = await planningFollowUp.json();
+      assert(planningFollowUp.status === 202 && planningFollowUpBody.delivery === 'queue' && planningFollowUpBody.status === 'queued'
+        && planningFollowUpBody.requiresNewTurn === true && planningFollowUpBody.disposition === 'queued_new_turn',
+      'implementation steer during the starting plan-null window is conservatively queued');
+    }
+
     // 4. GET & POST /api/accounts
     let createdAccountId = '';
     {

@@ -1,5 +1,5 @@
 import { LocalEventBus, registerSupervisorTurnRunner } from '@atris-agent-code/event-bus';
-import type { MissionSelect, TaskSelect } from '@atris-agent-code/database';
+import { artifacts, missionRuns, type MissionSelect, type TaskSelect } from '@atris-agent-code/database';
 import type { EffectiveWorkerPoolPolicy, MemoryNode, OrchestratorDelegation } from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
@@ -120,6 +120,7 @@ function task(params: {
     requiredCapabilities: [],
     dependsOn: params.dependsOn || [],
     worktreeId: null,
+    targetDescriptor: null,
     createdAt: now,
     updatedAt: now,
     completedAt: params.status === 'done' ? now : null,
@@ -158,6 +159,19 @@ class CompletionFenceDb {
           const row = this.completions[0];
           if (row) Object.assign(row, values);
         },
+      }),
+    };
+  }
+}
+
+class ResearchBundleLookupDb {
+  artifactRows: Array<{ content: string | null; createdAt: string }> = [];
+  runRows: Array<{ planId: string | null; status: string }> = [];
+
+  select() {
+    return {
+      from: (table: unknown) => ({
+        where: async () => table === artifacts ? this.artifactRows : table === missionRuns ? this.runRows : [],
       }),
     };
   }
@@ -1101,6 +1115,75 @@ async function runTests() {
 
     await orchestrator.reconcileMissionPlan(missionId, planId);
     assert(missionCompletedCount === 1, 'repeated reconciliation does not synthesize the same read-only plan twice');
+  }
+
+  // Prior-plan reuse requires every Researcher result plus a successfully
+  // completed run. Incremental same-plan artifacts remain available internally.
+  {
+    const missionId = 'mission-research-bundle-completeness';
+    const planId = 'plan-research-bundle-completeness';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('research-a', task({
+      id: 'research-a', missionId, planId, role: 'researcher', status: 'done', assignedAgentId: 'agent-ra',
+    }));
+    manager.tasks.set('research-b', task({
+      id: 'research-b', missionId, planId, role: 'researcher', status: 'running', assignedAgentId: 'agent-rb',
+    }));
+    const db = new ResearchBundleLookupDb();
+    const bundle = {
+      version: 1,
+      missionId,
+      planId,
+      complete: false,
+      sourceTaskIds: ['research-a'],
+      sources: [{ taskId: 'research-a', result: 'First finding', uncertain: false }],
+      findings: ['First finding'],
+      evidence: [{ taskId: 'research-a' }],
+      conflicts: [],
+      uncertainties: [],
+      truncated: false,
+    };
+    db.artifactRows = [{ content: JSON.stringify(bundle), createdAt: new Date().toISOString() }];
+    db.runRows = [{ planId, status: 'completed' }];
+    class TestOrchestrator extends OrchestratorV2 {
+      latestResearchBundle(mission: string): Promise<any> {
+        return this.getLatestResearchBundle(mission);
+      }
+    }
+    const orchestrator = new TestOrchestrator(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      new LocalEventBus(),
+      db as any,
+      manager as unknown as WorkspaceManager,
+    );
+
+    assert(await orchestrator.latestResearchBundle(missionId) === null,
+      'multi-Researcher partial artifacts are not reusable by a later plan');
+
+    manager.tasks.set('research-b', task({
+      id: 'research-b', missionId, planId, role: 'researcher', status: 'rejected', assignedAgentId: 'agent-rb',
+    }));
+    db.artifactRows[0].content = JSON.stringify({
+      ...bundle, complete: true, sourceTaskIds: ['research-a', 'research-b'],
+      sources: [...bundle.sources, { taskId: 'research-b', result: 'Failed finding', uncertain: false }],
+    });
+    assert(await orchestrator.latestResearchBundle(missionId) === null,
+      'a failed required Researcher prevents bundle reuse even if an artifact claims completeness');
+
+    manager.tasks.set('research-b', task({
+      id: 'research-b', missionId, planId, role: 'researcher', status: 'done', assignedAgentId: 'agent-rb',
+    }));
+    db.runRows = [{ planId, status: 'cancelled' }];
+    assert(await orchestrator.latestResearchBundle(missionId) === null,
+      'a cancelled plan bundle is not reusable');
+
+    db.runRows = [{ planId, status: 'failed' }];
+    assert(await orchestrator.latestResearchBundle(missionId) === null,
+      'a failed plan bundle is not reusable');
+
+    db.runRows = [{ planId, status: 'completed' }];
+    assert((await orchestrator.latestResearchBundle(missionId))?.planId === planId,
+      'a complete successful multi-Researcher bundle is reusable');
   }
 
   // The synthesis intent must exist before a potentially slow supervisor call,
