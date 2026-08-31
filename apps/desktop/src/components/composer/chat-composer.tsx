@@ -55,11 +55,7 @@ function QueuedTurnComposer() {
     const targetRole = directive.targetRole || 'Orchestrator';
     const scopedSelectedModel = selectedModel || undefined;
     const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
-    const routeScope: StartMissionOptions['routeScope'] = directive.modelCatalogId
-      ? 'role'
-      : scopedSelectedModel
-        ? 'mission'
-        : undefined;
+    const routeScope: StartMissionOptions['routeScope'] = resolvedModel ? 'role' : undefined;
     const resolvedReasoning = directive.reasoningLevel
       || (directive.modelCatalogId
         ? directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0]
@@ -114,7 +110,7 @@ function QueuedTurnComposer() {
           <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
             <div className="flex min-w-0 items-center gap-1.5 text-[9px] text-muted-foreground">
               {selectedModelObject ? <RuntimeBrandIcon runtimeId={selectedModelObject.runtimeType} className="h-3 w-3 shrink-0" /> : <Sparkles className="h-3 w-3 shrink-0 text-primary" />}
-              <span className="truncate">Next turn model: {selectedModelObject?.name || 'Auto routing'}</span>
+              <span className="truncate">Next Orchestrator model: {selectedModelObject?.name || 'Auto routing'}</span>
               {reasoningLevel && reasoningLevel !== 'none' && selectedModelObject?.supportedReasoning.length ? <span className="shrink-0">· {reasoningLevel}</span> : null}
             </div>
             <div className="flex items-center gap-1">

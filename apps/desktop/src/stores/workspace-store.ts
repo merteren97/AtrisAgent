@@ -25,7 +25,7 @@ interface WorkspaceState {
   setActiveWorkspace: (id: string) => void;
   rememberMission: (workspaceId: string, missionId: string) => void;
   forgetMission: (workspaceId: string, missionId: string) => void;
-  removeWorkspace: (id: string) => Promise<boolean>;
+  removeWorkspace: (id: string, removeMemory?: boolean) => Promise<void>;
   clearError: () => void;
 }
 
@@ -103,10 +103,13 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         return { lastMissionByWorkspace };
       }),
 
-      removeWorkspace: async (id) => {
+      removeWorkspace: async (id, removeMemory = false) => {
         set({ loading: true, error: null });
         try {
-          await apiRequest(`/workspaces/${id}`, { method: 'DELETE' });
+          await apiRequest(`/workspaces/${id}`, {
+            method: 'DELETE',
+            body: JSON.stringify({ removeMemory }),
+          });
           set((state) => {
             const workspaces = state.workspaces.filter((workspace) => workspace.id !== id);
             const { [id]: _removed, ...lastMissionByWorkspace } = state.lastMissionByWorkspace;
@@ -117,10 +120,10 @@ export const useWorkspaceStore = create<WorkspaceState>()(
               loading: false,
             };
           });
-          return true;
         } catch (error: any) {
-          set({ loading: false, error: error?.message || 'Workspace removal failed.' });
-          return false;
+          const message = error?.message || 'Workspace removal failed.';
+          set({ loading: false, error: message });
+          throw new Error(message);
         }
       },
     }),

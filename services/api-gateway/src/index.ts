@@ -15,6 +15,7 @@ import { Orchestrator } from '@atris-agent-code/orchestration-core';
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { MergeCoordinator } from '@atris-agent-code/merge-coordinator';
 import { ActionBroker } from '@atris-agent-code/policy-engine';
+import { resolveWorkerPoolPolicy } from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AtrisAuthService, extractBearerHeader, installAuthRoutes } from './auth';
 import {
@@ -31,10 +32,13 @@ import {
   createRuntimeShutdownCoordinator,
   installRuntimeShutdownRoute,
 } from './runtime-lifecycle';
-import { cursorFromQuery, encodeEventCursor } from './event-cursor';
+import { cursorFromQuery, encodeEventCursor, replayPages } from './event-cursor';
 import { decodeMissionCommandCursor, encodeMissionCommandCursor } from './command-cursor';
 import { persistRuntimeTelemetry } from './runtime-telemetry-store';
 import { ApprovalOutbox, type ApprovalDecision } from './approval-outbox';
+import { verifyAppliedMission } from './post-apply-verification';
+import { ApplyVerificationOperationStore, executeApplyVerificationOperation } from './apply-verification-operation';
+import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 
 import path from 'path';
 import fs from 'fs';
@@ -113,6 +117,8 @@ sqlite.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    max_parallel_agents INTEGER,
+    worker_pools TEXT,
     is_default INTEGER DEFAULT 0,
     created_at TEXT NOT NULL
   );
@@ -300,6 +306,7 @@ sqlite.exec(`
 migrateDatabase(sqlite as any);
 
 const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
+const deletionStore = new DeletionOperationStore(sqlite);
 const approvalOutbox = new ApprovalOutbox(sqlite);
 
 // Seed default team template
@@ -345,6 +352,7 @@ try {
 const eventBus = new LocalEventBus();
 const workspaceManager = new WorkspaceManager(db, eventBus);
 const mergeCoordinator = new MergeCoordinator(workspaceManager);
+const applyVerificationStore = new ApplyVerificationOperationStore(sqlite);
 const actionBroker = new ActionBroker();
 const orchestrator = new Orchestrator(
   {
@@ -353,6 +361,16 @@ const orchestrator = new Orchestrator(
       const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
       return { success: result.success, output: result.output, checkpointId: result.checkpointId };
     },
+    postApplyVerification: (context) => verifyAppliedMission(context, workspaceManager),
+    executeApplyVerificationOperation: (context) => executeApplyVerificationOperation(
+      applyVerificationStore,
+      context,
+      async (taskId, operation) => {
+        const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
+        return { success: result.success, output: result.output };
+      },
+      (operation) => verifyAppliedMission(operation, workspaceManager),
+    ),
   },
   eventBus,
   db,
@@ -719,10 +737,7 @@ eventBus.on('*', (event) => {
 
 async function cleanupMissionResources(missionId: string): Promise<void> {
   await runtimeHost.stopMission(missionId).catch(() => undefined);
-  const missionTasks = await workspaceManager.listTasks(missionId);
-  for (const task of missionTasks) {
-    if (task.worktreeId) await workspaceManager.removeWorktreeForTask(task.id);
-  }
+  await (workspaceManager as WorkspaceManager & { removeMissionWorktrees(missionId: string): Promise<void> }).removeMissionWorktrees(missionId);
   await workspaceManager.deleteRoleExecutionPolicies('mission', missionId);
   runtimeHost.clearMissionRoutingPreference(missionId, false);
 }
@@ -802,23 +817,18 @@ app.get('/api/workspaces/:id', async (req: Request, res: Response) => {
 app.delete('/api/workspaces/:id', async (req: Request, res: Response) => {
   try {
     const workspaceId = routeParam(req.params.id);
+    const existingOperation = deletionStore.get('workspace', workspaceId);
+    if (existingOperation) return void sendDeletionOutcome(res, await executeDeletion(existingOperation));
     const workspace = await workspaceManager.getWorkspace(workspaceId);
     if (!workspace) return void res.status(404).json({ error: 'Workspace not found' });
+    const removeMemory = req.body?.removeMemory === true;
 
     const workspaceMissions = await workspaceManager.listMissions(workspaceId);
-    const activeMissions = workspaceMissions.filter((mission) => ACTIVE_MISSION_STATUSES.has(String(mission.status)));
-    if (activeMissions.length > 0) {
-      return void res.status(409).json({
-        error: `Stop or finish ${activeMissions.length === 1 ? 'the active conversation' : 'all active conversations'} before deleting this workspace.`,
-      });
-    }
-
-    // Remove runtime-owned resources before the workspace cascade removes the
-    // mission rows that are needed to locate them.
-    for (const mission of workspaceMissions) await cleanupMissionResources(mission.id);
-    await workspaceManager.deleteRoleExecutionPolicies('workspace', workspaceId);
-    db.delete((schema as any).workspaces).where(eq((schema as any).workspaces.id, workspaceId)).run();
-    res.json({ success: true });
+    const operation = deletionStore.begin('workspace', workspaceId, removeMemory, [
+      `workspace-path:${workspace.path}`,
+      ...workspaceMissions.map((mission) => `mission:${mission.id}`),
+    ]);
+    sendDeletionOutcome(res, await executeDeletion(operation));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to remove workspace' });
   }
@@ -828,6 +838,7 @@ app.post('/api/missions', async (req: Request, res: Response) => {
   try {
     const { workspaceId, title, description, teamTemplateId, executionMode } = req.body;
     if (!workspaceId || !title) return void res.status(400).json({ error: 'workspaceId and title are required' });
+    if (isDeletionFenced('workspace', workspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
     const mission = await workspaceManager.createMission({ workspaceId, title, description, teamTemplateId, executionMode });
     res.status(201).json(mission);
   } catch (error: any) {
@@ -906,17 +917,13 @@ app.get('/api/missions/:id', async (req: Request, res: Response) => {
 app.delete('/api/missions/:id', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
+    const existingOperation = deletionStore.get('mission', missionId);
+    if (existingOperation) return void sendDeletionOutcome(res, await executeDeletion(existingOperation));
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Conversation not found' });
 
-    const deletableStatuses = new Set(['completed', 'failed', 'cancelled']);
-    if (!deletableStatuses.has(String(mission.status))) {
-      return void res.status(409).json({ error: 'Stop or finish this conversation before deleting it.' });
-    }
-
-    await cleanupMissionResources(missionId);
-    db.delete((schema as any).missions).where(eq((schema as any).missions.id, missionId)).run();
-    res.json({ success: true });
+    const operation = deletionStore.begin('mission', missionId, false, [`mission:${missionId}`, `workspace:${mission.workspaceId}`]);
+    sendDeletionOutcome(res, await executeDeletion(operation));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to delete conversation' });
   }
@@ -925,6 +932,7 @@ app.delete('/api/missions/:id', async (req: Request, res: Response) => {
 app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
+    if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
@@ -1034,7 +1042,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ?').run(missionId);
       })();
       await waitForMissionTurns(missionId);
-      await runtimeHost.stopMission(missionId).catch(() => undefined);
+      await runtimeHost.stopMission(missionId);
       await workspaceManager.cancelMissionTasks(missionId);
       for (const activeTurn of activeTurns) emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_cancelled',
         missionId, turnId: activeTurn.id, reason: 'Stopped for replanning', timestamp: cancelledAt });
@@ -1069,6 +1077,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
 app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
+    if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
     configureMissionRouting(missionId, req.body || {});
@@ -1117,6 +1126,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       targetWorkspaceId = existingWorkspaces[0]?.id;
       if (!targetWorkspaceId) return void res.status(400).json({ error: 'Create or select a workspace before starting a mission.' });
     }
+    if (isDeletionFenced('workspace', targetWorkspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
 
     const missionId = crypto.randomUUID();
     await workspaceManager.createMission({
@@ -1338,8 +1348,11 @@ function readTeamTemplate(templateId: string): any | null {
     eq((schema as any).executionPolicies.scopeId, templateId),
   )).all() as any[];
   const byRole = new Map(policies.map((policy) => [policy.role, policy]));
+  const workerPolicy = resolveWorkerPoolPolicy(template);
   return {
     ...template,
+    maxParallelAgents: workerPolicy.maxParallelAgents,
+    workerPools: workerPolicy.pools,
     roles: roles.map((role) => {
       const policy = byRole.get(role.role) as any;
       return {
@@ -1410,7 +1423,9 @@ app.post('/api/team-templates', (req, res) => {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     sqlite.transaction(() => {
-      db.insert((schema as any).teamTemplates).values({ id, name, description, isDefault: false, createdAt: now }).run();
+      const workerPolicy = resolveWorkerPoolPolicy(req.body);
+      db.insert((schema as any).teamTemplates).values({ id, name, description, maxParallelAgents: workerPolicy.maxParallelAgents,
+        workerPools: workerPolicy.pools, isDefault: false, createdAt: now }).run();
       replaceTemplateRoles(id, roles);
     })();
     res.status(201).json(readTeamTemplate(id));
@@ -1433,7 +1448,8 @@ app.patch('/api/team-templates/:id', (req, res) => {
     if (duplicate) return void res.status(409).json({ error: `A team template named '${name}' already exists.` });
 
     sqlite.transaction(() => {
-      db.update((schema as any).teamTemplates).set({ name, description })
+      const workerPolicy = resolveWorkerPoolPolicy(req.body?.maxParallelAgents === undefined && req.body?.workerPools === undefined ? template : req.body);
+      db.update((schema as any).teamTemplates).set({ name, description, maxParallelAgents: workerPolicy.maxParallelAgents, workerPools: workerPolicy.pools })
         .where(eq((schema as any).teamTemplates.id, req.params.id)).run();
       replaceTemplateRoles(req.params.id, roles);
     })();
@@ -1562,7 +1578,8 @@ app.get('/api/missions/:id/artifacts', async (req, res) => {
 app.get('/api/missions/:id/usage', (req, res) => {
   try {
     const telemetryRows = sqlite.prepare(`SELECT input_tokens AS inputTokens, output_tokens AS outputTokens,
-      cost, currency, duration_ms AS durationMs, queue_wait_ms AS queueWaitMs, retry_count AS retryCount,
+      outcome, usage_available AS usageAvailable, usage_source AS usageSource, cost, currency,
+      duration_ms AS durationMs, queue_wait_ms AS queueWaitMs, retry_count AS retryCount,
       worker_utilization AS workerUtilization, recorded_at AS recordedAt
       FROM runtime_telemetry WHERE mission_id = ? ORDER BY recorded_at`).all(req.params.id) as any[];
     const snapshotRows = db.select().from((schema as any).usageSnapshots)
@@ -1572,21 +1589,33 @@ app.get('/api/missions/:id/usage', (req, res) => {
     const rows = telemetryRows.length > 0 ? telemetryRows : snapshotRows;
     const inputTokens = rows.reduce((sum, row) => sum + Number(row.inputTokens || 0), 0);
     const outputTokens = rows.reduce((sum, row) => sum + Number(row.outputTokens || 0), 0);
-    const costValues = rows.map((row) => row.cost).filter((value) => value !== null && value !== undefined);
-    const currencies = [...new Set(rows.map((row) => row.currency).filter(Boolean))];
+    const costRows = rows.filter((row) => row.cost !== null && row.cost !== undefined && row.currency);
+    const currencies = [...new Set(costRows.map((row) => row.currency))];
+    const costsByCurrency = Object.fromEntries(currencies.map((currency) => [
+      currency,
+      costRows.filter((row) => row.currency === currency).reduce((sum, row) => sum + Number(row.cost), 0),
+    ]));
+    const completedCount = telemetryRows.filter((row) => row.outcome === 'completed').length;
+    const failedCount = telemetryRows.filter((row) => row.outcome === 'failed').length;
     res.json({
       available: rows.length > 0,
       inputTokens,
       outputTokens,
       totalTokens: inputTokens + outputTokens,
-      totalCost: costValues.length > 0 ? costValues.reduce((sum, value) => sum + Number(value || 0), 0) : null,
+      usageAvailable: telemetryRows.some((row) => Boolean(row.usageAvailable)),
+      usageSource: telemetryRows.some((row) => Boolean(row.usageAvailable)) ? 'provider_reported' : 'unavailable',
+      totalCost: currencies.length === 1 ? costsByCurrency[currencies[0]] : null,
       currency: currencies.length === 1 ? currencies[0] : null,
+      costsByCurrency,
       snapshotCount: rows.length,
       lastRecordedAt: rows.map((row) => row.recordedAt).filter(Boolean).sort().at(-1) || null,
       telemetryCount: telemetryRows.length,
       totalDurationMs: telemetryRows.reduce((sum, row) => sum + Number(row.durationMs || 0), 0),
       totalQueueWaitMs: telemetryRows.reduce((sum, row) => sum + Number(row.queueWaitMs || 0), 0),
       retryCount: telemetryRows.reduce((sum, row) => sum + Number(row.retryCount || 0), 0),
+      completedCount,
+      failedCount,
+      successRate: telemetryRows.length > 0 ? completedCount / telemetryRows.length : null,
       averageWorkerUtilization: telemetryRows.length > 0
         ? telemetryRows.reduce((sum, row) => sum + Number(row.workerUtilization || 0), 0) / telemetryRows.length
         : null,
@@ -1629,6 +1658,10 @@ app.post('/api/missions/:id/retry', async (req, res) => {
   try {
     const mission = await workspaceManager.getMission(req.params.id);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
+    if (isPostApplyVerificationPending(req.params.id)) {
+      await orchestrator.retryPostApplyVerification(req.params.id);
+      return void res.json({ success: true, verificationRetried: true, retriedTasks: [] });
+    }
     const tasks = await workspaceManager.listTasks(req.params.id);
     const retryable = tasks.filter((task) => ['rejected', 'blocked', 'revision_requested'].includes(task.status));
     if (retryable.length === 0) return void res.status(400).json({ error: 'The mission has no failed or blocked task to retry.' });
@@ -1645,8 +1678,87 @@ app.post('/api/tasks/:id/retry', async (req, res) => {
   catch (error: any) { res.status(400).json({ error: error?.message || 'Failed to retry task' }); }
 });
 
+app.post('/api/missions/:id/retry-verification', async (req, res) => {
+  try {
+    if (!await workspaceManager.getMission(req.params.id)) return void res.status(404).json({ error: 'Mission not found' });
+    if (!isPostApplyVerificationPending(req.params.id)) return void res.status(400).json({ error: 'The mission has no pending post-apply verification to retry.' });
+    await orchestrator.retryPostApplyVerification(req.params.id);
+    res.json({ success: true, verificationRetried: true });
+  } catch (error: any) {
+    res.status(400).json({ error: error?.message || 'Failed to retry verification' });
+  }
+});
+
 function claimApproval(approvalId: string, decision: ApprovalDecision): any | null {
   return approvalOutbox.claim(approvalId, decision);
+}
+
+function deletionMissionIds(operation: DeletionOperation): string[] {
+  return operation.targetType === 'mission' ? [operation.targetId]
+    : operation.manifest.filter((item) => item.startsWith('mission:')).map((item) => item.slice(8));
+}
+
+function isDeletionFenced(targetType: 'mission' | 'workspace', targetId: string): boolean {
+  return Boolean(deletionStore.get(targetType, targetId));
+}
+
+const deletionHandlers: DeletionHandlers = {
+  stop: async (operation) => {
+    const stoppedAt = new Date().toISOString();
+    for (const missionId of deletionMissionIds(operation)) {
+      const cancelRun = (orchestrator as any).cancelRun;
+      if (typeof cancelRun === 'function') cancelRun.call(orchestrator, missionId);
+      await runtimeHost.stopMission(missionId);
+      await workspaceManager.cancelMissionTasks(missionId);
+      sqlite.transaction(() => {
+        sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE mission_id = ? AND status IN ('pending', 'processing')").run(stoppedAt, missionId);
+        sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('queued', 'pending_priority', 'starting', 'running')").run(stoppedAt, missionId);
+        sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')").run(stoppedAt, missionId);
+        sqlite.prepare("UPDATE missions SET status = 'cancelled', active_run_id = NULL, completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE id = ?").run(stoppedAt, stoppedAt, missionId);
+      })();
+    }
+  },
+  runtime: async (operation) => {
+    for (const missionId of deletionMissionIds(operation)) {
+      await runtimeHost.stopMission(missionId).catch(() => undefined);
+      runtimeHost.clearMissionRoutingPreference(missionId, false);
+    }
+  },
+  worktrees: async (operation) => {
+    for (const missionId of deletionMissionIds(operation)) await workspaceManager.removeMissionWorktrees(missionId);
+  },
+  checkpoints: async (operation) => {
+    if (operation.targetType !== 'workspace') return;
+    const workspacePath = operation.manifest.find((item) => item.startsWith('workspace-path:'))?.slice(15);
+    if (workspacePath) workspaceManager.removeWorkspaceCheckpoints(workspacePath);
+  },
+  policy: async (operation) => {
+    for (const missionId of deletionMissionIds(operation)) await workspaceManager.deleteRoleExecutionPolicies('mission', missionId);
+    if (operation.targetType === 'workspace') await workspaceManager.deleteRoleExecutionPolicies('workspace', operation.targetId);
+  },
+  memory: async (operation) => {
+    if (operation.targetType !== 'workspace') return;
+    const projectMemory = orchestrator.getProjectMemoryService();
+    if (!projectMemory) return;
+    if (operation.removeMemory) await projectMemory.removeWorkspaceProvenance(operation.targetId, deletionMissionIds(operation));
+    else await projectMemory.detachWorkspace(operation.targetId);
+  },
+  relational: async (operation) => {
+    sqlite.prepare(`DELETE FROM ${operation.targetType === 'workspace' ? 'workspaces' : 'missions'} WHERE id = ?`).run(operation.targetId);
+  },
+};
+
+async function executeDeletion(operation: DeletionOperation): Promise<DeletionOperation> {
+  return deletionStore.execute(operation, deletionHandlers);
+}
+
+function sendDeletionOutcome(res: Response, operation: DeletionOperation): void {
+  const body = { operationId: operation.id, targetType: operation.targetType, targetId: operation.targetId,
+    removeMemory: operation.removeMemory, phase: operation.phase, status: operation.status,
+    progress: operation.progress, retryable: operation.status === 'retryable', error: operation.error };
+  if (operation.status === 'completed') return void res.status(200).json({ success: true, ...body });
+  if (operation.status === 'running' || operation.status === 'pending') return void res.status(202).json(body);
+  res.status(503).json(body);
 }
 
 function finalizeApproval(approvalId: string, decision: ApprovalDecision): boolean {
@@ -1754,18 +1866,19 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   const missionId = typeof req.query.missionId === 'string' ? req.query.missionId : undefined;
   let lastSequence = cursorFromQuery(req.query).sequence;
   let replaying = Boolean(missionId);
+  let highWaterSequence = 0;
   let closed = false;
   const queue = new BoundedEventQueue<AgentEvent>({
     maxItems: 2_000,
     maxBytes: 8 * 1024 * 1024,
     sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), 'utf8'),
   });
-  const writeEvent = (event: AgentEvent) => {
-    if (missionId && event.missionId !== missionId) return;
+  const writeEvent = (event: AgentEvent): boolean => {
+    if (missionId && event.missionId !== missionId) return true;
     const sequence = Number(event.sequence || 0);
-    if (missionId && sequence && sequence <= lastSequence) return;
+    if (missionId && sequence && sequence <= lastSequence) return true;
     if (sequence) lastSequence = sequence;
-    res.write(`id: ${sequence || event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    return res.write(`id: ${sequence || event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
   };
   const flush = () => {
     if (closed || res.writableEnded || res.writableNeedDrain || replaying) return;
@@ -1781,6 +1894,7 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   };
   const enqueue = (event: AgentEvent) => {
     if (missionId && event.missionId !== missionId) return;
+    if (replaying && Number(event.sequence || 0) <= highWaterSequence) return;
     queue.enqueue(event);
     flush();
   };
@@ -1788,14 +1902,8 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
     enqueue(event);
   });
   if (missionId) {
-    while (true) {
-      const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ? ORDER BY sequence LIMIT 1000`)
-        .all(missionId, lastSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
-      for (const row of rows) queue.enqueue({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent);
-      if (rows.length < 1000) break;
-    }
-    replaying = false;
-    flush();
+    highWaterSequence = Number((sqlite.prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM mission_events WHERE mission_id = ?')
+      .get(missionId) as { sequence: number }).sequence);
   }
   const onDrain = () => flush();
   res.on('drain', onDrain);
@@ -1808,6 +1916,34 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
     res.off('drain', onDrain);
     queue.clear();
     unsubscribe();
+  });
+  if (missionId) void (async () => {
+    for (const rows of replayPages(lastSequence, highWaterSequence, (afterSequence, throughSequence) =>
+      sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events
+        WHERE mission_id = ? AND sequence > ? AND sequence <= ? ORDER BY sequence LIMIT 1000`)
+        .all(missionId, afterSequence, throughSequence) as Array<{ payload: string; sequence: number; schema_version: number }>)) {
+      for (const row of rows) {
+        if (closed || res.writableEnded) return;
+        const event = { ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent;
+        if (!writeEvent(event)) {
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              res.off('drain', done);
+              req.off('close', done);
+              resolve();
+            };
+            res.once('drain', done);
+            req.once('close', done);
+          });
+        }
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    replaying = false;
+    flush();
+  })().catch((error) => {
+    console.warn('[API Gateway] Failed to replay mission event stream:', error);
+    if (!res.writableEnded) res.end();
   });
 });
 
@@ -1952,13 +2088,33 @@ wss.on('connection', (ws: WebSocket) => {
 });
 
 const isMain = shouldAutoStartGateway();
-setImmediate(async () => {
+function isPostApplyVerificationPending(missionId: string): boolean {
+  const operation = sqlite.prepare(`SELECT 1 FROM apply_verification_operations
+    WHERE mission_id = ? AND apply_phase = 'applied' AND verification_phase IN ('pending', 'blocked')`)
+    .get(missionId);
+  return Boolean(operation);
+}
+
+async function recoverGatewayStartup(): Promise<void> {
   const recoveredAt = new Date().toISOString();
+  deletionStore.recoverInterrupted();
+  for (const operation of deletionStore.listIncomplete()) await executeDeletion(operation);
+  applyVerificationStore.recoverInterrupted();
   await runtimeHost.reconcileStartup(new Date(recoveredAt));
   sqlite.transaction(() => {
     sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = COALESCE(error, 'Gateway restarted while command was starting') WHERE status = 'processing'")
       .run(recoveredAt);
-    sqlite.prepare("UPDATE mission_runs SET heartbeat_at = ? WHERE status IN ('starting', 'running')").run(recoveredAt);
+    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE status IN ('starting', 'running')")
+      .run(recoveredAt);
+    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, heartbeat_at = ?, error = COALESCE(error, 'Gateway restarted before run completion') WHERE status IN ('starting', 'running', 'stopping')")
+      .run(recoveredAt, recoveredAt);
+    sqlite.prepare(`UPDATE missions SET active_run_id = NULL, status = CASE
+        WHEN status IN ('planning', 'running', 'reviewing', 'revising') THEN 'ready' ELSE status END,
+        completed_at = CASE WHEN status IN ('planning', 'running', 'reviewing', 'revising', 'verifying') THEN NULL ELSE completed_at END
+      WHERE active_run_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM mission_runs WHERE mission_runs.id = missions.active_run_id
+          AND mission_runs.status IN ('starting', 'running', 'stopping')
+      )`).run();
   })();
   const expiredAttempts = sqlite.prepare(`SELECT id, mission_id, task_id, agent_instance_id, error
     FROM task_attempts WHERE status = 'expired' AND completed_at = ?`).all(recoveredAt) as Array<{
@@ -1979,21 +2135,36 @@ setImmediate(async () => {
   }
   approvalOutbox.recoverInterrupted();
   await orchestrator.recoverPendingCompletions();
-  const activePlans = sqlite.prepare(`SELECT id, plan_id FROM missions
-    WHERE status IN ('planning', 'ready', 'running', 'reviewing', 'revising', 'verifying') AND plan_id IS NOT NULL`)
-    .all() as Array<{ id: string; plan_id: string }>;
-  for (const mission of activePlans) await orchestrator.reconcileMissionPlan(mission.id, mission.plan_id);
+  const activePlans = sqlite.prepare(`SELECT id, plan_id, status FROM missions
+    WHERE status IN ('planning', 'ready', 'running', 'reviewing', 'revising', 'verifying', 'blocked') AND plan_id IS NOT NULL`)
+    .all() as Array<{ id: string; plan_id: string; status: string }>;
+  for (const mission of activePlans) {
+    if ((mission.status === 'verifying' || mission.status === 'blocked') && isPostApplyVerificationPending(mission.id)) {
+      await orchestrator.retryPostApplyVerification(mission.id).catch((error) => {
+        console.warn(`[API-Gateway] Post-apply verification remains pending for mission ${mission.id}:`, error);
+      });
+    }
+    else if (mission.status !== 'blocked') await orchestrator.reconcileMissionPlan(mission.id, mission.plan_id);
+  }
   const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
-  for (const row of pending) void drainMissionCommands(row.mission_id);
-});
+  for (const row of pending) await drainMissionCommands(row.mission_id);
+}
+
+const startupRecovery = recoverGatewayStartup();
 if (isMain && process.env.NODE_ENV !== 'test' && !server.listening) {
-  server.listen(PORT, '127.0.0.1', () => {
-    const ready = emitRuntimeReady(server, gatewayVersion());
-    const origin = ready?.origin || `http://127.0.0.1:${PORT}`;
-    console.log(`[API-Gateway] Server running on ${origin}`);
-    console.log(`[API-Gateway] WebSocket stream ready at ${origin.replace(/^http:/, 'ws:')}/ws/events`);
-    console.log(`[API-Gateway] SSE event stream ready at ${origin}/api/events/stream`);
+  startupRecovery.then(() => {
+    if (shutdownCoordinator.shuttingDown || server.listening) return;
+    server.listen(PORT, '127.0.0.1', () => {
+      const ready = emitRuntimeReady(server, gatewayVersion());
+      const origin = ready?.origin || `http://127.0.0.1:${PORT}`;
+      console.log(`[API-Gateway] Server running on ${origin}`);
+      console.log(`[API-Gateway] WebSocket stream ready at ${origin.replace(/^http:/, 'ws:')}/ws/events`);
+      console.log(`[API-Gateway] SSE event stream ready at ${origin}/api/events/stream`);
+    });
+  }).catch((error) => {
+    console.error('[API-Gateway] Startup recovery failed:', error);
+    void shutdownCoordinator.shutdown('startup-recovery-failed');
   });
 }
 
-export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator, db };
+export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator, startupRecovery, db };

@@ -4,6 +4,8 @@ import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 const configuredBase = import.meta.env?.VITE_ATRIS_API_URL as string | undefined;
 let apiOrigin = normalizeApiOrigin(configuredBase);
 let runtimeTransportToken: string | null = null;
+const API_REQUEST_TIMEOUT_MS = 30_000;
+const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
 
 export interface ApiRuntimeConfig {
   origin: string;
@@ -47,18 +49,37 @@ export interface ApiRequestInit extends RequestInit {
   skipAuth?: boolean;
   /** Logout handles cleanup itself and should not race the session-expired callback. */
   suppressUnauthorized?: boolean;
+  /** Override the desktop request deadline, or set to 0 to disable it. */
+  timeoutMs?: number;
+}
+
+async function fetchWithDeadline(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  if (timeoutMs <= 0) return fetch(input, init);
+
+  const controller = new AbortController();
+  const abort = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) abort();
+  else init.signal?.addEventListener('abort', abort, { once: true });
+  const timer = globalThis.setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms.`)), timeoutMs);
+
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    globalThis.clearTimeout(timer);
+    init.signal?.removeEventListener('abort', abort);
+  }
 }
 
 export async function apiRequestWithHeaders<T>(pathname: string, init: ApiRequestInit = {}): Promise<{ data: T; headers: Headers }> {
-  const { skipAuth = false, suppressUnauthorized = false, ...requestInit } = init;
+  const { skipAuth = false, suppressUnauthorized = false, timeoutMs = API_REQUEST_TIMEOUT_MS, ...requestInit } = init;
   const headers = runtimeHeaders(requestInit.headers);
   if (requestInit.body && !(requestInit.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = getAuthToken();
   if (!skipAuth && token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
-  const response = await fetch(`${getApiBaseUrl()}${pathname.startsWith('/') ? pathname : `/${pathname}`}`, {
+  const response = await fetchWithDeadline(`${getApiBaseUrl()}${pathname.startsWith('/') ? pathname : `/${pathname}`}`, {
     ...requestInit,
     headers,
-  });
+  }, timeoutMs);
   const contentType = response.headers.get('content-type') || '';
   const payload = contentType.includes('application/json')
     ? await response.json().catch(() => null)
@@ -80,7 +101,7 @@ export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {})
 export async function checkApiHealth(): Promise<{ status: string; version?: string; connectedAccounts?: number }> {
   // Health is intentionally public: it reports local process availability,
   // not AtrisHub identity or Premium entitlement.
-  const response = await fetch(`${getApiOrigin()}/health`, { headers: runtimeHeaders() });
+  const response = await fetchWithDeadline(`${getApiOrigin()}/health`, { headers: runtimeHeaders() }, HEALTH_REQUEST_TIMEOUT_MS);
   if (!response.ok) throw new ApiError(`Local service returned ${response.status}`, response.status);
   return response.json();
 }

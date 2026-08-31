@@ -192,7 +192,7 @@ async function runTests() {
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu-read-file-1', name: 'ReadFile', input: { path: 'package.json' } }] } }),
       JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu-read-file-1', content: '{ "name": "app" }', is_error: false }] } }),
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Analyzed package.json successfully.' }] } }),
-      JSON.stringify({ type: 'result', is_error: true, result: 'Token quota warning' }),
+      JSON.stringify({ type: 'result', is_error: true, result: 'Token quota warning', usage: { input_tokens: 120, output_tokens: 30 }, total_cost_usd: 0.04 }),
     ];
     for (const line of claudeLines) (claudeAdapter as any).handleStreamLine('test-session-1', line);
     const claudeTypes = emittedEvents.map((e) => e.type);
@@ -205,6 +205,8 @@ async function runTests() {
     const claudeCompleted = emittedEvents.find((event) => event.type === 'tool_call_completed') as any;
     assert(claudeStarted?.toolCallId === 'toolu-read-file-1' && claudeStarted.toolName === 'ReadFile', 'Claude preserves tool_use id without replacing the visible tool name');
     assert(claudeCompleted?.toolCallId === 'toolu-read-file-1' && claudeCompleted.toolName === 'ReadFile', 'Claude matches tool_result by tool_use_id and keeps the start tool name');
+    const claudeUsage = await claudeAdapter.getUsage('test-session-1');
+    assert(claudeUsage?.inputTokens === 120 && claudeUsage.outputTokens === 30 && claudeUsage.totalCost === 0.04 && claudeUsage.currency === 'USD', 'Claude preserves provider-reported tokens and cost from the terminal result');
 
     emittedEvents.length = 0;
     const codexAdapter = new CodexAdapter(eventBus);
@@ -223,9 +225,11 @@ async function runTests() {
     assert(codexCommandEvents[0]?.runId === 'codex-run-1' && codexCommandEvents[0]?.attemptId === 'codex-attempt-1', 'Codex preserves run and attempt ids when provided');
     assert(codexMcpEvents[0]?.toolCallId === 'mcp-1' && codexMcpEvents[1]?.toolCallId === 'mcp-1', 'Codex preserves MCP item id across start and completion');
     assert(codexCommandEvents[2]?.toolCallId && codexCommandEvents[3]?.toolCallId && codexCommandEvents[2].toolCallId !== codexCommandEvents[3].toolCallId, 'Codex fallback ids are deterministic event keys and do not fabricate a cross-event match');
-    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.completed' }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 80, output_tokens: 20 } }));
     (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.failed', error: { message: 'late duplicate' } }));
     assert(emittedEvents.filter((event) => event.type === 'task_completed').length === 1, 'CodexAdapter emits one terminal event when completed and failed signals race');
+    const codexUsage = await codexAdapter.getUsage('test-codex-session');
+    assert(codexUsage?.inputTokens === 80 && codexUsage.outputTokens === 20 && codexUsage.totalCost === null, 'Codex records official token usage without fabricating cost');
 
     emittedEvents.length = 0;
     const openCodeAdapter = new OpenCodeAdapter(eventBus);
@@ -251,6 +255,12 @@ async function runTests() {
     });
     const openCodeToolEvents = emittedEvents.filter((event) => event.type === 'tool_call_started' || event.type === 'tool_call_completed') as any[];
     assert(openCodeToolEvents[0]?.toolCallId === 'part-tool-1' && openCodeToolEvents[1]?.toolCallId === 'part-tool-1', 'OpenCode preserves part id across tool start and completion');
+    (openCodeAdapter as any).handleServerEvent('test-opencode-session', {
+      type: 'message.updated',
+      properties: { sessionID: 'opencode-runtime-session', info: { tokens: { input: 44, output: 11 }, cost: 0.02 } },
+    });
+    const openCodeUsage = await openCodeAdapter.getUsage('test-opencode-session');
+    assert(openCodeUsage?.inputTokens === 44 && openCodeUsage.outputTokens === 11 && openCodeUsage.totalCost === 0.02, 'OpenCode records provider-reported message usage');
 
     emittedEvents.length = 0;
     (codexAdapter as any).sessionContext.set('cancelled-codex-session', { missionId: 'm-1', taskId: 't-cancelled-codex' });
@@ -325,10 +335,13 @@ async function runTests() {
       success: true,
       status: 'SUCCESS',
       response: 'Research complete',
+      usage: { input_tokens: 60, output_tokens: 15 },
     }));
     const successPendingOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-3');
     assert(successStdinEnded, 'AntigravityAdapter starts native shutdown after a successful terminal result');
     assert(successPendingOutcome?.kind === 'completed', 'AntigravityAdapter records a successful terminal result for close-phase handoff');
+    const antigravityUsage = await antigravityAdapter.getUsage('test-session-3');
+    assert(antigravityUsage?.inputTokens === 60 && antigravityUsage.outputTokens === 15 && antigravityUsage.totalCost === null, 'Antigravity records reported token usage without inventing cost');
     assert(!emittedEvents.some((event) => event.type === 'task_completed'), 'AntigravityAdapter still waits for native cleanup before publishing task_completed');
     (antigravityAdapter as any).activeProcesses.delete('test-session-3');
 
@@ -601,6 +614,84 @@ async function runTests() {
     await host.stopAll();
   }
 
+  // Quiet server sessions are renewed from a positive protocol probe, not process existence alone.
+  {
+    let heartbeatCalls = 0;
+    let probeCalls = 0;
+    const manager: any = {
+      async heartbeatTaskAttempt() { heartbeatCalls += 1; return true; },
+      async expireStaleTaskAttempts() { return []; },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, sessionTimeout: 100, sessionIdleGrace: 100, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'quiet', setEventBus() {}, isSessionAlive: () => true,
+      async probeSessionResponsiveness() { probeCalls += 1; return true; },
+      shutdown: async () => undefined,
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('quiet-session', {
+      adapterId: 'quiet', session: { id: 'quiet-session' }, attemptId: 'quiet-attempt', queuedAt: 0, startedAt: 0, retryCount: 1,
+      lastProtocolResponseAt: 0, probeFailures: 0,
+    });
+    await host.runSessionWatchdog(new Date(101));
+    assert(probeCalls === 1 && heartbeatCalls === 1, 'watchdog renews a quiet session only after a positive responsiveness probe');
+    (host as any).activeSessions.clear();
+    await host.stopAll();
+  }
+
+  // A live but unresponsive process is never renewed and is cancelled after bounded failures.
+  {
+    let heartbeatCalls = 0;
+    let cancelCalls = 0;
+    let expiredCalls = 0;
+    const manager: any = {
+      async heartbeatTaskAttempt() { heartbeatCalls += 1; return true; },
+      async finishTaskAttempt(_id: string, status: string) { if (status === 'expired') expiredCalls += 1; return true; },
+      async expireStaleTaskAttempts() { return []; },
+    };
+    const host = new RuntimeHost(undefined, {
+      workspaceManager: manager, sessionTimeout: 100, sessionIdleGrace: 100, maxProbeFailures: 2, watchdogInterval: 0,
+    });
+    const adapter: any = {
+      id: 'stuck', setEventBus() {}, isSessionAlive: () => true,
+      async probeSessionResponsiveness() { return false; },
+      async cancel() { cancelCalls += 1; }, async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('stuck-session', {
+      adapterId: 'stuck', session: { id: 'stuck-session' }, attemptId: 'stuck-attempt', queuedAt: 0, startedAt: 0, retryCount: 1,
+      lastProtocolResponseAt: 0, probeFailures: 0,
+    });
+    await host.runSessionWatchdog(new Date(101));
+    assert(heartbeatCalls === 0 && cancelCalls === 0, 'a failed probe does not renew a live process lease');
+    await host.runSessionWatchdog(new Date(102));
+    assert(cancelCalls === 1 && expiredCalls === 1 && !(host as any).activeSessions.has('stuck-session'), 'repeated probe failure expires and cancels the session once');
+    await host.stopAll();
+  }
+
+  // OpenCode probes inherit the local request deadline even when fetch never settles itself.
+  {
+    const adapter = new OpenCodeAdapter();
+    const child: any = { exitCode: null, killed: false };
+    (adapter as any).activeSessions.set('probe-timeout', { id: 'probe-timeout' });
+    (adapter as any).sessionContext.set('probe-timeout', { serverKey: 'server', runtimeSessionId: 'runtime' });
+    (adapter as any).servers.set('server', { url: 'http://127.0.0.1:1', username: 'u', password: 'p', process: child });
+    const originalFetch = globalThis.fetch;
+    const startedAt = Date.now();
+    try {
+      globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      })) as typeof fetch;
+      const responsive = await adapter.probeSessionResponsiveness('probe-timeout');
+      assert(!responsive && Date.now() - startedAt < 1_500, 'OpenCode probe timeout resolves false within its request deadline');
+    } finally {
+      globalThis.fetch = originalFetch;
+      (adapter as any).activeSessions.clear();
+      (adapter as any).sessionContext.clear();
+      (adapter as any).servers.clear();
+    }
+  }
+
   {
     const manager: any = {
       async expireOrphanedTaskAttempts(completedAt: string) {
@@ -612,6 +703,75 @@ async function runTests() {
     const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
     assert(await host.reconcileStartup(new Date('2026-01-02T00:00:00.000Z')) === 1, 'startup reconciliation deterministically expires persisted orphan attempts');
     await host.stopAll();
+  }
+
+  // Effective routes cross the WorkspaceManager boundary before provider execution.
+  {
+    const cases = [
+      {
+        name: 'explicit chat route',
+        eventRoute: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'high', routeSelectionMode: 'fixed' },
+        expectedSource: 'explicit', expectedMode: 'fixed', policy: undefined,
+      },
+      {
+        name: 'workspace role policy route', eventRoute: {}, expectedSource: 'workspace', expectedMode: 'prefer',
+        policy: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'medium', fallbackCatalogIds: [], selectionMode: 'prefer', source: 'workspace' },
+      },
+      {
+        name: 'scheduler fallback route', eventRoute: {}, expectedSource: 'scheduler', expectedMode: 'auto', policy: undefined,
+      },
+    ];
+    for (const testCase of cases) {
+      let claimedRoute: any;
+      let spawned = false;
+      const manager: any = {
+        async getTask() { return { description: 'Research route durability', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
+        async getMission() { return { workspaceId: 'workspace-route', automationPolicy: null }; },
+        async getWorkspace() { return { path: process.cwd() }; },
+        async listTasks() { return []; },
+        async resolveRoleExecutionPolicy() { return testCase.policy; },
+        async claimTaskAttempt(input: any) {
+          claimedRoute = input.route;
+          assert(!spawned, `${testCase.name} snapshot is claimed before provider execution`);
+          return { id: `attempt-${testCase.expectedSource}`, attemptNumber: 1 };
+        },
+        async markTaskAttemptRunning() { return true; },
+        async updateTask() {},
+        async expireOrphanedTaskAttempts() { return []; },
+      };
+      const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+      const adapter: any = {
+        id: 'codex', runtimeType: 'codex', name: 'Codex test', setEventBus() {}, configureProfile() {},
+        async probeCapabilities() { return {}; },
+        async spawnAgent(options: any) { spawned = true; return { id: `provider-${testCase.expectedSource}`, agentInstanceId: options.sessionId }; },
+        async shutdown() {}, async cancel() {},
+      };
+      host.registerAdapter(adapter);
+      (host as any).profileManager.getProfiles = async () => [{
+        id: 'profile-primary', provider: 'openai', runtimeType: 'codex', profileName: 'Primary', authStatus: 'connected',
+        configDir: '', supportedModels: ['gpt-test'], usageScope: null, createdAt: '', updatedAt: '', allowedRoles: ['researcher'], schedulerAuto: true,
+      }];
+      (host as any).catalogService.getCachedCatalog = () => [{
+        catalogId: 'catalog-primary', runtimeId: 'codex', accountProfileId: 'profile-primary', providerId: 'openai', runtimeModelId: 'gpt-test',
+        displayName: 'GPT Test', supportedRoles: ['researcher'], supportedReasoning: ['medium', 'high'], inputModalities: ['text'], availability: 'available', source: 'discovered',
+      }];
+      await host.handleTaskCreated({
+        id: `event-${testCase.expectedSource}`, type: 'task_created', missionId: 'mission-route', taskId: `task-${testCase.expectedSource}`,
+        agentInstanceId: `agent-${testCase.expectedSource}`, assignedRole: 'researcher', title: testCase.name,
+        timestamp: '2026-08-30T01:00:00.000Z', ...testCase.eventRoute,
+      } as any);
+      assert(
+        claimedRoute?.source === testCase.expectedSource
+          && claimedRoute?.selectionMode === testCase.expectedMode
+          && claimedRoute?.adapterId === 'codex'
+          && claimedRoute?.accountProfileId === 'profile-primary'
+          && claimedRoute?.modelCatalogId === 'catalog-primary'
+          && claimedRoute?.runtimeModelId === 'gpt-test',
+        `${testCase.name} persists the effective adapter, account, catalog/runtime model, source, and selection mode`,
+      );
+      (host as any).activeSessions.clear();
+      await host.stopAll();
+    }
   }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);

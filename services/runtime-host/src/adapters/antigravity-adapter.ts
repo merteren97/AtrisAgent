@@ -675,6 +675,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'result') {
+      this.recordProviderUsage(sessionId, parsed.raw);
       if (this.terminalSessions.has(sessionId)) return;
       if (!parsed.success) {
         this.recordTerminalOutcome(sessionId, {

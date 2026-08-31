@@ -22,7 +22,7 @@ import type {
   CanonicalReasoning,
   Provider,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
+import { BaseRuntimeAdapter, type SessionContinuityCapabilities, type SpawnAgentOptions } from './base-adapter';
 import {
   appendControlPlaneInstructions,
   controlPlaneEnv,
@@ -36,9 +36,11 @@ import {
   findExecutable,
   getFreePort,
   getRuntimeProfileDir,
+  redactSecrets,
   runCommand,
   runtimeProfileEnv,
   spawnHidden,
+  terminateProcessTree,
   waitForHttp,
 } from '../runtime-utils';
 
@@ -52,6 +54,7 @@ interface ServerInstance {
   process: ChildProcess;
   version?: string;
   dedicated?: boolean;
+  diagnostics: string;
 }
 
 interface OpenCodeProvider {
@@ -70,6 +73,52 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   private abortControllers = new Map<string, AbortController>();
   private sessionContext = new Map<string, { missionId: string; taskId: string; serverKey: string; runtimeSessionId: string }>();
   private profileModes = new Map<string, 'isolated' | 'shared_cli'>();
+  private reusableSessions = new Map<string, { serverKey: string; profileId: string; cwd: string }>();
+
+  override isSessionAlive(sessionId: string): boolean {
+    const context = this.sessionContext.get(sessionId);
+    const server = context ? this.servers.get(context.serverKey) : undefined;
+    return Boolean(server && server.process.exitCode === null && !server.process.killed && this.activeSessions.has(sessionId));
+  }
+
+  override async probeSessionResponsiveness(sessionId: string): Promise<boolean> {
+    const context = this.sessionContext.get(sessionId);
+    const server = context ? this.servers.get(context.serverKey) : undefined;
+    if (!server || server.process.exitCode !== null || server.process.killed || !this.activeSessions.has(sessionId)) return false;
+    try {
+      const response = await this.fetchServer(server, '/global/health', {}, 1_000);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  override getSessionContinuityCapabilities(): SessionContinuityCapabilities {
+    return { reuseWhileAlive: true, resumeAfterRestart: true };
+  }
+
+  override async probeProviderSession(providerSessionId: string, options: { profileId?: string; cwd?: string } = {}): Promise<boolean> {
+    try {
+      const remembered = this.reusableSessions.get(providerSessionId);
+      const server = remembered
+        ? this.getServer(remembered.serverKey)
+        : await this.ensureServer(options.profileId || 'default', options.cwd);
+      const response = await this.fetchServer(server, `/session/${encodeURIComponent(providerSessionId)}`, {}, 1_000);
+      if (!response.ok) return false;
+      this.reusableSessions.set(providerSessionId, { serverKey: server.key, profileId: server.profileId, cwd: server.cwd });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  override async releaseProviderSession(providerSessionId: string): Promise<void> {
+    const remembered = this.reusableSessions.get(providerSessionId);
+    this.reusableSessions.delete(providerSessionId);
+    if (!remembered) return;
+    const server = this.servers.get(remembered.serverKey);
+    if (server) await this.fetchServer(server, `/session/${encodeURIComponent(providerSessionId)}`, { method: 'DELETE' }).catch(() => undefined);
+  }
 
   constructor(eventBus?: LocalEventBus) {
     super(eventBus);
@@ -222,7 +271,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   async logout(profileId = 'default'): Promise<void> {
     for (const [key, server] of this.servers.entries()) {
       if (server.profileId !== profileId) continue;
-      if (!server.process.killed) server.process.kill('SIGTERM');
+      await terminateProcessTree(server.process);
       this.servers.delete(key);
     }
     if (this.profileModes.get(profileId) === 'shared_cli') {
@@ -411,14 +460,16 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (context) {
       const server = this.getServer(context.serverKey);
       await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`, { method: 'POST' }).catch(() => undefined);
+      if (server.dedicated) await terminateProcessTree(server.process).catch(() => undefined);
     }
     this.cleanupSession(sessionId);
   }
 
   override async shutdown(): Promise<void> {
     for (const sessionId of [...this.activeSessions.keys()]) await this.cancel(sessionId);
-    for (const server of this.servers.values()) if (!server.process.killed) server.process.kill('SIGTERM');
+    for (const server of this.servers.values()) await terminateProcessTree(server.process);
     this.servers.clear();
+    this.reusableSessions.clear();
     await super.shutdown();
   }
 
@@ -430,14 +481,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
     try {
       const server = await this.ensureServer(profileId, workspaceCwd, controlPlane, agentInstanceId);
-      const createResponse = await this.fetchServer(server, '/session', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: `${options.role || 'agent'} · ${options.taskId}` }),
-      });
-      if (!createResponse.ok) throw new Error(`OpenCode failed to create a session (${createResponse.status}).`);
-      const created = await createResponse.json() as any;
-      const runtimeSessionId = created.id || created.sessionID;
-      if (!runtimeSessionId) throw new Error('OpenCode session response did not contain an id.');
+      let runtimeSessionId = options.providerSessionId;
+      if (runtimeSessionId && !(await this.probeProviderSession(runtimeSessionId, { profileId, cwd: workspaceCwd }))) {
+        throw new Error('OpenCode provider session is unavailable or failed health validation.');
+      }
+      if (!runtimeSessionId) {
+        const createResponse = await this.fetchServer(server, '/session', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: `${options.role || 'agent'} · ${options.taskId}` }),
+        });
+        if (!createResponse.ok) throw new Error(`OpenCode failed to create a session (${createResponse.status}).`);
+        const created = await createResponse.json() as any;
+        runtimeSessionId = created.id || created.sessionID;
+        if (!runtimeSessionId) throw new Error('OpenCode session response did not contain an id.');
+      }
 
       const session: AgentSession = {
         id: agentInstanceId,
@@ -459,6 +516,9 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         this.emitFailure(agentInstanceId, error.message);
         this.cleanupSession(agentInstanceId);
       });
+      if (options.preserveProviderSession) {
+        this.reusableSessions.set(runtimeSessionId, { serverKey: server.key, profileId, cwd: workspaceCwd });
+      }
       const model = this.parseModelRoute(options.model);
       const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
       const response = await this.fetchServer(server, `/session/${encodeURIComponent(runtimeSessionId)}/prompt_async`, {
@@ -531,10 +591,6 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let startupError: Error | undefined;
-    let stderr = '';
-    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
-    child.once('error', (error) => { startupError = error; });
     const instance: ServerInstance = {
       key,
       profileId,
@@ -544,7 +600,13 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       password,
       process: child,
       dedicated: Boolean(controlPlane),
+      diagnostics: '',
     };
+    const appendDiagnostic = (stream: string, chunk: Buffer) => {
+      instance.diagnostics = redactSecrets(`${instance.diagnostics}${stream}: ${chunk.toString()}`).slice(-16_384);
+    };
+    child.stdout?.on('data', (chunk: Buffer) => appendDiagnostic('stdout', chunk));
+    child.stderr?.on('data', (chunk: Buffer) => appendDiagnostic('stderr', chunk));
     child.on('close', () => {
       if (this.servers.get(key)?.process === child) this.servers.delete(key);
       for (const [sessionId, context] of this.sessionContext.entries()) {
@@ -554,17 +616,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       }
     });
     this.servers.set(key, instance);
-    const health = await Promise.race([
-      waitForHttp(`${instance.url}/global/health`, { headers: { Authorization: basicAuthHeader(username, password) } }, 15_000),
-      new Promise<never>((_, reject) => {
-        const check = () => {
-          if (startupError) reject(new Error(`OpenCode server could not start: ${startupError.message}`));
-          else if (child.exitCode !== null) reject(new Error(`OpenCode server exited with code ${child.exitCode}. ${stderr.trim()}`.trim()));
-          else setTimeout(check, 50);
-        };
-        check();
-      }),
-    ]);
+    const startupController = new AbortController();
+    const exited = new Promise<never>((_, reject) => {
+      child.once('error', (error) => reject(new Error(`OpenCode server could not start: ${error.message}`)));
+      child.once('close', (code) => reject(new Error(`OpenCode server exited with code ${code}. ${instance.diagnostics.trim()}`.trim())));
+    });
+    let health: Response;
+    try {
+      health = await Promise.race([
+        waitForHttp(`${instance.url}/global/health`, { headers: { Authorization: basicAuthHeader(username, password) }, signal: startupController.signal }, 15_000),
+        exited,
+      ]);
+    } finally {
+      startupController.abort();
+    }
     const data = await health.json() as any;
     instance.version = data.version || install.version;
     return instance;
@@ -576,10 +641,19 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     return server;
   }
 
-  private fetchServer(server: ServerInstance, pathname: string, init: RequestInit = {}): Promise<Response> {
+  private async fetchServer(server: ServerInstance, pathname: string, init: RequestInit = {}, timeoutMs = 15_000): Promise<Response> {
     const headers = new Headers(init.headers || {});
     headers.set('Authorization', basicAuthHeader(server.username, server.password));
-    return fetch(`${server.url}${pathname}`, { ...init, headers });
+    const controller = new AbortController();
+    const abort = () => controller.abort(init.signal?.reason);
+    init.signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new Error(`OpenCode request timed out after ${timeoutMs}ms`)), timeoutMs);
+    try {
+      return await fetch(`${server.url}${pathname}`, { ...init, headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+      init.signal?.removeEventListener('abort', abort);
+    }
   }
 
   private async startEventStream(sessionId: string, server: ServerInstance): Promise<void> {
@@ -626,6 +700,8 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         if (part.state?.status === 'running') this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_started', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', args: part.state?.input || {}, ...correlation, timestamp });
         if (['completed', 'error'].includes(part.state?.status)) this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', result: JSON.stringify(part.state?.output || part.state?.error || ''), success: part.state?.status === 'completed', ...correlation, timestamp });
       }
+    } else if (type === 'message.updated') {
+      this.recordProviderUsage(sessionId, properties.info || properties.message || properties);
     } else if (type === 'permission.updated' || type === 'permission.asked') {
       const permission = properties.permission || properties;
       const input = permission.input || permission.metadata || {};
@@ -644,6 +720,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         timestamp,
       });
     } else if (type === 'session.idle') {
+      this.recordProviderUsage(sessionId, properties);
       this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: 'OpenCode session completed', timestamp });
       const session = this.activeSessions.get(sessionId);
       if (session) session.endedAt = timestamp;
@@ -663,7 +740,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (context) {
       const server = this.servers.get(context.serverKey);
       if (server?.dedicated) {
-        if (!server.process.killed) server.process.kill('SIGTERM');
+        void terminateProcessTree(server.process).catch(() => undefined);
         this.servers.delete(context.serverKey);
       }
       this.sessionContext.delete(sessionId);

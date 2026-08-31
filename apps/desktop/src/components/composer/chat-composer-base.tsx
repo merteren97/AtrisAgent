@@ -172,10 +172,9 @@ export function ChatComposer() {
     }
 
     const targetRole = directive.targetRole || 'Orchestrator';
-    const explicitDirectiveModel = Boolean(directive.modelCatalogId);
     const scopedSelectedModel = selectedModel || undefined;
     const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
-    const routeScope: 'role' | 'mission' | undefined = explicitDirectiveModel ? 'role' : scopedSelectedModel ? 'mission' : undefined;
+    const routeScope: 'role' | undefined = resolvedModel ? 'role' : undefined;
     const resolvedReasoning = directive.reasoningLevel && directiveReasoningSupported
       ? directive.reasoningLevel
       : directive.modelCatalogId
@@ -384,7 +383,7 @@ export function ChatComposer() {
                   <div className="flex items-center justify-between border-b border-border bg-muted/20 px-3 py-2.5">
                     <div>
                       <div className="flex items-center gap-1.5 text-xs font-semibold"><Settings2 className="h-3.5 w-3.5 text-primary" />Run settings</div>
-                      <p className="mt-0.5 text-[9px] text-muted-foreground">Normal missions are orchestrated automatically. Override only when needed.</p>
+                      <p className="mt-0.5 text-[9px] text-muted-foreground">This picker overrides Orchestrator only. Child roles keep their role policies.</p>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" onClick={(event) => { event.preventDefault(); void refreshModels(); }}>
@@ -456,7 +455,7 @@ export function ChatComposer() {
                         </div>
                       </div>
                     )}
-                     <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {selectedModelObject ? `Mission model: ${selectedModelObject.name} · all compatible agents` : 'Auto routing uses role policies.'}</div>
+                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child role directives preserved` : 'Auto routing uses role policies.'}</div>
                   </div>
                 </DropdownMenuContent>
               </DropdownMenu>

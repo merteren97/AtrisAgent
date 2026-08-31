@@ -52,6 +52,7 @@ async function runTests() {
   delete process.env.ATRIS_RUNTIME_MODE;
 
   const gateway = await import('./index');
+  await gateway.startupRecovery;
   const { app, server, eventBus } = gateway;
   const authorizedFetch = (input: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers || {});
@@ -211,10 +212,14 @@ async function runTests() {
           name: customTemplateName,
           description: 'Specialized security team',
           roles: [{ role: 'reviewer', accessLevel: 'read', defaultCapabilities: ['security-audit'] }],
+          maxParallelAgents: 2,
+          workerPools: [{ role: 'reviewer', minInstances: 0, maxInstances: 1, maxParallel: 1 }],
         }),
       });
       const createBody = await createRes.json();
-      assert(createRes.status === 201 && typeof createBody.id === 'string', 'POST /api/team-templates creates custom team template');
+      assert(createRes.status === 201 && typeof createBody.id === 'string' && createBody.maxParallelAgents === 2
+        && createBody.workerPools?.find((pool: any) => pool.role === 'reviewer')?.maxParallel === 1,
+      'POST /api/team-templates persists normalized global and role worker limits');
 
       const policyRes = await authorizedFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}/builder`, {
         method: 'PUT',
@@ -240,6 +245,20 @@ async function runTests() {
         && builderPolicy?.fallbackCatalogIds?.[0] === 'claude_code:test:fallback',
         'GET execution policies restores account, reasoning and ordered fallback fields',
       );
+
+      const mission = await gateway.workspaceManager.createMission({ id: `route-mission-${Date.now()}`, workspaceId: createdWorkspaceId, title: 'Route read model' });
+      const task = await gateway.workspaceManager.createTask({ id: `${mission.id}-task`, missionId: mission.id, title: 'Inspect route', assignedRole: 'researcher' });
+      await gateway.workspaceManager.claimTaskAttempt({ taskId: task.id, missionId: mission.id, agentInstanceId: 'route-agent',
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(), route: { adapterId: 'codex', provider: 'openai', accountProfileId: 'account-public-id',
+          modelCatalogId: 'catalog-route', runtimeModelId: 'gpt-route', reasoningLevel: 'high', source: 'mission', selectionMode: 'fixed' } });
+      const missionRes = await authorizedFetch(`${baseUrl}/api/missions/${encodeURIComponent(mission.id)}`);
+      const missionBody = await missionRes.json();
+      const exposedRoute = missionBody.tasks?.find((item: any) => item.id === task.id)?.effectiveRoute;
+      assert(missionRes.status === 200 && exposedRoute?.adapterId === 'codex' && exposedRoute?.provider === 'openai'
+        && exposedRoute?.accountProfileId === 'account-public-id' && exposedRoute?.modelCatalogId === 'catalog-route'
+        && exposedRoute?.runtimeModelId === 'gpt-route' && exposedRoute?.reasoningLevel === 'high'
+        && exposedRoute?.source === 'mission' && exposedRoute?.selectionMode === 'fixed' && exposedRoute.providerSessionId === undefined,
+      'GET /api/missions/:id exposes the latest effective task route without provider session data');
     }
 
     // 7. SSE (/api/events/stream) Event Stream Verification
@@ -291,6 +310,80 @@ async function runTests() {
         setTimeout(() => { request.destroy(); resolve(false); }, 2000);
       });
       assert(replayReceived, 'SSE replays persisted mission events and filters other missions');
+
+      const verifyBoundedReplay = async (eventCount: number, payloadSize: number, emitDuringReplay: boolean) => {
+        const missionResponse = await authorizedFetch(`${baseUrl}/api/missions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ workspaceId: createdWorkspaceId, title: `SSE replay ${eventCount} ${payloadSize}` }),
+        });
+        const mission = await missionResponse.json();
+        const expected: number[] = [];
+        for (let index = 0; index < eventCount; index++) {
+          const event: any = {
+            id: crypto.randomUUID(),
+            type: 'agent_progressed',
+            missionId: mission.id,
+            agentInstanceId: 'replay-agent',
+            progress: payloadSize ? `${index}:${'x'.repeat(payloadSize)}` : String(index),
+            timestamp: new Date().toISOString(),
+          };
+          eventBus.emit(event);
+          expected.push(index + 1);
+        }
+
+        const received = await new Promise<number[]>((resolve, reject) => {
+          const sequences: number[] = [];
+          let buffer = '';
+          let emittedLive = false;
+          const timeout = setTimeout(() => {
+            request.destroy();
+            reject(new Error(`Timed out after receiving ${sequences.length}/${eventCount + Number(emitDuringReplay)} replay events`));
+          }, 15_000);
+          const request = http.get(`${baseUrl}/api/events/stream?missionId=${mission.id}&afterSequence=0`,
+            { headers: { Authorization: 'Bearer integration-premium-token', 'X-Atris-Runtime-Token': 'gateway-runtime-secret' } }, (response) => {
+              response.on('data', (chunk: Buffer) => {
+                buffer += chunk.toString('utf8');
+                let boundary = buffer.indexOf('\n\n');
+                while (boundary >= 0) {
+                  const frame = buffer.slice(0, boundary);
+                  buffer = buffer.slice(boundary + 2);
+                  const data = frame.split('\n').find((line) => line.startsWith('data: '));
+                  if (data) sequences.push(Number(JSON.parse(data.slice(6)).sequence));
+                  boundary = buffer.indexOf('\n\n');
+                }
+                if (emitDuringReplay && !emittedLive && sequences.length > 0) {
+                  emittedLive = true;
+                  const event: any = {
+                    id: crypto.randomUUID(), type: 'agent_progressed', missionId: mission.id,
+                    agentInstanceId: 'live-during-replay', progress: 'live', timestamp: new Date().toISOString(),
+                  };
+                  eventBus.emit(event);
+                }
+                if (sequences.length === eventCount + Number(emitDuringReplay)) {
+                  clearTimeout(timeout);
+                  request.destroy();
+                  resolve(sequences);
+                }
+              });
+            });
+          request.on('error', (error: NodeJS.ErrnoException) => {
+            if (error.code !== 'ECONNRESET') reject(error);
+          });
+        });
+        return { expected: expected.slice(0, eventCount), received };
+      };
+
+      const smallReplay = await verifyBoundedReplay(2_101, 0, true);
+      assert(smallReplay.received.slice(0, 2_101).every((sequence, index) => sequence === smallReplay.expected[index])
+        && new Set(smallReplay.received).size === 2_102
+        && smallReplay.received[2_101] === smallReplay.expected[2_100]! + 1,
+      'SSE streams more than 2000 replay events through high-water exactly once in order, then drains concurrent live events');
+
+      const largeReplay = await verifyBoundedReplay(9, 950_000, false);
+      assert(largeReplay.received.length === largeReplay.expected.length
+        && largeReplay.received.every((sequence, index) => sequence === largeReplay.expected[index]),
+      'SSE streams bounded replay payloads larger than the 8 MiB live queue exactly once in order');
 
       const sseReceived = await new Promise<boolean>((resolve, reject) => {
         const timeout = setTimeout(() => resolve(false), 3000);
@@ -562,9 +655,31 @@ async function runTests() {
       });
       const protectedMission = await protectedMissionRes.json();
       const protectedDeleteRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`, { method: 'DELETE' });
-      assert(protectedDeleteRes.status === 409, 'DELETE /api/missions/:id rejects nonterminal conversations');
+      assert(protectedDeleteRes.status === 200, 'DELETE /api/missions/:id fences, stops, and removes a nonterminal conversation');
       const preservedMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`);
-      assert(preservedMissionRes.status === 200, 'Rejected conversation deletion preserves the mission');
+      assert(preservedMissionRes.status === 404, 'Conversation is removed only after its cleanup operation completes');
+      const repeatedMissionDelete = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`, { method: 'DELETE' });
+      assert(repeatedMissionDelete.status === 200, 'Repeated conversation DELETE returns the completed durable operation');
+
+      eventBus.emit({
+        id: 'runtime-telemetry:usage-attempt-1', type: 'runtime_telemetry', missionId: createdMissionId,
+        taskId: 'usage-task', agentInstanceId: 'usage-agent-1', adapterId: 'claude_code', attemptId: 'usage-attempt-1',
+        outcome: 'completed', usageAvailable: true, usageSource: 'provider_reported', inputTokens: 100, outputTokens: 25,
+        cost: 0.1, currency: 'USD', queueWaitMs: 10, durationMs: 100, retryCount: 0, workerUtilization: 0.5,
+        timestamp: new Date().toISOString(),
+      });
+      eventBus.emit({
+        id: 'runtime-telemetry:usage-attempt-2', type: 'runtime_telemetry', missionId: createdMissionId,
+        taskId: 'usage-task', agentInstanceId: 'usage-agent-2', adapterId: 'opencode', attemptId: 'usage-attempt-2',
+        outcome: 'failed', usageAvailable: true, usageSource: 'provider_reported', inputTokens: 40, outputTokens: 10,
+        cost: 0.2, currency: 'EUR', queueWaitMs: 20, durationMs: 200, retryCount: 1, workerUtilization: 1,
+        timestamp: new Date().toISOString(),
+      });
+      const usageRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/usage`);
+      const usage = await usageRes.json();
+      assert(usage.totalCost === null && usage.currency === null && usage.costsByCurrency.USD === 0.1 && usage.costsByCurrency.EUR === 0.2, 'usage metrics never add mixed currencies');
+      assert(usage.completedCount === 1 && usage.failedCount === 1 && usage.successRate === 0.5 && usage.retryCount === 1, 'usage metrics cover attempt lifecycle and true retry count');
+      assert(usage.usageAvailable === true && usage.usageSource === 'provider_reported', 'usage metrics expose provider provenance and availability');
 
       const cancelRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/cancel`, { method: 'POST' });
       const cancelBody = await cancelRes.json();
@@ -597,8 +712,19 @@ async function runTests() {
         timestamp: new Date().toISOString(),
       });
 
-      const deleteWorkspaceRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`, { method: 'DELETE' });
-      assert(deleteWorkspaceRes.status === 200, 'DELETE /api/workspaces/:id removes a workspace with its conversations');
+      await gateway.workspaceManager.updateMission(childMissionId, { status: 'running' });
+      const activeWorkspaceDeleteRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`, { method: 'DELETE' });
+      assert(activeWorkspaceDeleteRes.status === 200, 'DELETE /api/workspaces/:id fences active conversations and completes external cleanup first');
+      assert((await gateway.workspaceManager.getWorkspace(createdWorkspaceId)) === null, 'workspace row is removed after cleanup completes');
+
+      const deleteWorkspaceRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ removeMemory: false }),
+      });
+      assert(deleteWorkspaceRes.status === 200, 'Repeated workspace DELETE returns the completed durable operation');
+      const deleteWorkspaceBody = await deleteWorkspaceRes.json();
+      assert(deleteWorkspaceBody.removeMemory === false, 'workspace deletion preserves memory by default');
 
       const deletedWorkspaceRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`);
       assert(deletedWorkspaceRes.status === 404, 'Deleted workspace is no longer available');

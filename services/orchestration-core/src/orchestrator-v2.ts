@@ -1,9 +1,11 @@
 import { and, eq } from 'drizzle-orm';
 import {
   conversationTurns,
+  artifacts,
   missionCompletions,
   missionEvents,
   missionRuns,
+  taskAttempts,
   type AtrisDatabase,
   type MissionSelect,
   type TaskSelect,
@@ -18,6 +20,8 @@ import type {
   AgentRole,
   OrchestratorDecision,
   OrchestratorTurnAction,
+  QualityResultEnvelope,
+  PostApplyVerificationResult,
 } from '@atris-agent-code/domain';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator as LegacyOrchestrator } from './orchestrator';
@@ -33,7 +37,7 @@ import {
   parseSupervisorDecision,
   type SupervisorTurnContext,
 } from './supervisor-turn';
-import { allocateWorkerBatch, DEFAULT_CORE_WORKER_POOL } from './worker-pool';
+import { allocateWorkerBatch } from './worker-pool';
 
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const NON_PROGRESSING_MISSION_STATUSES = new Set(['blocked', ...TERMINAL_MISSION_STATUSES]);
@@ -46,6 +50,10 @@ const RECONCILABLE_MISSION_STATUSES = new Set([...SCHEDULABLE_MISSION_STATUSES, 
 const MAX_CONTEXT_EVENTS = 24;
 const MAX_CONTEXT_CHARS = 18_000;
 const MAX_QUALITY_SUMMARY_CHARS = 4_000;
+const MAX_RESEARCH_SOURCE_CHARS = 6_000;
+const MAX_RESEARCH_BUNDLE_CHARS = 16_000;
+const RESEARCH_CONTEXT_START = '[ATRIS_RESEARCH_CONTEXT_START]';
+const RESEARCH_CONTEXT_END = '[ATRIS_RESEARCH_CONTEXT_END]';
 
 interface QualityVerdict {
   passed: boolean;
@@ -54,9 +62,45 @@ interface QualityVerdict {
   reason: 'approved' | 'failed' | 'ambiguous';
 }
 
+function parseQualityEnvelope(rawResult: unknown): QualityResultEnvelope | null | 'invalid' {
+  if (typeof rawResult !== 'string' && (typeof rawResult !== 'object' || rawResult === null)) return null;
+  let value: unknown = rawResult;
+  if (typeof rawResult === 'string') {
+    const trimmed = rawResult.trim();
+    const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const candidate = fenced?.[1] || trimmed;
+    if (!candidate.startsWith('{')) return null;
+    try { value = JSON.parse(candidate); } catch { return 'invalid'; }
+  }
+  if (!value || typeof value !== 'object') return 'invalid';
+  const envelope = value as Partial<QualityResultEnvelope>;
+  if (envelope.type !== 'quality_result' || envelope.version !== 1
+    || (envelope.role !== 'reviewer' && envelope.role !== 'qa')
+    || (envelope.verdict !== 'pass' && envelope.verdict !== 'fail')
+    || typeof envelope.summary !== 'string' || !envelope.summary.trim()
+    || (envelope.findings !== undefined && (!Array.isArray(envelope.findings) || envelope.findings.some((item) => typeof item !== 'string')))
+    || (envelope.evidence !== undefined && (!Array.isArray(envelope.evidence) || envelope.evidence.some((item) => typeof item !== 'string')))) {
+    return 'invalid';
+  }
+  return envelope as QualityResultEnvelope;
+}
+
 interface QualityEmissionResult {
   verdict: QualityVerdict;
   emitted: boolean;
+}
+
+interface ResearchContextBundle {
+  version: 1;
+  missionId: string;
+  planId: string;
+  sourceTaskIds: string[];
+  sources: Array<{ taskId: string; attemptId?: string; result: string; uncertain: boolean }>;
+  findings: string[];
+  evidence: Array<{ taskId: string; attemptId?: string }>;
+  conflicts: string[];
+  uncertainties: string[];
+  truncated: boolean;
 }
 
 type SchedulableWorkerRole = 'researcher' | 'builder' | 'reviewer' | 'qa';
@@ -114,6 +158,22 @@ function inferQualityVerdict(
 ): QualityVerdict | null {
   if (role !== 'reviewer' && role !== 'qa') return null;
 
+  const envelope = parseQualityEnvelope(rawResult);
+  if (envelope === 'invalid' || (envelope && envelope.role !== role)) {
+    return { passed: false, summary: 'Invalid or mismatched structured quality result.', findingCount: 1, reason: 'ambiguous' };
+  }
+  if (envelope) {
+    const detail = [envelope.summary, ...(envelope.findings || []), ...(envelope.evidence || [])].join('\n');
+    const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(detail);
+    const passed = envelope.verdict === 'pass' && !contradictory;
+    return {
+      passed,
+      summary: String(redactSensitiveValue(detail)).slice(0, MAX_QUALITY_SUMMARY_CHARS),
+      findingCount: passed ? 0 : Math.max(1, envelope.findings?.length || 0),
+      reason: passed ? 'approved' : contradictory ? 'ambiguous' : 'failed',
+    };
+  }
+
   const rawText = typeof rawResult === 'string' ? rawResult.trim() : '';
   const safeResult = rawText ? String(redactSensitiveValue(rawText)).slice(0, MAX_QUALITY_SUMMARY_CHARS) : '';
   const hasFailure = hasQualityFailureSignal(rawText);
@@ -124,9 +184,9 @@ function inferQualityVerdict(
   );
   const passed = !hasFailure && hasExplicitPass;
   const reason: QualityVerdict['reason'] = passed ? 'approved' : hasFailure ? 'failed' : 'ambiguous';
-  const summary = safeResult || (role === 'reviewer'
+  const summary = `[legacy_compatibility_fallback] ${safeResult || (role === 'reviewer'
     ? 'No explicit review approval or revision verdict was reported.'
-    : 'No explicit QA pass or failure verdict was reported.');
+    : 'No explicit QA pass or failure verdict was reported.')}`.slice(0, MAX_QUALITY_SUMMARY_CHARS);
 
   return {
     passed,
@@ -165,6 +225,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
    private readonly v2Db?: AtrisDatabase;
    private readonly v2WorkspacePath: string;
    private readonly v2ApplyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
+   private readonly v2PostApplyVerification?: OrchestratorConfig['postApplyVerification'];
+   private readonly v2ExecuteApplyVerificationOperation?: OrchestratorConfig['executeApplyVerificationOperation'];
   private readonly missionQueues = new Map<string, Promise<void>>();
   private readonly planActions = new Map<string, OrchestratorTurnAction>();
   private readonly synthesizedPlans = new Set<string>();
@@ -187,6 +249,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     this.v2Db = db ?? config.db;
     this.v2WorkspacePath = config.workspacePath;
     this.v2ApplyTaskChanges = config.applyTaskChanges;
+    this.v2PostApplyVerification = config.postApplyVerification;
+    this.v2ExecuteApplyVerificationOperation = config.executeApplyVerificationOperation;
     this.v2WorkspaceManager = workspaceManager
       ?? config.workspaceManager
       ?? (this.v2Db ? new WorkspaceManager(this.v2Db, this.v2EventBus) : undefined);
@@ -675,6 +739,18 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         ],
       };
     }
+    if (decision.action === 'execute' && !(decision.delegations || []).some((item) => item.role === 'researcher')) {
+      const researchId = 'research-1';
+      return {
+        ...decision,
+        delegations: [
+          { id: researchId, role: 'researcher', objective: `Inspect the codebase and constraints needed to implement: ${userRequest}`, requiredCapabilities: ['research', 'codebase-analysis'] },
+          ...(decision.delegations || []).map((item) => item.role === 'builder'
+            ? { ...item, dependsOnDelegationIds: [...new Set([...(item.dependsOnDelegationIds || []), researchId])] }
+            : item),
+        ],
+      };
+    }
     return decision;
   }
 
@@ -1129,6 +1205,12 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     ].filter(Boolean).join('\n\n');
     const steering = this.pendingSteers.get(missionId) || [];
     this.pendingSteers.delete(missionId);
+    const bundle = await this.getResearchBundle(missionId, planId);
+    const activeTurnId = this.lifecycleByMission.get(missionId)?.turnId;
+    const activeTurn = this.v2Db && activeTurnId
+      ? (await this.v2Db.select({ content: conversationTurns.content }).from(conversationTurns)
+        .where(eq(conversationTurns.id, activeTurnId)))[0]?.content
+      : undefined;
     if (!runner) return fallback || 'Delegated work completed.';
 
     try {
@@ -1145,6 +1227,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           '',
           'Conversation and worker evidence:',
            loaded.conversationContext,
+          activeTurn ? `\nCurrent user turn (must be answered):\n${activeTurn}` : '',
+          bundle ? `\nDurable research context bundle:\n${JSON.stringify(bundle)}` : '',
           steering.length ? `\nUser steering received during execution:\n${steering.join('\n')}` : '',
           currentResult ? `\nLatest worker result:\n${currentResult}` : '',
         ].join('\n'),
@@ -1185,6 +1269,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       status: verdict && !verdict.passed ? 'rejected' : 'done',
       completedAt: new Date().toISOString(),
     });
+    if (task.assignedRole === 'researcher') {
+      task.status = 'done';
+      await this.refreshResearchBundle(event.missionId, task.planId, planTasks, { taskId: task.id, result: event.result || '' });
+    }
     await this.assertTaskCompletionCurrent(event);
     const emittedVerdict = await this.emitQualityTaskCompleted(event, task, false, verdict);
     if (emittedVerdict && !emittedVerdict.passed) {
@@ -1303,6 +1391,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         status: verdict && !verdict.passed ? 'rejected' : 'done',
         completedAt: new Date().toISOString(),
       });
+      if (task.assignedRole === 'researcher') {
+        task.status = 'done';
+        await this.refreshResearchBundle(event.missionId, task.planId, planTasks, { taskId: task.id, result: event.result || '' });
+      }
       await this.assertTaskCompletionCurrent(event);
       const emittedVerdict = await this.emitQualityTaskCompleted(event, task, false, verdict);
       if (emittedVerdict && !emittedVerdict.passed) {
@@ -1350,6 +1442,124 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     });
   }
 
+  private researchArtifactId(planId: string): string {
+    return `research-context:${planId}`;
+  }
+
+  private async getResearchBundle(missionId: string, planId: string): Promise<ResearchContextBundle | null> {
+    if (!this.v2Db) return null;
+    const row = (await this.v2Db.select({ content: artifacts.content }).from(artifacts)
+      .where(eq(artifacts.id, this.researchArtifactId(planId))))[0];
+    if (!row?.content) return null;
+    try {
+      return JSON.parse(row.content) as ResearchContextBundle;
+    } catch {
+      return null;
+    }
+  }
+
+  private async refreshResearchBundle(
+    missionId: string,
+    planId: string,
+    planTasks: TaskSelect[],
+    completed?: { taskId: string; result: string },
+  ): Promise<ResearchContextBundle | null> {
+    if (!this.v2Db) return null;
+    const researchers = planTasks.filter((task) => task.assignedRole === 'researcher' && task.status === 'done');
+    if (researchers.length === 0 && !completed) return null;
+    const existing = await this.getResearchBundle(missionId, planId);
+    const byTask = new Map((existing?.sources || []).map((source) => [source.taskId, source]));
+    for (const task of researchers) {
+      const attempts = await this.v2Db.select().from(taskAttempts).where(eq(taskAttempts.taskId, task.id));
+      const attempt = attempts.filter((item) => item.status === 'completed' && item.resultSummary)
+        .sort((a, b) => b.attemptNumber - a.attemptNumber)[0];
+      const completionEvents = attempt?.resultSummary ? [] : await this.v2Db.select({ payload: missionEvents.payload })
+        .from(missionEvents).where(and(eq(missionEvents.taskId, task.id), eq(missionEvents.type, 'task_completed')));
+      const eventResult = completionEvents.map((item) => item.payload as Record<string, unknown>)
+        .map((payload) => payload.result).filter((result): result is string => typeof result === 'string').at(-1);
+      const raw = completed?.taskId === task.id ? completed.result : attempt?.resultSummary || eventResult;
+      if (!raw) continue;
+      const result = String(redactSensitiveValue(raw)).trim().slice(0, MAX_RESEARCH_SOURCE_CHARS);
+      byTask.set(task.id, {
+        taskId: task.id,
+        ...(attempt?.id ? { attemptId: attempt.id } : {}),
+        result,
+        uncertain: /\b(?:uncertain|unknown|unclear|inconclusive|may|might|possibly|not verified)\b/i.test(result),
+      });
+    }
+    if (completed && !byTask.has(completed.taskId)) {
+      const result = String(redactSensitiveValue(completed.result)).trim().slice(0, MAX_RESEARCH_SOURCE_CHARS);
+      byTask.set(completed.taskId, {
+        taskId: completed.taskId,
+        result,
+        uncertain: /\b(?:uncertain|unknown|unclear|inconclusive|may|might|possibly|not verified)\b/i.test(result),
+      });
+    }
+    const sources = [...byTask.values()].sort((a, b) => a.taskId.localeCompare(b.taskId));
+    const positive = sources.filter((source) => /\b(?:yes|supported|exists|confirmed|verified)\b/i.test(source.result));
+    const negative = sources.filter((source) => /\b(?:no|not supported|does not exist|absent|disproved)\b/i.test(source.result));
+    const bundle: ResearchContextBundle = {
+      version: 1,
+      missionId,
+      planId,
+      sourceTaskIds: sources.map((source) => source.taskId),
+      sources,
+      findings: sources.map((source) => source.result),
+      evidence: sources.map((source) => ({ taskId: source.taskId, ...(source.attemptId ? { attemptId: source.attemptId } : {}) })),
+      conflicts: positive.length && negative.length
+        ? ['Research sources contain potentially conflicting positive and negative conclusions; Builder must verify before choosing.']
+        : [],
+      uncertainties: sources.filter((source) => source.uncertain).map((source) => `Uncertainty reported by research task ${source.taskId}.`),
+      truncated: sources.some((source) => source.result.length === MAX_RESEARCH_SOURCE_CHARS),
+    };
+    let content = JSON.stringify(bundle);
+    if (content.length > MAX_RESEARCH_BUNDLE_CHARS) {
+      bundle.truncated = true;
+      while (bundle.sources.length > 1 && JSON.stringify(bundle).length > MAX_RESEARCH_BUNDLE_CHARS) bundle.sources.pop();
+      bundle.sourceTaskIds = bundle.sources.map((source) => source.taskId);
+      bundle.findings = bundle.sources.map((source) => source.result);
+      bundle.evidence = bundle.sources.map((source) => ({ taskId: source.taskId, ...(source.attemptId ? { attemptId: source.attemptId } : {}) }));
+      bundle.uncertainties = bundle.sources.filter((source) => source.uncertain).map((source) => `Uncertainty reported by research task ${source.taskId}.`);
+      content = JSON.stringify(bundle);
+    }
+    const lifecycle = this.lifecycleByMission.get(missionId);
+    if (existing) {
+      await this.v2Db.update(artifacts).set({ content, sizeBytes: Buffer.byteLength(content) })
+        .where(eq(artifacts.id, this.researchArtifactId(planId)));
+    } else {
+      await this.v2Db.insert(artifacts).values({
+        id: this.researchArtifactId(planId), missionId, taskId: null, runId: lifecycle?.runId || null,
+        type: 'research', name: 'Research context bundle', path: null, content,
+        sizeBytes: Buffer.byteLength(content), createdAt: new Date().toISOString(),
+      });
+    }
+
+    const byId = new Map(planTasks.map((task) => [task.id, task]));
+    const upstreamResearchers = (task: TaskSelect): Set<string> => {
+      const found = new Set<string>();
+      const visit = (id: string) => {
+        const dependency = byId.get(id);
+        if (!dependency || found.has(id)) return;
+        if (dependency.assignedRole === 'researcher') found.add(id);
+        for (const parent of (dependency.dependsOn as string[]) || []) visit(parent);
+      };
+      for (const id of (task.dependsOn as string[]) || []) visit(id);
+      return found;
+    };
+    for (const builder of planTasks.filter((task) => task.assignedRole === 'builder' && (task.status === 'planned' || task.status === 'ready'))) {
+      const upstream = upstreamResearchers(builder);
+      const exactBundle = { ...bundle, sourceTaskIds: bundle.sourceTaskIds.filter((id) => upstream.has(id)), sources: bundle.sources.filter((source) => upstream.has(source.taskId)) };
+      if (exactBundle.sources.length === 0) continue;
+      const base = builder.description.split(RESEARCH_CONTEXT_START)[0].trimEnd();
+      const description = `${base}\n\n${RESEARCH_CONTEXT_START}\nUse this exact completed upstream research context. Preserve provenance and verify conflicts/uncertainty:\n${JSON.stringify(exactBundle)}\n${RESEARCH_CONTEXT_END}`;
+      if (description !== builder.description) {
+        await this.v2WorkspaceManager!.updateTask(builder.id, { description });
+        builder.description = description;
+      }
+    }
+    return bundle;
+  }
+
   private async applyApprovedChanges(
     missionId: string,
     options?: { operationId?: string; idempotencyKey?: string },
@@ -1364,6 +1574,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!mission.planId) throw new Error('Changes cannot be applied without an active plan.');
 
     const tasks = (await manager.listTasks(missionId)).filter((task) => task.planId === mission.planId);
+    const resumingVerification = mission.status === 'verifying';
     const incomplete = tasks.filter((task) => task.status !== 'done');
     if (incomplete.length > 0) throw new Error('Changes cannot be applied while mission tasks are incomplete.');
     const reviewerDone = tasks.some((task) => task.assignedRole === 'reviewer' && task.status === 'done');
@@ -1372,9 +1583,18 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       throw new Error('Reviewer and configured QA quality gates must pass before apply.');
     }
 
-    await this.assertMissionActionCurrent(missionId, runId);
-    await manager.updateMission(missionId, { status: 'applying' });
-    for (const task of tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
+    const builderTaskIds = tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done').map((item) => item.id);
+    let operationVerification;
+    if (this.v2ExecuteApplyVerificationOperation) {
+      if (!resumingVerification) await manager.updateMission(missionId, { status: 'applying' });
+      operationVerification = await this.v2ExecuteApplyVerificationOperation({ missionId, planId: mission.planId, runId, builderTaskIds });
+      for (const taskId of operationVerification.appliedTaskIds) this.emitEvent({
+        id: `changes-applied:${operationVerification.operationId}:${taskId}`,
+        type: 'changes_applied', missionId, taskId, filesChanged: 0, checkpointId: '', timestamp: new Date().toISOString(),
+      });
+    } else {
+    if (!resumingVerification) await manager.updateMission(missionId, { status: 'applying' });
+    for (const task of resumingVerification ? [] : tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
       await this.assertMissionActionCurrent(missionId, runId);
       const operation = options?.operationId || options?.idempotencyKey
         ? {
@@ -1400,17 +1620,70 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         timestamp: new Date().toISOString(),
       });
     }
+    }
 
     await this.assertMissionActionCurrent(missionId, runId);
     await manager.updateMission(missionId, { status: 'verifying' });
+    const verificationTaskId = `post-apply:${mission.planId}`;
+    this.emitEvent({
+      id: crypto.randomUUID(), type: 'verification_started', missionId, ...lifecycle,
+      taskId: verificationTaskId, timestamp: new Date().toISOString(),
+    });
+    if (!operationVerification && !this.v2PostApplyVerification) {
+      this.trace('post-apply-verification-pending', { missionId, planId: mission.planId, runId, builderTaskIds });
+      return;
+    }
+    let verification: PostApplyVerificationResult | undefined = operationVerification;
+    try {
+      verification ||= await this.v2PostApplyVerification!({ missionId, planId: mission.planId, runId, builderTaskIds });
+    } catch (error) {
+      await manager.updateMission(missionId, { status: 'blocked', completedAt: null });
+      throw error;
+    }
+    if (!verification) throw new Error('Post-apply verification did not return a result.');
+    await this.assertMissionActionCurrent(missionId, runId);
+    const summary = typeof verification.summary === 'string'
+      ? String(redactSensitiveValue(verification.summary)).slice(0, MAX_QUALITY_SUMMARY_CHARS)
+      : '';
+    const evidenceItems = Array.isArray(verification.evidence)
+      ? verification.evidence.filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+      : [];
+    const evidence = evidenceItems.map((item: string) => String(redactSensitiveValue(item))).join('\n').slice(0, MAX_QUALITY_SUMMARY_CHARS);
+    const verificationSummary = [summary, evidence].filter(Boolean).join('\n');
+    this.emitEvent({
+      id: crypto.randomUUID(), type: 'verification_completed', missionId, ...lifecycle,
+      taskId: verificationTaskId, passed: verification.passed,
+      findingCount: verification.passed ? 0 : 1, summary: verificationSummary,
+      timestamp: new Date().toISOString(),
+    });
+    if (verification.passed !== true || !summary || evidenceItems.length === 0) {
+      await manager.updateMission(missionId, { status: 'blocked', completedAt: null });
+      throw new Error(verificationSummary || 'Post-apply verification failed or returned no evidence.');
+    }
     await this.completeWithSynthesis({
       missionId,
       planId: mission.planId,
       tasksCompleted: tasks.length,
       totalTasks: tasks.length,
+      latestResult: `Post-apply verification passed against the base workspace.\n${verificationSummary}`,
     }, async () => {
       await this.assertMissionActionCurrent(missionId, runId);
       await manager.updateMission(missionId, { status: 'completed', completedAt: new Date().toISOString() });
+    });
+  }
+
+  async retryPostApplyVerification(missionId: string): Promise<void> {
+    const manager = this.v2WorkspaceManager;
+    if (!manager) throw new Error('No workspace manager is configured.');
+    await this.enqueueMission(missionId, async () => {
+      const mission = await manager.getMission(missionId);
+      if (!mission || !mission.planId) throw new Error('Mission with an active plan was not found.');
+      if (mission.status === 'completed') return;
+      if (mission.status !== 'blocked' && mission.status !== 'verifying') {
+        throw new Error('Mission is not waiting for post-apply verification.');
+      }
+      await manager.updateMission(missionId, { status: 'verifying', completedAt: null });
+      await this.applyApprovedChanges(missionId);
     });
   }
 
@@ -1538,6 +1811,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       this.trace('plan-has-no-tasks', { missionId, planId });
       return;
     }
+    await this.refreshResearchBundle(missionId, planId || planTasks[0].planId, planTasks);
 
     const byId = new Map(planTasks.map((task) => [task.id, task]));
     const ready = planTasks.filter((task) => {
@@ -1621,7 +1895,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           : []),
       completedDelegationIds: completedTaskIds,
       runningWorkers,
-      policy: DEFAULT_CORE_WORKER_POOL,
+      policy: await manager.resolveMissionWorkerPoolPolicy(missionId),
     });
     const dispatchableTaskIds = new Set(allocation.dispatchable.map((delegation) => delegation.id));
     if (allocation.deferred.length > 0) {

@@ -1,4 +1,4 @@
-import { Fragment, useRef, useEffect } from 'react';
+import { Fragment, useRef, useEffect, useState } from 'react';
 import * as Tabs from '@radix-ui/react-tabs';
 import { cn } from '@/lib/utils';
 import { PlanTab } from './plan-tab';
@@ -41,6 +41,8 @@ export function InspectorPanel() {
   const isResizing = useRef(false);
   const panelRef = useRef<HTMLElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const [constrained, setConstrained] = useState(() => window.matchMedia('(max-width: 1099px)').matches);
+  const overlay = inspectorExpanded || constrained;
   const activeSection = WORKBENCH_SECTIONS.find((section) => section.views.some((view) => view.id === inspectorTab)) || WORKBENCH_SECTIONS[0];
 
   const focusSection = (index: number) => {
@@ -57,8 +59,19 @@ export function InspectorPanel() {
   };
 
   useEffect(() => {
+    const query = window.matchMedia('(max-width: 1099px)');
+    const update = () => {
+      setConstrained(query.matches);
+      useSettingsStore.setState({ inspectorCollapsed: true, inspectorExpanded: false });
+    };
+    if (query.matches) useSettingsStore.setState({ inspectorCollapsed: true, inspectorExpanded: false });
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (!isResizing.current || inspectorExpanded) return;
+      if (!isResizing.current || overlay) return;
       const newWidth = window.innerWidth - e.clientX;
       const maxWidth = Math.min(720, Math.max(360, window.innerWidth * 0.55));
       if (newWidth >= 300 && newWidth <= maxWidth) setInspectorWidth(newWidth);
@@ -76,14 +89,14 @@ export function InspectorPanel() {
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [inspectorExpanded, setInspectorWidth]);
+  }, [overlay, setInspectorWidth]);
 
   useEffect(() => {
-    if (!inspectorExpanded) return;
+    if (!overlay) return;
     previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     panelRef.current?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setInspectorExpanded(false);
+      if (event.key === 'Escape') constrained ? toggleInspector() : setInspectorExpanded(false);
       if (event.key !== 'Tab' || !panelRef.current) return;
       const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
       if (!focusable.length) return;
@@ -102,7 +115,7 @@ export function InspectorPanel() {
       window.removeEventListener('keydown', handleKeyDown);
       previousFocusRef.current?.focus();
     };
-  }, [inspectorExpanded, setInspectorExpanded]);
+  }, [constrained, overlay, setInspectorExpanded, toggleInspector]);
 
   if (inspectorCollapsed) {
     return (
@@ -112,7 +125,7 @@ export function InspectorPanel() {
           size="icon"
           className="h-12 w-8 rounded-l-md rounded-r-none border-r-0 bg-card shadow-sm hover:bg-accent"
           onClick={toggleInspector}
-          aria-label="Open inspector"
+          aria-label={constrained ? 'Open Mission Workbench overlay' : 'Open Mission Workbench'}
         >
           <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
         </Button>
@@ -122,26 +135,26 @@ export function InspectorPanel() {
 
   return (
     <Fragment>
-    {inspectorExpanded && (
-      <button type="button" className="fixed inset-0 z-[69] cursor-default bg-background/55 backdrop-blur-[1px]" onClick={() => setInspectorExpanded(false)} aria-label="Exit inspector focus mode" />
+    {overlay && (
+      <button type="button" className="fixed inset-0 z-[69] cursor-default bg-background/55 backdrop-blur-[1px]" onClick={() => constrained ? toggleInspector() : setInspectorExpanded(false)} aria-label="Close inspector overlay" />
     )}
     <aside
       ref={panelRef}
-      tabIndex={inspectorExpanded ? -1 : undefined}
-      role={inspectorExpanded ? 'dialog' : undefined}
-      aria-modal={inspectorExpanded || undefined}
+       tabIndex={overlay ? -1 : undefined}
+       role={overlay ? 'dialog' : undefined}
+       aria-modal={overlay || undefined}
       aria-label="Mission Workbench"
       className={cn(
         'flex min-w-0 flex-col overflow-hidden border-l border-border bg-card',
-        inspectorExpanded
+         overlay
           ? 'fixed bottom-3 right-3 top-3 z-[70] rounded-xl border border-border shadow-2xl outline-none'
           : 'relative shrink-0 transition-[width] duration-0',
       )}
-        style={inspectorExpanded
-        ? { width: 'min(960px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)' }
+        style={overlay
+        ? { width: constrained ? 'min(480px, calc(100vw - 24px))' : 'min(960px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)' }
         : { width: inspectorWidth, minWidth: 'min(300px, 100vw)', maxWidth: '55vw' }}
     >
-      {!inspectorExpanded && (
+       {!overlay && (
         <div
           className="absolute bottom-0 left-0 top-0 z-20 w-1 cursor-col-resize transition-colors hover:bg-primary/50 active:bg-primary"
           onMouseDown={() => {
@@ -186,7 +199,7 @@ export function InspectorPanel() {
           </div>
         </div>
 
-        <Tooltip delayDuration={0}>
+        {!constrained && <Tooltip delayDuration={0}>
           <TooltipTrigger asChild>
             <Button
               variant="ghost"
@@ -199,7 +212,7 @@ export function InspectorPanel() {
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom">{inspectorExpanded ? 'Restore inspector (Esc)' : 'Focus inspector'}</TooltipContent>
-        </Tooltip>
+        </Tooltip>}
 
         <Button
           variant="ghost"

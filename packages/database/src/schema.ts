@@ -148,6 +148,15 @@ export const taskAttempts = sqliteTable('task_attempts', {
   status: text('status').$type<import('@atris-agent-code/domain').TaskAttempt['status']>().notNull().default('running'),
   worktreePath: text('worktree_path'),
   runtimeSessionId: text('runtime_session_id'),
+  routeAdapterId: text('route_adapter_id'),
+  routeProvider: text('route_provider'),
+  routeAccountProfileId: text('route_account_profile_id'),
+  routeModelCatalogId: text('route_model_catalog_id'),
+  routeRuntimeModelId: text('route_runtime_model_id'),
+  routeReasoningLevel: text('route_reasoning_level').$type<CanonicalReasoning>(),
+  routeSource: text('route_source').$type<import('@atris-agent-code/domain').RoutingPreferenceSource>(),
+  routeSelectionMode: text('route_selection_mode').$type<import('@atris-agent-code/domain').RouteSelectionMode>(),
+  providerSessionId: text('provider_session_id'),
   heartbeatAt: text('heartbeat_at'),
   leaseExpiresAt: text('lease_expires_at'),
   retryable: integer('retryable', { mode: 'boolean' }).notNull().default(false),
@@ -231,6 +240,8 @@ export const teamTemplates = sqliteTable('team_templates', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   description: text('description').notNull().default(''),
+  maxParallelAgents: integer('max_parallel_agents'),
+  workerPools: text('worker_pools', { mode: 'json' }).$type<import('@atris-agent-code/domain').WorkerPoolPolicy[]>(),
   isDefault: integer('is_default', { mode: 'boolean' }).default(false),
   createdAt: text('created_at').notNull(),
 });
@@ -345,17 +356,62 @@ export const runtimeTelemetry = sqliteTable('runtime_telemetry', {
   agentInstanceId: text('agent_instance_id').notNull(),
   adapterId: text('adapter_id').notNull(),
   accountProfileId: text('account_profile_id'),
+  attemptId: text('attempt_id'),
   outcome: text('outcome').$type<'completed' | 'failed'>().notNull(),
+  usageAvailable: integer('usage_available', { mode: 'boolean' }).notNull().default(false),
+  usageSource: text('usage_source').$type<'provider_reported' | 'unavailable'>().notNull().default('unavailable'),
   inputTokens: integer('input_tokens').notNull().default(0),
   outputTokens: integer('output_tokens').notNull().default(0),
   cost: real('cost'),
-  currency: text('currency').notNull().default('USD'),
+  currency: text('currency'),
   queueWaitMs: integer('queue_wait_ms').notNull().default(0),
   durationMs: integer('duration_ms').notNull().default(0),
   retryCount: integer('retry_count').notNull().default(1),
   workerUtilization: real('worker_utilization').notNull().default(0),
   recordedAt: text('recorded_at').notNull(),
 });
+
+export const applyVerificationOperations = sqliteTable('apply_verification_operations', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  planId: text('plan_id').notNull(),
+  runId: text('run_id'),
+  idempotencyKey: text('idempotency_key').notNull(),
+  applyPhase: text('apply_phase').$type<'pending' | 'in_progress' | 'applied' | 'blocked'>().notNull().default('pending'),
+  verificationPhase: text('verification_phase').$type<'pending' | 'running' | 'blocked' | 'completed'>().notNull().default('pending'),
+  builderTaskIds: text('builder_task_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  appliedTaskIds: text('applied_task_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  verificationPassed: integer('verification_passed', { mode: 'boolean' }),
+  summary: text('summary'),
+  evidence: text('evidence', { mode: 'json' }).$type<string[]>(),
+  error: text('error'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+  completedAt: text('completed_at'),
+}, (table) => ({
+  missionPlan: uniqueIndex('idx_apply_verification_mission_plan').on(table.missionId, table.planId),
+  idempotency: uniqueIndex('idx_apply_verification_idempotency').on(table.idempotencyKey),
+}));
+
+export const deletionOperations = sqliteTable('deletion_operations', {
+  id: text('id').primaryKey(),
+  targetType: text('target_type').$type<'mission' | 'workspace'>().notNull(),
+  targetId: text('target_id').notNull(),
+  removeMemory: integer('remove_memory', { mode: 'boolean' }).notNull().default(false),
+  phase: text('phase').notNull().default('stop'),
+  status: text('status').$type<'pending' | 'running' | 'retryable' | 'completed'>().notNull().default('pending'),
+  manifest: text('manifest', { mode: 'json' }).$type<string[]>().notNull(),
+  progress: text('progress', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  error: text('error'),
+  ownerToken: text('owner_token'),
+  leaseExpiresAt: text('lease_expires_at'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+  completedAt: text('completed_at'),
+}, (table) => ({
+  target: uniqueIndex('idx_deletion_operations_target').on(table.targetType, table.targetId),
+}));
 
 export const worktrees = sqliteTable('worktrees', {
   id: text('id').primaryKey(),
@@ -443,6 +499,10 @@ export type UsageSnapshotSelect = typeof usageSnapshots.$inferSelect;
 export type UsageSnapshotInsert = typeof usageSnapshots.$inferInsert;
 export type RuntimeTelemetrySelect = typeof runtimeTelemetry.$inferSelect;
 export type RuntimeTelemetryInsert = typeof runtimeTelemetry.$inferInsert;
+export type ApplyVerificationOperationSelect = typeof applyVerificationOperations.$inferSelect;
+export type ApplyVerificationOperationInsert = typeof applyVerificationOperations.$inferInsert;
+export type DeletionOperationSelect = typeof deletionOperations.$inferSelect;
+export type DeletionOperationInsert = typeof deletionOperations.$inferInsert;
 
 export type WorktreeSelect = typeof worktrees.$inferSelect;
 export type WorktreeInsert = typeof worktrees.$inferInsert;

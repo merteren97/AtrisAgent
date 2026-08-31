@@ -1,6 +1,6 @@
 import { LocalEventBus, registerSupervisorTurnRunner } from '@atris-agent-code/event-bus';
 import type { MissionSelect, TaskSelect } from '@atris-agent-code/database';
-import type { MemoryNode, OrchestratorDelegation } from '@atris-agent-code/domain';
+import type { EffectiveWorkerPoolPolicy, MemoryNode, OrchestratorDelegation } from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { OrchestratorV2 } from './orchestrator-v2';
@@ -12,6 +12,7 @@ class FakeWorkspaceManager {
   tasks = new Map<string, TaskSelect>();
   doneUpdateCount = 0;
   throwOnSecondDoneUpdate = false;
+  workerPoolPolicy: EffectiveWorkerPoolPolicy = DEFAULT_CORE_WORKER_POOL;
 
   constructor(missionId: string, planId: string) {
     const now = new Date().toISOString();
@@ -72,6 +73,10 @@ class FakeWorkspaceManager {
     const updated = { ...current, ...updates, updatedAt: new Date().toISOString() } as TaskSelect;
     this.tasks.set(id, updated);
     return updated;
+  }
+
+  async resolveMissionWorkerPoolPolicy(): Promise<EffectiveWorkerPoolPolicy> {
+    return this.workerPoolPolicy;
   }
 
   async createTask(input: any): Promise<TaskSelect> {
@@ -419,6 +424,7 @@ async function runTests() {
         { turnId, runId },
       );
       const builder = result.tasks.find((task) => task.assignedRole === 'builder');
+      const researcher = result.tasks.find((task) => task.assignedRole === 'researcher');
       const reviewer = result.tasks.find((task) => task.assignedRole === 'reviewer');
       const qa = result.tasks.find((task) => task.assignedRole === 'qa');
       const taskCreatedIds = () => events
@@ -428,9 +434,17 @@ async function runTests() {
         (event) => event.type === type && 'taskId' in event && event.taskId === taskId,
       );
 
-      assert(Boolean(builder && reviewer && qa), 'execute plan contains Builder, Reviewer, and QA quality stages');
-      assert(taskCreatedIds().length === 1 && taskCreatedIds()[0] === builder?.id,
-        'only the dependency-free Builder is initially visible through task_created');
+      assert(Boolean(researcher && builder && reviewer && qa), 'execute plan contains Researcher, Builder, Reviewer, and QA stages');
+      assert(taskCreatedIds().length === 1 && taskCreatedIds()[0] === researcher?.id,
+        'only the dependency-free Researcher is initially visible through task_created');
+
+      const researcherAgentId = (await manager.getTask(researcher!.id))?.assignedAgentId || undefined;
+      await orchestrator.handleTaskCompleted({
+        id: crypto.randomUUID(), type: 'task_completed', missionId, taskId: researcher!.id,
+        agentInstanceId: researcherAgentId, result: 'Inspected the implementation constraints.', timestamp: new Date().toISOString(),
+      });
+      assert(taskCreatedIds().length === 2 && taskCreatedIds()[1] === builder?.id,
+        'Builder dispatch waits for the Researcher result');
 
       const builderAgentId = (await manager.getTask(builder!.id))?.assignedAgentId || undefined;
       await orchestrator.handleTaskCompleted({
@@ -445,7 +459,7 @@ async function runTests() {
 
       const reviewerAfterBuilder = await manager.getTask(reviewer!.id);
       assert(reviewerAfterBuilder?.status === 'running', 'Reviewer dispatch follows Builder completion');
-      assert(taskCreatedIds().length === 2 && taskCreatedIds()[1] === reviewer!.id,
+       assert(taskCreatedIds().length === 3 && taskCreatedIds()[2] === reviewer!.id,
         'Reviewer dispatch is visible through the existing task_created event flow');
       const reviewerCreatedEvent = events.find(
         (event): event is Extract<AgentEvent, { type: 'task_created' }> => event.type === 'task_created' && event.taskId === reviewer!.id,
@@ -481,7 +495,7 @@ async function runTests() {
         && reviewEvents[0]?.approved === true,
       'Reviewer completion emits one correlated review_completed event');
       assert(qaAfterReview?.status === 'running', 'QA dispatch follows Reviewer completion');
-      assert(taskCreatedIds().length === 3 && taskCreatedIds()[2] === qa!.id,
+       assert(taskCreatedIds().length === 4 && taskCreatedIds()[3] === qa!.id,
         'QA dispatch is visible through the existing task_created event flow');
       assert(verificationStartedEvents.length === 1
         && verificationStartedEvents[0]?.taskId === qa!.id
@@ -615,6 +629,46 @@ async function runTests() {
     'Reviewer rejection cancels the pending QA lane and cannot complete the mission');
     assert(applyErrors.length === 1 && applyCalls === 0 && manager.mission.status === 'blocked',
       'Reviewer rejection remains ineligible for apply');
+  }
+
+  // Structured quality results are preferred over prose, but malformed or
+  // contradictory envelopes fail closed.
+  {
+    const missionId = 'mission-structured-quality';
+    const planId = 'plan-structured-quality';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('reviewer', task({
+      id: 'reviewer', missionId, planId, role: 'reviewer', status: 'running', assignedAgentId: 'agent-reviewer',
+    }));
+    manager.tasks.set('qa', task({ id: 'qa', missionId, planId, role: 'qa', status: 'planned', dependsOn: ['reviewer'] }));
+    const events: AgentEvent[] = [];
+    const eventBus = new LocalEventBus();
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus, undefined, manager as unknown as WorkspaceManager,
+    );
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(), type: 'task_completed', missionId, taskId: 'reviewer', agentInstanceId: 'agent-reviewer',
+      result: JSON.stringify({ type: 'quality_result', version: 1, role: 'reviewer', verdict: 'pass', summary: 'Reviewed changes.', evidence: ['diff inspected'] }),
+      timestamp: new Date().toISOString(),
+    });
+    assert(manager.tasks.get('reviewer')?.status === 'done'
+      && events.some((event) => event.type === 'review_completed' && event.approved),
+    'Valid structured Reviewer envelope passes and remains adapter-compatible as text');
+
+    const invalidManager = new FakeWorkspaceManager('mission-invalid-envelope', 'plan-invalid-envelope');
+    invalidManager.tasks.set('qa', task({ id: 'qa', missionId: 'mission-invalid-envelope', planId: 'plan-invalid-envelope', role: 'qa', status: 'running' }));
+    const invalidOrchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: invalidManager as unknown as WorkspaceManager },
+      new LocalEventBus(), undefined, invalidManager as unknown as WorkspaceManager,
+    );
+    await invalidOrchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(), type: 'task_completed', missionId: 'mission-invalid-envelope', taskId: 'qa',
+      result: '{"type":"quality_result","version":1,"role":"qa","verdict":"pass"}', timestamp: new Date().toISOString(),
+    });
+    assert(invalidManager.tasks.get('qa')?.status === 'rejected' && invalidManager.mission.status === 'blocked',
+      'Malformed structured quality envelope fails closed');
   }
 
   // A Reviewer that omits the required recommendation is also ambiguous and
@@ -890,6 +944,70 @@ async function runTests() {
       'Cancellation during apply emits no stale apply or completion event');
   }
 
+  // Apply completion waits for base-workspace evidence. Restarting from the
+  // durable verifying state retries verification without applying twice.
+  {
+    const missionId = 'mission-post-apply-verification';
+    const planId = 'plan-post-apply-verification';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, status: 'waiting_for_approval' };
+    manager.tasks.set('builder', task({ id: 'builder', missionId, planId, role: 'builder', status: 'done' }));
+    manager.tasks.set('reviewer', task({ id: 'reviewer', missionId, planId, role: 'reviewer', status: 'done' }));
+    manager.tasks.set('qa', task({ id: 'qa', missionId, planId, role: 'qa', status: 'done' }));
+    const events: AgentEvent[] = [];
+    const eventBus = new LocalEventBus();
+    eventBus.on('*', (event) => { events.push(event); });
+    let applyCalls = 0;
+    let verificationCalls = 0;
+    const orchestrator = new OrchestratorV2({
+      workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager,
+      applyTaskChanges: async () => { applyCalls += 1; return { success: true }; },
+      postApplyVerification: async () => {
+        verificationCalls += 1;
+        return verificationCalls === 1
+          ? { passed: false, summary: 'Base tests failed', evidence: ['test: failed'] }
+          : { passed: true, summary: 'Base tests passed', evidence: ['test: passed'] };
+      },
+    }, eventBus, undefined, manager as unknown as WorkspaceManager);
+    let failed = false;
+    try { await orchestrator.handleApprovalDecision(missionId, 'apply', true); } catch { failed = true; }
+    assert(failed && applyCalls === 1 && manager.mission.status === 'blocked'
+      && !events.some((event) => event.type === 'mission_completed'),
+    'Failed post-apply verification becomes explicitly retryable after one apply');
+
+    await Promise.all([
+      orchestrator.retryPostApplyVerification(missionId),
+      orchestrator.retryPostApplyVerification(missionId),
+    ]);
+    assert(applyCalls === 1 && verificationCalls === 2 && manager.mission.status === 'completed',
+      'Concurrent startup/manual retries are idempotent and never repeat destructive apply');
+    const completion = events.find((event): event is Extract<AgentEvent, { type: 'mission_completed' }> => event.type === 'mission_completed');
+    assert(completion?.summary.includes('Base tests passed') === true,
+      'Final synthesis includes post-apply verification evidence');
+  }
+
+  {
+    const missionId = 'mission-post-apply-hook-pending';
+    const planId = 'plan-post-apply-hook-pending';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, status: 'waiting_for_approval' };
+    manager.tasks.set('builder', task({ id: 'builder', missionId, planId, role: 'builder', status: 'done' }));
+    manager.tasks.set('reviewer', task({ id: 'reviewer', missionId, planId, role: 'reviewer', status: 'done' }));
+    manager.tasks.set('qa', task({ id: 'qa', missionId, planId, role: 'qa', status: 'done' }));
+    const events: AgentEvent[] = [];
+    const eventBus = new LocalEventBus();
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2({
+      workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager,
+      applyTaskChanges: async () => ({ success: true }),
+    }, eventBus, undefined, manager as unknown as WorkspaceManager);
+    await orchestrator.handleApprovalDecision(missionId, 'apply', true);
+    assert(manager.mission.status === 'verifying'
+      && events.some((event) => event.type === 'verification_started' && event.taskId === `post-apply:${planId}`)
+      && !events.some((event) => event.type === 'mission_completed'),
+    'Missing runtime verification hook leaves a durable explicit gate and blocks synthesis');
+  }
+
   // A task terminal state and the current lifecycle run both fence late worker
   // completions before any task mutation or legacy transition can occur.
   {
@@ -1047,6 +1165,7 @@ async function runTests() {
     const missionId = 'mission-global-worker-capacity';
     const planId = 'plan-global-worker-capacity';
     const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.workerPoolPolicy = { ...DEFAULT_CORE_WORKER_POOL, maxParallelAgents: 2 };
     const roles: Array<TaskSelect['assignedRole']> = ['researcher', 'researcher', 'builder', 'builder', 'qa'];
     for (const [index, role] of roles.entries()) {
       manager.tasks.set(`task-${index}`, task({
@@ -1069,9 +1188,9 @@ async function runTests() {
 
     await orchestrator.reconcileMissionPlan(missionId, planId);
     const running = [...manager.tasks.values()].filter((item) => item.status === 'running');
-    assert(running.length === 4 && manager.tasks.get('task-4')?.status === 'planned',
-      'Reconciliation respects the four-worker global capacity');
-    assert(spawned.length === 4 && !spawned.includes('task-4'),
+    assert(running.length === 2 && manager.tasks.get('task-2')?.status === 'planned',
+      'Restart reconciliation respects the persisted mission global capacity');
+    assert(spawned.length === 2 && !spawned.includes('task-2'),
       'Capacity-deferred tasks remain undispatched for a later reconciliation');
   }
 
@@ -1126,6 +1245,12 @@ async function runTests() {
     assert(allocation.dispatchable.length === 3, 'three independent Researchers are allocated in parallel');
     assert(allocation.dispatchable.every((item) => item.role === 'researcher'), 'parallel batch contains only dependency-free Researchers');
     assert(allocation.deferred.some((item) => item.delegation.id === 'b1' && item.reason === 'dependency'), 'Builder waits for research join dependencies');
+    const roleLimited = allocateWorkerBatch({ delegations: delegations.slice(0, 3), policy: {
+      ...DEFAULT_CORE_WORKER_POOL,
+      pools: DEFAULT_CORE_WORKER_POOL.pools.map((pool) => pool.role === 'researcher' ? { ...pool, maxInstances: 1, maxParallel: 1 } : pool),
+    } });
+    assert(roleLimited.dispatchable.length === 1 && roleLimited.deferred.filter((item) => item.reason === 'role_capacity').length === 2,
+      'Role pool limits constrain independent workers below the global ceiling');
   }
 
   // Memory retrieval: project-local, related and current evidence should outrank

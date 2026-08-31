@@ -31,6 +31,12 @@ export interface ApplyOperationContext {
   idempotencyKey?: string;
 }
 
+export interface AppliedWorkspaceVerification {
+  passed: boolean;
+  summary: string;
+  evidence: string[];
+}
+
 export class MergeCoordinator {
   private generator: ReviewPackGenerator;
 
@@ -114,6 +120,23 @@ export class MergeCoordinator {
     }
 
     return { success: true, status: 'Merged', output: mergeOutput.output, checkpointId };
+  }
+
+  /** Runs verification against the resolved base repository, never the candidate worktree. */
+  async verifyAppliedWorkspace(
+    taskId: string,
+    verifier: (basePath: string) => Promise<AppliedWorkspaceVerification>,
+  ): Promise<AppliedWorkspaceVerification> {
+    const task = await this.workspaceManager.getTask(taskId);
+    if (!task) throw new Error(`Task with ID "${taskId}" not found`);
+    if (!task.worktreeId) throw new Error(`Task "${taskId}" does not have an active worktree`);
+    const mission = await this.workspaceManager.getMission(task.missionId);
+    if (!mission) throw new Error(`Mission with ID "${task.missionId}" not found for task "${taskId}"`);
+    const workspace = await this.workspaceManager.getWorkspace(mission.workspaceId);
+    if (!workspace?.path) throw new Error(`Workspace with ID "${mission.workspaceId}" not found for mission "${mission.id}"`);
+    const basePath = await this.workspaceManager.getWorktreeManager()
+      .resolveMergeBasePath(task.worktreeId, workspace.path);
+    return verifier(basePath);
   }
 
   async rollback(checkpointId: string, workspacePath: string, context: RollbackContext): Promise<void> {

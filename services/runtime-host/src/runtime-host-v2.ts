@@ -30,6 +30,18 @@ const SUPERVISOR_TIMEOUT_MS = 180_000;
 const ADAPTER_IDS: RuntimeType[] = ['codex', 'claude_code', 'antigravity', 'opencode'];
 const MAX_PROCESS_DELTA_CHARS = 8_000;
 const MAX_PROCESS_RESULT_CHARS = 16_000;
+const DEFAULT_SUPERVISOR_IDLE_TTL_MS = 10 * 60_000;
+
+interface SupervisorSession {
+  adapter: BaseRuntimeAdapter;
+  adapterId: RuntimeType;
+  providerSessionId: string;
+  profileId?: string;
+  cwd: string;
+  busy: boolean;
+  lastUsedAt: number;
+  evictionTimer?: ReturnType<typeof setTimeout>;
+}
 
 function boundedObservationText(value: unknown, maxChars: number): string {
   const safe = String(redactSensitiveValue(String(value ?? '')));
@@ -50,6 +62,8 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   private readonly supervisorRouting = new Map<string, MissionRoutingPreference>();
   private readonly activeSupervisorTurns = new Map<string, Set<{ adapter: BaseRuntimeAdapter; cancel: () => void }>>();
   private readonly supervisorRunner: SupervisorTurnRunner;
+  private readonly supervisorSessions = new Map<string, SupervisorSession>();
+  private readonly supervisorIdleTtlMs: number;
   private observationBus?: LocalEventBus;
 
   constructor(
@@ -60,6 +74,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     super(eventBus, config, workspaceManager);
     this.v2WorkspaceManager = workspaceManager ?? config.workspaceManager;
     this.v2WorkspacePath = config.workspacePath || process.cwd();
+    this.supervisorIdleTtlMs = Math.max(1, config.supervisorSessionIdleTtl ?? DEFAULT_SUPERVISOR_IDLE_TTL_MS);
     this.observationBus = eventBus;
     this.supervisorRunner = (request) => this.runSupervisorTurn(request);
     registerSupervisorTurnRunner(this.supervisorRunner);
@@ -86,6 +101,13 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   override async stopAll(): Promise<void> {
     unregisterSupervisorTurnRunner(this.supervisorRunner);
     this.supervisorRouting.clear();
+    const sessions = [...this.supervisorSessions.values()];
+    this.supervisorSessions.clear();
+    for (const session of sessions) {
+      if (session.evictionTimer) clearTimeout(session.evictionTimer);
+      await session.adapter.releaseProviderSession(session.providerSessionId).catch(() => undefined);
+      await session.adapter.shutdown().catch(() => undefined);
+    }
     const turns = [...this.activeSupervisorTurns.values()].flatMap((missionTurns) => [...missionTurns]);
     for (const turn of turns) turn.cancel();
     await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
@@ -105,6 +127,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
       this.activeSupervisorTurns.delete(missionId);
     }
+    await this.discardSupervisorSession(missionId);
     await super.stopMission(missionId);
   }
 
@@ -120,7 +143,37 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
         source: 'explicit',
       };
     }
+    const persisted = await this.v2WorkspaceManager?.getLatestSupervisorSessionMetadata(missionId);
+    if (persisted?.route) {
+      return {
+        modelCatalogId: persisted.route.modelCatalogId || undefined,
+        accountProfileId: persisted.route.accountProfileId || undefined,
+        reasoningLevel: persisted.route.reasoningLevel || undefined,
+        fallbackCatalogIds: [],
+        selectionMode: persisted.route.selectionMode,
+        source: persisted.route.source,
+      };
+    }
     return this.v2WorkspaceManager?.resolveRoleExecutionPolicy(missionId, 'orchestrator');
+  }
+
+  private async discardSupervisorSession(missionId: string): Promise<void> {
+    const session = this.supervisorSessions.get(missionId);
+    if (!session) return;
+    this.supervisorSessions.delete(missionId);
+    if (session.evictionTimer) clearTimeout(session.evictionTimer);
+    await session.adapter.releaseProviderSession(session.providerSessionId).catch(() => undefined);
+    await session.adapter.shutdown().catch(() => undefined);
+  }
+
+  private scheduleSupervisorEviction(missionId: string, session: SupervisorSession): void {
+    if (session.evictionTimer) clearTimeout(session.evictionTimer);
+    session.evictionTimer = setTimeout(() => {
+      if (!session.busy && Date.now() - session.lastUsedAt >= this.supervisorIdleTtlMs) {
+        void this.discardSupervisorSession(missionId);
+      }
+    }, this.supervisorIdleTtlMs);
+    session.evictionTimer.unref?.();
   }
 
   private createIsolatedAdapter(runtimeType: RuntimeType, eventBus: LocalEventBus): BaseRuntimeAdapter {
@@ -182,8 +235,33 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     const scheduler = new Scheduler({ availableAdapters: ADAPTER_IDS });
     const route = scheduler.resolveRoute(workerRequest, profiles, models);
     const turnBus = new LocalEventBus();
-    const adapter = this.createIsolatedAdapter(route.adapterId as RuntimeType, turnBus);
+    const cwd = request.workspacePath || this.v2WorkspacePath;
+    let continuity = this.supervisorSessions.get(request.missionId);
+    let continuityRejected = false;
+    if (continuity?.busy) throw new Error('A supervisor turn is already in flight for this conversation.');
+    if (continuity && (continuity.adapterId !== route.adapterId || continuity.profileId !== route.profile?.id
+      || !(await continuity.adapter.probeProviderSession(continuity.providerSessionId, { profileId: continuity.profileId, cwd: continuity.cwd })))) {
+      await this.discardSupervisorSession(request.missionId);
+      continuity = undefined;
+      continuityRejected = true;
+    }
+    let adapter = continuity?.adapter || this.createIsolatedAdapter(route.adapterId as RuntimeType, turnBus);
+    if (continuity) adapter.setEventBus(turnBus);
     if (route.profile) adapter.configureProfile(route.profile);
+    const capabilities = adapter.getSessionContinuityCapabilities();
+    if (!continuity && !continuityRejected && capabilities.resumeAfterRestart) {
+      const persisted = await this.v2WorkspaceManager?.getLatestSupervisorSessionMetadata(request.missionId);
+      if (persisted?.providerSessionId && persisted.resumeCapability === 'restart'
+        && persisted.route.adapterId === route.adapterId
+        && await adapter.probeProviderSession(persisted.providerSessionId, { profileId: route.profile?.id, cwd })) {
+        continuity = {
+          adapter, adapterId: route.adapterId as RuntimeType, providerSessionId: persisted.providerSessionId,
+          profileId: route.profile?.id, cwd, busy: false, lastUsedAt: Date.now(),
+        };
+        this.supervisorSessions.set(request.missionId, continuity);
+      }
+    }
+    if (continuity) continuity.busy = true;
 
     const sessionId = `orchestrator-${request.turnId}`;
     const syntheticMissionId = `supervisor-${request.missionId}`;
@@ -280,7 +358,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     try {
       try {
         emitObservation({ type: 'process_started', model: route.model?.displayName || route.model?.runtimeModelId, phase: 'turn' });
-        await adapter.spawnAgent({
+        const spawned = await adapter.spawnAgent({
           sessionId,
           taskId: syntheticTaskId,
           missionId: syntheticMissionId,
@@ -290,9 +368,41 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
           reasoningLevel: route.reasoningLevel,
           profileId: route.profile?.id,
           isolated: false,
-          cwd: request.workspacePath || this.v2WorkspacePath,
+          cwd,
           enableCoordinationMcp: false,
+          providerSessionId: continuity?.providerSessionId,
+          preserveProviderSession: capabilities.reuseWhileAlive,
         });
+        if (capabilities.reuseWhileAlive) {
+          const reusable = continuity || {
+            adapter, adapterId: route.adapterId as RuntimeType, providerSessionId: spawned.runtimeSessionId || spawned.id,
+            profileId: route.profile?.id, cwd, busy: true, lastUsedAt: Date.now(),
+          };
+          this.supervisorSessions.set(request.missionId, reusable);
+          continuity = reusable;
+          await this.v2WorkspaceManager?.saveSupervisorSessionMetadata(request.turnId, {
+            providerSessionId: reusable.providerSessionId,
+            resumeCapability: capabilities.resumeAfterRestart ? 'restart' : 'live',
+            route: {
+              adapterId: route.adapterId, provider: route.profile?.provider, accountProfileId: route.profile?.id,
+              modelCatalogId: route.model?.catalogId, runtimeModelId: route.model?.runtimeModelId,
+              reasoningLevel: route.reasoningLevel, source: mergedPreference?.source || 'scheduler',
+              selectionMode: mergedPreference?.selectionMode || 'auto',
+            },
+            updatedAt: new Date().toISOString(),
+          });
+        } else {
+          await this.v2WorkspaceManager?.saveSupervisorSessionMetadata(request.turnId, {
+            resumeCapability: 'none',
+            route: {
+              adapterId: route.adapterId, provider: route.profile?.provider, accountProfileId: route.profile?.id,
+              modelCatalogId: route.model?.catalogId, runtimeModelId: route.model?.runtimeModelId,
+              reasoningLevel: route.reasoningLevel, source: mergedPreference?.source || 'scheduler',
+              selectionMode: mergedPreference?.selectionMode || 'auto',
+            },
+            updatedAt: new Date().toISOString(),
+          });
+        }
       } catch (error) {
         settled = true;
         cleanup();
@@ -305,7 +415,13 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       const active = this.activeSupervisorTurns.get(request.missionId);
       active?.delete(activeTurn);
       if (active?.size === 0) this.activeSupervisorTurns.delete(request.missionId);
-      await adapter.shutdown().catch(() => undefined);
+      if (continuity) {
+        continuity.busy = false;
+        continuity.lastUsedAt = Date.now();
+        this.scheduleSupervisorEviction(request.missionId, continuity);
+      } else {
+        await adapter.shutdown().catch(() => undefined);
+      }
     }
   }
 }

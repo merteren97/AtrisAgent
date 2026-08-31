@@ -1,4 +1,6 @@
 import type { AgentRole } from './agent';
+import type { CanonicalReasoning } from './model-profile';
+import type { RouteSelectionMode, RoutingPreferenceSource } from './execution-policy';
 
 export type TaskStatus =
   | 'planned'
@@ -33,6 +35,18 @@ export interface Task {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  effectiveRoute?: EffectiveAttemptRoute | null;
+}
+
+export interface EffectiveAttemptRoute {
+  adapterId: string;
+  provider?: string | null;
+  accountProfileId?: string | null;
+  modelCatalogId?: string | null;
+  runtimeModelId?: string | null;
+  reasoningLevel?: CanonicalReasoning | null;
+  source: RoutingPreferenceSource;
+  selectionMode: RouteSelectionMode;
 }
 
 export interface TaskDependency {
@@ -49,6 +63,15 @@ export interface TaskAttempt {
   status: 'claimed' | 'running' | 'completed' | 'failed' | 'cancelled' | 'expired' | 'reviewing' | 'verified' | 'applied';
   worktreePath?: string | null;
   runtimeSessionId?: string | null;
+  routeAdapterId?: string | null;
+  routeProvider?: string | null;
+  routeAccountProfileId?: string | null;
+  routeModelCatalogId?: string | null;
+  routeRuntimeModelId?: string | null;
+  routeReasoningLevel?: CanonicalReasoning | null;
+  routeSource?: RoutingPreferenceSource | null;
+  routeSelectionMode?: RouteSelectionMode | null;
+  providerSessionId?: string | null;
   heartbeatAt?: string | null;
   leaseExpiresAt?: string | null;
   retryable: boolean;

@@ -76,7 +76,7 @@ useMissionStore.setState({
   queuedTurns: [{ id: 'turn-1', missionId: mission.id } as any],
   commandQueue: [{ id: 'command-1', missionId: mission.id } as any],
 });
-assert.equal(await useMissionStore.getState().deleteMission(mission.id), true, 'terminal conversation deletion succeeds');
+await useMissionStore.getState().deleteMission(mission.id);
 assert.equal(useMissionStore.getState().missions.length, 0, 'deleted conversation is removed from the sidebar state');
 assert.equal(useMissionStore.getState().queuedTurns.length, 0, 'deleted conversation queued turns are removed');
 assert.equal(useMissionStore.getState().commandQueue.length, 0, 'deleted conversation durable commands are removed');
@@ -85,9 +85,13 @@ assert.equal(useMissionStore.getState().timeline.length, 0, 'deleting the active
 
 useMissionStore.setState({ missions: [mission], activeMissionId: mission.id, error: null });
 globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Stop or finish this conversation before deleting it.' }), { status: 409, headers: { 'content-type': 'application/json' } });
-assert.equal(await useMissionStore.getState().deleteMission(mission.id), false, 'rejected conversation deletion remains retryable');
+await assert.rejects(() => useMissionStore.getState().deleteMission(mission.id), /Stop or finish this conversation before deleting it/, 'rejected conversation deletion remains retryable');
 assert.equal(useMissionStore.getState().missions.length, 1, 'failed deletion preserves the conversation');
 assert.equal(useMissionStore.getState().error, 'Stop or finish this conversation before deleting it.', 'failed deletion exposes the server reason');
+
+globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Runtime did not acknowledge cancellation.' }), { status: 503, headers: { 'content-type': 'application/json' } });
+await assert.rejects(() => useMissionStore.getState().stopMission(mission.id), /Runtime did not acknowledge cancellation/, 'stop failures are throwable for dialog callers');
+await assert.rejects(() => useMissionStore.getState().retryMission(mission.id), /Runtime did not acknowledge cancellation/, 'retry failures are throwable for action callers');
 globalThis.fetch = originalFetch;
 
 console.log('mission approval lifecycle tests passed');

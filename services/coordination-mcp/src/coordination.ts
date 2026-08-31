@@ -258,17 +258,25 @@ export class CoordinationMCP {
       }
     }
 
-    const activeCount = [...this.agentRegistry.values()].filter((agent) =>
-      agent.missionId === request.missionId && ['idle', 'running', 'waiting'].includes(agent.status)).length;
-    if (activeCount >= DEFAULT_MAX_PARALLEL) {
-      throw new Error(`Mission parallel-agent limit reached (${DEFAULT_MAX_PARALLEL}). Wait for an active agent to complete before spawning another.`);
-    }
-
     const agentInstanceId = crypto.randomUUID();
     const role = request.role;
     const displayName = request.displayName?.trim() || request.specialty?.trim() || this.defaultAgentName(role);
     const workspaceMode: AgentWorkspaceMode = request.workspaceMode
       || (role === 'builder' ? 'isolated_worktree' : role === 'orchestrator' ? 'shared' : 'read_only');
+    const timestamp = new Date().toISOString();
+
+    await this.workspaceManager.reserveAgentCapacity({
+      id: agentInstanceId,
+      missionId: request.missionId,
+      role,
+      modelProfileId: request.modelCatalogId || request.modelProfileId,
+      parentAgentId: request.parentAgentId || null,
+      displayName,
+      specialty: request.specialty,
+      spawnReason: request.spawnReason.trim(),
+      workspaceMode,
+      createdAt: timestamp,
+    });
 
     let task;
     if (request.taskId) {
@@ -293,7 +301,6 @@ export class CoordinationMCP {
       });
     }
 
-    const timestamp = new Date().toISOString();
     this.saveAgentState({
       id: agentInstanceId,
       missionId: request.missionId,

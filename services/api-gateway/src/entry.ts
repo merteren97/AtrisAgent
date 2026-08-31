@@ -1,6 +1,6 @@
 import { CoordinationMCP, getControlPlaneBridgeScriptPath } from '@atris-agent-code/coordination-mcp';
 import { configureRuntimeControlPlaneBridge } from '@atris-agent-code/runtime-host';
-import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, db } from './index';
+import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, startupRecovery, db } from './index';
 import { ControlPlaneGrantRegistry } from './control-plane-grants';
 import { installControlPlaneRoutes } from './control-plane-router';
 import { installProjectMemoryRoutes } from './project-memory-routes';
@@ -78,19 +78,31 @@ server.on('close', () => {
   process.off('SIGTERM', handleShutdownSignal);
 });
 
-if (!server.listening) {
-  server.listen(PORT, '127.0.0.1', () => {
-    const origin = configureBridgeForListeningServer();
-    const ready = emitRuntimeReady(server, gatewayVersion());
-    const actualOrigin = ready?.origin || origin || `http://127.0.0.1:${PORT}`;
-    console.log(`[API-Gateway] Server running on ${actualOrigin}`);
-    console.log(`[API-Gateway] Native CLI control plane ready through session-scoped MCP grants`);
-    console.log(`[API-Gateway] WebSocket stream ready at ${actualOrigin.replace(/^http:/, 'ws:')}/ws/events`);
-    console.log(`[API-Gateway] SSE event stream ready at ${actualOrigin}/api/events/stream`);
-  });
-} else {
-  configureBridgeForListeningServer();
-  emitRuntimeReady(server, gatewayVersion());
+async function bootstrap(): Promise<void> {
+  try {
+    await startupRecovery;
+  } catch (error) {
+    console.error('[API-Gateway] Startup recovery failed:', error);
+    await shutdownCoordinator.shutdown('startup-recovery-failed');
+    return;
+  }
+
+  if (!shutdownCoordinator.shuttingDown && !server.listening) {
+    server.listen(PORT, '127.0.0.1', () => {
+      const origin = configureBridgeForListeningServer();
+      const ready = emitRuntimeReady(server, gatewayVersion());
+      const actualOrigin = ready?.origin || origin || `http://127.0.0.1:${PORT}`;
+      console.log(`[API-Gateway] Server running on ${actualOrigin}`);
+      console.log(`[API-Gateway] Native CLI control plane ready through session-scoped MCP grants`);
+      console.log(`[API-Gateway] WebSocket stream ready at ${actualOrigin.replace(/^http:/, 'ws:')}/ws/events`);
+      console.log(`[API-Gateway] SSE event stream ready at ${actualOrigin}/api/events/stream`);
+    });
+  } else {
+    configureBridgeForListeningServer();
+    emitRuntimeReady(server, gatewayVersion());
+  }
 }
+
+void bootstrap();
 
 export { coordination, grants };

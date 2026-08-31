@@ -3,6 +3,10 @@ export interface EventCursor {
   eventId?: string;
 }
 
+export interface SequencedRow {
+  sequence: number;
+}
+
 const CURSOR_VERSION = 1;
 
 export function encodeEventCursor(cursor: EventCursor): string {
@@ -30,4 +34,20 @@ export function cursorFromQuery(query: { cursor?: unknown; afterSequence?: unkno
   if (cursor) return cursor;
   const legacy = Number(query.afterSequence || 0);
   return { sequence: Number.isSafeInteger(legacy) && legacy > 0 ? legacy : 0 };
+}
+
+export function* replayPages<T extends SequencedRow>(
+  afterSequence: number,
+  highWaterSequence: number,
+  readPage: (after: number, through: number) => T[],
+): Generator<T[]> {
+  let cursor = afterSequence;
+  while (cursor < highWaterSequence) {
+    const rows = readPage(cursor, highWaterSequence);
+    if (rows.length === 0) return;
+    yield rows;
+    const nextCursor = rows[rows.length - 1]!.sequence;
+    if (nextCursor <= cursor) throw new Error('Mission event replay did not advance its cursor.');
+    cursor = nextCursor;
+  }
 }

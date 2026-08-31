@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 11;
+export const DATABASE_SCHEMA_VERSION = 16;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -275,5 +275,103 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
       CREATE INDEX IF NOT EXISTS idx_task_attempts_active_lease
       ON task_attempts(status, lease_expires_at);
       PRAGMA user_version = 11;`);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 12) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'task_attempts')) {
+      const columns: Array<[string, string]> = [
+        ['route_adapter_id', 'TEXT'],
+        ['route_provider', 'TEXT'],
+        ['route_account_profile_id', 'TEXT'],
+        ['route_model_catalog_id', 'TEXT'],
+        ['route_runtime_model_id', 'TEXT'],
+        ['route_reasoning_level', 'TEXT'],
+        ['route_source', 'TEXT'],
+        ['route_selection_mode', 'TEXT'],
+        ['provider_session_id', 'TEXT'],
+      ];
+      for (const [name, definition] of columns) {
+        if (!hasColumn(sqlite, 'task_attempts', name)) sqlite.exec(`ALTER TABLE task_attempts ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    sqlite.exec('PRAGMA user_version = 12');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 13) sqlite.transaction(() => {
+    sqlite.exec(`CREATE TABLE IF NOT EXISTS apply_verification_operations (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      plan_id TEXT NOT NULL,
+      run_id TEXT,
+      idempotency_key TEXT NOT NULL,
+      apply_phase TEXT NOT NULL DEFAULT 'pending',
+      verification_phase TEXT NOT NULL DEFAULT 'pending',
+      builder_task_ids TEXT NOT NULL,
+      applied_task_ids TEXT NOT NULL DEFAULT '[]',
+      verification_passed INTEGER,
+      summary TEXT,
+      evidence TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_apply_verification_mission_plan
+      ON apply_verification_operations(mission_id, plan_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_apply_verification_idempotency
+      ON apply_verification_operations(idempotency_key);
+    UPDATE apply_verification_operations SET apply_phase = 'blocked',
+      error = COALESCE(error, 'Gateway restarted during apply; external state requires reconciliation')
+      WHERE apply_phase = 'in_progress';
+    UPDATE apply_verification_operations SET verification_phase = 'blocked',
+      error = COALESCE(error, 'Gateway restarted during verification; retry is safe')
+      WHERE verification_phase = 'running';
+    PRAGMA user_version = 13;`);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 14) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'team_templates')) {
+      if (!hasColumn(sqlite, 'team_templates', 'max_parallel_agents')) sqlite.exec('ALTER TABLE team_templates ADD COLUMN max_parallel_agents INTEGER');
+      if (!hasColumn(sqlite, 'team_templates', 'worker_pools')) sqlite.exec('ALTER TABLE team_templates ADD COLUMN worker_pools TEXT');
+    }
+    sqlite.exec('PRAGMA user_version = 14');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 15) sqlite.transaction(() => {
+    sqlite.exec(`CREATE TABLE IF NOT EXISTS deletion_operations (
+      id TEXT PRIMARY KEY,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      remove_memory INTEGER NOT NULL DEFAULT 0,
+      phase TEXT NOT NULL DEFAULT 'stop',
+      status TEXT NOT NULL DEFAULT 'pending',
+      manifest TEXT NOT NULL DEFAULT '[]',
+      progress TEXT NOT NULL DEFAULT '{}',
+      error TEXT,
+      owner_token TEXT,
+      lease_expires_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_deletion_operations_target
+      ON deletion_operations(target_type, target_id);
+    CREATE INDEX IF NOT EXISTS idx_deletion_operations_incomplete
+      ON deletion_operations(status, updated_at) WHERE status <> 'completed';
+    UPDATE deletion_operations SET status = 'retryable', owner_token = NULL,
+      lease_expires_at = NULL, error = COALESCE(error, 'Gateway restarted during deletion; retry is safe')
+      WHERE status = 'running';
+    PRAGMA user_version = 15;`);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 16) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'runtime_telemetry')) {
+      if (!hasColumn(sqlite, 'runtime_telemetry', 'attempt_id')) sqlite.exec('ALTER TABLE runtime_telemetry ADD COLUMN attempt_id TEXT');
+      if (!hasColumn(sqlite, 'runtime_telemetry', 'usage_available')) sqlite.exec('ALTER TABLE runtime_telemetry ADD COLUMN usage_available INTEGER NOT NULL DEFAULT 0');
+      if (!hasColumn(sqlite, 'runtime_telemetry', 'usage_source')) sqlite.exec("ALTER TABLE runtime_telemetry ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'unavailable'");
+      sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_telemetry_attempt ON runtime_telemetry(attempt_id) WHERE attempt_id IS NOT NULL');
+    }
+    sqlite.exec('PRAGMA user_version = 16');
   })();
 }

@@ -394,6 +394,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
         }
       }
     } else if (message.type === 'result') {
+      this.recordProviderUsage(sessionId, message);
       if (message.is_error || message.subtype === 'error') this.emitFailure(sessionId, message.result || message.error || 'Claude run failed');
       else this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: message.result || 'Claude task completed', timestamp });
     }

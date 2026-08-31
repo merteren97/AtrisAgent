@@ -7,8 +7,16 @@ import type {
   TaskCompleted,
   TaskFailed,
 } from '@atris-agent-code/event-schema';
-import type { ExecutionMode, AgentRole, MissionStatus } from '@atris-agent-code/domain';
+import type {
+  ExecutionMode,
+  AgentRole,
+  MissionStatus,
+  PostApplyVerificationContext,
+  PostApplyVerificationResult,
+  ApplyVerificationOperationResult,
+} from '@atris-agent-code/domain';
 import { PolicyEngine, resolveAutomationAction } from '@atris-agent-code/policy-engine';
+import { allocateWorkerBatch } from './worker-pool';
 
 export interface OrchestratorConfig {
   workspacePath: string;
@@ -20,6 +28,8 @@ export interface OrchestratorConfig {
   workspaceManager?: WorkspaceManager;
   maxTaskRetries?: number;
   applyTaskChanges?: (taskId: string, operation?: ApplyTaskChangesContext) => Promise<{ success: boolean; output?: string; filesChanged?: number; checkpointId?: string }>;
+  postApplyVerification?: (context: PostApplyVerificationContext) => Promise<PostApplyVerificationResult>;
+  executeApplyVerificationOperation?: (context: PostApplyVerificationContext) => Promise<ApplyVerificationOperationResult>;
 }
 
 export interface StructuredTaskPlan {
@@ -496,6 +506,26 @@ export class Orchestrator {
     ));
   }
 
+  private async capacityAllowedTasks(missionId: string, candidates: TaskSelect[]): Promise<TaskSelect[]> {
+    if (!this.workspaceManager || candidates.length === 0) return candidates;
+    const allTasks = await this.workspaceManager.listTasks(missionId);
+    const policy = typeof this.workspaceManager.resolveMissionWorkerPoolPolicy === 'function'
+      ? await this.workspaceManager.resolveMissionWorkerPoolPolicy(missionId)
+      : undefined;
+    const candidateIds = new Set(candidates.map((task) => task.id));
+    const allocation = allocateWorkerBatch({
+      delegations: candidates.flatMap((task) => task.assignedRole && task.assignedRole !== 'orchestrator' ? [{
+        id: task.id, role: task.assignedRole, objective: task.description,
+        requiredCapabilities: task.requiredCapabilities || [], dependsOnDelegationIds: [],
+      }] : []),
+      runningWorkers: allTasks.filter((task) => !candidateIds.has(task.id) && ['claimed', 'running', 'review'].includes(String(task.status)) && task.assignedRole)
+        .map((task) => ({ role: task.assignedRole!, delegationId: task.id })),
+      policy,
+    });
+    const allowed = new Set(allocation.dispatchable.map((item) => item.id));
+    return candidates.filter((task) => allowed.has(task.id));
+  }
+
   private async failBlockedPlan(missionId: string, planId: string | null, tasks: TaskSelect[]): Promise<void> {
     const now = new Date().toISOString();
     const blockers = tasks.map((task) => {
@@ -885,8 +915,9 @@ export class Orchestrator {
 
     // Start first ready task(s); a plan without roots was failed before Running.
     if (firstTasks.length > 0) {
-      console.info(`[Orchestrator] Mission ${missionId} plan ${planId} dispatching root task(s): ${firstTasks.map((task) => task.id).join(', ')}`);
-      for (const taskToStart of firstTasks) {
+      const dispatchableFirstTasks = await this.capacityAllowedTasks(missionId, firstTasks);
+      console.info(`[Orchestrator] Mission ${missionId} plan ${planId} dispatching root task(s): ${dispatchableFirstTasks.map((task) => task.id).join(', ')}`);
+      for (const taskToStart of dispatchableFirstTasks) {
         await this.assignTask(taskToStart.id, taskToStart.assignedRole ?? 'researcher');
       }
     }
@@ -1236,7 +1267,7 @@ export class Orchestrator {
       return;
     }
 
-    for (const task of nextTasks) {
+    for (const task of await this.capacityAllowedTasks(missionId, nextTasks)) {
       if (this.workspaceManager) {
         await this.workspaceManager.updateTask(task.id, { status: 'ready' });
       }
@@ -1265,7 +1296,8 @@ export class Orchestrator {
 
       console.warn(`[Orchestrator] Task ${taskId} failed (${error}). Retrying (${newCount}/${this.maxTaskRetries})...`);
 
-      await this.assignTask(taskId);
+      const retryTask = this.workspaceManager ? await this.workspaceManager.getTask(taskId) : null;
+      if (!retryTask || (await this.capacityAllowedTasks(missionId, [retryTask])).length > 0) await this.assignTask(taskId);
       return;
     }
 
@@ -1397,8 +1429,9 @@ export class Orchestrator {
         return;
       }
       await this.workspaceManager.updateMission(missionId, { status: 'running' });
-      console.info(`[Orchestrator] Mission ${missionId} plan ${mission?.planId || tasks[0]?.planId || 'unknown'} dispatching root task(s): ${roots.map((task) => task.id).join(', ') || 'none'}`);
-      for (const task of roots) {
+      const dispatchableRoots = await this.capacityAllowedTasks(missionId, roots);
+      console.info(`[Orchestrator] Mission ${missionId} plan ${mission?.planId || tasks[0]?.planId || 'unknown'} dispatching root task(s): ${dispatchableRoots.map((task) => task.id).join(', ') || 'none'}`);
+      for (const task of dispatchableRoots) {
         await this.assignTask(task.id, task.assignedRole ?? undefined);
       }
       return;
@@ -1498,7 +1531,7 @@ export class Orchestrator {
         return dependency?.status === 'done' || dependency?.status === 'superseded';
       });
     });
-    for (const task of nextTasks) await this.assignTask(task.id, task.assignedRole ?? undefined);
+    for (const task of await this.capacityAllowedTasks(missionId, nextTasks)) await this.assignTask(task.id, task.assignedRole ?? undefined);
   }
 
   async retryTask(taskId: string): Promise<TaskSelect> {
@@ -1518,6 +1551,9 @@ export class Orchestrator {
     }
     this.taskRetries.set(taskId, 0);
     this.taskAttempts.set(taskId, 1);
+    if (missionId && task && (await this.capacityAllowedTasks(missionId, [task])).length === 0) {
+      throw new Error(`Mission '${missionId}' has no available worker capacity for task '${taskId}'.`);
+    }
     return await this.assignTask(taskId);
   }
 
@@ -1564,7 +1600,7 @@ export class Orchestrator {
       const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(mission.id), mission.planId);
 
       const activeTasks = tasks.filter((t) => t.status === 'running' || t.status === 'revision_requested');
-      for (const task of activeTasks) {
+      for (const task of await this.capacityAllowedTasks(mission.id, activeTasks)) {
         console.log(`[Orchestrator] Resuming active task: ${task.id}`);
         await this.assignTask(task.id, task.assignedRole ?? undefined);
       }

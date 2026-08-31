@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {
   appendControlPlaneInstructions,
@@ -10,6 +11,7 @@ import {
   createClaudeMcpConfig,
   opencodeControlPlaneConfig,
   prepareControlPlaneSession,
+  removeTemporaryDirectory,
 } from './control-plane';
 
 async function runTests() {
@@ -81,6 +83,25 @@ async function runTests() {
     assert(overlay.extraArgs[0] === '--add-dir' && overlay.extraArgs[1] === process.cwd(), 'Antigravity overlay exposes only the real assigned task workspace');
   } finally {
     overlay.cleanup();
+    overlay.cleanup();
+  }
+  assert(!fs.existsSync(overlay.cwd), 'Antigravity overlay cleanup is idempotent');
+
+  {
+    let attempts = 0;
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('temporary-directory retry test timed out')), 5_000);
+      removeTemporaryDirectory(path.join(os.tmpdir(), 'atris-ebusy-regression'), () => {
+        attempts += 1;
+        if (attempts < 3) {
+          const error = Object.assign(new Error('directory is still in use'), { code: 'EBUSY' });
+          throw error;
+        }
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    assert(attempts === 3, 'Windows EBUSY cleanup retries without escaping the teardown callback');
   }
 
   const prompt = appendControlPlaneInstructions(options.prompt, session, process.cwd());

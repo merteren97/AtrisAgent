@@ -137,7 +137,7 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- respond: answer directly from the supplied conversation/project context; create no workers and no plan.',
     '- clarify: ask only the minimum blocking question(s); create no workers and no plan.',
     '- delegate: read-only investigation/research/validation. Use 1-3 independent Researchers in parallel when the work naturally splits.',
-    '- execute: source changes are requested. Research is optional. Use at most 2 parallel Builders and only for genuinely independent implementation lanes. Every Builder lane must be reviewable and testable.',
+    '- execute: source changes are requested. Research first is the default for coding or complex execution. Use at most 3 parallel Researchers, then at most 2 Builders for genuinely independent implementation lanes. Every Builder must depend on all Researcher tasks whose evidence it needs and must be reviewable and testable.',
     '- plan_only: the user explicitly asks to create/show a plan without beginning execution; include the intended review/QA path but do not start it.',
     '',
     'Capacity policy: at most 3 Researchers, 2 Builders, 2 Reviewers, 2 QA workers; no more than 4 dependency-free workers may start concurrently.',
@@ -145,7 +145,7 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     'Important behavior:',
     '- Interpret short follow-ups such as "devam edelim", "2. yöntemi uygula", "öncekini boşver" from conversation context instead of treating them as new isolated requests.',
     '- Prefer a direct response when the existing context already answers the user.',
-    '- Do not force Researcher -> Builder -> Reviewer for every turn.',
+    '- Direct response and clarification remain valid for simple turns. Do not create workers when they are unnecessary.',
     '- Split independent research topics into multiple researcher delegations with no dependencies and the same preferredParallelGroup.',
     '- For execute, Builder dependencies should reference only research that is actually required.',
     '- Never invent completed work. If current code/evidence must be inspected, delegate it.',
@@ -210,7 +210,10 @@ export function fallbackSupervisorDecision(context: SupervisorTurnContext): Orch
       turnId: context.turnId,
       action: 'execute',
       response: 'İsteği mevcut konuşma bağlamını koruyarak uygulama çalışmasına dönüştürüyorum.',
-      delegations: [{ id: 'builder-1', role: 'builder', objective: context.userMessage, requiredCapabilities: ['implementation'] }],
+      delegations: [
+        { id: 'research-1', role: 'researcher', objective: `Inspect the codebase and constraints needed to implement: ${context.userMessage}`, requiredCapabilities: ['research', 'codebase-analysis'] },
+        { id: 'builder-1', role: 'builder', objective: context.userMessage, requiredCapabilities: ['implementation'], dependsOnDelegationIds: ['research-1'] },
+      ],
     };
   }
   if (researchRequested) {

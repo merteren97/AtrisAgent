@@ -1,12 +1,15 @@
-import { and, eq, inArray, lte, max } from 'drizzle-orm';
+import { and, desc, eq, inArray, lte, max } from 'drizzle-orm';
 import {
   workspaces,
   missions,
   tasks,
   taskAttempts,
   worktrees,
+  agentInstances,
   teamRoles,
+  teamTemplates,
   executionPolicies,
+  conversationTurns,
   type WorkspaceSelect,
   type WorkspaceInsert,
   type MissionSelect,
@@ -34,7 +37,12 @@ import type {
   EffectiveRoutingPreference,
   RoutingPreferenceSource,
   MissionAutomationPolicy,
+  CanonicalReasoning,
+  RouteSelectionMode,
+  EffectiveAttemptRoute,
+  EffectiveWorkerPoolPolicy,
 } from '@atris-agent-code/domain';
+import { resolveWorkerPoolPolicy } from '@atris-agent-code/domain';
 
 export interface CreateWorkspaceInput {
   name: string;
@@ -80,6 +88,36 @@ export interface ClaimTaskAttemptInput {
   leaseExpiresAt: string;
   now?: string;
   id?: string;
+  route: {
+    adapterId: string;
+    provider?: string | null;
+    accountProfileId?: string | null;
+    modelCatalogId?: string | null;
+    runtimeModelId?: string | null;
+    reasoningLevel?: CanonicalReasoning | null;
+    source: RoutingPreferenceSource;
+    selectionMode: RouteSelectionMode;
+  };
+}
+
+export interface SupervisorSessionMetadata {
+  providerSessionId?: string;
+  resumeCapability: 'none' | 'live' | 'restart';
+  route: ClaimTaskAttemptInput['route'];
+  updatedAt: string;
+}
+
+export interface ReserveAgentCapacityInput {
+  id: string;
+  missionId: string;
+  role: AgentRole;
+  modelProfileId?: string;
+  parentAgentId?: string | null;
+  displayName: string;
+  specialty?: string | null;
+  spawnReason: string;
+  workspaceMode: string;
+  createdAt: string;
 }
 
 export class WorkspaceManager {
@@ -180,6 +218,59 @@ export class WorkspaceManager {
   async listMissions(workspaceId?: string): Promise<MissionSelect[]> {
     if (workspaceId) return await this.db.select().from(missions).where(eq(missions.workspaceId, workspaceId));
     return await this.db.select().from(missions);
+  }
+
+  async resolveMissionWorkerPoolPolicy(missionId: string): Promise<EffectiveWorkerPoolPolicy> {
+    const mission = await this.getMission(missionId);
+    if (!mission?.teamTemplateId) return resolveWorkerPoolPolicy();
+    const template = (await this.db.select().from(teamTemplates).where(eq(teamTemplates.id, mission.teamTemplateId)))[0];
+    return resolveWorkerPoolPolicy(template ? {
+      maxParallelAgents: template.maxParallelAgents ?? undefined,
+      workerPools: template.workerPools ?? undefined,
+    } : undefined);
+  }
+
+  async reserveAgentCapacity(input: ReserveAgentCapacityInput): Promise<void> {
+    this.db.transaction((tx) => {
+      const mission = (tx.select().from(missions).where(eq(missions.id, input.missionId)) as any).get() as MissionSelect | undefined;
+      if (!mission) throw new Error(`Mission ${input.missionId} was not found.`);
+      const template = mission.teamTemplateId
+        ? (tx.select().from(teamTemplates).where(eq(teamTemplates.id, mission.teamTemplateId)) as any).get() as typeof teamTemplates.$inferSelect | undefined
+        : undefined;
+      const policy = resolveWorkerPoolPolicy(template ? {
+        maxParallelAgents: template.maxParallelAgents ?? undefined,
+        workerPools: template.workerPools ?? undefined,
+      } : undefined);
+      const rolePool = policy.pools.find((pool) => pool.role === input.role);
+      if (!rolePool) throw new Error(`Agent role ${input.role} is not supported by the effective worker pool.`);
+      const roleLimit = Math.min(rolePool.maxInstances, rolePool.maxParallel ?? rolePool.maxInstances);
+
+      const activeQuery = tx.select({ role: agentInstances.role }).from(agentInstances)
+        .where(and(eq(agentInstances.missionId, input.missionId), inArray(agentInstances.status, ['idle', 'running', 'waiting'])));
+      const active = (activeQuery as any).all() as Array<{ role: AgentRole }>;
+      if (active.length >= policy.maxParallelAgents) {
+        throw new Error(`Mission parallel-agent limit reached (${policy.maxParallelAgents}). Wait for an active agent to complete before spawning another.`);
+      }
+      if (active.filter((agent) => agent.role === input.role).length >= roleLimit) {
+        throw new Error(`Mission ${input.role} parallel-agent limit reached (${roleLimit}). Wait for an active ${input.role} agent to complete before spawning another.`);
+      }
+
+      tx.insert(agentInstances).values({
+        id: input.id,
+        missionId: input.missionId,
+        role: input.role,
+        modelProfileId: input.modelProfileId || '',
+        accountProfileId: '',
+        runtimeAdapterId: '',
+        status: 'idle',
+        parentAgentId: input.parentAgentId || null,
+        displayName: input.displayName,
+        specialty: input.specialty || null,
+        spawnReason: input.spawnReason,
+        workspaceMode: input.workspaceMode,
+        createdAt: input.createdAt,
+      }).run();
+    });
   }
 
   async upsertRoleExecutionPolicy(
@@ -315,8 +406,28 @@ export class WorkspaceManager {
   }
 
   /** List all tasks for a mission. */
-  async listTasks(missionId: string): Promise<TaskSelect[]> {
-    return await this.db.select().from(tasks).where(eq(tasks.missionId, missionId));
+  async listTasks(missionId: string): Promise<Array<TaskSelect & { effectiveRoute?: EffectiveAttemptRoute | null }>> {
+    const missionTasks = await this.db.select().from(tasks).where(eq(tasks.missionId, missionId));
+    if (!missionTasks.length) return missionTasks;
+    const attempts = await this.db.select().from(taskAttempts)
+      .where(inArray(taskAttempts.taskId, missionTasks.map((task) => task.id)))
+      .orderBy(desc(taskAttempts.attemptNumber));
+    const latestByTask = new Map<string, TaskAttemptSelect>();
+    for (const attempt of attempts) if (!latestByTask.has(attempt.taskId)) latestByTask.set(attempt.taskId, attempt);
+    return missionTasks.map((task) => {
+      const attempt = latestByTask.get(task.id);
+      if (!attempt?.routeAdapterId || !attempt.routeSource || !attempt.routeSelectionMode) return task;
+      return { ...task, effectiveRoute: {
+        adapterId: attempt.routeAdapterId,
+        provider: attempt.routeProvider,
+        accountProfileId: attempt.routeAccountProfileId,
+        modelCatalogId: attempt.routeModelCatalogId,
+        runtimeModelId: attempt.routeRuntimeModelId,
+        reasoningLevel: attempt.routeReasoningLevel,
+        source: attempt.routeSource,
+        selectionMode: attempt.routeSelectionMode,
+      } };
+    });
   }
 
   async cancelMissionTasks(missionId: string): Promise<void> {
@@ -338,6 +449,25 @@ export class WorkspaceManager {
     return updated;
   }
 
+  async saveSupervisorSessionMetadata(turnId: string, metadata: SupervisorSessionMetadata): Promise<void> {
+    const rows = await this.db.select().from(conversationTurns).where(eq(conversationTurns.id, turnId));
+    const turn = rows[0];
+    if (!turn) return;
+    await this.db.update(conversationTurns).set({
+      options: { ...(turn.options || {}), supervisorSession: metadata },
+    }).where(eq(conversationTurns.id, turnId));
+  }
+
+  async getLatestSupervisorSessionMetadata(missionId: string): Promise<SupervisorSessionMetadata | undefined> {
+    const rows = await this.db.select().from(conversationTurns)
+      .where(eq(conversationTurns.missionId, missionId)).orderBy(desc(conversationTurns.createdAt));
+    for (const turn of rows) {
+      const metadata = turn.options?.supervisorSession as SupervisorSessionMetadata | undefined;
+      if (metadata?.route?.adapterId && metadata.resumeCapability) return metadata;
+    }
+    return undefined;
+  }
+
   async claimTaskAttempt(input: ClaimTaskAttemptInput): Promise<TaskAttemptSelect> {
     const claimed = this.db.transaction((tx) => {
       const rows = tx.select({ value: max(taskAttempts.attemptNumber) })
@@ -352,6 +482,15 @@ export class WorkspaceManager {
         status: 'claimed',
         worktreePath: input.worktreePath ?? null,
         runtimeSessionId: null,
+        routeAdapterId: input.route.adapterId,
+        routeProvider: input.route.provider ?? null,
+        routeAccountProfileId: input.route.accountProfileId ?? null,
+        routeModelCatalogId: input.route.modelCatalogId ?? null,
+        routeRuntimeModelId: input.route.runtimeModelId ?? null,
+        routeReasoningLevel: input.route.reasoningLevel ?? null,
+        routeSource: input.route.source,
+        routeSelectionMode: input.route.selectionMode,
+        providerSessionId: null,
         heartbeatAt: now,
         leaseExpiresAt: input.leaseExpiresAt,
         retryable: false,
@@ -367,9 +506,9 @@ export class WorkspaceManager {
     return claimed;
   }
 
-  async markTaskAttemptRunning(attemptId: string, runtimeSessionId: string, heartbeatAt: string, leaseExpiresAt: string): Promise<boolean> {
+  async markTaskAttemptRunning(attemptId: string, runtimeSessionId: string, heartbeatAt: string, leaseExpiresAt: string, providerSessionId?: string | null): Promise<boolean> {
     const result = await this.db.update(taskAttempts).set({
-      status: 'running', runtimeSessionId, heartbeatAt, leaseExpiresAt,
+      status: 'running', runtimeSessionId, providerSessionId: providerSessionId ?? null, heartbeatAt, leaseExpiresAt,
     }).where(and(eq(taskAttempts.id, attemptId), eq(taskAttempts.status, 'claimed'))).returning({ id: taskAttempts.id });
     return result.length === 1;
   }
@@ -483,5 +622,21 @@ export class WorkspaceManager {
     await this.worktreeManager.removeWorktree(task.worktreeId);
     await this.updateTask(taskId, { worktreeId: null });
     await this.db.update(worktrees).set({ status: 'abandoned' }).where(eq(worktrees.taskId, taskId));
+  }
+
+  async removeMissionWorktrees(missionId: string): Promise<void> {
+    const records = await this.db.select().from(worktrees).where(eq(worktrees.missionId, missionId));
+    const missionTasks = await this.listTasks(missionId);
+    const paths = new Set([
+      ...records.map((record) => record.path),
+      ...missionTasks.map((task) => task.worktreeId).filter((value): value is string => Boolean(value)),
+    ]);
+    for (const worktreePath of paths) await this.worktreeManager.removeWorktree(worktreePath);
+    for (const task of missionTasks.filter((item) => item.worktreeId)) await this.updateTask(task.id, { worktreeId: null });
+    await this.db.update(worktrees).set({ status: 'abandoned' }).where(eq(worktrees.missionId, missionId));
+  }
+
+  removeWorkspaceCheckpoints(workspacePath: string): void {
+    this.checkpointManager.removeWorkspaceCheckpoints(workspacePath);
   }
 }

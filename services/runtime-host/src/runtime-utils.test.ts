@@ -7,6 +7,7 @@ import {
   prepareRuntimeCommand,
   runCommand,
   spawnHiddenChecked,
+  waitForHttp,
 } from './runtime-utils';
 
 async function runTests() {
@@ -75,6 +76,20 @@ async function runTests() {
     );
   } finally {
     fs.rmSync(resolutionRoot, { recursive: true, force: true });
+  }
+
+  const originalFetch = globalThis.fetch;
+  const startedAt = Date.now();
+  try {
+    globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    })) as typeof fetch;
+    await waitForHttp('http://127.0.0.1:1/health', {}, 40);
+    assert(false, 'bounds an individual hung startup health request');
+  } catch {
+    assert(Date.now() - startedAt < 1_500, 'bounds an individual hung startup health request');
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 
   const hostileArguments = [

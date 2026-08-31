@@ -22,7 +22,6 @@ import {
   Ban,
   SquarePen,
   MoreHorizontal,
-  Trash2,
   LogOut,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -31,9 +30,9 @@ import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
+import { ConversationDeleteDialog } from '../history/ConversationDeleteDialog';
 import { useWorkspaceStore } from '../../stores/workspace-store';
 import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
@@ -114,10 +113,6 @@ function agentTitle(agent: AgentInstance): string {
   return `${agent.role.charAt(0).toUpperCase()}${agent.role.slice(1)}`;
 }
 
-function canDeleteConversation(mission: Mission): boolean {
-  return ['completed', 'failed', 'cancelled'].includes(mission.status);
-}
-
 function SidebarAgentTree({
   agent,
   allAgents,
@@ -167,11 +162,9 @@ export function Sidebar() {
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
-  const [deletingMissionId, setDeletingMissionId] = useState<string | null>(null);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
-  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, forgetMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
-  const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput, deleteMission } = useMissionStore();
+  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
+  const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput } = useMissionStore();
   const agents = useAgentStore((state) => state.agents);
   const selectedAgentId = useAgentStore((state) => state.selectedAgentId);
   const setSelectedAgent = useAgentStore((state) => state.setSelectedAgent);
@@ -278,19 +271,7 @@ export function Sidebar() {
     openInspector('agents');
   };
 
-  const handleDeleteConversation = async () => {
-    const mission = pendingDeleteMission;
-    if (!mission || !canDeleteConversation(mission)) return;
-    setDeleteError(null);
-    setDeletingMissionId(mission.id);
-    const deleted = await deleteMission(mission.id);
-    setDeletingMissionId(null);
-    if (!deleted) {
-      setDeleteError(useMissionStore.getState().error || 'Conversation deletion failed.');
-      return;
-    }
-    forgetMission(mission.workspaceId, mission.id);
-    setPendingDeleteMission(null);
+  const handleConversationDeleted = (mission: Mission) => {
     if (mission.id === activeMissionId) {
       setComposerInput('');
       setActiveView('chat');
@@ -449,8 +430,7 @@ export function Sidebar() {
                     const missionAgents = isActiveMission ? activeMissionAgents : [];
                     const missionCancelled = mission.status === 'cancelled';
                     const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
-                    const deletable = canDeleteConversation(mission);
-                    return (
+                     return (
                       <div key={mission.id} className="group/conversation mb-0.5">
                         <div className={`flex items-center rounded-md transition-colors ${isActiveMission ? 'bg-primary/[0.07] text-sidebar-foreground' : 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
                           <button
@@ -481,16 +461,12 @@ export function Sidebar() {
                             </DropdownMenuTrigger>
                             <DropdownMenuContent side="right" align="start" className="w-52">
                               <DropdownMenuItem
-                                variant={deletable ? 'destructive' : 'default'}
-                                disabled={!deletable}
+                                variant="destructive"
                                 onSelect={() => {
-                                  if (!deletable) return;
-                                  setDeleteError(null);
                                   setPendingDeleteMission(mission);
                                 }}
                               >
-                                <Trash2 className="h-3.5 w-3.5" />
-                                {deletable ? 'Delete conversation' : 'Stop before deleting'}
+                                Delete conversation…
                               </DropdownMenuItem>
                             </DropdownMenuContent>
                           </DropdownMenu>
@@ -585,46 +561,7 @@ export function Sidebar() {
 
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
-
-      <Dialog open={Boolean(pendingDeleteMission)} onOpenChange={(open) => {
-        if (!open && !deletingMissionId) {
-          setDeleteError(null);
-          setPendingDeleteMission(null);
-        }
-      }}>
-        <DialogContent className="sm:max-w-[440px]">
-          <DialogHeader>
-            <div className="mb-1 flex h-9 w-9 items-center justify-center rounded-lg border border-destructive/25 bg-destructive/10 text-destructive">
-              <Trash2 className="h-4 w-4" />
-            </div>
-            <DialogTitle>Delete conversation?</DialogTitle>
-            <DialogDescription className="leading-relaxed">
-              This permanently removes the mission timeline, tasks, agent history, events, artifacts, and managed task worktrees for this conversation. Changes that were already applied to your project files are not reverted.
-            </DialogDescription>
-          </DialogHeader>
-
-          {pendingDeleteMission && (
-            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5">
-              <div className="truncate text-xs font-medium text-foreground">{pendingDeleteMission.title}</div>
-              <div className="mt-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{pendingDeleteMission.status}</div>
-            </div>
-          )}
-
-          {deleteError && (
-            <div role="alert" className="rounded-lg border border-destructive/25 bg-destructive/10 px-3 py-2.5 text-xs leading-relaxed text-destructive">
-              {deleteError}
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setDeleteError(null); setPendingDeleteMission(null); }} disabled={Boolean(deletingMissionId)}>Cancel</Button>
-            <Button variant="destructive" onClick={() => void handleDeleteConversation()} disabled={!pendingDeleteMission || Boolean(deletingMissionId)}>
-              {deletingMissionId ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Trash2 className="mr-2 h-3.5 w-3.5" />}
-              Delete conversation
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConversationDeleteDialog mission={pendingDeleteMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />
     </aside>
   );
 }

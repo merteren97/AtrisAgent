@@ -6,21 +6,24 @@ export interface TelemetrySqlite {
 
 export function persistRuntimeTelemetry(sqlite: TelemetrySqlite, event: RuntimeTelemetry): void {
   sqlite.prepare(`INSERT OR IGNORE INTO runtime_telemetry
-    (id, mission_id, task_id, agent_instance_id, adapter_id, account_profile_id, outcome,
-     input_tokens, output_tokens, cost, currency, queue_wait_ms, duration_ms, retry_count,
-     worker_utilization, recorded_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    (id, mission_id, task_id, agent_instance_id, adapter_id, account_profile_id, attempt_id, outcome,
+     usage_available, usage_source, input_tokens, output_tokens, cost, currency, queue_wait_ms,
+     duration_ms, retry_count, worker_utilization, recorded_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     event.id,
     event.missionId,
     event.taskId,
     event.agentInstanceId,
     event.adapterId,
     event.accountProfileId || null,
+    event.attemptId || null,
     event.outcome,
+    event.usageAvailable ? 1 : 0,
+    event.usageSource,
     event.inputTokens,
     event.outputTokens,
     event.cost,
-    event.currency,
+    event.currency || '',
     event.queueWaitMs,
     event.durationMs,
     event.retryCount,

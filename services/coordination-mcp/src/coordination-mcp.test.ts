@@ -168,6 +168,7 @@ async function runTests() {
         return task;
       },
       async listTasks(missionId: string) { return tasks.filter((task) => task.missionId === missionId); },
+      async reserveAgentCapacity() {},
       async getMission(missionId: string) {
         return missionId === 'm-100'
           ? { id: missionId, workspaceId: 'w-100', title: 'Production hardening', status: 'running', executionMode: 'balanced' }

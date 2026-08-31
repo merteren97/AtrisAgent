@@ -8,6 +8,7 @@ import type { RuntimeType } from '@atris-agent-code/domain';
 const DEFAULT_MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_CONFIGURABLE_COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024;
 const WINDOWS_SAFE_BRIDGE_CWD = () => path.dirname(process.execPath);
+const detachedProcessGroups = new WeakSet<ChildProcess>();
 
 const WINDOWS_RUNTIME_ARGUMENT_BRIDGE_SOURCE = [
   "'use strict';",
@@ -481,16 +482,54 @@ export async function waitForHttp(
   const startedAt = Date.now();
   let lastError: unknown;
   while (Date.now() - startedAt < timeoutMs) {
+    if (init.signal?.aborted) throw init.signal.reason ?? new Error(`Waiting for ${url} was aborted`);
+    const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    const controller = new AbortController();
+    const abort = () => controller.abort(init.signal?.reason);
+    init.signal?.addEventListener('abort', abort, { once: true });
+    const requestTimer = setTimeout(() => controller.abort(new Error(`Request to ${url} timed out`)), Math.min(1_000, remainingMs));
     try {
-      const response = await fetch(url, init);
+      const response = await fetch(url, { ...init, signal: controller.signal });
       if (response.ok) return response;
       lastError = new Error(`${url} returned ${response.status}`);
     } catch (error) {
       lastError = error;
+    } finally {
+      clearTimeout(requestTimer);
+      init.signal?.removeEventListener('abort', abort);
     }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise<void>((resolve, reject) => {
+      const finish = () => { init.signal?.removeEventListener('abort', abortDelay); resolve(); };
+      const timer = setTimeout(finish, Math.min(200, Math.max(0, timeoutMs - (Date.now() - startedAt))));
+      const abortDelay = () => { clearTimeout(timer); init.signal?.removeEventListener('abort', abortDelay); reject(init.signal?.reason ?? new Error(`Waiting for ${url} was aborted`)); };
+      init.signal?.addEventListener('abort', abortDelay, { once: true });
+    });
   }
   throw lastError instanceof Error ? lastError : new Error(`Timed out waiting for ${url}`);
+}
+
+export async function terminateProcessTree(child: ChildProcess, force = false): Promise<void> {
+  if (child.exitCode !== null || child.killed) return;
+  if (process.platform !== 'win32' && child.pid && detachedProcessGroups.has(child)) {
+    try { process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process group already exited */ }
+    return;
+  }
+  if (process.platform !== 'win32' || !child.pid) {
+    try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process already exited */ }
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/t', ...(force ? ['/f'] : [])], {
+      windowsHide: true,
+      shell: false,
+      stdio: 'ignore',
+    });
+    killer.once('error', () => resolve());
+    killer.once('close', () => resolve());
+  });
+  if (child.exitCode === null && !child.killed) {
+    try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process already exited */ }
+  }
 }
 
 export async function launchInteractiveTerminal(
@@ -572,7 +611,9 @@ export function spawnHidden(command: string, args: string[], options: SpawnOptio
     windowsVerbatimArguments: prepared.windowsVerbatimArguments ?? options.windowsVerbatimArguments,
     shell: false,
     env: bridgeContext.env,
+    detached: process.platform === 'win32' ? options.detached : true,
   });
+  if (process.platform !== 'win32') detachedProcessGroups.add(child);
   // Node treats an unobserved child-process `error` event as fatal. Runtime
   // adapters attach their own listeners when they need diagnostics, while this
   // baseline listener guarantees that a missing optional CLI cannot terminate

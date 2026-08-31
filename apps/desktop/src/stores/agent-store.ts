@@ -133,7 +133,9 @@ function applyEvent(map: Map<string, AgentInstance>, missionId: string, event: R
     map.set(agentId, { ...existing, status: 'running', statusMessage: event.reason || 'Resumed', lastActivityAt: timestamp });
   } else if (event.type === 'agent_completed') {
     map.set(agentId, { ...existing, status: 'completed', statusMessage: event.summary || 'Completed', progress: 100, completedAt: timestamp, lastActivityAt: timestamp });
-  } else if (event.type === 'agent_error' || event.type === 'task_failed') {
+  } else if (event.type === 'agent_error') {
+    map.set(agentId, { ...existing, statusMessage: event.error || 'Runtime diagnostic', lastActivityAt: timestamp });
+  } else if (event.type === 'task_failed') {
     map.set(agentId, { ...existing, status: 'failed', statusMessage: event.error || 'Execution failed', completedAt: timestamp, lastActivityAt: timestamp });
   } else if (event.type === 'agent_cancelled') {
     map.set(agentId, { ...existing, status: 'cancelled', statusMessage: event.reason || 'Mission cancelled', completedAt: timestamp, lastActivityAt: timestamp });

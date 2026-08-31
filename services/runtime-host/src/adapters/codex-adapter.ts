@@ -485,8 +485,10 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (event.type === 'turn.completed') {
+      this.recordProviderUsage(sessionId, event);
       this.emitCompleted(sessionId, 'Codex turn completed');
     } else if (event.type === 'turn.failed' || event.type === 'error') {
+      this.recordProviderUsage(sessionId, event);
       this.emitFailure(sessionId, event.error?.message || event.message || 'Codex turn failed');
     }
   }

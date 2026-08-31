@@ -446,11 +446,14 @@ export interface RuntimeTelemetry extends BaseEvent {
   agentInstanceId: string;
   adapterId: string;
   accountProfileId?: string;
+  attemptId?: string;
   outcome: 'completed' | 'failed';
+  usageAvailable: boolean;
+  usageSource: 'provider_reported' | 'unavailable';
   inputTokens: number;
   outputTokens: number;
   cost: number | null;
-  currency: string;
+  currency: string | null;
   queueWaitMs: number;
   durationMs: number;
   retryCount: number;

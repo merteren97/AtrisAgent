@@ -46,6 +46,9 @@ export interface RuntimeHostConfig {
   maxConcurrentSessions?: number;
   sessionTimeout?: number;
   watchdogInterval?: number;
+  sessionIdleGrace?: number;
+  maxProbeFailures?: number;
+  supervisorSessionIdleTtl?: number;
   defaultAdapterId?: string;
   workspacePath?: string;
   workspaceManager?: WorkspaceManager;
@@ -67,6 +70,8 @@ export class RuntimeHost {
     retryCount: number;
     attemptId?: string;
     role?: AgentRole | string;
+    lastProtocolResponseAt: number;
+    probeFailures: number;
   }>();
   private scheduler: Scheduler;
   private profileManager: AccountProfileManager;
@@ -105,7 +110,7 @@ export class RuntimeHost {
     if (this.eventBus) this.subscribeToEventBus(this.eventBus);
     const interval = this.config.watchdogInterval ?? Math.min(this.sessionTimeoutMs(), 30_000);
     if (interval > 0) {
-      this.watchdog = setInterval(() => { void this.runSessionWatchdog(); }, interval);
+      this.watchdog = setInterval(() => { void this.runSessionWatchdog().catch((error) => console.error('[RuntimeHost] watchdog failed:', error)); }, interval);
       this.watchdog.unref?.();
     }
   }
@@ -193,7 +198,7 @@ export class RuntimeHost {
             summary: event.result,
             timestamp: new Date().toISOString(),
           });
-          void this.emitRuntimeTelemetry(event, active, 'completed');
+          void this.emitRuntimeTelemetry(event, active, 'completed').catch(() => undefined);
           this.activeSessions.delete(sessionId);
         } finally {
           this.finishingSessions.delete(sessionId);
@@ -217,7 +222,7 @@ export class RuntimeHost {
             error: event.error,
             timestamp: new Date().toISOString(),
           });
-          void this.emitRuntimeTelemetry(event, active, 'failed');
+          void this.emitRuntimeTelemetry(event, active, 'failed').catch(() => undefined);
           this.activeSessions.delete(sessionId);
         } finally {
           this.finishingSessions.delete(sessionId);
@@ -228,7 +233,12 @@ export class RuntimeHost {
     this.unsubscribeRuntimeActivity = eventBus.on('*', (event) => {
       if (!('agentInstanceId' in event) || typeof event.agentInstanceId !== 'string') return;
       if (!this.activeSessions.has(event.agentInstanceId)) return;
-      void this.heartbeatSession(event.agentInstanceId);
+      const active = this.activeSessions.get(event.agentInstanceId);
+      if (active) {
+        active.lastProtocolResponseAt = Date.now();
+        active.probeFailures = 0;
+      }
+      void this.heartbeatSession(event.agentInstanceId).catch(() => undefined);
     });
   }
 
@@ -269,6 +279,7 @@ export class RuntimeHost {
       queuedAt: number;
       startedAt: number;
       retryCount: number;
+      attemptId?: string;
       role?: AgentRole | string;
     },
     outcome: 'completed' | 'failed',
@@ -284,21 +295,24 @@ export class RuntimeHost {
     }
     const maxSessions = Math.max(1, this.config.maxConcurrentSessions || 1);
     this.eventBus.emit({
-      id: crypto.randomUUID(),
+      id: `runtime-telemetry:${active.attemptId || active.session.id}`,
       type: 'runtime_telemetry',
       missionId: event.missionId,
       taskId: event.taskId,
       agentInstanceId: active.session.agentInstanceId || active.session.id,
       adapterId: active.adapterId,
       accountProfileId: active.accountProfileId,
+      attemptId: active.attemptId,
       outcome,
+      usageAvailable: usage !== null,
+      usageSource: usage ? 'provider_reported' : 'unavailable',
       inputTokens: Math.max(0, Math.round(usage?.inputTokens || 0)),
       outputTokens: Math.max(0, Math.round(usage?.outputTokens || 0)),
       cost: usage?.totalCost == null ? null : Math.max(0, Number(usage.totalCost) || 0),
-      currency: usage?.currency || 'USD',
+      currency: usage?.currency || null,
       queueWaitMs: Math.max(0, active.startedAt - active.queuedAt),
       durationMs: Math.max(0, now - active.startedAt),
-      retryCount: Math.max(1, active.retryCount),
+      retryCount: Math.max(0, active.retryCount - 1),
       workerUtilization: Math.min(1, this.activeSessions.size / maxSessions),
       timestamp: new Date(now).toISOString(),
     });
@@ -582,9 +596,9 @@ export class RuntimeHost {
       role === 'builder'
          ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
         : role === 'reviewer'
-          ? 'Review only. Do not modify source files. Report concrete findings with file paths, severity, and an explicit approve or revision recommendation.'
+          ? 'Review only. Do not modify source files. Return exactly one QualityResultEnvelope JSON object: {"type":"quality_result","version":1,"role":"reviewer","verdict":"pass|fail","summary":"...","findings":["..."],"evidence":["file:line ..."]}. Do not wrap it in prose or Markdown.'
           : role === 'qa'
-            ? 'Validate the selected Builder result. Run the safest relevant build, test, lint, or static checks and report exact commands and results. Do not implement product changes.'
+            ? 'Validate the selected Builder result without implementing product changes. Return exactly one QualityResultEnvelope JSON object: {"type":"quality_result","version":1,"role":"qa","verdict":"pass|fail","summary":"...","findings":["..."],"evidence":["exact command and result"]}. Do not wrap it in prose or Markdown.'
             : role === 'orchestrator'
               ? 'Plan, coordinate, and evaluate. Do not implement source changes directly.'
               : 'Investigate and report evidence. Do not modify source files.',
@@ -598,6 +612,16 @@ export class RuntimeHost {
       worktreePath: execution.worktreePath ?? null,
       leaseExpiresAt: new Date(Date.parse(claimedAt) + this.sessionTimeoutMs()).toISOString(),
       now: claimedAt,
+      route: {
+        adapterId: route.adapterId,
+        provider: route.profile?.provider,
+        accountProfileId: route.profile?.id,
+        modelCatalogId: route.model?.catalogId,
+        runtimeModelId: route.model?.runtimeModelId,
+        reasoningLevel: route.reasoningLevel,
+        source: effectivePreference?.source || 'scheduler',
+        selectionMode: effectivePreference?.selectionMode || 'auto',
+      },
     }) : undefined;
     let session: AgentSession;
     try {
@@ -626,7 +650,7 @@ export class RuntimeHost {
     if (attempt && this.workspaceManager) {
       const heartbeatAt = new Date(startedAt).toISOString();
       const attemptStarted = await this.workspaceManager.markTaskAttemptRunning(
-        attempt.id, session.id, heartbeatAt, new Date(startedAt + this.sessionTimeoutMs()).toISOString(),
+        attempt.id, session.id, heartbeatAt, new Date(startedAt + this.sessionTimeoutMs()).toISOString(), session.runtimeSessionId || session.id,
       );
       if (!attemptStarted) {
         await adapter.cancel(session.id).catch(() => undefined);
@@ -644,6 +668,8 @@ export class RuntimeHost {
         retryCount: attempt?.attemptNumber ?? 1,
         attemptId: attempt?.id,
         role,
+        lastProtocolResponseAt: startedAt,
+        probeFailures: 0,
     });
     if (this.workspaceManager && task?.assignedAgentId !== session.id) {
       await this.workspaceManager.updateTask(event.taskId, { assignedAgentId: session.id }).catch(() => undefined);
@@ -782,6 +808,8 @@ export class RuntimeHost {
       queuedAt: Date.now(),
       startedAt: Date.now(),
       retryCount: 1,
+      lastProtocolResponseAt: Date.now(),
+      probeFailures: 0,
     });
     return session.id;
   }
@@ -818,6 +846,43 @@ export class RuntimeHost {
     if (this.watchdogRunning) return 0;
     this.watchdogRunning = true;
     try {
+      await Promise.all([...this.activeSessions.entries()].map(async ([sessionId, active]) => {
+        const adapter = this.adapters.get(active.adapterId);
+        if (!adapter?.isSessionAlive(sessionId)) return;
+        const idleFor = Math.max(0, now.getTime() - active.lastProtocolResponseAt);
+        if (idleFor <= this.sessionIdleGraceMs()) {
+          await this.heartbeatSession(sessionId, now).catch(() => false);
+          return;
+        }
+
+        const responsive = await adapter.probeSessionResponsiveness(sessionId).catch(() => false);
+        if (responsive) {
+          active.lastProtocolResponseAt = now.getTime();
+          active.probeFailures = 0;
+          await this.heartbeatSession(sessionId, now).catch(() => false);
+          return;
+        }
+
+        active.probeFailures += 1;
+        if (active.probeFailures >= this.maxProbeFailures()) {
+          await adapter.cancel(sessionId).catch(() => undefined);
+          await this.finishAttempt(active, 'expired', {
+            error: responsive === null
+              ? 'Runtime session exceeded the bounded quiet CLI allowance'
+              : 'Runtime session stopped responding to health probes',
+            retryable: true,
+          }).catch(() => false);
+          this.activeSessions.delete(sessionId);
+          this.eventBus?.emit({
+            id: crypto.randomUUID(), type: 'task_failed', missionId: active.missionId || '',
+            taskId: active.taskId || '', agentInstanceId: active.session.agentInstanceId || sessionId,
+            error: responsive === null
+              ? 'Runtime session exceeded the bounded quiet CLI allowance'
+              : 'Runtime session stopped responding to health probes',
+            timestamp: now.toISOString(),
+          });
+        }
+      }));
       const expired = await this.workspaceManager.expireStaleTaskAttempts(now.toISOString(), now.toISOString());
       for (const attempt of expired) {
         const sessionId = attempt.runtimeSessionId;
@@ -929,6 +994,14 @@ export class RuntimeHost {
 
   private sessionTimeoutMs(): number {
     return Math.max(1, this.config.sessionTimeout ?? 5 * 60_000);
+  }
+
+  private sessionIdleGraceMs(): number {
+    return Math.max(this.sessionTimeoutMs(), this.config.sessionIdleGrace ?? 15 * 60_000);
+  }
+
+  private maxProbeFailures(): number {
+    return Math.max(1, Math.floor(this.config.maxProbeFailures ?? 2));
   }
 
   private async finishAttempt(

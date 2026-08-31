@@ -83,6 +83,14 @@ async function runTests() {
     assert(checkpointLabel.includes('approval:approval-1:1:task:t1'), 'Apply operation idempotency key is carried into the durable checkpoint label');
     assert(fs.existsSync(path.join(wsPath, 'new-file.ts')), 'Merged files reflected in main workspace');
 
+    let verifiedPath = '';
+    const verification = await coordinator.verifyAppliedWorkspace('t1', async (basePath) => {
+      verifiedPath = basePath;
+      return { passed: true, summary: 'Base checks passed', evidence: ['test: passed'] };
+    });
+    assert(path.resolve(verifiedPath) === path.resolve(wsPath), 'Post-apply verifier runs against the actual base workspace');
+    assert(verification.passed && verification.evidence.length === 1, 'Post-apply verification evidence is preserved');
+
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

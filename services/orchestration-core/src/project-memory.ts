@@ -42,6 +42,7 @@ export interface RawSqliteStatement {
 export interface RawSqliteConnection {
   exec(sql: string): unknown;
   prepare(sql: string): RawSqliteStatement;
+  transaction<T>(callback: () => T): () => T;
 }
 
 export interface ProjectMemoryOverview {
@@ -448,6 +449,79 @@ export class ProjectMemoryService {
         }
       }
     }
+  }
+
+  /** Remove only memory inputs owned by a workspace while retaining shared inputs. */
+  async removeWorkspaceProvenance(workspaceId: string, missionIds: string[]): Promise<void> {
+    const ownedMissionIds = new Set(missionIds);
+    const remove = this.sqlite.transaction(() => {
+      const links = this.sqlite.prepare(`
+        SELECT id, project_id AS projectId
+        FROM project_workspace_links
+        WHERE workspace_id = ?
+      `).all(workspaceId) as Array<{ id: string; projectId: string }>;
+      const now = new Date().toISOString();
+
+      for (const link of links) {
+        const nodes = this.sqlite.prepare(`
+          SELECT id, project_id AS projectId, title, summary, body, tags, provenance
+          FROM memory_nodes
+          WHERE project_id = ?
+        `).all(link.projectId) as Array<{
+          id: string;
+          projectId: string;
+          title: string;
+          summary: string;
+          body: string | null;
+          tags: string;
+          provenance: string;
+        }>;
+        const rootId = this.projectRootNodeId(link.projectId);
+        for (const node of nodes) {
+          const existing = JSON.parse(node.provenance || '[]') as MemoryProvenance[];
+          const provenance = existing.filter((item) => !item.missionId || !ownedMissionIds.has(item.missionId));
+          if (provenance.length === existing.length) continue;
+
+          if (provenance.length === 0 && node.id !== rootId) {
+            this.sqlite.prepare('DELETE FROM memory_nodes WHERE id = ?').run(node.id);
+            if (this.ftsAvailable) this.sqlite.prepare('DELETE FROM memory_nodes_fts WHERE node_id = ?').run(node.id);
+          } else {
+            this.sqlite.prepare('UPDATE memory_nodes SET provenance = ?, updated_at = ? WHERE id = ?')
+              .run(JSON.stringify(provenance), now, node.id);
+            if (this.ftsAvailable) {
+              this.sqlite.prepare('DELETE FROM memory_nodes_fts WHERE node_id = ?').run(node.id);
+              this.sqlite.prepare(`
+                INSERT INTO memory_nodes_fts(node_id, project_id, title, summary, body, tags)
+                VALUES (?, ?, ?, ?, ?, ?)
+              `).run(node.id, node.projectId, node.title, node.summary, node.body || '', node.tags || '[]');
+            }
+          }
+        }
+
+        for (const missionId of ownedMissionIds) {
+          this.sqlite.prepare('DELETE FROM memory_evidence WHERE project_id = ? AND mission_id = ?')
+            .run(link.projectId, missionId);
+        }
+        this.sqlite.prepare('DELETE FROM project_workspace_links WHERE id = ?').run(link.id);
+        const activeLink = this.sqlite.prepare(`
+          SELECT 1 FROM project_workspace_links WHERE project_id = ? AND active = 1 LIMIT 1
+        `).get(link.projectId);
+        if (!activeLink) {
+          this.sqlite.prepare(`
+            UPDATE projects SET status = 'detached', detached_at = ?, updated_at = ?
+            WHERE id = ? AND status <> 'archived'
+          `).run(now, now, link.projectId);
+        }
+        this.sqlite.prepare(`
+          UPDATE project_memory_spaces
+          SET node_count = (SELECT COUNT(*) FROM memory_nodes WHERE project_id = ?),
+              edge_count = (SELECT COUNT(*) FROM memory_edges WHERE project_id = ?),
+              updated_at = ?
+          WHERE project_id = ?
+        `).run(link.projectId, link.projectId, now, link.projectId);
+      }
+    });
+    remove();
   }
 
   async archiveProject(projectId: string): Promise<ProjectMemoryOverview> {

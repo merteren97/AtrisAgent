@@ -217,11 +217,13 @@ async function runTests() {
 
     const result = await orchestrator.startMission(missionId, 'İki bağımsız sorunu düzelt.', { turnId: 'turn-execute', runId: 'run-execute' });
     const builders = result.tasks.filter((task) => task.assignedRole === 'builder');
+    const researchers = result.tasks.filter((task) => task.assignedRole === 'researcher');
     const reviewers = result.tasks.filter((task) => task.assignedRole === 'reviewer');
     const qa = result.tasks.filter((task) => task.assignedRole === 'qa');
     assert(builders.length === 2, 'execute decision preserves two independent Builder lanes');
     assert(reviewers.length === 2 && qa.length === 2, 'each Builder lane receives a dedicated Reviewer and QA task');
-    assert(initiallyCreated.length === 2 && initiallyCreated.every((id) => builders.some((task) => task.id === id)), 'only dependency-free Builder lanes start initially');
+    assert(researchers.length === 1 && initiallyCreated.length === 1 && initiallyCreated[0] === researchers[0].id, 'Researcher starts before dependent Builder lanes');
+    assert(builders.every((task) => (task.dependsOn as string[]).includes(researchers[0].id)), 'all Builder lanes join on the required Researcher result');
     for (const reviewer of reviewers) {
       assert((reviewer.dependsOn as string[]).length === 1 && builders.some((builder) => builder.id === (reviewer.dependsOn as string[])[0]), 'each Reviewer depends on exactly one Builder worktree');
     }

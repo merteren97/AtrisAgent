@@ -64,6 +64,10 @@ async function runTests() {
       assert(fs.readFileSync(sentinel, 'utf8') === 'outside-sentinel', 'restore never writes snapshot content through a hostile symlink into an external target');
       assert(!fs.existsSync(path.join(externalCollisionDir, 'stable.ts')), 'external symlink target receives no restored workspace file');
     }
+    manager.removeWorkspaceCheckpoints(workspace);
+    manager.removeWorkspaceCheckpoints(workspace);
+    assert(!fs.existsSync(path.join(workspace, '.atris-checkpoints')), 'checkpoint cleanup is idempotent');
+    assert(fs.existsSync(path.join(workspace, 'src', 'stable.ts')), 'checkpoint cleanup retains source project files');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

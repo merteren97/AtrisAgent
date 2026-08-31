@@ -41,6 +41,19 @@ export interface TaskItem {
   assignedRole?: string | null;
   assignedAgentId?: string | null;
   worktreeId?: string | null;
+  /** Effective persisted attempt route, when supplied by the mission-state API. */
+  effectiveRoute?: EffectiveAttemptRoute | null;
+}
+
+export interface EffectiveAttemptRoute {
+  adapterId?: string | null;
+  provider?: string | null;
+  accountProfileId?: string | null;
+  modelCatalogId?: string | null;
+  runtimeModelId?: string | null;
+  reasoningLevel?: string | null;
+  source?: string | null;
+  selectionMode?: string | null;
 }
 
 export interface TimelineItem {
@@ -62,7 +75,7 @@ export interface StartMissionOptions {
   targetRole?: string;
   /** Route override scope without changing which role the mission DAG starts with. */
   routeRole?: string;
-  /** A selected mission route applies to every compatible child role by default. */
+  /** Normal selection targets Orchestrator; advanced directives can target another role. */
   routeScope?: 'mission' | 'role';
   command?: string;
   automationSettings?: { fileWrite: boolean | null; gitCommit: boolean | null; packageInstall: boolean | null };
@@ -110,6 +123,7 @@ interface MissionState {
   transportError: string | null;
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
+  refreshMission: (missionId: string) => Promise<Mission>;
   fetchCommandQueue: (workspaceId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
   continueMission: (missionId: string, request: string, options?: StartMissionOptions, skipOptimisticUserMessage?: boolean) => Promise<void>;
@@ -117,7 +131,7 @@ interface MissionState {
   sendMissionCommand: (missionId: string, request: string, delivery: TurnDelivery, options?: StartMissionOptions) => Promise<void>;
   drainQueuedTurn: (missionId: string) => Promise<void>;
   setTransportStatus: (status: EventTransportStatus, error?: string | null) => void;
-  deleteMission: (id: string) => Promise<boolean>;
+  deleteMission: (id: string) => Promise<void>;
   addMission: (mission: Mission) => void;
   setActiveMission: (id: string) => void;
   clearActiveMission: () => void;
@@ -126,7 +140,7 @@ interface MissionState {
   setTasks: (tasks: TaskItem[]) => void;
   patchTask: (id: string, updates: Partial<TaskItem>) => void;
   pauseMission: (id: string) => Promise<void>;
-  stopMission: (id: string) => Promise<void>;
+  stopMission: (id: string) => Promise<Mission>;
   retryMission: (id: string) => Promise<void>;
   missionFilter: 'all' | 'active' | 'review' | 'blocked';
   setMissionFilter: (filter: 'all' | 'active' | 'review' | 'blocked') => void;
@@ -523,6 +537,24 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 
+  refreshMission: async (missionId) => {
+    try {
+      const state = await apiRequest<{ mission?: Mission }>(`/missions/${missionId}`);
+      if (!state.mission) throw new Error('Conversation was not found.');
+      set((current) => ({
+        missions: current.missions.some((mission) => mission.id === missionId)
+          ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission! } : mission)
+          : [state.mission!, ...current.missions],
+        error: null,
+      }));
+      return state.mission;
+    } catch (error: any) {
+      const message = error?.message || 'Conversation refresh failed.';
+      set({ error: message });
+      throw new Error(message);
+    }
+  },
+
   startMission: async (request, workspaceId, options) => {
     const trimmed = request.trim();
     if (!trimmed) return;
@@ -755,10 +787,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           } : {}),
         };
       });
-      return true;
     } catch (error: any) {
-      set({ error: error?.message || 'Conversation deletion failed.' });
-      return false;
+      const message = error?.message || 'Conversation deletion failed.';
+      set({ error: message });
+      throw new Error(message);
     }
   },
 
@@ -867,8 +899,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           }),
         };
       });
+      return mission;
     } catch (error: any) {
-      set({ error: error?.message || 'Mission cancellation failed.' });
+      const message = error?.message || 'Mission cancellation failed.';
+      set({ error: message });
+      throw new Error(message);
     }
   },
 
@@ -878,7 +913,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       set((state) => ({ missions: state.missions.map((mission) => mission.id === id ? { ...mission, status: 'running' } : mission) }));
       await get().fetchMissionState(id);
     } catch (error: any) {
-      set({ error: error?.message || 'Mission retry failed.' });
+      const message = error?.message || 'Mission retry failed.';
+      set({ error: message });
+      throw new Error(message);
     }
   },
 }));

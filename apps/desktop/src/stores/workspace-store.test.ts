@@ -24,4 +24,16 @@ assert.equal(useWorkspaceStore.getState().lastMissionByWorkspace['workspace-2'],
 useWorkspaceStore.getState().forgetMission('workspace-2', 'different-mission');
 assert.equal(useWorkspaceStore.getState().lastMissionByWorkspace['workspace-2'], 'mission-2', 'unrelated conversation deletion does not clear the remembered selection');
 
+const originalFetch = globalThis.fetch;
+useWorkspaceStore.setState({ workspaces: [{ id: 'workspace-2', name: 'Project', path: 'C:/Project' }], activeWorkspaceId: 'workspace-2', error: null });
+let deletionBody = '';
+globalThis.fetch = async (_input, init) => {
+  deletionBody = String(init?.body || '');
+  return new Response(JSON.stringify({ error: 'Active conversations remain.' }), { status: 409, headers: { 'content-type': 'application/json' } });
+};
+await assert.rejects(() => useWorkspaceStore.getState().removeWorkspace('workspace-2', true), /Active conversations remain/, 'workspace deletion failures are visible to the confirmation dialog');
+assert.deepEqual(JSON.parse(deletionBody), { removeMemory: true }, 'workspace and memory deletion use one authoritative backend operation');
+assert.equal(useWorkspaceStore.getState().workspaces.length, 1, 'failed workspace deletion preserves local navigation state');
+globalThis.fetch = originalFetch;
+
 console.log('workspace navigation cleanup tests passed');

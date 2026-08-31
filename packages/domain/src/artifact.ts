@@ -26,3 +26,20 @@ export interface Artifact {
   content: string | null;
   createdAt: string;
 }
+
+export interface ResearchContextSource {
+  taskId: string;
+  attemptId?: string;
+  result: string;
+  uncertain: boolean;
+}
+
+export interface ResearchContextBundle {
+  version: 1;
+  missionId: string;
+  planId: string;
+  sourceTaskIds: string[];
+  sources: ResearchContextSource[];
+  conflicts: string[];
+  truncated: boolean;
+}

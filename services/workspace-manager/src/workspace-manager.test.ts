@@ -60,8 +60,13 @@ async function runTests() {
       CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, git_initialized INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT, last_team_template_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', team_template_id TEXT NOT NULL DEFAULT '', plan_id TEXT, execution_mode TEXT NOT NULL DEFAULT 'balanced', automation_policy TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
       CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
-      CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
+      CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, route_adapter_id TEXT, route_provider TEXT, route_account_profile_id TEXT, route_model_catalog_id TEXT, route_runtime_model_id TEXT, route_reasoning_level TEXT, route_source TEXT, route_selection_mode TEXT, provider_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
       CREATE UNIQUE INDEX idx_task_attempts_task_number ON task_attempts(task_id, attempt_number);
+      CREATE TABLE team_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', max_parallel_agents INTEGER, worker_pools TEXT, is_default INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+      CREATE TABLE team_roles (id TEXT PRIMARY KEY, template_id TEXT NOT NULL REFERENCES team_templates(id), role TEXT NOT NULL, model_profile_id TEXT, account_profile_id TEXT, default_capabilities TEXT NOT NULL, access_level TEXT NOT NULL);
+      CREATE TABLE execution_policies (id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, role TEXT NOT NULL, model_catalog_id TEXT, account_profile_id TEXT, reasoning_level TEXT, fallback_catalog_ids TEXT NOT NULL, selection_mode TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE conversation_turns (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, content TEXT NOT NULL, delivery TEXT NOT NULL, options TEXT, status TEXT NOT NULL DEFAULT 'queued', idempotency_key TEXT, request_hash TEXT, command_id TEXT, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT);
+      CREATE TABLE agent_instances (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, role TEXT NOT NULL, model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '', session_id TEXT, status TEXT DEFAULT 'idle', task_id TEXT, parent_agent_id TEXT, display_name TEXT, specialty TEXT, spawn_reason TEXT, status_message TEXT, progress INTEGER, workspace_mode TEXT, started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL);
     `);
     const attemptManager = new WorkspaceManager(drizzle(sqlite, { schema }) as unknown as AtrisDatabase);
     const attemptWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
@@ -78,6 +83,7 @@ async function runTests() {
       agentInstanceId: `researcher-${index}`,
       leaseExpiresAt: '2026-08-30T01:05:00.000Z',
       now: '2026-08-30T01:00:00.000Z',
+      route: { adapterId: 'codex', provider: 'openai', accountProfileId: 'profile-explicit', modelCatalogId: 'catalog-explicit', runtimeModelId: 'gpt-5', reasoningLevel: 'high', source: 'explicit', selectionMode: 'fixed' },
     })));
     assert(claimedAttempts.length === 3 && claimedAttempts.every((attempt) => attempt.attemptNumber === 1), 'parallel task attempts are claimed through a synchronous SQLite transaction');
     const retryAttempt = await attemptManager.claimTaskAttempt({
@@ -86,8 +92,57 @@ async function runTests() {
       agentInstanceId: 'researcher-retry',
       leaseExpiresAt: '2026-08-30T01:10:00.000Z',
       now: '2026-08-30T01:05:00.000Z',
+      route: { adapterId: 'claude_code', provider: 'anthropic', accountProfileId: 'profile-workspace', modelCatalogId: 'catalog-workspace', runtimeModelId: 'claude-sonnet', reasoningLevel: 'medium', source: 'workspace', selectionMode: 'prefer' },
     });
     assert(retryAttempt.attemptNumber === 2, 'task attempt numbering remains atomic across retries');
+    assert(claimedAttempts[0].routeSource === 'explicit' && claimedAttempts[0].routeRuntimeModelId === 'gpt-5', 'explicit chat route is persisted on the claimed attempt');
+    assert(retryAttempt.routeSource === 'workspace' && retryAttempt.routeAdapterId === 'claude_code', 'a retry receives a distinct policy snapshot in a new attempt');
+    const routedTasks = await attemptManager.listTasks(attemptMission.id);
+    assert(routedTasks[0].effectiveRoute?.adapterId === 'claude_code' && routedTasks[0].effectiveRoute?.runtimeModelId === 'claude-sonnet'
+      && !('providerSessionId' in (routedTasks[0].effectiveRoute || {})), 'task read model exposes only the latest effective route snapshot without session secrets');
+    sqlite.prepare("INSERT INTO team_templates (id, name, max_parallel_agents, worker_pools, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run('limited-team', 'Limited', 99, JSON.stringify([{ role: 'researcher', minInstances: -4, maxInstances: 2, maxParallel: 1 }]), new Date().toISOString());
+    await attemptManager.updateMission(attemptMission.id, { teamTemplateId: 'limited-team' });
+    const effectivePool = await attemptManager.resolveMissionWorkerPoolPolicy(attemptMission.id);
+    assert(effectivePool.maxParallelAgents === 32 && effectivePool.pools.find((pool) => pool.role === 'researcher')?.maxParallel === 1,
+      'template global and role overrides are resolved with invalid values capped');
+    const fallbackPool = await attemptManager.resolveMissionWorkerPoolPolicy('missing-mission');
+    assert(fallbackPool.maxParallelAgents === 4, 'missing and legacy templates use the safe Core worker-pool default');
+    sqlite.prepare('UPDATE team_templates SET max_parallel_agents = 2 WHERE id = ?').run('limited-team');
+    const reserve = (id: string, role: 'researcher' | 'builder' = 'researcher') => attemptManager.reserveAgentCapacity({
+      id, missionId: attemptMission.id, role, displayName: id, spawnReason: 'capacity test', workspaceMode: 'read_only', createdAt: new Date().toISOString(),
+    });
+    const concurrentReservations = await Promise.allSettled([reserve('pool-researcher-1'), reserve('pool-researcher-2')]);
+    assert(concurrentReservations.filter((result) => result.status === 'fulfilled').length === 1,
+      'concurrent dynamic spawns atomically enforce the effective role cap');
+    await reserve('pool-builder-1', 'builder');
+    let globalCapBlocked = false;
+    try { await reserve('pool-builder-2', 'builder'); } catch (error: any) { globalCapBlocked = String(error.message).includes('parallel-agent limit reached (2)'); }
+    assert(globalCapBlocked, 'dynamic children and existing durable workers share the mission-global cap');
+    const restartedManager = new WorkspaceManager(drizzle(sqlite, { schema }) as unknown as AtrisDatabase);
+    let restartBlocked = false;
+    try { await restartedManager.reserveAgentCapacity({ id: 'restart-reader', missionId: attemptMission.id, role: 'builder', displayName: 'Restart', spawnReason: 'restart test', workspaceMode: 'isolated_worktree', createdAt: new Date().toISOString() }); }
+    catch (error: any) { restartBlocked = String(error.message).includes('parallel-agent limit reached (2)'); }
+    assert(restartBlocked, 'capacity read model survives WorkspaceManager restart');
+    sqlite.prepare("UPDATE agent_instances SET status = 'completed', completed_at = ? WHERE id = 'pool-researcher-1'").run(new Date().toISOString());
+    await restartedManager.reserveAgentCapacity({ id: 'released-slot', missionId: attemptMission.id, role: 'researcher', displayName: 'Released slot', spawnReason: 'terminal release test', workspaceMode: 'read_only', createdAt: new Date().toISOString() });
+    assert((sqlite.prepare("SELECT COUNT(*) AS count FROM agent_instances WHERE mission_id = ? AND status IN ('idle', 'running', 'waiting')").get(attemptMission.id) as { count: number }).count === 2,
+      'terminal agents release durable global and role capacity');
+    await attemptManager.markTaskAttemptRunning(retryAttempt.id, 'runtime-session', '2026-08-30T01:05:01.000Z', '2026-08-30T01:10:01.000Z', 'provider-session');
+    const persistedAttempts = await attemptManager.listTaskAttempts(attemptTasks[0].id);
+    assert(persistedAttempts[0].routeAdapterId === 'codex' && persistedAttempts[1].providerSessionId === 'provider-session', 'attempt reads retain stable route snapshots and attach the provider session at start');
+    sqlite.prepare('INSERT INTO conversation_turns (id, mission_id, content, delivery, options, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('supervisor-turn', attemptMission.id, 'Continue', 'queue', JSON.stringify({ clientOption: true }), 'completed', '2026-08-30T01:20:00.000Z');
+    await attemptManager.saveSupervisorSessionMetadata('supervisor-turn', {
+      providerSessionId: 'opencode-provider-session', resumeCapability: 'restart',
+      route: { adapterId: 'opencode', provider: 'opencode', accountProfileId: 'profile-explicit', modelCatalogId: 'catalog-explicit', runtimeModelId: 'provider/model', reasoningLevel: 'high', source: 'explicit', selectionMode: 'fixed' },
+      updatedAt: '2026-08-30T01:20:01.000Z',
+    });
+    const supervisorMetadata = await attemptManager.getLatestSupervisorSessionMetadata(attemptMission.id);
+    const persistedTurn = sqlite.prepare('SELECT options FROM conversation_turns WHERE id = ?').get('supervisor-turn') as { options: string };
+    const persistedOptions = JSON.parse(persistedTurn.options);
+    assert(supervisorMetadata?.providerSessionId === 'opencode-provider-session' && supervisorMetadata.route.modelCatalogId === 'catalog-explicit', 'supervisor provider session capability and explicit route survive manager restart reads');
+    assert(persistedOptions.clientOption === true && !JSON.stringify(persistedOptions).includes('password'), 'supervisor metadata preserves existing turn options and contains no server credentials');
     sqlite.close();
 
     assert(isValidGitCommitSha('0123456789abcdef0123456789abcdef01234567'), '40-character Git commit SHA is accepted');
