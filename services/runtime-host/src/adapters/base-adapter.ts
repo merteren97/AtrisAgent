@@ -27,6 +27,7 @@ export interface SpawnAgentOptions {
   missionId: string;
   prompt: string;
   role?: AgentRole | string;
+  accessMode?: 'read-only' | 'workspace-write';
   model?: string;
   reasoningLevel?: string;
   isolated?: boolean;

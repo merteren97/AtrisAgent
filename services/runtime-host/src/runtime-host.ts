@@ -54,6 +54,12 @@ export interface RuntimeHostConfig {
   workspaceManager?: WorkspaceManager;
 }
 
+interface TaskExecutionAccess {
+  role: AgentRole;
+  accessMode: 'read-only' | 'workspace-write';
+  requiresIsolatedWorktree: boolean;
+}
+
 export class RuntimeHost {
   private config: RuntimeHostConfig;
   private eventBus?: LocalEventBus;
@@ -507,8 +513,25 @@ export class RuntimeHost {
 
   async handleTaskCreated(event: TaskCreated): Promise<AgentSession> {
     const missionPreference = this.missionRouting.get(event.missionId);
-    const role = (event.assignedRole || missionPreference?.targetRole || 'builder') as AgentRole;
     const task = this.workspaceManager ? await this.workspaceManager.getTask(event.taskId) : null;
+    if (this.workspaceManager && !task) {
+      throw new Error(`Persisted task ${event.taskId} was not found; refusing to derive execution access from the event.`);
+    }
+    if (task && task.missionId !== event.missionId) {
+      throw new Error(`Task ${event.taskId} belongs to mission ${task.missionId}, not event mission ${event.missionId}.`);
+    }
+    const persistedRole = task ? normalizeAgentRole(task.assignedRole) : undefined;
+    if (task && !persistedRole) {
+      throw new Error(`Persisted task ${event.taskId} has no valid assigned role; refusing to launch it.`);
+    }
+    const eventRole = normalizeAgentRole(event.assignedRole);
+    if (persistedRole && eventRole && persistedRole !== eventRole) {
+      console.warn(`[RuntimeHost] task_created role mismatch for ${event.taskId}: event=${eventRole}, persisted=${persistedRole}; using persisted role.`);
+    }
+    const role = persistedRole || eventRole || missionPreference?.targetRole || 'builder';
+    const executionAccess: TaskExecutionAccess = role === 'builder'
+      ? { role, accessMode: 'workspace-write', requiresIsolatedWorktree: true }
+      : { role, accessMode: 'read-only', requiresIsolatedWorktree: false };
     const queuedAt = Date.parse(event.timestamp);
     const queuedAtMs = Number.isFinite(queuedAt) ? queuedAt : Date.now();
     const eventPreference: EffectiveRoutingPreference | undefined = Boolean(
@@ -527,7 +550,7 @@ export class RuntimeHost {
       capabilities: (task?.requiredCapabilities as string[] | undefined) || [],
       task: task?.description || event.title,
       priority: task?.priority || 'medium',
-      requiresWorktree: role === 'builder',
+      requiresWorktree: executionAccess.requiresIsolatedWorktree,
       preferredCatalogId: effectivePreference?.modelCatalogId,
       preferredAccountProfileId: effectivePreference?.accountProfileId,
       preferredReasoning: effectivePreference?.reasoningLevel,
@@ -589,6 +612,12 @@ export class RuntimeHost {
     }
     if (route.profile) adapter.configureProfile(route.profile);
     const execution = await this.resolveTaskExecutionContext(event, role);
+    if (executionAccess.requiresIsolatedWorktree) {
+      if (!execution.worktreePath || execution.cwd !== execution.worktreePath) {
+        throw new Error(`Builder task ${event.taskId} did not resolve to one isolated worktree.`);
+      }
+      this.assertBuilderWorktreeWritable(execution.worktreePath, event.taskId);
+    }
     const prompt = [
       `Task: ${event.title}`,
       task?.description ? `Instructions:\n${task.description}` : undefined,
@@ -630,11 +659,12 @@ export class RuntimeHost {
       taskId: event.taskId,
       missionId: event.missionId,
       prompt,
-      role,
+      role: executionAccess.role,
+      accessMode: executionAccess.accessMode,
       model: route.model?.runtimeModelId,
       reasoningLevel: route.reasoningLevel,
       profileId: route.profile?.id,
-      isolated: role === 'builder',
+      isolated: executionAccess.requiresIsolatedWorktree,
       worktreePath: execution.worktreePath,
       cwd: execution.cwd,
       });
@@ -677,6 +707,27 @@ export class RuntimeHost {
     return session;
   }
 
+  private assertBuilderWorktreeWritable(worktreePath: string, taskId: string): void {
+    const probePath = path.join(worktreePath, `.atris-write-probe-${process.pid}-${crypto.randomUUID()}.tmp`);
+    let failure: Error | undefined;
+    try {
+      fs.writeFileSync(probePath, taskId, { encoding: 'utf8', flag: 'wx' });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      failure = new Error(`Builder worktree is not writable (${worktreePath}): ${message}`);
+    } finally {
+      try {
+        fs.rmSync(probePath, { force: true });
+      } catch (error: unknown) {
+        if (!failure) {
+          const message = error instanceof Error ? error.message : String(error);
+          failure = new Error(`Builder worktree probe could not be cleaned up (${probePath}): ${message}`);
+        }
+      }
+    }
+    if (failure) throw failure;
+  }
+
   private async resolveTaskExecutionContext(
     event: TaskCreated,
     role: AgentRole,
@@ -693,9 +744,18 @@ export class RuntimeHost {
 
     if (role === 'builder') {
       if (task?.worktreeId && path.isAbsolute(task.worktreeId) && fs.existsSync(task.worktreeId)) {
+        const record = await this.workspaceManager.getWorktreeForTask(event.taskId);
+        if (!record || record.missionId !== event.missionId || record.taskId !== event.taskId || path.resolve(record.path) !== path.resolve(task.worktreeId)) {
+          throw new Error(`Persisted Builder worktree ownership is invalid for task ${event.taskId}.`);
+        }
+        const worktreePath = await fs.promises.realpath(record.path);
+        const worktreeStat = await fs.promises.lstat(worktreePath);
+        if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink()) {
+          throw new Error(`Persisted Builder worktree is not a real directory for task ${event.taskId}.`);
+        }
         return {
-          cwd: task.worktreeId,
-          worktreePath: task.worktreeId,
+          cwd: worktreePath,
+          worktreePath,
           promptContext: 'This is a revision or resumed attempt. Continue in the existing Builder worktree; do not create a second implementation branch.',
         };
       }
@@ -1024,4 +1084,11 @@ function automationActionForApproval(approvalType: string): AutomationAction {
   if (type.includes('push')) return 'gitPush';
   if (type.includes('pull') || type.includes('request')) return 'pullRequest';
   return 'commandExecution';
+}
+
+function normalizeAgentRole(role: unknown): AgentRole | undefined {
+  const normalized = typeof role === 'string' ? role.trim().toLowerCase() : '';
+  return ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'].includes(normalized)
+    ? normalized as AgentRole
+    : undefined;
 }

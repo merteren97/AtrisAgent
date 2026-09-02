@@ -5,6 +5,7 @@ import type { ChildProcess } from 'child_process';
 import {
   assertRuntimeLaunchPreconditions,
   normalizeExecutablePath,
+  prepareInteractiveTerminalLaunch,
   prepareBackgroundSpawnOptions,
   prepareRuntimeCommand,
   runCommand,
@@ -101,6 +102,31 @@ async function runTests() {
     prepared.command !== 'C:\\untrusted\\cmd.exe' && !prepared.args.join(' ').includes('C:\\untrusted-windows'),
     'does not trust caller-controlled ComSpec or SystemRoot values as shell executables',
   );
+
+  const interactiveCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-interactive-terminal-'));
+  try {
+    const interactive = prepareInteractiveTerminalLaunch(
+      process.execPath,
+      ['--print', 'sign-in & continue', '--output-format', 'json'],
+      { cwd: interactiveCwd, title: 'Antigravity CLI Sign-In' },
+      'win32',
+      { Path: 'C:\\Windows\\System32' },
+    );
+    assert(interactive.command === 'powershell.exe', 'uses PowerShell as the visible Windows terminal host');
+    assert(interactive.args.includes('-NoExit'), 'keeps the sign-in terminal open after the CLI exits');
+    assert(!interactive.args.includes('-NonInteractive'), 'keeps the sign-in host interactive for browser/terminal setup');
+    assert(interactive.args.includes('-WindowStyle') && interactive.args.includes('Normal'), 'requests a normal visible PowerShell window explicitly');
+    assert(!interactive.args.includes('Hidden') && !interactive.args.includes('hidden'), 'does not hide the sign-in terminal window');
+    assert(
+      JSON.stringify(JSON.parse(decodeBase64(interactive.env.ATRIS_TERMINAL_ARGS_B64)))
+        === JSON.stringify(['--print', 'sign-in & continue', '--output-format', 'json']),
+      'passes interactive CLI arguments without PowerShell-only flags or shell interpolation',
+    );
+    assert(decodeBase64(interactive.env.ATRIS_TERMINAL_CWD_B64) === interactiveCwd, 'passes the interactive working directory as opaque data');
+    assert(decodeBase64(interactive.env.ATRIS_TERMINAL_TITLE_B64) === 'Antigravity CLI Sign-In', 'passes the interactive window title as opaque data');
+  } finally {
+    fs.rmSync(interactiveCwd, { recursive: true, force: true });
+  }
 
   const resolutionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-path-resolution-'));
   try {

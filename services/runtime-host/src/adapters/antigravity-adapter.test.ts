@@ -1,7 +1,7 @@
-import { AntigravityAdapter, resolveAntigravityPassiveAuthCommand } from './antigravity-adapter';
+import { AntigravityAdapter, resolveAntigravityExecutionMode } from './antigravity-adapter';
 
 async function runTests() {
-  console.log('--- Starting Antigravity Passive Authentication Tests ---');
+  console.log('--- Starting Antigravity Authentication Probe Tests ---');
   let passed = 0;
   let failed = 0;
 
@@ -15,15 +15,12 @@ async function runTests() {
     }
   }
 
-  assert(
-    JSON.stringify(resolveAntigravityPassiveAuthCommand('Commands:\n  auth status   Show authentication status')) === JSON.stringify(['auth', 'status']),
-    'detects an explicitly advertised non-interactive auth status command',
-  );
-  assert(resolveAntigravityPassiveAuthCommand('Options:\n  --print, -p') === null, 'does not infer passive auth support from print mode');
+  assert(resolveAntigravityExecutionMode('workspace-write') === 'accept-edits', 'maps Builder write access to Antigravity accept-edits mode');
+  assert(resolveAntigravityExecutionMode('read-only') === 'plan', 'maps read-only agent access to Antigravity plan mode');
 
   const passiveInvocations: string[][] = [];
   const unsupported = new AntigravityAdapter(undefined, {
-    getHelpText: async () => 'Options:\n  --print, -p',
+    getHelpText: async () => 'Options:\n  --version',
     runCommand: async (_command, args) => {
       passiveInvocations.push(args || []);
       return { stdout: '', stderr: '', exitCode: 0 };
@@ -31,53 +28,60 @@ async function runTests() {
   });
   unsupported.discoverInstallation = async () => ({ installed: true, path: 'agy.exe' });
   const unsupportedStatus = await unsupported.verifyAuthentication();
-  assert(unsupportedStatus === 'login_required', 'requires interactive setup when no safe passive status command is advertised');
-  assert(passiveInvocations.length === 0, 'does not spawn agy print or any auth probe when passive status is unsupported');
+  assert(unsupportedStatus === 'error', 'rejects verification when the installed CLI has no structured print mode');
+  assert(passiveInvocations.length === 0, 'does not spawn an auth probe when structured print mode is unsupported');
   assert(
-    String((unsupported as any).lastVerification?.message).includes('interactive setup'),
-    'returns a clear interactive-setup explanation for unsupported passive verification',
+    String((unsupported as any).lastVerification?.message).includes('print mode'),
+    'returns a clear print-mode compatibility explanation for unsupported verification',
   );
 
   const supportedInvocations: string[][] = [];
   const supported = new AntigravityAdapter(undefined, {
-    getHelpText: async () => 'Commands:\n  auth status   Show authentication status',
+    getHelpText: async () => 'Options:\n  --print, -p\n  --output-format json\n  --sandbox',
     runCommand: async (_command, args) => {
       supportedInvocations.push(args || []);
-      return { stdout: 'Authenticated', stderr: '', exitCode: 0 };
+      return { stdout: '{"model":"gemini-3.7-flash-high","response":"ATRIS_AUTH_OK"}', stderr: '', exitCode: 0 };
     },
   });
   supported.discoverInstallation = async () => ({ installed: true, path: 'agy.exe' });
-  assert(await supported.verifyAuthentication() === 'connected', 'accepts authentication confirmed by the advertised status command');
+  assert(await supported.verifyAuthentication() === 'connected', 'accepts authentication confirmed by a successful structured print probe');
   assert(
-    JSON.stringify(supportedInvocations) === JSON.stringify([['auth', 'status']]),
-    'passive verification invokes only the advertised status command and never print mode',
+    JSON.stringify(supportedInvocations) === JSON.stringify([[
+      '--print',
+      'Reply with exactly ATRIS_AUTH_OK. Do not use tools and do not modify files.',
+      '--output-format',
+      'json',
+      '--sandbox',
+    ]]),
+    'verification invokes the bounded structured print probe supported by the installed CLI',
   );
+  assert((supported as any).lastVerification?.activeModel === 'gemini-3.7-flash-high', 'structured print metadata preserves the active model route');
 
   async function verifyOutput(stdout: string, exitCode = 0): Promise<string> {
     const adapter = new AntigravityAdapter(undefined, {
-      getHelpText: async () => 'Commands:\n  auth status   Show authentication status',
+      getHelpText: async () => 'Options:\n  --print, -p\n  --output-format json',
       runCommand: async () => ({ stdout, stderr: '', exitCode }),
     });
     adapter.discoverInstallation = async () => ({ installed: true, path: 'agy.exe' });
     return adapter.verifyAuthentication();
   }
 
-  assert(await verifyOutput('{"authenticated":false,"message":"Authenticated account found"}') === 'login_required', 'rejects a false authenticated JSON field despite incidental positive text');
-  assert(await verifyOutput('connected: false') === 'login_required', 'rejects an explicit false connected field');
-  assert(await verifyOutput('Session expired. Previously authenticated.') === 'login_required', 'prioritizes expired-session output over positive words');
-  assert(await verifyOutput('Authentication status check completed') === 'error', 'returns error for ambiguous successful output');
-  assert(await verifyOutput('{"authenticated":true}') === 'connected', 'accepts a documented true authentication field');
-  assert(await verifyOutput('Authenticated') === 'connected', 'accepts an unambiguous positive status response');
-  assert(await verifyOutput('Authenticated account found, but status command failed', 1) === 'error', 'never accepts positive incidental text from a non-zero command result');
+  assert(await verifyOutput('{"authenticated":false,"message":"Authenticated account found"}', 1) === 'login_required', 'classifies an authentication failure from a non-zero probe');
+  assert(await verifyOutput('connected: false', 1) === 'login_required', 'classifies an explicit disconnected probe');
+  assert(await verifyOutput('Session expired. Previously authenticated.', 1) === 'login_required', 'prioritizes expired-session output over positive words');
+  assert(await verifyOutput('rate limit exceeded', 1) === 'rate_limited', 'classifies a provider rate limit separately from authentication failure');
+  assert(await verifyOutput('Authentication status check completed', 1) === 'error', 'returns error for an ambiguous failed probe');
+  assert(await verifyOutput('ATRIS_AUTH_OK') === 'connected', 'treats a successful print probe as a connected CLI session');
+  assert(await verifyOutput('') === 'error', 'does not treat an empty successful process as an authenticated session');
 
   const rejected = new AntigravityAdapter(undefined, {
-    getHelpText: async () => 'Commands:\n  auth status   Show authentication status',
-    runCommand: async () => { throw Object.assign(new Error('status command rejected after reading authenticated account metadata'), { stdout: 'Authenticated account found' }); },
+    getHelpText: async () => 'Options:\n  --print, -p\n  --output-format json',
+    runCommand: async () => { throw Object.assign(new Error('Authentication required'), { stdout: 'Authentication required' }); },
   });
   rejected.discoverInstallation = async () => ({ installed: true, path: 'agy.exe' });
-  assert(await rejected.verifyAuthentication() === 'error', 'never accepts positive incidental text from a rejected command');
+  assert(await rejected.verifyAuthentication() === 'login_required', 'classifies a rejected auth probe as login required');
 
-  console.log(`\nAntigravity passive authentication tests: ${passed} passed, ${failed} failed`);
+  console.log(`\nAntigravity authentication probe tests: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
 

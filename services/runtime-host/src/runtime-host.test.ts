@@ -725,7 +725,7 @@ async function runTests() {
       let claimedRoute: any;
       let spawned = false;
       const manager: any = {
-        async getTask() { return { description: 'Research route durability', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
+        async getTask() { return { missionId: 'mission-route', assignedRole: 'researcher', description: 'Research route durability', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
         async getMission() { return { workspaceId: 'workspace-route', automationPolicy: null }; },
         async getWorkspace() { return { path: process.cwd() }; },
         async listTasks() { return []; },
@@ -771,6 +771,129 @@ async function runTests() {
       );
       (host as any).activeSessions.clear();
       await host.stopAll();
+    }
+  }
+
+  // Persisted task identity and role are authoritative for execution access.
+  {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-runtime-access-'));
+    try {
+      async function executeAccessCase(options: {
+        name: string;
+        eventRole: 'builder' | 'researcher';
+        persistedRole: 'builder' | 'researcher';
+        worktreePath: string;
+      }) {
+        let spawnOptions: any;
+        let spawnCalls = 0;
+        let worktreeCalls = 0;
+        let claimCalls = 0;
+        const task = {
+          id: `task-${options.name}`,
+          missionId: 'mission-access',
+          assignedRole: options.persistedRole,
+          description: 'Verify authoritative runtime access',
+          priority: 'medium',
+          requiredCapabilities: [],
+          assignedAgentId: null,
+          worktreeId: null,
+          dependsOn: [],
+          title: options.name,
+        };
+        const manager: any = {
+          async getTask() { return task; },
+          async getMission() { return { workspaceId: 'workspace-access', automationPolicy: null }; },
+          async getWorkspace() { return { path: options.persistedRole === 'researcher' ? path.join(tempRoot, 'missing-read-only-root') : tempRoot }; },
+          async listTasks() { return [task]; },
+          async resolveRoleExecutionPolicy() { return undefined; },
+          async createWorktreeForTask() { worktreeCalls += 1; return options.worktreePath; },
+          async claimTaskAttempt() { claimCalls += 1; return { id: `attempt-${options.name}`, attemptNumber: 1 }; },
+          async markTaskAttemptRunning() { return true; },
+          async updateTask() {},
+        };
+        const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+        const adapter: any = {
+          id: 'codex', runtimeType: 'codex', name: 'Codex access test', setEventBus() {}, configureProfile() {},
+          async probeCapabilities() { return { worktreeAwareness: true }; },
+          async spawnAgent(input: any) {
+            spawnCalls += 1;
+            spawnOptions = input;
+            return { id: `session-${options.name}`, agentInstanceId: input.sessionId };
+          },
+          async shutdown() {}, async cancel() {},
+        };
+        host.registerAdapter(adapter);
+        (host as any).profileManager.getProfiles = async () => [{
+          id: `profile-${options.name}`, provider: 'openai', runtimeType: 'codex', profileName: 'Access profile', authStatus: 'connected',
+          configDir: '', supportedModels: ['gpt-access'], usageScope: null, createdAt: '', updatedAt: '',
+          allowedRoles: [options.persistedRole], schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true },
+        }];
+        (host as any).catalogService.getCachedCatalog = () => [{
+          catalogId: `catalog-${options.name}`, runtimeId: 'codex', accountProfileId: `profile-${options.name}`, providerId: 'openai', runtimeModelId: 'gpt-access',
+          displayName: 'GPT Access', supportedRoles: [options.persistedRole], supportedReasoning: ['medium'], inputModalities: ['text'], availability: 'available', source: 'discovered',
+        }];
+        let error: Error | undefined;
+        try {
+          await host.handleTaskCreated({
+            id: `event-${options.name}`, type: 'task_created', missionId: 'mission-access', taskId: task.id,
+            agentInstanceId: `agent-${options.name}`, assignedRole: options.eventRole, title: options.name,
+            timestamp: '2026-08-30T02:00:00.000Z',
+          } as any);
+        } catch (caught) {
+          error = caught instanceof Error ? caught : new Error(String(caught));
+        }
+        (host as any).activeSessions.clear();
+        await host.stopAll();
+        return { error, spawnOptions, spawnCalls, worktreeCalls, claimCalls };
+      }
+
+      const builderWorktree = path.join(tempRoot, 'builder-worktree');
+      fs.mkdirSync(builderWorktree);
+      const builder = await executeAccessCase({
+        name: 'persisted-builder', eventRole: 'researcher', persistedRole: 'builder', worktreePath: builderWorktree,
+      });
+      assert(!builder.error, 'persisted Builder launches despite a conflicting researcher event role');
+      assert(
+        builder.spawnOptions?.role === 'builder'
+          && builder.spawnOptions?.accessMode === 'workspace-write'
+          && builder.spawnOptions?.isolated === true
+          && builder.spawnOptions?.worktreePath === builderWorktree
+          && builder.worktreeCalls === 1,
+        'persisted Builder role controls the isolated worktree and write-capable provider route',
+      );
+      assert(fs.readdirSync(builderWorktree).length === 0, 'Builder writeability preflight removes its contained Atris probe file');
+
+      const researcher = await executeAccessCase({
+        name: 'persisted-researcher', eventRole: 'builder', persistedRole: 'researcher', worktreePath: path.join(tempRoot, 'unused-worktree'),
+      });
+      assert(!researcher.error && researcher.spawnOptions?.role === 'researcher' && researcher.spawnOptions?.accessMode === 'read-only' && researcher.spawnOptions?.isolated === false, 'persisted read-only role stays read-only despite a conflicting Builder event role');
+      assert(researcher.worktreeCalls === 0, 'read-only execution does not create or write-probe a Builder worktree');
+
+      const unwritable = await executeAccessCase({
+        name: 'unwritable-builder', eventRole: 'builder', persistedRole: 'builder', worktreePath: path.join(tempRoot, 'missing-parent', 'worktree'),
+      });
+      assert(Boolean(unwritable.error?.message.includes('Builder worktree is not writable')), 'unwritable Builder worktree fails the writeability preflight');
+      assert(unwritable.spawnCalls === 0 && unwritable.claimCalls === 0, 'Builder writeability failure occurs before task claim and provider spawn');
+
+      const resumedPath = path.join(tempRoot, 'resumed-worktree');
+      const foreignPath = path.join(tempRoot, 'foreign-worktree');
+      fs.mkdirSync(resumedPath);
+      fs.mkdirSync(foreignPath);
+      const ownershipHost = new RuntimeHost(undefined, { workspaceManager: {
+        async getTask() { return { id: 'task-owned', missionId: 'mission-access', worktreeId: resumedPath }; },
+        async getMission() { return { workspaceId: 'workspace-access' }; },
+        async getWorkspace() { return { path: tempRoot }; },
+        async getWorktreeForTask() { return { taskId: 'task-owned', missionId: 'mission-access', path: foreignPath }; },
+      } as any, watchdogInterval: 0 });
+      let ownershipError = '';
+      try {
+        await (ownershipHost as any).resolveTaskExecutionContext({ taskId: 'task-owned', missionId: 'mission-access' }, 'builder');
+      } catch (error) {
+        ownershipError = error instanceof Error ? error.message : String(error);
+      }
+      assert(ownershipError.includes('worktree ownership is invalid'), 'resumed Builder rejects a persisted path that is not owned by its task record');
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   }
 

@@ -71,11 +71,10 @@ const TERMINAL_FORCE_KILL_MS = 3_000;
 const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
 const FINAL_RESPONSE_QUIET_GRACE_MS = 2_500;
 const TERMINAL_RELEASE_GRACE_MS = TERMINAL_EXIT_GRACE_MS + TERMINAL_FORCE_KILL_MS + 500;
+const ANTIGRAVITY_AUTH_PROBE_MARKER = 'ATRIS_AUTH_OK';
 
-export function resolveAntigravityPassiveAuthCommand(help: string): string[] | null {
-  if (/\bauth\s+status\b/i.test(help)) return ['auth', 'status'];
-  if (/^\s*status\b[^\r\n]*\b(?:auth|login|account|credential)/im.test(help)) return ['status'];
-  return null;
+export function resolveAntigravityExecutionMode(accessMode?: SpawnAgentOptions['accessMode']): 'accept-edits' | 'plan' {
+  return accessMode === 'workspace-write' ? 'accept-edits' : 'plan';
 }
 
 function classifyAntigravityAuthStatus(output: string): AccountProfileStatus {
@@ -274,24 +273,40 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) return 'not_installed';
     const help = await this.passiveAuthCommands.getHelpText(install.path);
-    const statusCommand = resolveAntigravityPassiveAuthCommand(help);
-    if (!statusCommand) {
+    if (!/--print(?:\s|,)|(?:^|\s)-p(?:\s|,)/i.test(help) || !/--output-format/i.test(help)) {
       this.lastVerification = {
-        status: 'login_required',
+        status: 'error',
         checkedAt: Date.now(),
-        message: 'Passive verification requires interactive setup because this Antigravity CLI does not advertise a non-interactive authentication status command. Start sign-in to open the visible setup terminal.',
+        message: 'Antigravity print mode with structured output is unavailable. Update Antigravity CLI to 1.1.8 or newer.',
       };
-      return 'login_required';
+      return 'error';
     }
 
     try {
-      const result = await this.passiveAuthCommands.runCommand(install.path, statusCommand, { timeoutMs: 8_000, cwd: os.homedir() });
-      const status = classifyAntigravityAuthStatus(`${result.stdout}\n${result.stderr}`);
+      const result = await this.passiveAuthCommands.runCommand(install.path, [
+        '--print',
+        'Reply with exactly ATRIS_AUTH_OK. Do not use tools and do not modify files.',
+        '--output-format',
+        'json',
+        '--sandbox',
+      ], { timeoutMs: 75_000, cwd: os.homedir() });
+      const raw = `${result.stdout}\n${result.stderr}`;
       const commandFailed = result.exitCode !== 0;
-      const finalStatus = commandFailed && status === 'connected' ? 'error' : status;
+      const classified = classifyAntigravityAuthStatus(raw);
+      const text = raw.toLowerCase();
+      const finalStatus: AccountProfileStatus = commandFailed
+        ? /rate.?limit|quota|resource exhausted|too many requests/.test(text)
+          ? 'rate_limited'
+          : classified === 'login_required' ? 'login_required' : 'error'
+        : /rate.?limit|quota|resource exhausted|too many requests/.test(text)
+          ? 'rate_limited'
+          : classified === 'login_required'
+            ? 'login_required'
+            : result.stdout.includes(ANTIGRAVITY_AUTH_PROBE_MARKER) ? 'connected' : 'error';
       this.lastVerification = {
         status: finalStatus,
         checkedAt: Date.now(),
+        activeModel: finalStatus === 'connected' ? this.extractModelId(result.stdout) : undefined,
         message: finalStatus === 'error'
           ? 'Antigravity returned an unrecognized authentication status. Use the visible sign-in terminal to verify setup.'
           : undefined,
@@ -301,16 +316,42 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       const raw = `${error?.stdout || ''}\n${error?.stderr || ''}\n${error?.message || ''}`;
       const message = redactSecrets(raw).trim().slice(-1_500);
       const classified = classifyAntigravityAuthStatus(raw);
-      const status = classified === 'login_required' ? 'login_required' : 'error';
+      const text = raw.toLowerCase();
+      const status: AccountProfileStatus = /rate.?limit|quota|resource exhausted|too many requests/.test(text)
+        ? 'rate_limited'
+        : classified === 'login_required' ? 'login_required' : 'error';
       this.lastVerification = {
         status,
         checkedAt: Date.now(),
         message: status === 'login_required'
           ? 'Antigravity requires interactive setup. Start sign-in and finish setup in the visible terminal, then check the connection again.'
-          : message || 'Antigravity authentication status could not be determined non-interactively.',
+          : message || 'Antigravity authentication status could not be determined from the CLI probe.',
       };
       return status;
     }
+  }
+
+  private extractModelId(stdout: string): string | undefined {
+    const candidates: unknown[] = [];
+    for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
+      try { candidates.push(JSON.parse(line)); } catch { /* Text output is allowed. */ }
+    }
+    const visit = (value: unknown, depth = 0): string | undefined => {
+      if (!value || depth > 5) return undefined;
+      if (Array.isArray(value)) {
+        for (const item of value) { const found = visit(item, depth + 1); if (found) return found; }
+        return undefined;
+      }
+      if (typeof value !== 'object') return undefined;
+      const record = value as Record<string, unknown>;
+      for (const key of ['model_id', 'modelId', 'model', 'reasoning_model']) {
+        if (typeof record[key] === 'string' && record[key]) return record[key] as string;
+      }
+      for (const nested of Object.values(record)) { const found = visit(nested, depth + 1); if (found) return found; }
+      return undefined;
+    };
+    for (const candidate of candidates) { const found = visit(candidate); if (found) return found; }
+    return undefined;
   }
 
   async logout(): Promise<void> {
@@ -521,6 +562,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       '--output-format',
       'stream-json',
       '--sandbox',
+      '--mode',
+      resolveAntigravityExecutionMode(options.accessMode),
       '--print-timeout',
       printTimeout,
     ];

@@ -629,7 +629,7 @@ async function startDurableTurn(command: any, turn: any): Promise<void> {
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
       content: turn.content, delivery: turn.delivery, timestamp: now });
     const options = turn.options ? JSON.parse(turn.options) : {};
-    configureMissionRouting(command.mission_id, options);
+    await configureMissionRouting(command.mission_id, options);
     const result = await orchestrator.startMission(command.mission_id, turn.content, { ...options, turnId: turn.id, runId });
     sqlite.transaction(() => {
       const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, command.mission_id) as { status: string } | undefined;
@@ -758,7 +758,7 @@ async function cleanupMissionResources(missionId: string): Promise<void> {
   runtimeHost.clearMissionRoutingPreference(missionId, false);
 }
 
-function configureMissionRouting(missionId: string, body: Record<string, any>): void {
+export async function configureMissionRouting(missionId: string, body: Record<string, any>): Promise<void> {
   const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId ? body.modelCatalogId : undefined;
   const accountProfileId = typeof body.accountProfileId === 'string' && body.accountProfileId ? body.accountProfileId : undefined;
   const targetRole = typeof body.targetRole === 'string' ? body.targetRole.toLowerCase() : undefined;
@@ -777,7 +777,7 @@ function configureMissionRouting(missionId: string, body: Record<string, any>): 
   const fallbackCatalogIds = normalizeFallbackCatalogIds(body.fallbackCatalogIds, modelCatalogId);
 
   if (!modelCatalogId && !accountProfileId && !body.reasoningLevel && fallbackCatalogIds.length === 0) return;
-  runtimeHost.setMissionRoutingPreference(missionId, {
+  const preference = {
     modelCatalogId,
     accountProfileId,
     reasoningLevel: typeof body.reasoningLevel === 'string' ? body.reasoningLevel.toLowerCase() as any : undefined,
@@ -785,7 +785,21 @@ function configureMissionRouting(missionId: string, body: Record<string, any>): 
     selectionMode: selectionMode as any,
     scopeRole: routeScope as any,
     targetRole: targetRole as any,
-  });
+  };
+  const roles = routeScope === 'mission'
+    ? ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'] as const
+    : ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'].includes(String(routeScope))
+      ? [routeScope as 'orchestrator' | 'builder' | 'reviewer' | 'researcher' | 'qa']
+      : [];
+  await Promise.all(roles.map((role) => workspaceManager.upsertRoleExecutionPolicy('mission', missionId, {
+    role,
+    modelCatalogId: preference.modelCatalogId,
+    accountProfileId: preference.accountProfileId,
+    reasoningLevel: preference.reasoningLevel,
+    fallbackCatalogIds: preference.fallbackCatalogIds,
+    selectionMode: preference.selectionMode,
+  }, 'mission')));
+  runtimeHost.setMissionRoutingPreference(missionId, preference);
 }
 
 // 4. REST API Routes
@@ -974,7 +988,14 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         explicitCommand: turnOptions.command,
         explicitTargetRole: turnOptions.targetRole,
       });
-    if (queuedImplementationFollowUp) delivery = 'queue';
+    const queuedRoutingFollowUp = active && delivery === 'steer' && Boolean(
+      turnOptions.modelCatalogId
+      || turnOptions.accountProfileId
+      || turnOptions.reasoningLevel
+      || turnOptions.fallbackCatalogIds?.length
+      || turnOptions.routeScope,
+    );
+    if (queuedImplementationFollowUp || queuedRoutingFollowUp) delivery = 'queue';
     const requestHash = turnRequestHash(missionId, content, requestedDelivery, turnOptions);
     if (idempotencyKey) {
       const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?')
@@ -1077,7 +1098,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     }
     res.status(202).json({
       ...turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }),
-      ...(queuedImplementationFollowUp ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
+      ...(queuedImplementationFollowUp || queuedRoutingFollowUp ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
     });
   } catch (error: any) {
     if (String(error?.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -1107,7 +1128,7 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
-    configureMissionRouting(missionId, req.body || {});
+    await configureMissionRouting(missionId, req.body || {});
     res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, {
       modelCatalogId: req.body?.modelCatalogId,
       reasoningLevel: req.body?.reasoningLevel,
@@ -1170,7 +1191,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       teamTemplateId: teamTemplate || 'default-core-dev-team',
     });
 
-    configureMissionRouting(missionId, {
+    await configureMissionRouting(missionId, {
       modelCatalogId,
       accountProfileId,
       reasoningLevel,

@@ -60,7 +60,12 @@ const WINDOWS_TERMINAL_LAUNCHER_SCRIPT = [
   '$targetArgsJson = DecodeAtris $env:ATRIS_TERMINAL_ARGS_B64',
   '$targetArgs = @(ConvertFrom-Json -InputObject $targetArgsJson)',
   '$targetCwd = DecodeAtris $env:ATRIS_TERMINAL_CWD_B64',
-  'Start-Process -FilePath $targetCommand -ArgumentList $targetArgs -WorkingDirectory $targetCwd',
+  'if ($env:ATRIS_TERMINAL_TITLE_B64) { try { $Host.UI.RawUI.WindowTitle = DecodeAtris $env:ATRIS_TERMINAL_TITLE_B64 } catch { } }',
+  'if ($targetCwd) { Set-Location -LiteralPath $targetCwd }',
+  'Write-Host ("Starting " + $targetCommand)',
+  '& $targetCommand @targetArgs',
+  '$targetExitCode = $LASTEXITCODE',
+  'if ($null -ne $targetExitCode -and $targetExitCode -ne 0) { Write-Host ("Process exited with code " + $targetExitCode) }',
 ].join('; ');
 
 function encodeUtf8Base64(value: string): string {
@@ -86,6 +91,13 @@ export interface PreparedRuntimeCommand {
   windowsVerbatimArguments?: boolean;
   env?: NodeJS.ProcessEnv;
   usesPowerShellBridge?: boolean;
+}
+
+export interface InteractiveTerminalLaunch {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
 }
 
 export function prepareBackgroundSpawnOptions(
@@ -544,6 +556,18 @@ export async function terminateProcessTree(child: ChildProcess, force = false): 
   }
 }
 
+async function findWindowsTerminalExecutable(): Promise<string | undefined> {
+  try {
+    const result = await runCommand('where.exe', ['wt'], { timeoutMs: 5_000 });
+    return result.stdout
+      .split(/\r?\n/)
+      .map(normalizeExecutablePath)
+      .find((candidate) => path.basename(candidate).toLowerCase() === 'wt.exe');
+  } catch {
+    return undefined;
+  }
+}
+
 export async function launchInteractiveTerminal(
   command: string,
   args: string[] = [],
@@ -557,28 +581,52 @@ export async function launchInteractiveTerminal(
     const normalizedCommand = normalizeExecutablePath(command);
     const resolvedCommand = resolveWindowsExecutableSync(normalizedCommand, environment);
     assertRuntimeLaunchPreconditions(resolvedCommand, cwd);
-    const prepared = prepareWindowsPowerShellBridge(resolvedCommand, args, environment);
-    const bridgeContext = applyWindowsBridgeContext(prepared, environment, cwd, title);
-    const terminalArgs = ['-NoExit', ...prepared.args];
-    const launcherEnvironment = {
-      ...bridgeContext.env,
-      ATRIS_TERMINAL_COMMAND_B64: encodeUtf8Base64(prepared.command),
-      ATRIS_TERMINAL_ARGS_B64: encodeUtf8Base64(JSON.stringify(terminalArgs)),
-      ATRIS_TERMINAL_CWD_B64: encodeUtf8Base64(bridgeContext.cwd || WINDOWS_SAFE_BRIDGE_CWD()),
-    };
-    const launcher = spawn('powershell.exe', [
-      '-NoLogo',
-      '-NoProfile',
-      '-NonInteractive',
-      '-WindowStyle',
-      'Hidden',
-      '-EncodedCommand',
-      WINDOWS_TERMINAL_LAUNCHER_ENCODED,
-    ], {
-      cwd: WINDOWS_SAFE_BRIDGE_CWD(),
-      env: launcherEnvironment,
+
+    // Windows app-execution aliases (including wt.exe) can be returned by
+    // where.exe while Node's fs APIs report the zero-byte alias as missing.
+    const windowsTerminal = await findWindowsTerminalExecutable();
+    if (windowsTerminal) {
+      try {
+        const launcher = spawn(windowsTerminal, [
+          '-w',
+          '0',
+          'new-tab',
+          '--startingDirectory',
+          cwd,
+          '--title',
+          title,
+          '--suppressApplicationTitle',
+          resolvedCommand,
+          ...args,
+        ], {
+          cwd,
+          env: environment,
+          detached: true,
+          windowsHide: false,
+          shell: false,
+          stdio: 'ignore',
+        });
+        await new Promise<void>((resolve, reject) => {
+          const onSpawn = () => { launcher.off('error', onError); resolve(); };
+          const onError = (error: Error) => { launcher.off('spawn', onSpawn); reject(error); };
+          launcher.once('spawn', onSpawn);
+          launcher.once('error', onError);
+        });
+        launcher.on('error', () => undefined);
+        launcher.unref();
+        return;
+      } catch {
+        // Fall through to the visible PowerShell host when Windows Terminal
+        // is installed but cannot accept a new window in this user session.
+      }
+    }
+
+    const prepared = prepareInteractiveTerminalLaunch(command, args, { cwd, title });
+    const launcher = spawn(prepared.command, prepared.args, {
+      cwd: prepared.cwd,
+      env: prepared.env,
       detached: true,
-      windowsHide: true,
+      windowsHide: false,
       shell: false,
       stdio: 'ignore',
     });
@@ -608,6 +656,54 @@ export async function launchInteractiveTerminal(
     return;
   }
   throw new Error('No supported terminal emulator was found for the interactive authentication flow.');
+}
+
+/**
+ * Build a visible PowerShell host for commands that need a real Windows
+ * console. Runtime argv stays in Base64/JSON environment values, while the
+ * target command runs directly in the interactive host instead of receiving
+ * PowerShell-only flags such as `-NoExit`.
+ */
+export function prepareInteractiveTerminalLaunch(
+  rawCommand: string,
+  args: string[] = [],
+  options: { cwd?: string; title?: string } = {},
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+): InteractiveTerminalLaunch {
+  const cwd = options.cwd || process.cwd();
+  const title = options.title || 'AtrisAgent Runtime';
+  const normalizedCommand = normalizeExecutablePath(rawCommand);
+  const resolvedCommand = platform === 'win32'
+    ? resolveWindowsExecutableSync(normalizedCommand, environment)
+    : normalizedCommand;
+  assertRuntimeLaunchPreconditions(resolvedCommand, cwd);
+  if (platform !== 'win32') {
+    return { command: resolvedCommand, args, cwd, env: { ...environment } };
+  }
+
+  return {
+    command: 'powershell.exe',
+    args: [
+      '-NoLogo',
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-WindowStyle',
+      'Normal',
+      '-NoExit',
+      '-EncodedCommand',
+      WINDOWS_TERMINAL_LAUNCHER_ENCODED,
+    ],
+    cwd: WINDOWS_SAFE_BRIDGE_CWD(),
+    env: {
+      ...environment,
+      ATRIS_TERMINAL_COMMAND_B64: encodeUtf8Base64(resolvedCommand),
+      ATRIS_TERMINAL_ARGS_B64: encodeUtf8Base64(JSON.stringify(args)),
+      ATRIS_TERMINAL_CWD_B64: encodeUtf8Base64(cwd),
+      ATRIS_TERMINAL_TITLE_B64: encodeUtf8Base64(title),
+    },
+  };
 }
 
 export function spawnHidden(command: string, args: string[], options: SpawnOptions = {}): ChildProcess {

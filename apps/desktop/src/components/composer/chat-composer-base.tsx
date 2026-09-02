@@ -29,7 +29,7 @@ import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { cn } from '@/lib/utils';
-import { AGENT_ROLES, parseAgentDirective } from '@/lib/agent-directive';
+import { AGENT_ROLES, buildComposerRouteOptions, parseAgentDirective } from '@/lib/agent-directive';
 
 const ROLES = AGENT_ROLES;
 const COMMANDS = [
@@ -114,6 +114,12 @@ export function ChatComposer() {
     || !directiveModel
     || directiveModel.supportedReasoning.length === 0
     || directiveModel.supportedReasoning.includes(directive.reasoningLevel as never);
+  const routeResolution = useMemo(() => buildComposerRouteOptions(directive, {
+    selectedModel: selectedModelObject?.available ? selectedModel : undefined,
+    selectedReasoning: reasoningLevel,
+    directiveModelDefaultReasoning: directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0],
+    directiveReasoningSupported,
+  }), [directive, directiveModel, directiveReasoningSupported, reasoningLevel, selectedModel, selectedModelObject]);
 
   useEffect(() => {
     if (!selectedModel) return;
@@ -165,33 +171,17 @@ export function ChatComposer() {
 
   const submit = async () => {
     const prompt = message.trim();
-    if (!prompt || loading || activeConversationBusy || !directiveModelRoleCompatible || !activeWorkspaceId) return;
+    if (!prompt || loading || activeConversationBusy || !directiveModelRoleCompatible || routeResolution.error || !activeWorkspaceId) return;
     if (!serviceOnline) {
       setActiveView('accounts');
       return;
     }
 
-    const targetRole = directive.targetRole || 'Orchestrator';
-    const scopedSelectedModel = selectedModel || undefined;
-    const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
-    const routeScope: 'role' | undefined = resolvedModel ? 'role' : undefined;
-    const resolvedReasoning = directive.reasoningLevel && directiveReasoningSupported
-      ? directive.reasoningLevel
-      : directive.modelCatalogId
-        ? directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0]
-        : scopedSelectedModel
-          ? reasoningLevel
-          : undefined;
     const options = {
-      model: resolvedModel,
-      reasoningLevel: resolvedReasoning,
       teamTemplate,
       trustMode,
-      targetRole: directive.targetRole,
-      routeRole: targetRole,
-      routeScope,
-      command: directive.command,
       automationSettings,
+      ...routeResolution.options,
     };
 
     setMessage('');
@@ -288,15 +278,16 @@ export function ChatComposer() {
   return (
     <div className="border-t border-border bg-background">
       <div className="mx-auto max-w-4xl px-4 py-3">
-        {directive.dynamicAgent && (
+        {(directive.dynamicAgent || directive.teamWideModel) && (
           <div className={cn(
             'mb-2 flex items-center gap-2 rounded-lg border px-3 py-1.5 text-[10px]',
-            directiveReasoningSupported && directiveModelRoleCompatible ? 'border-primary/25 bg-primary/[0.04]' : 'border-amber-500/40 bg-amber-500/[0.04]',
+            directiveReasoningSupported && directiveModelRoleCompatible && !routeResolution.error ? 'border-primary/25 bg-primary/[0.04]' : 'border-amber-500/40 bg-amber-500/[0.04]',
           )}>
             <Sparkles className="h-3 w-3 shrink-0 text-primary" />
-            <span className="font-medium">Delegate to {directive.targetRole || 'specialist'}</span>
-            <span className="truncate text-muted-foreground">{directive.modelName || 'role policy'}{directive.reasoningLevel ? ` · ${titleCase(directive.reasoningLevel)}` : ''}</span>
+            <span className="font-medium">{directive.teamWideModel ? `All mission agents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Delegate to ${directive.targetRole || 'specialist'}`}</span>
+            {!directive.teamWideModel && <span className="truncate text-muted-foreground">{directive.modelName || 'role policy'}{directive.reasoningLevel ? ` · ${titleCase(directive.reasoningLevel)}` : ''}</span>}
             {!directiveModelRoleCompatible && <span className="ml-auto text-amber-400">Incompatible model</span>}
+            {routeResolution.error && <span className="ml-auto text-amber-400">{routeResolution.error}</span>}
           </div>
         )}
 
@@ -383,7 +374,7 @@ export function ChatComposer() {
                   <div className="flex items-center justify-between border-b border-border bg-muted/20 px-3 py-2.5">
                     <div>
                       <div className="flex items-center gap-1.5 text-xs font-semibold"><Settings2 className="h-3.5 w-3.5 text-primary" />Run settings</div>
-                      <p className="mt-0.5 text-[9px] text-muted-foreground">This picker overrides Orchestrator only. Child roles keep their role policies.</p>
+                      <p className="mt-0.5 text-[9px] text-muted-foreground">{directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : 'This picker overrides Orchestrator only. Child roles keep their role policies.'}</p>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" onClick={(event) => { event.preventDefault(); void refreshModels(); }}>
@@ -455,7 +446,7 @@ export function ChatComposer() {
                         </div>
                       </div>
                     )}
-                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child role directives preserved` : 'Auto routing uses role policies.'}</div>
+                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child role directives preserved` : 'Auto routing uses role policies.'}</div>
                   </div>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -463,7 +454,7 @@ export function ChatComposer() {
               <Button
                 size="icon"
                 className="h-8 w-8 rounded-lg"
-                disabled={!message.trim() || loading || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible}
+                disabled={!message.trim() || loading || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible || Boolean(routeResolution.error)}
                 onClick={() => void submit()}
                 aria-label={activeConversationCanContinue ? 'Continue conversation' : 'Send mission'}
               >

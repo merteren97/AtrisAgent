@@ -119,6 +119,21 @@ async function runTests() {
       const listRes = await authorizedFetch(`${baseUrl}/api/missions?workspaceId=${createdWorkspaceId}`);
       const listBody = await listRes.json();
       assert(listRes.status === 200 && Array.isArray(listBody) && listBody.some((m: any) => m.id === createdMissionId), 'GET /api/missions returns missions for workspace');
+
+      await gateway.configureMissionRouting(createdMissionId, {
+        modelCatalogId: 'catalog-shared-model',
+        reasoningLevel: 'high',
+        routeScope: 'mission',
+      });
+      const durableRoles = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'] as const;
+      const durablePolicies = await Promise.all(durableRoles.map((role) => gateway.workspaceManager.resolveRoleExecutionPolicy(createdMissionId, role)));
+      assert(durablePolicies.every((policy) => policy?.modelCatalogId === 'catalog-shared-model'
+        && policy.selectionMode === 'fixed' && policy.source === 'mission'),
+      'mission-wide exact model routing is durably persisted for every agent role');
+      gateway.runtimeHost.clearMissionRoutingPreference(createdMissionId, false);
+      const restartPolicy = await gateway.workspaceManager.resolveRoleExecutionPolicy(createdMissionId, 'builder');
+      assert(restartPolicy?.modelCatalogId === 'catalog-shared-model' && restartPolicy.selectionMode === 'fixed',
+        'persisted mission-wide Builder routing survives loss of the runtime in-memory preference');
     }
 
     // Start and continuation turns must have one durable, turn-correlated user message.
@@ -206,6 +221,19 @@ async function runTests() {
       assert(followUp.status === 202 && followUpBody.delivery === 'queue' && followUpBody.status === 'queued'
         && followUpBody.requiresNewTurn === true && followUpBody.disposition === 'queued_new_turn',
       'implementation intent during active research is durably queued for a new same-conversation turn instead of consumed by steer');
+
+      const routingFollowUp = await authorizedFetch(`${baseUrl}/api/missions/${missionId}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: 'Keep every agent on this exact model.',
+          delivery: 'steer',
+          options: { modelCatalogId: 'catalog-shared-model', routeScope: 'mission', reasoningLevel: 'high' },
+        }),
+      });
+      const routingFollowUpBody = await routingFollowUp.json();
+      assert(routingFollowUp.status === 202 && routingFollowUpBody.delivery === 'queue'
+        && routingFollowUpBody.requiresNewTurn === true && routingFollowUpBody.disposition === 'queued_new_turn',
+      'mission routing changes requested as steer are queued as a durable new turn instead of being silently ignored');
 
       const planningCreateRes = await authorizedFetch(`${baseUrl}/api/missions`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },

@@ -358,12 +358,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     const model = options.model || '';
     const controlPlane = prepareControlPlaneSession(options, sessionId);
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, cwd);
-    const readOnly = isReadOnlyAgentRole(options.role);
-    const args = ['exec', '--json', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '--skip-git-repo-check'];
-    args.push(...codexControlPlaneArgs(controlPlane));
-    if (model) args.push('--model', model);
-    if (options.reasoningLevel) args.push('-c', `model_reasoning_effort="${options.reasoningLevel}"`);
-    args.push(prompt);
+    const args = buildCodexExecArgs(options, prompt, codexControlPlaneArgs(controlPlane));
 
     const session: AgentSession = {
       id: sessionId,
@@ -531,6 +526,28 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     this.terminalSessions.add(sessionId);
     this.emitEvent({ id: crypto.randomUUID(), type: 'task_failed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, error: redactSecrets(error), exitCode, timestamp: new Date().toISOString() });
   }
+}
+
+export function buildCodexExecArgs(
+  options: Pick<SpawnAgentOptions, 'accessMode' | 'model' | 'reasoningLevel' | 'role'>,
+  prompt: string,
+  controlPlaneArgs: string[] = [],
+): string[] {
+  const accessMode = options.accessMode || (isReadOnlyAgentRole(options.role) ? 'read-only' : 'workspace-write');
+  const args = [
+    'exec',
+    '--json',
+    '--sandbox',
+    accessMode,
+    '-c',
+    'approval_policy="never"',
+    '--skip-git-repo-check',
+    ...controlPlaneArgs,
+  ];
+  if (options.model) args.push('--model', options.model);
+  if (options.reasoningLevel) args.push('-c', `model_reasoning_effort="${options.reasoningLevel}"`);
+  args.push(prompt);
+  return args;
 }
 
 function identifierValue(...values: unknown[]): string | undefined {

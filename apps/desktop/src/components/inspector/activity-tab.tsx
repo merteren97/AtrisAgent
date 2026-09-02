@@ -122,8 +122,8 @@ export function ActivityTab() {
       case 'task_completed':
       case 'agent_completed': return 'bg-success/10 text-success hover:bg-success/20';
       case 'task_failed':
-      case 'agent_error':
       case 'mission_failed': return 'bg-destructive/10 text-destructive hover:bg-destructive/20';
+      case 'agent_error': return 'bg-warning/10 text-warning hover:bg-warning/20';
       case 'mission_started':
       case 'mission_completed': return 'bg-primary/10 text-primary hover:bg-primary/20';
       case 'file_changed': return 'bg-warning/10 text-warning hover:bg-warning/20';

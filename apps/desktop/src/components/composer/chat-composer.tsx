@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { Clock3, Send, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
-import { parseAgentDirective } from '@/lib/agent-directive';
+import { buildComposerRouteOptions, parseAgentDirective } from '@/lib/agent-directive';
 import { useAccountStore } from '@/stores/account-store';
 import { useMissionStore, type StartMissionOptions, type TurnDelivery } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
@@ -33,6 +33,16 @@ function QueuedTurnComposer() {
     () => discoveredModels.find((model) => model.catalogId === directive.modelCatalogId),
     [discoveredModels, directive.modelCatalogId],
   );
+  const directiveReasoningSupported = !directive.reasoningLevel
+    || !directiveModel
+    || directiveModel.supportedReasoning.length === 0
+    || directiveModel.supportedReasoning.includes(directive.reasoningLevel as never);
+  const routeResolution = useMemo(() => buildComposerRouteOptions(directive, {
+    selectedModel: selectedModelObject?.available ? selectedModel : undefined,
+    selectedReasoning: reasoningLevel,
+    directiveModelDefaultReasoning: directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0],
+    directiveReasoningSupported,
+  }), [directive, directiveModel, directiveReasoningSupported, reasoningLevel, selectedModel, selectedModelObject]);
   const queuedCount = useMemo(
     () => activeMissionId ? queuedTurns.filter((turn) => turn.missionId === activeMissionId).length : 0,
     [activeMissionId, queuedTurns],
@@ -46,30 +56,17 @@ function QueuedTurnComposer() {
 
   const submit = () => {
     const prompt = message.trim();
-    if (!prompt || !activeMissionId || !activeWorkspaceId) return;
+    if (!prompt || !activeMissionId || !activeWorkspaceId || routeResolution.error) return;
     if (!serviceOnline) {
       setActiveView('accounts');
       return;
     }
 
-    const targetRole = directive.targetRole || 'Orchestrator';
-    const scopedSelectedModel = selectedModel || undefined;
-    const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
-    const routeScope: StartMissionOptions['routeScope'] = resolvedModel ? 'role' : undefined;
-    const resolvedReasoning = directive.reasoningLevel
-      || (directive.modelCatalogId
-        ? directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0]
-        : scopedSelectedModel ? reasoningLevel : undefined);
     const options: StartMissionOptions = {
-      model: resolvedModel,
-      reasoningLevel: resolvedReasoning,
       teamTemplate,
       trustMode,
-      targetRole: directive.targetRole,
-      routeRole: targetRole,
-      routeScope,
-      command: directive.command,
       automationSettings,
+      ...routeResolution.options,
     };
 
     void sendMissionCommand(activeMissionId, prompt, delivery, options);
@@ -110,8 +107,9 @@ function QueuedTurnComposer() {
           <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
             <div className="flex min-w-0 items-center gap-1.5 text-[9px] text-muted-foreground">
               {selectedModelObject ? <RuntimeBrandIcon runtimeId={selectedModelObject.runtimeType} className="h-3 w-3 shrink-0" /> : <Sparkles className="h-3 w-3 shrink-0 text-primary" />}
-              <span className="truncate">Next Orchestrator model: {selectedModelObject?.name || 'Auto routing'}</span>
+              <span className="truncate">{directive.teamWideModel ? `All mission agents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Next Orchestrator model: ${selectedModelObject?.name || 'Auto routing'}`}</span>
               {reasoningLevel && reasoningLevel !== 'none' && selectedModelObject?.supportedReasoning.length ? <span className="shrink-0">· {reasoningLevel}</span> : null}
+              {routeResolution.error ? <span className="shrink-0 text-amber-400">· {routeResolution.error}</span> : null}
             </div>
             <div className="flex items-center gap-1">
               <div className="flex rounded-md border border-border/70 bg-background/70 p-0.5" aria-label="Message delivery">
@@ -123,7 +121,7 @@ function QueuedTurnComposer() {
               <Button
               size="icon"
               className="h-8 w-8 rounded-lg"
-              disabled={!message.trim() || !serviceOnline || !activeWorkspaceId}
+              disabled={!message.trim() || !serviceOnline || !activeWorkspaceId || Boolean(routeResolution.error)}
               onClick={submit}
               aria-label={`Send with ${delivery} delivery`}
             >

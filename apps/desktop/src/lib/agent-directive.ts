@@ -7,6 +7,7 @@ export type ChatCommand = 'plan' | 'agent' | 'review' | 'summarize';
 export interface AgentDirective {
   command?: ChatCommand;
   targetRole?: AgentRoleLabel;
+  teamWideModel: boolean;
   modelCatalogId?: string;
   modelName?: string;
   reasoningLevel?: string;
@@ -60,6 +61,20 @@ function findCommand(input: string): ChatCommand | undefined {
   if (/\b(?:review|incele|denetle|kod\s+incelemesi)\b/i.test(input) && /\b(?:ajan|agent|sub[\s-]?agent)\b/i.test(input)) return 'review';
   if (/\b(?:summarize|ozetle|özetle)\b/i.test(input) && /\b(?:ajan|agent|mission|gorev|görev)\b/i.test(input)) return 'summarize';
   return undefined;
+}
+
+function hasTeamWideModelIntent(input: string): boolean {
+  const value = ` ${normalize(input)} `;
+  const mentionsTeam = /\b(?:all|every)\s+(?:the\s+)?(?:subagents?|sub\s+agents?|child\s+agents?|mission\s+agents?|agents?)\b/.test(value)
+    || /\b(?:subagents?|sub\s+agents?|child\s+agents?)\b/.test(value)
+    || /\b(?:tum|butun|her)\s+(?:alt\s+ajanlar?|ajanlar?)\b/.test(value)
+    || /\balt\s+ajanlar\b/.test(value);
+  const sameModel = /\b(?:the\s+)?same\s+(?:selected\s+)?model\b/.test(value)
+    || /\bayni\s+(?:secili\s+)?model(?:i|le)?\b/.test(value);
+  const directive = /\b(?:use|uses|using|share|run|runs|keep|stick|have|be|should|must|kullansin|kullansinlar|kullan|calissin|calissinlar|olsun|olarak\s+olsun)\b/.test(value);
+  const negated = /\b(?:not|different|separate|farkli|ayri)\b.{0,30}\b(?:same|ayni)\s+(?:selected\s+|secili\s+)?model/.test(value)
+    || /\b(?:same|ayni)\s+(?:selected\s+|secili\s+)?model\b.{0,20}\b(?:not|degil)\b/.test(value);
+  return mentionsTeam && sameModel && directive && !negated;
 }
 
 function findReasoning(input: string): string | undefined {
@@ -133,7 +148,10 @@ export function parseAgentDirective(
   const command = findCommand(input);
   const explicitRole = findRole(input);
   const matchedModel = findModel(input, models);
-  const dynamicAgent = command === 'agent' || DYNAMIC_AGENT_TRIGGER.test(input) || Boolean(explicitRole && matchedModel.modelCatalogId);
+  const teamWideModel = hasTeamWideModelIntent(input);
+  const dynamicAgent = command === 'agent'
+    || (!teamWideModel && DYNAMIC_AGENT_TRIGGER.test(input))
+    || Boolean(explicitRole && matchedModel.modelCatalogId);
 
   let targetRole = explicitRole;
   if (!targetRole && command === 'review') targetRole = 'Reviewer';
@@ -147,8 +165,57 @@ export function parseAgentDirective(
   return {
     command: command || (dynamicAgent ? 'agent' : undefined),
     targetRole,
+    teamWideModel,
     reasoningLevel: findReasoning(input),
     dynamicAgent,
     ...matchedModel,
+  };
+}
+
+export interface ComposerRouteOptions {
+  model?: string;
+  reasoningLevel?: string;
+  targetRole?: AgentRoleLabel;
+  routeRole?: AgentRoleLabel;
+  routeScope?: 'mission' | 'role';
+  command?: ChatCommand;
+}
+
+interface ComposerRouteContext {
+  selectedModel?: string;
+  selectedReasoning?: string;
+  directiveModelDefaultReasoning?: string;
+  directiveReasoningSupported?: boolean;
+}
+
+export function buildComposerRouteOptions(
+  directive: AgentDirective,
+  context: ComposerRouteContext,
+): { options: ComposerRouteOptions; error?: string } {
+  const model = directive.modelCatalogId || context.selectedModel;
+  const reasoningLevel = directive.reasoningLevel && context.directiveReasoningSupported !== false
+    ? directive.reasoningLevel
+    : directive.modelCatalogId
+      ? context.directiveModelDefaultReasoning
+      : context.selectedModel
+        ? context.selectedReasoning
+        : undefined;
+
+  if (directive.teamWideModel && !model) {
+    return {
+      options: { command: directive.command, targetRole: directive.targetRole },
+      error: 'Select an available model before applying it to all mission agents.',
+    };
+  }
+
+  return {
+    options: {
+      model,
+      reasoningLevel,
+      targetRole: directive.targetRole,
+      routeRole: directive.teamWideModel ? undefined : directive.targetRole || 'Orchestrator',
+      routeScope: model ? (directive.teamWideModel ? 'mission' : 'role') : undefined,
+      command: directive.command,
+    },
   };
 }
