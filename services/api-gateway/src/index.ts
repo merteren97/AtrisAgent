@@ -520,9 +520,73 @@ const ACTIVE_MISSION_STATUSES = new Set([
   'revising',
 ]);
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
-const DRAINABLE_MISSION_STATUSES = new Set(['draft', 'ready', ...TERMINAL_MISSION_STATUSES]);
+// A newly accepted mission is kept in `planning` until its durable command is
+// claimed and the orchestrator has materialized the first turn. Keeping this
+// status drainable lets the existing command lifecycle do the actual work
+// without making the HTTP request wait for provider startup.
+const DRAINABLE_MISSION_STATUSES = new Set(['draft', 'ready', 'planning', ...TERMINAL_MISSION_STATUSES]);
 const missionDrains = new Map<string, Promise<void>>();
 const missionTurnOperations = new Map<string, Set<Promise<void>>>();
+const missionStartIdempotencyOperations = new Map<string, Promise<Record<string, unknown>>>();
+
+type MissionStartStage = 'durability' | 'routing' | 'orchestration';
+
+function formatMissionStartError(stage: MissionStartStage, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `Mission start failed during ${stage}: ${message}`;
+}
+
+function missionStartIdempotencyKey(value: unknown): string | undefined {
+  const raw = String(value || '').trim();
+  return raw ? `mission-start:${raw}` : undefined;
+}
+
+function normalizeMissionStartOptions(body: Record<string, any>, automationPolicy?: unknown): Record<string, any> {
+  const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId.trim()
+    ? body.modelCatalogId.trim()
+    : typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
+  return {
+    modelCatalogId,
+    accountProfileId: typeof body.accountProfileId === 'string' && body.accountProfileId.trim() ? body.accountProfileId.trim() : undefined,
+    reasoningLevel: typeof body.reasoningLevel === 'string' && body.reasoningLevel.trim() ? body.reasoningLevel.trim().toLowerCase() : undefined,
+    fallbackCatalogIds: normalizeFallbackCatalogIds(body.fallbackCatalogIds, modelCatalogId),
+    routeSelectionMode: body.routeSelectionMode,
+    routeRole: body.routeRole,
+    routeScope: body.routeScope,
+    targetRole: body.targetRole,
+    command: body.command,
+    teamTemplate: body.teamTemplate,
+    executionMode: body.executionMode,
+    automationPolicy,
+    clientMessageId: body.clientMessageId,
+  };
+}
+
+function missionStartRequestHash(missionId: string, content: string, options: Record<string, any>): string {
+  const { clientMessageId: _clientMessageId, idempotencyKey: _idempotencyKey, ...requestOptions } = options;
+  return turnRequestHash(missionId, content, 'start', requestOptions);
+}
+
+function missionStartRequestMatches(existing: any, content: string, options: Record<string, any>): boolean {
+  if (!existing) return false;
+  if (existing.content !== content) return false;
+  if (!existing.request_hash) return true;
+  return existing.request_hash === missionStartRequestHash(existing.mission_id, content, options);
+}
+
+function queuedMissionStartDto(mission: any, turn: any, command: any, duplicate = false): Record<string, unknown> {
+  return {
+    accepted: true,
+    duplicate,
+    missionId: mission.id,
+    turnId: turn.id,
+    commandId: command.id,
+    planId: mission.planId || null,
+    tasks: [],
+    status: mission.status,
+    turn: turnDto(turn, command),
+  };
+}
 
 function trackMissionTurn<T>(missionId: string, operation: () => Promise<T>): Promise<T> {
   const operationPromise = Promise.resolve().then(operation);
@@ -613,6 +677,7 @@ function activeRunIsResearchOnly(missionId: string): boolean {
 async function startDurableTurn(command: any, turn: any): Promise<void> {
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
+  let stage: MissionStartStage = 'durability';
   try {
     sqlite.transaction(() => {
       const commandState = sqlite.prepare('SELECT status FROM mission_commands WHERE id = ?').get(command.id) as { status: string } | undefined;
@@ -622,14 +687,17 @@ async function startDurableTurn(command: any, turn: any): Promise<void> {
       if (transitioned.changes !== 1) throw new Error('The queued turn was cancelled before execution started.');
       sqlite.prepare("INSERT INTO mission_runs (id, mission_id, turn_id, command_id, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'starting', ?, ?)")
         .run(runId, command.mission_id, turn.id, command.id, now, now);
-      sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, command.mission_id);
+      sqlite.prepare("UPDATE missions SET active_run_id = ?, status = CASE WHEN status = 'cancelled' THEN status ELSE 'planning' END, completed_at = CASE WHEN status = 'cancelled' THEN completed_at ELSE NULL END, updated_at = ? WHERE id = ?")
+        .run(runId, now, command.mission_id);
     })();
+    const options = turn.options ? JSON.parse(turn.options) : {};
+    stage = 'routing';
     emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId: command.mission_id, turnId: turn.id,
-      content: turn.content, timestamp: now });
+      content: turn.content, clientMessageId: options.clientMessageId, timestamp: now });
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
       content: turn.content, delivery: turn.delivery, timestamp: now });
-    const options = turn.options ? JSON.parse(turn.options) : {};
     await configureMissionRouting(command.mission_id, options);
+    stage = 'orchestration';
     const result = await orchestrator.startMission(command.mission_id, turn.content, { ...options, turnId: turn.id, runId });
     sqlite.transaction(() => {
       const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, command.mission_id) as { status: string } | undefined;
@@ -642,11 +710,13 @@ async function startDurableTurn(command: any, turn: any): Promise<void> {
     })();
   } catch (error: any) {
     const failedAt = new Date().toISOString();
+    const failure = formatMissionStartError(stage, error);
     sqlite.transaction(() => {
-      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ? AND status = 'processing'").run(failedAt, error?.message || String(error), command.id);
+      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ? AND status = 'processing'").run(failedAt, failure, command.id);
       sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turn.id);
-      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')").run(failedAt, error?.message || String(error), runId);
-      sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(command.mission_id, runId);
+      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')").run(failedAt, failure, runId);
+      sqlite.prepare("UPDATE missions SET active_run_id = NULL, status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'failed' END, completed_at = CASE WHEN status IN ('completed', 'cancelled') THEN completed_at ELSE ? END, updated_at = ? WHERE id = ? AND active_run_id = ?")
+        .run(failedAt, failedAt, command.mission_id, runId);
     })();
     throw error;
   }
@@ -691,6 +761,7 @@ async function startMissionWithDurability(missionId: string, content: string, op
   const now = new Date().toISOString();
   const turnId = crypto.randomUUID();
   const runId = crypto.randomUUID();
+  let stage: MissionStartStage = 'durability';
   try {
     sqlite.transaction(() => {
       const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
@@ -704,12 +775,14 @@ async function startMissionWithDurability(missionId: string, content: string, op
         VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
       sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
         VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
-      sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, missionId);
+      sqlite.prepare("UPDATE missions SET active_run_id = ?, status = CASE WHEN status = 'cancelled' THEN status ELSE 'planning' END, completed_at = CASE WHEN status = 'cancelled' THEN completed_at ELSE NULL END, updated_at = ? WHERE id = ?")
+        .run(runId, now, missionId);
     })();
     emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
       clientMessageId: options.clientMessageId, content, timestamp: now });
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
       content, delivery: 'queue', timestamp: now });
+    stage = 'orchestration';
     const result = await orchestrator.startMission(missionId, content, { ...options, turnId, runId });
     sqlite.transaction(() => {
       const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, missionId) as { status: string } | undefined;
@@ -722,11 +795,132 @@ async function startMissionWithDurability(missionId: string, content: string, op
     return result;
   } catch (error: any) {
     const failedAt = new Date().toISOString();
-    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turnId);
-    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')")
-      .run(failedAt, error?.message || String(error), runId);
-    sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(missionId, runId);
+    const failure = formatMissionStartError(stage, error);
+    sqlite.transaction(() => {
+      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turnId);
+      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')")
+        .run(failedAt, failure, runId);
+      sqlite.prepare("UPDATE missions SET active_run_id = NULL, status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'failed' END, completed_at = CASE WHEN status IN ('completed', 'cancelled') THEN completed_at ELSE ? END, updated_at = ? WHERE id = ? AND active_run_id = ?")
+        .run(failedAt, failedAt, missionId, runId);
+    })();
     throw error;
+  }
+}
+
+async function createQueuedMissionStart(params: {
+  workspaceId: string;
+  promptText: string;
+  automationPolicy: import('@atris-agent-code/domain').MissionAutomationPolicy;
+  teamTemplate: string;
+  options: Record<string, any>;
+  idempotencyKey?: string;
+}): Promise<Record<string, unknown>> {
+  const perform = async (): Promise<Record<string, unknown>> => {
+    const existing = params.idempotencyKey
+      ? sqlite.prepare('SELECT * FROM conversation_turns WHERE idempotency_key = ?').get(params.idempotencyKey) as any
+      : null;
+    if (existing) {
+      if (!missionStartRequestMatches(existing, params.promptText, params.options)) {
+        const error = new Error('Idempotency key was already used for a different mission start request.');
+        Object.assign(error, { code: 'IDEMPOTENCY_KEY_REUSED' });
+        throw error;
+      }
+      const existingMission = await workspaceManager.getMission(existing.mission_id);
+      if (!existingMission) {
+        const error = new Error('The idempotent mission start points to a missing mission.');
+        Object.assign(error, { code: 'IDEMPOTENCY_RECORD_INVALID' });
+        throw error;
+      }
+      setImmediate(() => void drainMissionCommands(existing.mission_id));
+      return queuedMissionStartDto(existingMission, existing, { id: existing.command_id || null }, true);
+    }
+
+    const missionId = crypto.randomUUID();
+    const turnId = crypto.randomUUID();
+    const commandId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const requestHash = missionStartRequestHash(missionId, params.promptText, params.options);
+    await workspaceManager.createMission({
+      id: missionId,
+      workspaceId: params.workspaceId,
+      title: params.promptText,
+      description: params.promptText,
+      status: 'planning',
+      executionMode: params.options.executionMode || 'balanced',
+      automationPolicy: params.automationPolicy,
+      teamTemplateId: params.teamTemplate || 'default-core-dev-team',
+    });
+    try {
+      sqlite.transaction(() => {
+        if (params.idempotencyKey) {
+          const raced = sqlite.prepare('SELECT mission_id FROM conversation_turns WHERE idempotency_key = ?').get(params.idempotencyKey);
+          if (raced) {
+            const error = new Error('Idempotency key was already used for a different mission start request.');
+            Object.assign(error, { code: 'IDEMPOTENCY_RECORD_RACED' });
+            throw error;
+          }
+        }
+        sqlite.prepare(`INSERT INTO conversation_turns
+          (id, mission_id, content, delivery, options, status, idempotency_key, request_hash, command_id, created_at)
+          VALUES (?, ?, ?, 'queue', ?, 'queued', ?, ?, ?, ?)`).run(
+          turnId,
+          missionId,
+          params.promptText,
+          JSON.stringify(params.options),
+          params.idempotencyKey || null,
+          requestHash,
+          commandId,
+          now,
+        );
+        sqlite.prepare(`INSERT INTO mission_commands
+          (id, mission_id, turn_id, type, status, priority, request_hash, created_at)
+          VALUES (?, ?, ?, 'start', 'pending', 0, ?, ?)`).run(commandId, missionId, turnId, requestHash, now);
+      })();
+    } catch (error: any) {
+      if (error?.code === 'IDEMPOTENCY_RECORD_RACED' && params.idempotencyKey) {
+        const raced = sqlite.prepare('SELECT * FROM conversation_turns WHERE idempotency_key = ?').get(params.idempotencyKey) as any;
+        if (raced && missionStartRequestMatches(raced, params.promptText, params.options)) {
+          sqlite.prepare('DELETE FROM missions WHERE id = ? AND active_run_id IS NULL').run(missionId);
+          const racedMission = await workspaceManager.getMission(raced.mission_id);
+          if (racedMission) {
+            setImmediate(() => void drainMissionCommands(raced.mission_id));
+            return queuedMissionStartDto(racedMission, raced, { id: raced.command_id || null }, true);
+          }
+        }
+        sqlite.prepare('DELETE FROM missions WHERE id = ? AND active_run_id IS NULL').run(missionId);
+        const conflict = new Error('Idempotency key was already used for a different mission start request.');
+        Object.assign(conflict, { code: 'IDEMPOTENCY_KEY_REUSED' });
+        throw conflict;
+      }
+      const failedAt = new Date().toISOString();
+      sqlite.prepare("UPDATE missions SET status = 'failed', completed_at = ?, updated_at = ? WHERE id = ? AND status NOT IN ('completed', 'cancelled')")
+        .run(failedAt, failedAt, missionId);
+      throw error;
+    }
+
+    const turn = sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId) as any;
+    const command = sqlite.prepare('SELECT * FROM mission_commands WHERE id = ?').get(commandId) as any;
+    const mission = await workspaceManager.getMission(missionId);
+    if (!turn || !command || !mission) throw new Error('Mission start was accepted but its durable records could not be reloaded.');
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content: params.promptText,
+      delivery: 'queue', priorityPending: false, clientMessageId: params.options.clientMessageId || undefined, timestamp: now });
+    setImmediate(() => void drainMissionCommands(missionId));
+    return queuedMissionStartDto(mission, turn, command);
+  };
+
+  if (!params.idempotencyKey) return perform();
+  const previous = missionStartIdempotencyOperations.get(params.idempotencyKey);
+  if (previous) await previous.catch(() => undefined);
+  const existingAfterWait = missionStartIdempotencyOperations.get(params.idempotencyKey);
+  if (existingAfterWait) await existingAfterWait.catch(() => undefined);
+  const operation = perform();
+  missionStartIdempotencyOperations.set(params.idempotencyKey, operation);
+  try {
+    return await operation;
+  } finally {
+    if (missionStartIdempotencyOperations.get(params.idempotencyKey) === operation) {
+      missionStartIdempotencyOperations.delete(params.idempotencyKey);
+    }
   }
 }
 
@@ -1151,22 +1345,14 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       request,
       title,
       workspaceId,
-      modelCatalogId,
-      accountProfileId,
-      reasoningLevel,
-      fallbackCatalogIds,
-      routeSelectionMode,
-      routeRole,
       teamTemplate,
       trustMode,
       executionMode,
-      targetRole,
-      command,
       automationSettings,
       automationOverrides,
       trustProfile,
       executionStrategy,
-    } = req.body;
+    } = req.body || {};
     const automationPolicy = normalizeAutomationPolicy({ trustMode, executionMode, automationSettings, automationOverrides, trustProfile, executionStrategy });
     const promptText = request || title;
     if (!promptText) return void res.status(400).json({ error: 'title or request is required' });
@@ -1179,46 +1365,30 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
     }
     if (isDeletionFenced('workspace', targetWorkspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
 
-    const missionId = crypto.randomUUID();
-    await workspaceManager.createMission({
-      id: missionId,
+    const startOptions = {
+      ...normalizeMissionStartOptions(req.body || {}, automationPolicy),
+      // Keep workspace scope in the idempotency fingerprint without relying on
+      // the generated mission id, which would make retries impossible to match.
       workspaceId: targetWorkspaceId,
-      title: promptText,
-      description: promptText,
-      status: 'running',
-      executionMode: executionMode || 'balanced',
+    };
+    const idempotencyKey = missionStartIdempotencyKey(req.header('Idempotency-Key') || req.body?.clientMessageId);
+    const result = await createQueuedMissionStart({
+      workspaceId: targetWorkspaceId,
+      promptText,
       automationPolicy,
-      teamTemplateId: teamTemplate || 'default-core-dev-team',
+      teamTemplate: teamTemplate || 'default-core-dev-team',
+      options: {
+        ...startOptions,
+      },
+      idempotencyKey,
     });
-
-    await configureMissionRouting(missionId, {
-      modelCatalogId,
-      accountProfileId,
-      reasoningLevel,
-      fallbackCatalogIds,
-      routeSelectionMode,
-      routeRole,
-      routeScope: req.body?.routeScope,
-      targetRole,
-    });
-
-    const result = await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, promptText, {
-      modelCatalogId,
-      reasoningLevel,
-      targetRole,
-      command,
-      automationPolicy,
-      clientMessageId: req.body?.clientMessageId,
-    }));
-    res.status(201).json({
-      missionId: result.missionId,
-      planId: result.planId,
-      tasks: result.tasks,
-      status: (await workspaceManager.getMission(result.missionId))?.status || 'running',
-    });
+    res.status(result.duplicate ? 200 : 202).json(result);
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
-    res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
+    const status = /^Invalid automation override:/.test(message)
+      || error?.code === 'IDEMPOTENCY_KEY_REUSED'
+      || error?.code === 'IDEMPOTENCY_RECORD_INVALID' ? 400 : 500;
+    res.status(status).json({ code: error?.code, error: message });
   }
 });
 

@@ -82,7 +82,13 @@ function mapModels(models: ModelDescriptor[], accounts: AccountProfile[]): Disco
   return models.map((model) => {
     const account = accounts.find((profile) => profile.id === model.accountProfileId);
     const connected = account?.authStatus === 'connected';
-    const available = connected && (model.availability === 'available' || model.availability === 'unknown');
+    // `unknown` is a cached/unverified observation, not proof that a concrete
+    // route can run. The synthetic active route is the one exception: AGY can
+    // execute it without passing a model flag and the runtime validates it
+    // independently before spawn.
+    const isAntigravityActiveRoute = model.runtimeId === 'antigravity'
+      && model.runtimeModelId === 'antigravity-active-route';
+    const available = connected && (model.availability === 'available' || isAntigravityActiveRoute);
     const roles = model.supportedRoles.map((role) => role[0].toUpperCase() + role.slice(1));
     const category: DiscoveredModel['category'] = !available
       ? 'unavailable'

@@ -71,6 +71,15 @@ export function AccountsView() {
     for (const model of discoveredModels) map.set(model.accountProfileId, (map.get(model.accountProfileId) || 0) + 1);
     return map;
   }, [discoveredModels]);
+  const antigravityRuntime = runtimes.find((runtime) => runtime.runtimeType === 'antigravity');
+  const antigravityProfile = accounts.find((account) => account.runtimeType === 'antigravity');
+  const antigravityModels = discoveredModels.filter((model) => model.runtimeType === 'antigravity');
+  const liveAntigravityModels = antigravityModels.filter((model) => model.source === 'discovered' && model.available);
+  const antigravityReady = Boolean(
+    antigravityRuntime?.installation.installed
+      && antigravityProfile?.authStatus === 'connected'
+      && liveAntigravityModels.length > 0,
+  );
 
   useEffect(() => {
     if (!selectedMethods.some((method) => method.id === authMethod)) setAuthMethod(selectedMethods[0]?.id || '');
@@ -231,6 +240,24 @@ export function AccountsView() {
           </div>
         )}
 
+        <section aria-label="Antigravity readiness" className="rounded-xl border border-border/80 bg-card/50 p-3">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-medium">Antigravity readiness</h2>
+              <p className="text-[11px] text-muted-foreground">Provider availability is shown separately from local API health.</p>
+            </div>
+            <Badge variant="outline" className={antigravityReady ? 'border-emerald-500/30 text-emerald-400' : 'border-amber-500/30 text-amber-300'}>
+              {antigravityReady ? 'Ready to run' : 'Action needed'}
+            </Badge>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-4">
+            <ReadinessItem label="Local service" ready={serviceOnline} detail={serviceOnline ? 'Online' : 'Offline'} />
+            <ReadinessItem label="AGY CLI" ready={Boolean(antigravityRuntime?.installation.installed)} detail={antigravityRuntime?.installation.version || 'Not detected'} />
+            <ReadinessItem label="Authentication" ready={antigravityProfile?.authStatus === 'connected'} detail={antigravityProfile?.authStatus === 'connected' ? 'Connected' : 'Not connected'} />
+            <ReadinessItem label="Live catalog" ready={liveAntigravityModels.length > 0} detail={liveAntigravityModels.length ? `${liveAntigravityModels.length} models` : 'Refresh required'} />
+          </div>
+        </section>
+
         <section className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-3">
           {runtimes.map((runtime) => {
             const profileCount = accounts.filter((account) => account.runtimeType === runtime.runtimeType).length;
@@ -381,6 +408,18 @@ export function AccountsView() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+function ReadinessItem({ label, ready, detail }: { label: string; ready: boolean; detail: string }) {
+  return (
+    <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2">
+      {ready ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" /> : <XCircle className="h-3.5 w-3.5 shrink-0 text-amber-300" />}
+      <div className="min-w-0">
+        <div className="truncate text-[11px] font-medium">{label}</div>
+        <div className="truncate text-[10px] text-muted-foreground">{detail}</div>
+      </div>
     </div>
   );
 }

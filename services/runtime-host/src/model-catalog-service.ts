@@ -2,7 +2,20 @@ import fs from 'fs';
 import path from 'path';
 import type { ModelDescriptor, AccountProfile, RuntimeType } from '@atris-agent-code/domain';
 import type { BaseRuntimeAdapter } from './adapters/base-adapter';
-import { getAtrisDataDir } from './runtime-utils';
+import { getAtrisDataDir, redactSecrets } from './runtime-utils';
+
+const MAX_DISCOVERY_DIAGNOSTIC_CHARS = 1_500;
+
+function discoveryDiagnostic(error: unknown): string {
+  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const parts = [
+    typeof record.message === 'string' ? record.message : undefined,
+    typeof record.stderr === 'string' ? record.stderr : undefined,
+    typeof record.stdout === 'string' ? record.stdout : undefined,
+    typeof error === 'string' ? error : undefined,
+  ].filter(Boolean).join('\n').trim();
+  return redactSecrets(parts || 'runtime discovery failed').slice(-MAX_DISCOVERY_DIAGNOSTIC_CHARS);
+}
 
 export class ModelCatalogService {
   private cacheFilePath: string;
@@ -28,11 +41,18 @@ export class ModelCatalogService {
       if (!Array.isArray(list)) return;
       this.cachedCatalog.clear();
       for (const model of list) {
+        const documented = model.source === 'documented';
         this.cachedCatalog.set(model.catalogId, {
           ...model,
-          source: 'cached',
-          availability: model.availability === 'deprecated' ? 'deprecated' : 'unknown',
-          warning: model.warning || 'Cached route. Refresh the connected account before starting a run.',
+          // Documented aliases remain documented across restarts. Routes that
+          // came from a prior live discovery become cached and unverified.
+          source: documented ? 'documented' : 'cached',
+          availability: documented
+            ? model.availability
+            : model.availability === 'deprecated' ? 'deprecated' : 'unknown',
+          warning: documented
+            ? model.warning
+            : model.warning || 'Cached route. Refresh the connected account before starting a run.',
         });
       }
     } catch (error) {
@@ -50,6 +70,7 @@ export class ModelCatalogService {
 
   async discoverLiveModels(accountProfiles: AccountProfile[]): Promise<ModelDescriptor[]> {
     let successfulProfiles = 0;
+    let catalogChanged = false;
     for (const profile of accountProfiles) {
       if (profile.authStatus !== 'connected') continue;
       const adapter = this.adapters.get(profile.runtimeType);
@@ -58,6 +79,7 @@ export class ModelCatalogService {
       try {
         const models = await adapter.discoverModels(profile.id);
         successfulProfiles += 1;
+        catalogChanged = catalogChanged || this.getModelsForProfile(profile.id).length > 0 || models.length > 0;
         this.removeProfile(profile.id, false);
         for (const model of models) {
           const descriptor: ModelDescriptor = {
@@ -71,16 +93,16 @@ export class ModelCatalogService {
           this.cachedCatalog.set(descriptor.catalogId, descriptor);
         }
       } catch (error) {
-        // Keep the last known cache slice for this profile when live discovery
-        // itself fails. Cached descriptors already load as availability=unknown,
-        // so the UI can keep a degraded route visible without presenting it as live.
-        console.warn(`[ModelCatalogService] Discovery failed for ${profile.profileName}:`, error);
+        // A failed refresh is not authoritative, but the previous in-memory
+        // live descriptors must not continue to claim that they are live.
+        catalogChanged = this.markProfileStale(profile.id) || catalogChanged;
+        console.warn(`[ModelCatalogService] Discovery failed for ${profile.profileName}: ${discoveryDiagnostic(error)}`);
       }
     }
 
     // A successful discovery is authoritative even when the runtime returns an
     // empty list. Persist removals so stale models cannot reappear after restart.
-    if (successfulProfiles > 0) this.saveCachedCatalog();
+    if (successfulProfiles > 0 || catalogChanged) this.saveCachedCatalog();
     return this.getCachedCatalog();
   }
 
@@ -89,7 +111,14 @@ export class ModelCatalogService {
     if (!adapter) throw new Error(`Runtime adapter '${profile.runtimeType}' is not registered.`);
     if (profile.authStatus !== 'connected') return [];
     adapter.configureProfile(profile);
-    const models = await adapter.discoverModels(profile.id);
+    let models: ModelDescriptor[];
+    try {
+      models = await adapter.discoverModels(profile.id);
+    } catch (error) {
+      this.markProfileStale(profile.id);
+      this.saveCachedCatalog();
+      throw error;
+    }
     this.removeProfile(profile.id, false);
     const normalized: ModelDescriptor[] = [];
     for (const model of models) {
@@ -134,5 +163,24 @@ export class ModelCatalogService {
       }
     }
     if (changed && persist) this.saveCachedCatalog();
+  }
+
+  private markProfileStale(profileId: string): boolean {
+    let changed = false;
+    const warning = 'Live model discovery failed. This route is retained as unverified until the connected runtime is refreshed.';
+    for (const [catalogId, model] of this.cachedCatalog) {
+      if (model.accountProfileId !== profileId) continue;
+      const nextAvailability = model.availability === 'deprecated' ? 'deprecated' : 'unknown';
+      const nextSource = model.source === 'discovered' ? 'cached' : model.source;
+      if (model.source === nextSource && model.availability === nextAvailability && model.warning === warning) continue;
+      this.cachedCatalog.set(catalogId, {
+        ...model,
+        source: nextSource,
+        availability: nextAvailability,
+        warning,
+      });
+      changed = true;
+    }
+    return changed;
   }
 }

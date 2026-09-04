@@ -44,6 +44,22 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiRequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Request timed out after ${timeoutMs}ms.`);
+    this.name = 'ApiRequestTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export function isApiRequestTimeout(error: unknown): error is ApiRequestTimeoutError {
+  return error instanceof ApiRequestTimeoutError
+    || (error instanceof Error && error.name === 'ApiRequestTimeoutError')
+    || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'API_REQUEST_TIMEOUT');
+}
+
 export interface ApiRequestInit extends RequestInit {
   /** Auth endpoints can opt out when there is a stale token in memory. */
   skipAuth?: boolean;
@@ -57,20 +73,27 @@ async function fetchWithDeadline(input: RequestInfo | URL, init: RequestInit, ti
   if (timeoutMs <= 0) return fetch(input, init);
 
   const controller = new AbortController();
+  let timedOut = false;
   const abort = () => controller.abort(init.signal?.reason);
   if (init.signal?.aborted) abort();
   else init.signal?.addEventListener('abort', abort, { once: true });
-  const timer = globalThis.setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms.`)), timeoutMs);
+  const timer = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
 
   try {
     return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) throw new ApiRequestTimeoutError(timeoutMs);
+    throw error;
   } finally {
     globalThis.clearTimeout(timer);
     init.signal?.removeEventListener('abort', abort);
   }
 }
 
-export async function apiRequestWithHeaders<T>(pathname: string, init: ApiRequestInit = {}): Promise<{ data: T; headers: Headers }> {
+export async function apiRequestWithHeaders<T>(pathname: string, init: ApiRequestInit = {}): Promise<{ data: T; headers: Headers; status: number }> {
   const { skipAuth = false, suppressUnauthorized = false, timeoutMs = API_REQUEST_TIMEOUT_MS, ...requestInit } = init;
   const headers = runtimeHeaders(requestInit.headers);
   if (requestInit.body && !(requestInit.body instanceof FormData)) headers.set('Content-Type', 'application/json');
@@ -91,7 +114,7 @@ export async function apiRequestWithHeaders<T>(pathname: string, init: ApiReques
       : `Request failed with ${response.status}`;
     throw new ApiError(message, response.status, payload);
   }
-  return { data: payload as T, headers: response.headers };
+  return { data: payload as T, headers: response.headers, status: response.status };
 }
 
 export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {}): Promise<T> {

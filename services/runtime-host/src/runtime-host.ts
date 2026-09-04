@@ -60,6 +60,11 @@ interface TaskExecutionAccess {
   requiresIsolatedWorktree: boolean;
 }
 
+function isUnverifiedCatalogRoute(model?: ModelDescriptor): boolean {
+  if (!model || model.runtimeModelId === 'antigravity-active-route') return false;
+  return model.source === 'cached' || model.availability === 'unknown';
+}
+
 export class RuntimeHost {
   private config: RuntimeHostConfig;
   private eventBus?: LocalEventBus;
@@ -572,10 +577,15 @@ export class RuntimeHost {
       ...(effectivePreference?.fallbackCatalogIds || []),
     ]);
     const selectedRouteMissing = [...configuredCatalogIds].some((catalogId) => !models.some((model) => model.catalogId === catalogId));
-    if (models.length === 0 || selectedRouteMissing) {
+    if (models.length === 0 || selectedRouteMissing || models.some((model) => model.source === 'cached' || model.availability === 'unknown')) {
       models = await this.catalogService.discoverLiveModels(profiles);
     }
     const route = this.scheduler.resolveRoute(workerRequest, profiles, models);
+    if (isUnverifiedCatalogRoute(route.model)) {
+      throw new Error(
+        `The selected ${route.model?.displayName || route.model?.runtimeModelId || 'model'} route is not verified by a live runtime catalog. Refresh the connected runtime before starting the task.`,
+      );
+    }
     console.info(
       `[RuntimeHost] ${role} route -> ${route.adapterId}/${route.profile?.profileName || 'profile'}/${route.model?.displayName || 'runtime-default'} (${route.reasons.join('; ') || 'scheduler'})`,
     );

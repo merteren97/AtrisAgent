@@ -1,8 +1,26 @@
 import assert from 'node:assert/strict';
 import type { TimelineItem } from './mission-store';
-import { reconcileApprovalTimeline, restoreMissionTimeline, useMissionStore, type Mission } from './mission-store';
+import {
+  missionStartDisposition,
+  normalizeMissionStatus,
+  projectMissionStatusFromEvent,
+  reconcileApprovalTimeline,
+  restoreMissionTimeline,
+  statusFromStartResponse,
+  useMissionStore,
+  type Mission,
+} from './mission-store';
 import { projectMissionProcesses } from '@/lib/process-projection';
+import { ApiRequestTimeoutError } from '@/lib/api-client';
 import type { AgentInstance } from '@/stores/agent-store';
+
+assert.equal(missionStartDisposition(202, { accepted: true }), 'accepted', '202 mission starts are treated as accepted');
+assert.equal(statusFromStartResponse({ accepted: true, status: 'draft' }, 202, 'draft'), 'starting', 'an accepted draft is presented as starting');
+assert.equal(statusFromStartResponse({ accepted: true, status: 'planning' }, 202, 'draft'), 'planning', 'an explicit planning status is preserved after acceptance');
+assert.equal(normalizeMissionStatus('initializing'), 'starting', 'provider initialization status maps to starting');
+assert.equal(projectMissionStatusFromEvent('draft', 'turn_queued'), 'starting', 'queued events advance a draft mission');
+assert.equal(projectMissionStatusFromEvent('running', 'turn_queued'), undefined, 'queued follow-up events do not regress a running mission');
+assert.equal(projectMissionStatusFromEvent('completed', 'agent_progressed', { status: 'running' }), 'completed', 'late explicit running metadata does not revive a completed mission');
 
 function item(overrides: Partial<TimelineItem>): TimelineItem {
   return {
@@ -92,6 +110,15 @@ assert.equal(useMissionStore.getState().error, 'Stop or finish this conversation
 globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Runtime did not acknowledge cancellation.' }), { status: 503, headers: { 'content-type': 'application/json' } });
 await assert.rejects(() => useMissionStore.getState().stopMission(mission.id), /Runtime did not acknowledge cancellation/, 'stop failures are throwable for dialog callers');
 await assert.rejects(() => useMissionStore.getState().retryMission(mission.id), /Runtime did not acknowledge cancellation/, 'retry failures are throwable for action callers');
+globalThis.fetch = originalFetch;
+
+globalThis.fetch = async () => { throw new ApiRequestTimeoutError(30_000); };
+await useMissionStore.getState().startMission('Timed mission start', 'workspace-timeout');
+const timeoutState = useMissionStore.getState();
+assert.equal(timeoutState.loading, false, 'a mission start timeout stops the loading state');
+assert.equal(timeoutState.error, null, 'a mission start timeout is not presented as a definitive failure');
+assert.equal(timeoutState.pendingMissionStart?.reason, 'deadline', 'a mission start timeout records an uncertain pending request');
+assert(!timeoutState.timeline.some((entry) => entry.eventType === 'mission_failed'), 'a mission start timeout does not synthesize a failure event');
 globalThis.fetch = originalFetch;
 
 console.log('mission approval lifecycle tests passed');

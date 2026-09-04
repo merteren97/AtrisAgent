@@ -73,6 +73,7 @@ async function runTests() {
   const port = address.port;
   const baseUrl = `http://127.0.0.1:${port}`;
   const wsUrl = `ws://127.0.0.1:${port}/ws/events`;
+  let createdTeamTemplateId = '';
 
   try {
     // 1. GET /health
@@ -134,6 +135,51 @@ async function runTests() {
       const restartPolicy = await gateway.workspaceManager.resolveRoleExecutionPolicy(createdMissionId, 'builder');
       assert(restartPolicy?.modelCatalogId === 'catalog-shared-model' && restartPolicy.selectionMode === 'fixed',
         'persisted mission-wide Builder routing survives loss of the runtime in-memory preference');
+    }
+
+    // Public mission starts must acknowledge durable acceptance without waiting
+    // for provider startup, and a retry with the same client id must not create
+    // a second mission or conversation turn.
+    {
+      const clientMessageId = `public-start-${crypto.randomUUID()}`;
+      const requestStartedAt = performance.now();
+      const acceptedRes = await authorizedFetch(`${baseUrl}/api/missions/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientMessageId },
+        body: JSON.stringify({
+          workspaceId: createdWorkspaceId,
+          request: 'Public durable mission-start contract test',
+          clientMessageId,
+        }),
+      });
+      const accepted = await acceptedRes.json();
+      const requestDurationMs = performance.now() - requestStartedAt;
+      assert(acceptedRes.status === 202 && accepted.accepted === true && typeof accepted.missionId === 'string'
+        && typeof accepted.turnId === 'string' && requestDurationMs < 2_000,
+      'public mission start returns durable acceptance without waiting for provider startup');
+
+      const duplicateRes = await authorizedFetch(`${baseUrl}/api/missions/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientMessageId },
+        body: JSON.stringify({
+          workspaceId: createdWorkspaceId,
+          request: 'Public durable mission-start contract test',
+          clientMessageId,
+        }),
+      });
+      const duplicate = await duplicateRes.json();
+      assert(duplicateRes.status === 200 && duplicate.duplicate === true && duplicate.missionId === accepted.missionId
+        && duplicate.turnId === accepted.turnId,
+      'public mission start idempotency returns the original mission and turn');
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const acceptedEventsRes = await authorizedFetch(`${baseUrl}/api/missions/${accepted.missionId}/events`);
+      const acceptedEvents = await acceptedEventsRes.json();
+      assert(acceptedEvents.some((event: any) => event.type === 'turn_queued' && event.turnId === accepted.turnId),
+        'public mission start persists a turn_queued event before provider execution');
+      const acceptedUserMessages = acceptedEvents.filter((event: any) => event.type === 'user_message');
+      assert(acceptedUserMessages.length === 1 && acceptedUserMessages[0].clientMessageId === clientMessageId,
+        'public mission start preserves client message identity for optimistic timeline reconciliation');
     }
 
     // Start and continuation turns must have one durable, turn-correlated user message.
@@ -319,6 +365,7 @@ async function runTests() {
         }),
       });
       const createBody = await createRes.json();
+      createdTeamTemplateId = typeof createBody.id === 'string' ? createBody.id : '';
       assert(createRes.status === 201 && typeof createBody.id === 'string' && createBody.maxParallelAgents === 2
         && createBody.workerPools?.find((pool: any) => pool.role === 'reviewer')?.maxParallel === 1,
       'POST /api/team-templates persists normalized global and role worker limits');
@@ -838,6 +885,9 @@ async function runTests() {
       assert(cascadedEventsRes.status === 200 && Array.isArray(cascadedEvents) && cascadedEvents.length === 0, 'Workspace deletion cascades mission events');
     }
   } finally {
+    if (createdTeamTemplateId && server.listening) {
+      await authorizedFetch(`${baseUrl}/api/team-templates/${encodeURIComponent(createdTeamTemplateId)}`, { method: 'DELETE' }).catch(() => undefined);
+    }
     if (shouldCloseServer && server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

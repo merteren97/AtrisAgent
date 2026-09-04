@@ -28,6 +28,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { normalizeTeamTemplates } from '@/lib/team-template-utils';
 import { cn } from '@/lib/utils';
 
 const ROLE_UI: Record<AgentRole, { icon: typeof Brain; badgeColor: string; label: string; access: TeamRole['accessLevel']; capabilities: string[] }> = {
@@ -74,7 +75,8 @@ export function AgentsView() {
     setIsLoading(true);
     setError(null);
     try {
-      setTemplates(await apiRequest<TeamTemplate[]>('/team-templates'));
+      const items = await apiRequest<TeamTemplate[]>('/team-templates');
+      setTemplates(normalizeTeamTemplates(items));
     } catch (cause: any) {
       setTemplates([]);
       setError(cause?.message || 'Team templates could not be loaded from the local service.');

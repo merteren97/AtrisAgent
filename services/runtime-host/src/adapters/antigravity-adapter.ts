@@ -64,6 +64,12 @@ type PendingTerminalOutcome =
   | { kind: 'completed'; result: string }
   | { kind: 'failed'; error: string; exitCode?: number | null };
 
+interface AntigravityCliOptions {
+  supportsSandbox: boolean;
+  supportsMode: boolean;
+  supportsPrintTimeout: boolean;
+}
+
 const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'];
 const MAX_STDERR_CHARS = 8_000;
 const TERMINAL_EXIT_GRACE_MS = 750;
@@ -72,6 +78,22 @@ const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
 const FINAL_RESPONSE_QUIET_GRACE_MS = 2_500;
 const TERMINAL_RELEASE_GRACE_MS = TERMINAL_EXIT_GRACE_MS + TERMINAL_FORCE_KILL_MS + 500;
 const ANTIGRAVITY_AUTH_PROBE_MARKER = 'ATRIS_AUTH_OK';
+const AGY_VERSION_TIMEOUT_MS = 8_000;
+const AGY_AUTH_PROBE_TIMEOUT_MS = 75_000;
+const AGY_MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
+const AGY_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024;
+const MAX_COMMAND_DIAGNOSTIC_CHARS = 1_500;
+
+function commandDiagnostic(error: unknown, fallback: string): string {
+  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const parts = [
+    typeof record.message === 'string' ? record.message : undefined,
+    typeof record.stderr === 'string' ? record.stderr : undefined,
+    typeof record.stdout === 'string' ? record.stdout : undefined,
+    typeof error === 'string' ? error : undefined,
+  ].filter(Boolean).join('\n').trim();
+  return redactSecrets(parts || fallback).slice(-MAX_COMMAND_DIAGNOSTIC_CHARS);
+}
 
 export function resolveAntigravityExecutionMode(accessMode?: SpawnAgentOptions['accessMode']): 'accept-edits' | 'plan' {
   return accessMode === 'workspace-write' ? 'accept-edits' : 'plan';
@@ -117,6 +139,7 @@ function classifyAntigravityAuthStatus(output: string): AccountProfileStatus {
 
 // Last-resort fallback only. `agy models` is authoritative when the installed CLI exposes it.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
+  { slug: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
@@ -141,6 +164,11 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private softTerminalResultsBySession = new Map<string, string>();
   private terminalReleaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private liveModelFamilies: AntigravityCliModelFamily[] = [];
+  private cliOptions: AntigravityCliOptions = {
+    supportsSandbox: false,
+    supportsMode: false,
+    supportsPrintTimeout: false,
+  };
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
   constructor(
@@ -167,17 +195,34 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const executable = await findExecutable('agy');
     if (!executable) return { installed: false, error: 'Antigravity CLI (`agy`) was not found in PATH.' };
     try {
-      const version = (await runCommand(executable, ['--version'], { timeoutMs: 8_000 })).stdout.trim();
+      const version = (await runCommand(executable, ['--version'], {
+        timeoutMs: AGY_VERSION_TIMEOUT_MS,
+        maxOutputBytes: 4_096,
+      })).stdout.trim();
       return { installed: true, path: executable, version: version || undefined };
     } catch (error: any) {
-      return { installed: true, path: executable, error: error?.message || 'Could not read Antigravity version.' };
+      return {
+        installed: true,
+        path: executable,
+        error: `Antigravity version probe failed: ${commandDiagnostic(error, 'Could not read Antigravity version.')}`,
+      };
     }
   }
 
   async probeCapabilities(): Promise<CapabilitySnapshot> {
     const install = await this.discoverInstallation();
     if (!install.installed) return this.emptyCapabilities();
-    const help = (await getHelpText(install.path || 'agy')).toLowerCase();
+    let help = '';
+    try {
+      help = (await this.passiveAuthCommands.getHelpText(install.path || 'agy')).slice(-AGY_PROBE_OUTPUT_LIMIT_BYTES).toLowerCase();
+    } catch (error) {
+      console.warn(`[AntigravityAdapter] Capability probe failed: ${commandDiagnostic(error, 'could not read CLI help.')}`);
+    }
+    this.cliOptions = {
+      supportsSandbox: /(?:^|\s)--sandbox(?:\s|=|,|$)/.test(help),
+      supportsMode: /(?:^|\s)--mode(?:\s|=|,|$)/.test(help),
+      supportsPrintTimeout: /(?:^|\s)--print-timeout(?:\s|=|,|$)/.test(help),
+    };
     return {
       structuredEventStreaming: /stream-json/.test(help) && /--print|-p\b/.test(help),
       sessionResume: /--continue|-c\b|--conversation/.test(help),
@@ -281,15 +326,33 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       };
       return 'error';
     }
+    const supportsSandbox = /(?:^|\s)--sandbox(?:\s|=|,|$)/i.test(help);
+    if (!supportsSandbox) {
+      this.lastVerification = {
+        status: 'error',
+        checkedAt: Date.now(),
+        message: 'Antigravity structured authentication probe requires the CLI sandbox option. Update the installed CLI before connecting it.',
+      };
+      return 'error';
+    }
 
     try {
-      const result = await this.passiveAuthCommands.runCommand(install.path, [
+      const probeArgs = [
         '--print',
         'Reply with exactly ATRIS_AUTH_OK. Do not use tools and do not modify files.',
         '--output-format',
         'json',
         '--sandbox',
-      ], { timeoutMs: 75_000, cwd: os.homedir() });
+      ];
+      // `--print-timeout` is optional across CLI versions. Only pass it when
+      // the installed help text advertises the flag; runCommand still bounds
+      // the probe if an older CLI uses its own default timeout.
+      if (/(?:^|\s)--print-timeout(?:\s|=|,|$)/i.test(help)) probeArgs.push('--print-timeout', `${AGY_AUTH_PROBE_TIMEOUT_MS / 1000}s`);
+      const result = await this.passiveAuthCommands.runCommand(install.path, probeArgs, {
+        timeoutMs: AGY_AUTH_PROBE_TIMEOUT_MS,
+        cwd: os.homedir(),
+        maxOutputBytes: AGY_PROBE_OUTPUT_LIMIT_BYTES,
+      });
       const raw = `${result.stdout}\n${result.stderr}`;
       const commandFailed = result.exitCode !== 0;
       const classified = classifyAntigravityAuthStatus(raw);
@@ -367,13 +430,22 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   }
 
   private async discoverLiveModelFamilies(executable: string): Promise<AntigravityCliModelFamily[]> {
+    // Never reuse a prior live snapshot after a failed or empty refresh.
+    this.liveModelFamilies = [];
     try {
-      const result = await runCommand(executable, ['models'], { timeoutMs: 12_000, cwd: os.homedir() });
+      const result = await this.passiveAuthCommands.runCommand(executable, ['models'], {
+        timeoutMs: AGY_MODEL_DISCOVERY_TIMEOUT_MS,
+        cwd: os.homedir(),
+        maxOutputBytes: AGY_PROBE_OUTPUT_LIMIT_BYTES,
+      });
       const families = parseAntigravityModelsOutput(result.stdout);
-      if (families.length) this.liveModelFamilies = families;
+      this.liveModelFamilies = families;
+      if (!families.length) {
+        console.warn('[AntigravityAdapter] Live `agy models` returned no parseable model routes.');
+      }
       return families;
     } catch (error) {
-      console.warn('[AntigravityAdapter] Live `agy models` discovery failed; using fallback catalog.', error);
+      console.warn(`[AntigravityAdapter] Live \`agy models\` discovery failed; using fallback catalog: ${commandDiagnostic(error, 'model discovery failed.')}`);
       return [];
     }
   }
@@ -440,20 +512,20 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     }
 
     const models: ModelDescriptor[] = [];
-    const activeRouteId = activeModel || 'antigravity-active-route';
+    const activeRouteId = 'antigravity-active-route';
     models.push({
       catalogId: `${this.id}:${profileId}:${activeRouteId}`,
       runtimeId: this.runtimeType,
       accountProfileId: profileId,
       providerId: activeModel ? this.providerFor(activeModel) : 'google',
-      runtimeModelId: activeRouteId,
+      runtimeModelId: 'antigravity-active-route',
       displayName: activeModel ? this.displayName(activeModel) : 'Antigravity Active Model',
       description: 'The sticky model currently selected inside Antigravity. Live model discovery was unavailable.',
       supportedRoles: ALL_ROLES,
       supportedReasoning: capabilities.reasoningControl ? ['low', 'medium', 'high'] : [],
       inputModalities: ['text', 'image'],
-      availability: 'available',
-      source: 'discovered',
+      availability: 'unknown',
+      source: 'cached',
       routeLabel: 'Antigravity CLI · active route',
       isDefault: true,
       warning: 'Live `agy models` discovery failed. Refresh routes after confirming the CLI is reachable.',
@@ -531,17 +603,35 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private async resolveRequestedModelRoute(executable: string, model: string, reasoning?: string): Promise<string> {
     if (model === 'antigravity-active-route') return model;
     let families = this.liveModelFamilies;
-    if (!families.length || !families.some((family) => family.id === model || Object.values(family.routes).includes(model))) {
-      const discovered = await this.discoverLiveModelFamilies(executable);
-      if (discovered.length) families = discovered;
+    const normalizedModel = this.normalizeModelId(model);
+    const hasRequestedRoute = families.some((family) =>
+      this.normalizeModelId(family.id) === normalizedModel
+      || Object.values(family.routes).some((route) => this.normalizeModelId(route) === normalizedModel),
+    );
+    if (!hasRequestedRoute) {
+      families = await this.discoverLiveModelFamilies(executable);
     }
-    return resolveAntigravityModelRoute(families, model, reasoning);
+    if (!families.length) {
+      throw new Error(`Antigravity model route '${model}' could not be verified because the live model catalog is unavailable. Refresh the catalog or choose the active route.`);
+    }
+    const resolved = resolveAntigravityModelRoute(families, model, reasoning);
+    const resolvedFamily = families.some((family) =>
+      this.normalizeModelId(family.id) === this.normalizeModelId(model)
+      || Object.values(family.routes).some((route) => this.normalizeModelId(route) === this.normalizeModelId(model)),
+    );
+    if (!resolvedFamily) {
+      throw new Error(`Antigravity model route '${model}' is not present in the live model catalog.`);
+    }
+    return resolved;
   }
 
   async spawnAgent(options: SpawnAgentOptions): Promise<AgentSession> {
     const capabilities = await this.probeCapabilities();
     if (!capabilities.structuredEventStreaming) {
       throw new Error('Antigravity 1.1.8 or newer with print-mode `stream-json` is required for background agents.');
+    }
+    if (!this.cliOptions.supportsSandbox || !this.cliOptions.supportsMode) {
+      throw new Error('Antigravity background agents require CLI support for `--sandbox` and `--mode`; update the installed CLI before starting a run.');
     }
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) throw new Error(install.error || 'Antigravity CLI was not found.');
@@ -564,9 +654,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       '--sandbox',
       '--mode',
       resolveAntigravityExecutionMode(options.accessMode),
-      '--print-timeout',
-      printTimeout,
     ];
+    if (this.cliOptions.supportsPrintTimeout) args.push('--print-timeout', printTimeout);
     if (overlay) args.push(...overlay.extraArgs);
     if (modelRoute && modelRoute !== 'antigravity-active-route' && capabilities.modelSelection) args.push('--model', modelRoute);
     const routeEncodesReasoning = Boolean(modelRoute && /-(?:minimal|low|medium|high|xhigh|max)$/i.test(modelRoute));

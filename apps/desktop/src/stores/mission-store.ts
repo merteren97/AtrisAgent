@@ -1,9 +1,11 @@
 import { create } from 'zustand';
-import { apiRequest, apiRequestWithHeaders } from '@/lib/api-client';
+import { apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
 
 export type MissionStatus =
   | 'draft'
+  | 'queued'
+  | 'starting'
   | 'planning'
   | 'ready'
   | 'running'
@@ -95,6 +97,29 @@ export interface QueuedMissionTurn {
   turnId?: string;
 }
 
+export interface MissionStartResponse {
+  accepted?: boolean;
+  queued?: boolean;
+  missionId?: string;
+  mission?: Partial<Mission> & { id?: string; status?: string };
+  planId?: string | null;
+  tasks?: TaskItem[];
+  status?: string;
+  turnId?: string;
+  runId?: string;
+  message?: string;
+}
+
+export interface PendingMissionStart {
+  clientMessageId: string;
+  request: string;
+  workspaceId?: string;
+  missionId?: string;
+  kind: 'start' | 'continue';
+  reason: 'accepted' | 'deadline';
+  startedAt: string;
+}
+
 export interface DurableMissionCommand {
   id: string;
   missionId: string;
@@ -126,6 +151,7 @@ interface MissionState {
   missionStateError: string | null;
   transportStatus: EventTransportStatus;
   transportError: string | null;
+  pendingMissionStart: PendingMissionStart | null;
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
   refreshMission: (missionId: string) => Promise<Mission>;
@@ -155,6 +181,108 @@ interface MissionState {
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
 let commandQueueRequestId = 0;
+
+const KNOWN_MISSION_STATUSES = new Set<MissionStatus>([
+  'draft', 'queued', 'starting', 'planning', 'ready', 'running', 'waiting_for_approval', 'blocked',
+  'reviewing', 'revising', 'applying', 'verifying', 'completed', 'failed', 'cancelled',
+]);
+
+function knownMissionStatus(value: unknown): MissionStatus | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (KNOWN_MISSION_STATUSES.has(value as MissionStatus)) return value as MissionStatus;
+  if (['accepted', 'initializing', 'dispatching', 'preparing'].includes(value.toLowerCase())) return 'starting';
+  return undefined;
+}
+
+export function normalizeMissionStatus(value: unknown, fallback: MissionStatus = 'draft'): MissionStatus {
+  return knownMissionStatus(value) || fallback;
+}
+
+export type MissionStartDisposition = 'accepted' | 'uncertain' | 'failed';
+
+export function missionStartDisposition(
+  responseStatus?: number,
+  payload?: Pick<MissionStartResponse, 'accepted' | 'queued' | 'status'>,
+): MissionStartDisposition {
+  if (responseStatus === undefined) {
+    return payload?.accepted || payload?.queued || knownMissionStatus(payload?.status) === 'starting' ? 'accepted' : 'uncertain';
+  }
+  return responseStatus >= 200 && responseStatus < 300 ? 'accepted' : 'failed';
+}
+
+export function statusFromStartResponse(data: MissionStartResponse, responseStatus: number, fallback: MissionStatus): MissionStatus {
+  const explicitStatus = knownMissionStatus(data.status ?? data.mission?.status);
+  if (data.accepted || data.queued || responseStatus === 202) {
+    if (explicitStatus && !['draft', 'ready', 'queued'].includes(explicitStatus)) return explicitStatus;
+    return 'starting';
+  }
+  if (explicitStatus) return explicitStatus;
+  if (data.tasks?.length || data.planId) return 'running';
+  return fallback;
+}
+
+export function projectMissionStatusFromEvent(
+  current: MissionStatus,
+  eventType?: string,
+  metadata?: Record<string, unknown>,
+): MissionStatus | undefined {
+  const explicit = knownMissionStatus(metadata?.status);
+  if (explicit) {
+    if (TERMINAL_CONVERSATION_STATUSES.has(current) && !TERMINAL_CONVERSATION_STATUSES.has(explicit)) return current;
+    return explicit;
+  }
+
+  let next: MissionStatus | undefined;
+  switch (eventType) {
+    case 'mission_accepted':
+    case 'mission_queued':
+    case 'turn_queued':
+      if (['draft', 'queued', 'ready', 'starting'].includes(current)) next = 'starting';
+      break;
+    case 'mission_started':
+    case 'turn_started':
+    case 'planning_started':
+    case 'supervisor_started':
+      if (!['running', 'reviewing', 'revising', 'applying', 'verifying', 'completed', 'failed', 'cancelled'].includes(current)) next = 'planning';
+      break;
+    case 'plan_generated':
+    case 'agent_spawned':
+    case 'agent_started':
+    case 'task_assigned':
+    case 'task_claimed':
+    case 'process_started':
+    case 'agent_progressed':
+      next = 'running';
+      break;
+    case 'approval_requested':
+      next = 'waiting_for_approval';
+      break;
+    case 'review_started':
+    case 'verification_started':
+      next = 'reviewing';
+      break;
+    case 'mission_completed':
+      next = 'completed';
+      break;
+    case 'mission_cancelled':
+    case 'turn_cancelled':
+      next = 'cancelled';
+      break;
+    case 'mission_failed':
+    case 'process_failed':
+    case 'task_failed':
+    case 'agent_error':
+    case 'runtime_error':
+      next = 'failed';
+      break;
+    default:
+      break;
+  }
+
+  if (!next) return undefined;
+  if (TERMINAL_CONVERSATION_STATUSES.has(current) && !TERMINAL_CONVERSATION_STATUSES.has(next)) return current;
+  return next;
+}
 
 async function fetchMissionEvents(missionId: string): Promise<Array<Record<string, any>>> {
   const events: Array<Record<string, any>> = [];
@@ -440,6 +568,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   missionStateError: null,
   transportStatus: 'idle',
   transportError: null,
+  pendingMissionStart: null,
   missionFilter: 'all',
   composerInput: '',
 
@@ -528,6 +657,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           hydratedMissionId: missionId,
           missionStateLoading: false,
           missionStateError: null,
+          ...(current.pendingMissionStart?.missionId === missionId ? { pendingMissionStart: null } : {}),
         };
       });
 
@@ -582,40 +712,85 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       },
     };
     useAgentStore.getState().setSelectedAgent(null);
-    set({ timeline: [userMessage], activeTasks: [] });
+    set({
+      timeline: [userMessage],
+      activeTasks: [],
+      activeMissionId: null,
+      hydratedMissionId: null,
+      missionStateLoading: false,
+      missionStateError: null,
+      pendingMissionStart: null,
+    });
 
     try {
-      const data = await apiRequest<{ missionId: string; planId: string; tasks: TaskItem[]; status?: MissionStatus }>('/missions/start', {
+      const response = await apiRequestWithHeaders<MissionStartResponse>('/missions/start', {
         method: 'POST',
         body: JSON.stringify(requestBody(trimmed, workspaceId, options, clientMessageId)),
       });
+      const data = response.data;
+      if (missionStartDisposition(response.status, data) !== 'accepted') {
+        throw new Error(data.message || 'The mission start request was not accepted.');
+      }
+      const missionId = data.missionId || data.mission?.id;
+      if (!missionId) throw new Error('The mission start response did not include a mission ID.');
 
       const newMission: Mission = {
-        id: data.missionId,
-        workspaceId: workspaceId || 'default-workspace',
-        title: trimmed,
-        description: trimmed,
-        status: data.status || 'running',
-        createdAt: new Date().toISOString(),
+        id: missionId,
+        workspaceId: workspaceId || data.mission?.workspaceId || 'default-workspace',
+        title: data.mission?.title || trimmed,
+        description: data.mission?.description || trimmed,
+        status: statusFromStartResponse(data, response.status, 'starting'),
+        createdAt: data.mission?.createdAt || new Date().toISOString(),
+        updatedAt: data.mission?.updatedAt,
+        completedAt: data.mission?.completedAt,
         taskCount: data.tasks?.length || 0,
-        planId: data.planId,
+        planId: data.planId ?? data.mission?.planId ?? null,
       };
 
-      useAgentStore.getState().clearMissionAgents(data.missionId);
+      useAgentStore.getState().clearMissionAgents(missionId);
       set((state) => ({
         missions: [newMission, ...state.missions.filter((mission) => mission.id !== newMission.id)],
-        activeMissionId: data.missionId,
-        hydratedMissionId: data.missionId,
+        activeMissionId: missionId,
+        hydratedMissionId: null,
         activeTasks: data.tasks || [],
         loading: false,
+        error: null,
+        pendingMissionStart: null,
+        missionStateLoading: true,
       }));
 
-      void get().fetchMissionState(data.missionId);
+      void get().fetchMissionState(missionId);
     } catch (error: any) {
+      const message = error?.message || 'The local AtrisAgent service is unavailable.';
+      if (isApiRequestTimeout(error)) {
+        const pendingCard: TimelineItem = {
+          id: crypto.randomUUID(),
+          type: 'event',
+          content: 'Mission start request timed out. The local service may still be processing it; refresh missions before retrying.',
+          timestamp: nowLabel(),
+          eventType: 'mission_start_pending',
+          agentRole: 'orchestrator',
+          metadata: { pending: true, clientMessageId },
+        };
+        set((state) => ({
+          timeline: [...state.timeline, pendingCard],
+          loading: false,
+          error: null,
+          pendingMissionStart: {
+            clientMessageId,
+            request: trimmed,
+            workspaceId,
+            kind: 'start',
+            reason: 'deadline',
+            startedAt: new Date().toISOString(),
+          },
+        }));
+        return;
+      }
       const errorCard: TimelineItem = {
         id: crypto.randomUUID(),
         type: 'event',
-        content: `Mission could not start: ${error?.message || 'The local AtrisAgent service is unavailable.'}`,
+        content: `Mission could not start: ${message}`,
         timestamp: nowLabel(),
         eventType: 'mission_failed',
         agentRole: 'orchestrator',
@@ -623,7 +798,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       set((state) => ({
         timeline: [...state.timeline, errorCard],
         loading: false,
-        error: error?.message || 'Mission start failed.',
+        error: message,
+        pendingMissionStart: null,
       }));
     }
   },
@@ -663,31 +839,71 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       error: null,
       activeTasks: [],
       timeline: skipOptimisticUserMessage ? state.timeline : [...state.timeline, userMessage],
-      missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'planning' } : item),
+      pendingMissionStart: null,
+      missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'starting' } : item),
     }));
 
     try {
-      const data = await apiRequest<{ missionId: string; planId: string; tasks: TaskItem[] }>(`/missions/${missionId}/start`, {
+      const response = await apiRequestWithHeaders<MissionStartResponse>(`/missions/${missionId}/start`, {
         method: 'POST',
         body: JSON.stringify(requestBody(trimmed, mission.workspaceId, options, clientMessageId)),
       });
+      const data = response.data;
+      if (missionStartDisposition(response.status, data) !== 'accepted') {
+        throw new Error(data.message || 'The conversation turn was not accepted.');
+      }
 
       set((state) => ({
         loading: false,
         activeMissionId: missionId,
         hydratedMissionId: null,
         activeTasks: data.tasks || [],
+        error: null,
+        pendingMissionStart: null,
         missions: state.missions.map((item) => item.id === missionId
-          ? { ...item, status: 'running', planId: data.planId, taskCount: data.tasks?.length || 0 }
+          ? {
+            ...item,
+            status: statusFromStartResponse(data, response.status, 'planning'),
+            planId: data.planId ?? item.planId ?? null,
+            taskCount: data.tasks?.length || 0,
+          }
           : item),
       }));
       void get().fetchCommandQueue(mission.workspaceId);
       await get().fetchMissionState(missionId);
     } catch (error: any) {
+      const message = error?.message || 'The local AtrisAgent service is unavailable.';
+      if (isApiRequestTimeout(error)) {
+        const pendingCard: TimelineItem = {
+          id: crypto.randomUUID(),
+          type: 'event',
+          content: 'Conversation turn request timed out. The local service may still be processing it; refresh the mission before retrying.',
+          timestamp: nowLabel(),
+          eventType: 'turn_start_pending',
+          agentRole: 'orchestrator',
+          metadata: { pending: true, clientMessageId, missionId },
+        };
+        set((state) => ({
+          timeline: [...state.timeline, pendingCard],
+          missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'starting' } : item),
+          loading: false,
+          error: null,
+          pendingMissionStart: {
+            clientMessageId,
+            request: trimmed,
+            workspaceId: mission.workspaceId,
+            missionId,
+            kind: 'continue',
+            reason: 'deadline',
+            startedAt: new Date().toISOString(),
+          },
+        }));
+        return;
+      }
       const errorCard: TimelineItem = {
         id: crypto.randomUUID(),
         type: 'event',
-        content: `Conversation turn could not start: ${error?.message || 'The local AtrisAgent service is unavailable.'}`,
+        content: `Conversation turn could not start: ${message}`,
         timestamp: nowLabel(),
         eventType: 'mission_failed',
         agentRole: 'orchestrator',
@@ -696,7 +912,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         timeline: [...state.timeline, errorCard],
         missions: state.missions.map((item) => item.id === missionId ? mission : item),
         loading: false,
-        error: error?.message || 'Conversation continuation failed.',
+        error: message,
+        pendingMissionStart: null,
       }));
     }
   },
@@ -789,6 +1006,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
             hydratedMissionId: null,
             timeline: [],
             activeTasks: [],
+            pendingMissionStart: null,
           } : {}),
         };
       });
@@ -810,6 +1028,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       error: null,
       missionStateError: null,
       missionStateLoading: !sameMission || get().hydratedMissionId !== id,
+      pendingMissionStart: null,
       ...(sameMission ? {} : { timeline: [], activeTasks: [], hydratedMissionId: null }),
     });
     if (!sameMission || get().hydratedMissionId !== id) void get().fetchMissionState(id);
@@ -817,15 +1036,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
   clearActiveMission: () => {
     useAgentStore.getState().setSelectedAgent(null);
-    set({ activeMissionId: null, hydratedMissionId: null, timeline: [], activeTasks: [], missionStateLoading: false, missionStateError: null });
+    set({ activeMissionId: null, hydratedMissionId: null, timeline: [], activeTasks: [], missionStateLoading: false, missionStateError: null, pendingMissionStart: null });
   },
 
   updateMissionStatus: (id, status) => set((state) => ({
     missions: state.missions.map((mission) => mission.id === id ? { ...mission, status } : mission),
+    ...(state.pendingMissionStart?.missionId === id && status !== 'starting' ? { pendingMissionStart: null } : {}),
   })),
 
   addTimelineItem: (item) => {
     set((state) => {
+    const eventMissionId = metadataString(item.metadata, 'missionId');
+    const mission = state.missions.find((candidate) => candidate.id === (eventMissionId || state.activeMissionId));
+    const projectedStatus = mission
+      ? projectMissionStatusFromEvent(mission.status, item.eventType, item.metadata)
+      : undefined;
+    const missionPatch = projectedStatus && mission && projectedStatus !== mission.status
+      ? {
+        missions: state.missions.map((candidate) => candidate.id === mission.id ? { ...candidate, status: projectedStatus } : candidate),
+        ...(state.pendingMissionStart?.missionId === mission.id && projectedStatus !== 'starting' ? { pendingMissionStart: null } : {}),
+      }
+      : {};
     const turnId = metadataString(item.metadata, 'turnId') || metadataString(item.metadata, 'commandId');
     if (turnId && item.eventType?.startsWith('turn_')) {
       const clientMessageId = metadataString(item.metadata, 'clientMessageId');
@@ -841,8 +1072,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const queuedTurns = item.eventType === 'turn_queued'
         ? state.queuedTurns
         : state.queuedTurns.filter((turn) => turn.turnId !== turnId && turn.id !== turnId);
-      if (reconciled.some((entry) => entry.id === item.id)) return { timeline: reconciled, queuedTurns };
-      return { timeline: reconcileApprovalTimeline([...reconciled, item]), queuedTurns };
+      if (reconciled.some((entry) => entry.id === item.id)) return { ...missionPatch, timeline: reconciled, queuedTurns };
+      return { ...missionPatch, timeline: reconcileApprovalTimeline([...reconciled, item]), queuedTurns };
     }
     const toolCallId = metadataString(item.metadata, 'toolCallId');
     if (toolCallId && item.eventType === 'tool_call_completed') {
@@ -850,19 +1081,19 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       if (startedIndex >= 0) {
         const timeline = [...state.timeline];
         timeline[startedIndex] = { ...timeline[startedIndex], content: item.content, timestamp: item.timestamp, eventType: item.eventType, metadata: { ...timeline[startedIndex].metadata, ...item.metadata } };
-        return { timeline };
+        return { ...missionPatch, timeline };
       }
     }
     if (item.eventType === 'text_delta') {
       const agentId = metadataString(item.metadata, 'agentInstanceId');
       const previous = state.timeline[state.timeline.length - 1];
       if (previous?.eventType === 'text_delta' && metadataString(previous.metadata, 'agentInstanceId') === agentId) {
-        return { timeline: [...state.timeline.slice(0, -1), { ...previous, content: previous.content + item.content, timestamp: item.timestamp, metadata: { ...previous.metadata, ...item.metadata } }] };
+        return { ...missionPatch, timeline: [...state.timeline.slice(0, -1), { ...previous, content: previous.content + item.content, timestamp: item.timestamp, metadata: { ...previous.metadata, ...item.metadata } }] };
       }
     }
     return state.timeline.some((entry) => entry.id === item.id)
-      ? state
-      : { timeline: reconcileApprovalTimeline([...state.timeline, item]) };
+      ? missionPatch && Object.keys(missionPatch).length > 0 ? missionPatch : state
+      : { ...missionPatch, timeline: reconcileApprovalTimeline([...state.timeline, item]) };
     });
     if (item.eventType?.startsWith('turn_')) {
       const state = get();
@@ -889,6 +1120,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         return {
           missions: state.missions.map((item) => item.id === id ? mission : item),
           queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
+          ...(state.pendingMissionStart?.missionId === id ? { pendingMissionStart: null } : {}),
           timeline: state.timeline.map((item) => {
             const queueId = typeof item.metadata?.queueId === 'string' ? item.metadata.queueId : undefined;
             if (!queueId || !cancelledQueueIds.has(queueId)) return item;

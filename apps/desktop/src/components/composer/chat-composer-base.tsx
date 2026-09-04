@@ -65,6 +65,7 @@ export function ChatComposer() {
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const missions = useMissionStore((state) => state.missions);
   const loading = useMissionStore((state) => state.loading);
+  const pendingMissionStart = useMissionStore((state) => state.pendingMissionStart);
   const composerInput = useMissionStore((state) => state.composerInput);
   const setComposerInput = useMissionStore((state) => state.setComposerInput);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
@@ -94,6 +95,7 @@ export function ChatComposer() {
     activeMission && TERMINAL_CONVERSATION_STATUSES.has(activeMission.status),
   );
   const activeConversationBusy = Boolean(activeMission && !activeConversationCanContinue);
+  const missionStartPending = Boolean(pendingMissionStart);
 
   const selectedModelObject = useMemo(
     () => discoveredModels.find((model) => model.catalogId === selectedModel),
@@ -153,6 +155,7 @@ export function ChatComposer() {
   const matchingModels = useMemo(() => {
     const search = modelSearch.trim().toLowerCase();
     return discoveredModels.filter((model) => {
+      if (!model.available) return false;
       if (!modelSupportsRole(model, 'Orchestrator')) return false;
       if (modelRuntimeFilter !== 'all' && model.runtimeType !== modelRuntimeFilter) return false;
       return !search || [model.name, model.routeLabel, model.accountName, model.provider, model.runtimeModelId]
@@ -171,7 +174,7 @@ export function ChatComposer() {
 
   const submit = async () => {
     const prompt = message.trim();
-    if (!prompt || loading || activeConversationBusy || !directiveModelRoleCompatible || routeResolution.error || !activeWorkspaceId) return;
+    if (!prompt || loading || missionStartPending || activeConversationBusy || !directiveModelRoleCompatible || routeResolution.error || !activeWorkspaceId) return;
     if (!serviceOnline) {
       setActiveView('accounts');
       return;
@@ -269,6 +272,8 @@ export function ChatComposer() {
   const routeLabel = selectedModelObject?.name || 'Auto';
   const composerPlaceholder = !activeWorkspaceId
     ? 'Open a project before starting a mission…'
+    : missionStartPending
+      ? 'A previous mission start is still being reconciled. Select a mission before retrying…'
     : activeConversationBusy
       ? 'This mission is still running. Finish or stop it before sending the next turn…'
       : activeConversationCanContinue
@@ -327,7 +332,7 @@ export function ChatComposer() {
             rows={1}
             placeholder={composerPlaceholder}
             aria-label="Mission message"
-            disabled={loading || !activeWorkspaceId}
+            disabled={loading || missionStartPending || !activeWorkspaceId}
             className="block max-h-[170px] min-h-[42px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/75 disabled:cursor-not-allowed disabled:opacity-60"
           />
 
@@ -335,7 +340,7 @@ export function ChatComposer() {
             <div className="flex items-center gap-0.5">
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label="Attach context" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Attach context" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading || missionStartPending}>
                     <Paperclip className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -343,7 +348,7 @@ export function ChatComposer() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading || missionStartPending}>
                     <AtSign className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -351,7 +356,7 @@ export function ChatComposer() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label="Mission commands" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Mission commands" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading || missionStartPending}>
                     <Terminal className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -454,7 +459,7 @@ export function ChatComposer() {
               <Button
                 size="icon"
                 className="h-8 w-8 rounded-lg"
-                disabled={!message.trim() || loading || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible || Boolean(routeResolution.error)}
+                disabled={!message.trim() || loading || missionStartPending || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible || Boolean(routeResolution.error)}
                 onClick={() => void submit()}
                 aria-label={activeConversationCanContinue ? 'Continue conversation' : 'Send mission'}
               >
@@ -465,7 +470,7 @@ export function ChatComposer() {
         </div>
 
         <div className="mt-1.5 flex items-center justify-between px-1 text-[9px] text-muted-foreground/70">
-          <span>{activeConversationBusy ? 'Mission is running · stop or finish it before the next turn' : activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
+          <span>{missionStartPending ? 'Mission start is being reconciled · select a mission before retrying' : activeConversationBusy ? 'Mission is running · stop or finish it before the next turn' : activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
           {message.length > 0 && <span>~{Math.ceil(message.length / 4)} tokens</span>}
         </div>
       </div>

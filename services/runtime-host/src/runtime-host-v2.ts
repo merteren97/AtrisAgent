@@ -10,6 +10,7 @@ import {
 import type {
   CanonicalReasoning,
   EffectiveRoutingPreference,
+  ModelDescriptor,
   RuntimeType,
   WorkerRequest,
 } from '@atris-agent-code/domain';
@@ -46,6 +47,11 @@ interface SupervisorSession {
 function boundedObservationText(value: unknown, maxChars: number): string {
   const safe = String(redactSensitiveValue(String(value ?? '')));
   return safe.length > maxChars ? `${safe.slice(0, maxChars)}\n[truncated]` : safe;
+}
+
+function isUnverifiedCatalogRoute(model?: ModelDescriptor): boolean {
+  if (!model || model.runtimeModelId === 'antigravity-active-route') return false;
+  return model.source === 'cached' || model.availability === 'unknown';
 }
 
 /**
@@ -214,7 +220,13 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       ...(mergedPreference?.modelCatalogId ? [mergedPreference.modelCatalogId] : []),
       ...(mergedPreference?.fallbackCatalogIds || []),
     ]);
-    if (models.length === 0 || [...requiredCatalogIds].some((id) => !models.some((model) => model.catalogId === id))) {
+    const selectedModels = models.filter((model) => requiredCatalogIds.has(model.catalogId));
+    if (
+      models.length === 0
+      || [...requiredCatalogIds].some((id) => !models.some((model) => model.catalogId === id))
+      || models.some((model) => model.source === 'cached' || model.availability === 'unknown')
+      || selectedModels.some((model) => isUnverifiedCatalogRoute(model))
+    ) {
       models = await catalog.discoverLiveModels(profiles);
     }
 
@@ -234,6 +246,11 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
 
     const scheduler = new Scheduler({ availableAdapters: ADAPTER_IDS });
     const route = scheduler.resolveRoute(workerRequest, profiles, models);
+    if (isUnverifiedCatalogRoute(route.model)) {
+      throw new Error(
+        `The selected ${route.model?.displayName || route.model?.runtimeModelId || 'model'} route is not verified by a live runtime catalog. Refresh the connected runtime before starting the supervisor.`,
+      );
+    }
     const turnBus = new LocalEventBus();
     const cwd = request.workspacePath || this.v2WorkspacePath;
     let continuity = this.supervisorSessions.get(request.missionId);

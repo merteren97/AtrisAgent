@@ -112,6 +112,32 @@ async function runTests() {
     await host.stopAll();
   }
 
+  // Cached/unknown routes are refreshed before selection and never reach a
+  // provider process when the refresh still cannot verify them.
+  {
+    const manager = makeManager();
+    const adapter = makeAdapter();
+    const host: any = new RuntimeHostV2(undefined, { workspaceManager: manager as any, watchdogInterval: 0 });
+    configureHost(host, () => adapter);
+    const staleModel = {
+      catalogId: 'catalog-stale', runtimeId: 'opencode', accountProfileId: 'profile-1', providerId: 'opencode',
+      runtimeModelId: 'provider/stale-model', displayName: 'Stale model', supportedRoles: ['orchestrator'],
+      supportedReasoning: ['medium'], inputModalities: ['text'], availability: 'unknown', source: 'cached',
+    };
+    const catalog: any = host.getModelCatalogService();
+    catalog.getCachedCatalog = () => [staleModel];
+    catalog.discoverLiveModels = async () => [staleModel];
+    let staleError = '';
+    try {
+      await host.runSupervisorTurn({ missionId: 'conversation-stale', turnId: 'turn-stale', prompt: 'do not spawn', modelCatalogId: 'catalog-stale', accountProfileId: 'profile-1', selectionMode: 'fixed' });
+    } catch (error: any) {
+      staleError = String(error?.message || error);
+    }
+    assert(staleError.includes('not verified by a live runtime catalog'), 'supervisor fails closed for a stale cached route');
+    assert(adapter.state.spawns.length === 0, 'supervisor does not spawn an agent for an unverified route');
+    await host.stopAll();
+  }
+
   // Failed health validation discards continuity and safely creates a fresh provider session.
   {
     const manager = makeManager();

@@ -9,7 +9,7 @@ import type {
   TeamRole,
   TeamTemplate,
 } from '@atris-agent-code/domain';
-import { AlertCircle, CheckCircle2, Plus, RefreshCw, Route, Save, X } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Loader2, Plus, RefreshCw, Route, Save, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -17,6 +17,7 @@ import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-b
 import { apiRequest } from '@/lib/api-client';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { useSettingsStore } from '@/stores/settings-store';
+import { normalizeTeamTemplates, reconcileTeamTemplateId } from '@/lib/team-template-utils';
 
 const REASONING_LEVELS: CanonicalReasoning[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const SELECT_CLASS = 'h-9 w-full rounded-md border border-input bg-background px-2.5 text-xs outline-none focus:border-primary';
@@ -29,6 +30,10 @@ const MODES: Array<{ id: RouteSelectionMode; label: string; description: string 
 type PolicyDraft = Partial<Record<AgentRole, RoleExecutionPolicy>>;
 type RuntimeFilter = 'all' | RuntimeType;
 type SavePolicyResponse = { success: boolean; policies: RoleExecutionPolicy[] };
+type CatalogRefreshState = {
+  status: 'idle' | 'refreshing' | 'success' | 'error';
+  message?: string;
+};
 
 function roleLabel(role: AgentRole): string {
   if (role === 'qa') return 'QA';
@@ -74,6 +79,7 @@ function isRoleCompatible(model: DiscoveredModel, role: AgentRole): boolean {
 
 export function ExecutionPolicyEditor() {
   const activeTemplateId = useSettingsStore((state) => state.teamTemplate);
+  const setTeamTemplate = useSettingsStore((state) => state.setTeamTemplate);
   const accounts = useAccountStore((state) => state.accounts);
   const models = useAccountStore((state) => state.discoveredModels);
   const fetchAccounts = useAccountStore((state) => state.fetchAccounts);
@@ -86,6 +92,7 @@ export function ExecutionPolicyEditor() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [catalogRefresh, setCatalogRefresh] = useState<CatalogRefreshState>({ status: 'idle' });
 
   const selectedTemplate = useMemo(
     () => templates.find((template) => template.id === templateId),
@@ -97,16 +104,17 @@ export function ExecutionPolicyEditor() {
     void apiRequest<TeamTemplate[]>('/team-templates')
       .then((items) => {
         if (cancelled) return;
-        setTemplates(items);
-        setTemplateId((current) => items.some((item) => item.id === current)
-          ? current
-          : items.find((item) => item.id === activeTemplateId)?.id || items[0]?.id || '');
+        const normalized = normalizeTeamTemplates(items);
+        setTemplates(normalized);
+        const reconciledId = reconcileTeamTemplateId(items, activeTemplateId);
+        setTemplateId(reconciledId);
+        if (reconciledId !== activeTemplateId) setTeamTemplate(reconciledId);
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : 'Team templates could not be loaded.');
       });
     return () => { cancelled = true; };
-  }, [activeTemplateId]);
+  }, [activeTemplateId, setTeamTemplate]);
 
   useEffect(() => {
     if (!accounts.length || !models.length) void fetchAccounts();
@@ -175,6 +183,20 @@ export function ExecutionPolicyEditor() {
     }
   };
 
+  const refreshCatalog = async () => {
+    if (catalogRefresh.status === 'refreshing') return;
+    setCatalogRefresh({ status: 'refreshing' });
+    try {
+      await refreshModels();
+      setCatalogRefresh({ status: 'success', message: 'Catalog refreshed successfully.' });
+    } catch (cause) {
+      setCatalogRefresh({
+        status: 'error',
+        message: cause instanceof Error ? cause.message : 'Model catalog refresh failed.',
+      });
+    }
+  };
+
   return (
     <Card>
       <CardHeader className="gap-3">
@@ -184,10 +206,13 @@ export function ExecutionPolicyEditor() {
             <CardDescription className="mt-1 max-w-2xl">Configure account-scoped model, reasoning and ordered fallbacks independently for each team role. Explicit fallback models may use another connected account/runtime; unlisted routes remain blocked in Fixed mode.</CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <select value={templateId} onChange={(event) => setTemplateId(event.target.value)} className="h-9 min-w-48 rounded-md border border-input bg-background px-3 text-xs">
+            <select aria-label="Team template for execution policy" value={templateId} onChange={(event) => setTemplateId(event.target.value)} className="h-9 min-w-48 rounded-md border border-input bg-background px-3 text-xs">
               {templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}
             </select>
-            <Button variant="outline" size="sm" onClick={() => void refreshModels()}><RefreshCw className="mr-2 h-3.5 w-3.5" />Refresh catalog</Button>
+            <Button variant="outline" size="sm" onClick={() => void refreshCatalog()} disabled={catalogRefresh.status === 'refreshing'} aria-busy={catalogRefresh.status === 'refreshing'}>
+              {catalogRefresh.status === 'refreshing' ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-2 h-3.5 w-3.5" />}
+              {catalogRefresh.status === 'refreshing' ? 'Refreshing…' : 'Refresh catalog'}
+            </Button>
             <Button size="sm" onClick={() => void save()} disabled={!selectedTemplate || loading || saving}><Save className="mr-2 h-3.5 w-3.5" />{saving ? 'Saving…' : 'Save policy'}</Button>
           </div>
         </div>
@@ -196,6 +221,18 @@ export function ExecutionPolicyEditor() {
           {selectedTemplate?.id === activeTemplateId && <Badge variant="secondary">Active composer team</Badge>}
           {saved && <span className="flex items-center gap-1 text-emerald-400"><CheckCircle2 className="h-3.5 w-3.5" />Saved</span>}
           {error && <span className="flex items-center gap-1 text-amber-400"><AlertCircle className="h-3.5 w-3.5" />{error}</span>}
+          {catalogRefresh.status !== 'idle' && (
+            <span
+              className={`flex items-center gap-1 ${catalogRefresh.status === 'error' ? 'text-amber-400' : catalogRefresh.status === 'success' ? 'text-emerald-400' : 'text-muted-foreground'}`}
+              role={catalogRefresh.status === 'error' ? 'alert' : 'status'}
+              aria-live="polite"
+            >
+              {catalogRefresh.status === 'refreshing' && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />}
+              {catalogRefresh.status === 'success' && <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />}
+              {catalogRefresh.status === 'error' && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
+              {catalogRefresh.message || 'Refreshing model catalog…'}
+            </span>
+          )}
         </div>
       </CardHeader>
       <CardContent className="space-y-3">

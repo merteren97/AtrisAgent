@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { DEFAULT_TEAM_TEMPLATE_ID, normalizeStoredTeamTemplateId } from '@/lib/team-template-utils';
 
 export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts';
 export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate';
@@ -69,7 +70,7 @@ export const useSettingsStore = create<SettingsState>()(
       selectedRole: 'Orchestrator',
       selectedModel: '',
       reasoningLevel: 'medium',
-      teamTemplate: 'default-core-dev-team',
+      teamTemplate: DEFAULT_TEAM_TEMPLATE_ID,
       trustMode: 'Balanced',
       closeBehavior: 'quit',
       updateBehavior: 'notify',
@@ -93,7 +94,7 @@ export const useSettingsStore = create<SettingsState>()(
       setSelectedRole: (role) => set({ selectedRole: role }),
       setSelectedModel: (model) => set({ selectedModel: model }),
       setReasoningLevel: (level) => set({ reasoningLevel: level.toLowerCase() }),
-      setTeamTemplate: (template) => set({ teamTemplate: template }),
+      setTeamTemplate: (template) => set({ teamTemplate: normalizeStoredTeamTemplateId(template) }),
       setTrustMode: (mode) => set({ trustMode: mode }),
       setCloseBehavior: (behavior) => set({ closeBehavior: behavior }),
       setUpdateBehavior: (behavior) => set({ updateBehavior: behavior }),
@@ -118,7 +119,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 9,
+      version: 10,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
         const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
@@ -126,7 +127,7 @@ export const useSettingsStore = create<SettingsState>()(
           ...state,
           selectedModel: state.selectedModel?.includes(':') ? state.selectedModel : '',
           reasoningLevel: (state.reasoningLevel || 'medium').toLowerCase(),
-          teamTemplate: state.teamTemplate === 'Core Dev Team' || !state.teamTemplate ? 'default-core-dev-team' : state.teamTemplate,
+          teamTemplate: normalizeStoredTeamTemplateId(state.teamTemplate),
           closeBehavior: state.closeBehavior === 'tray' ? 'tray' : 'quit',
           updateBehavior: state.updateBehavior === 'automatic' ? 'automatic' : 'notify',
           timelineDetailMode: ['activity', 'telemetry'].includes(state.timelineDetailMode || '')

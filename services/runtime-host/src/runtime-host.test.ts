@@ -774,6 +774,49 @@ async function runTests() {
     }
   }
 
+  // A stale cached route must be refreshed and then rejected before any task
+  // claim or provider spawn if the runtime still cannot verify it live.
+  {
+    let discoveryCalls = 0;
+    let spawned = false;
+    const manager: any = {
+      async getTask() { return { missionId: 'mission-stale-route', assignedRole: 'researcher', description: 'Use a verified route', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
+      async getMission() { return { workspaceId: 'workspace-stale-route', automationPolicy: null }; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'codex', runtimeType: 'codex', name: 'Codex stale-route test', setEventBus() {}, configureProfile() {},
+      async probeCapabilities() { return {}; },
+      async spawnAgent() { spawned = true; return { id: 'never-spawned' }; },
+      async shutdown() {}, async cancel() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-stale-route', provider: 'openai', runtimeType: 'codex', profileName: 'Stale route profile', authStatus: 'connected',
+      allowedRoles: ['researcher'], schedulerAuto: true, capabilitySnapshot: {},
+    }];
+    const staleModel = {
+      catalogId: 'catalog-stale-route', runtimeId: 'codex', accountProfileId: 'profile-stale-route', providerId: 'openai',
+      runtimeModelId: 'gpt-stale', displayName: 'GPT stale', supportedRoles: ['researcher'], supportedReasoning: ['medium'],
+      inputModalities: ['text'], availability: 'unknown', source: 'cached',
+    };
+    (host as any).catalogService.getCachedCatalog = () => [staleModel];
+    (host as any).catalogService.discoverLiveModels = async () => { discoveryCalls += 1; return [staleModel]; };
+    let errorMessage = '';
+    try {
+      await host.handleTaskCreated({
+        id: 'event-stale-route', type: 'task_created', missionId: 'mission-stale-route', taskId: 'task-stale-route',
+        agentInstanceId: 'agent-stale-route', assignedRole: 'researcher', title: 'Stale route', timestamp: new Date().toISOString(),
+      } as any);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    assert(discoveryCalls === 1 && errorMessage.includes('not verified by a live runtime catalog'), 'RuntimeHost refreshes and rejects a stale route before task execution');
+    assert(!spawned, 'RuntimeHost never spawns a provider process for an unverified cached route');
+    await host.stopAll();
+  }
+
   // Persisted task identity and role are authoritative for execution access.
   {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-runtime-access-'));

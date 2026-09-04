@@ -49,6 +49,7 @@ export function Titlebar() {
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
   const showMissionControls = activeView === 'chat' && Boolean(activeMission);
   const canStop = Boolean(activeMission && isMissionCancellable(activeMission.status));
+  const canCancelBeforeStart = Boolean(activeMission && ['draft', 'queued', 'starting'].includes(activeMission.status));
   const canRetry = Boolean(activeMission && hydratedMissionId === activeMission.id
     && canRetryMission(activeMission.status, activeTasks.map((task) => task.status)));
   const viewTitle = activeView === 'dashboard' ? 'Command Center'
@@ -167,7 +168,7 @@ export function Titlebar() {
         </Button>
         {showMissionControls && <div className="mx-0.5 h-5 w-px bg-border" />}
         {showMissionControls && canStop && (
-          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('stop')} disabled={Boolean(pendingAction)} title={activeMission?.status === 'draft' || activeMission?.status === 'ready' ? 'Cancel' : t('Stop')} aria-label={activeMission?.status === 'draft' || activeMission?.status === 'ready' ? 'Cancel mission' : 'Stop mission'}>
+          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('stop')} disabled={Boolean(pendingAction)} title={canCancelBeforeStart ? 'Cancel' : t('Stop')} aria-label={canCancelBeforeStart ? 'Cancel mission' : 'Stop mission'}>
             <Square className="h-3.5 w-3.5" />
           </Button>
         )}
