@@ -545,8 +545,16 @@ export class RuntimeHost {
   private isCorrelatedTerminalEvent(
     event: TaskCompleted | TaskFailed,
     sessionId: string,
-    active: { missionId?: string; taskId?: string; session: AgentSession },
+    active: { missionId?: string; taskId?: string; attemptId?: string; session: AgentSession },
   ): boolean {
+    const identity = event as TaskCompleted & Record<string, unknown>;
+    // Once an attempt has a durable identity, a terminal signal must carry at
+    // least one matching identity. This prevents a late signal from an older
+    // process from closing a replacement attempt for the same task.
+    if (typeof identity.attemptId === 'string') return identity.attemptId === active.attemptId;
+    if (event.runId) {
+      return event.runId === active.session.runtimeSessionId || event.runId === sessionId;
+    }
     if (event.agentInstanceId) {
       return event.agentInstanceId === sessionId || event.agentInstanceId === active.session.agentInstanceId;
     }
@@ -554,7 +562,7 @@ export class RuntimeHost {
     // attempt. During retries, ignore it instead of closing the new session.
     const matches = [...this.activeSessions.entries()].filter(([, candidate]) =>
       candidate.missionId === active.missionId && candidate.taskId === active.taskId);
-    return matches.length === 1;
+    return !active.attemptId && matches.length === 1;
   }
 
   private async emitRuntimeTelemetry(
@@ -1286,6 +1294,7 @@ export class RuntimeHost {
     this.watchdogRunning = true;
     try {
       await Promise.all([...this.activeSessions.entries()].map(async ([sessionId, active]) => {
+        if (this.finishingSessions.has(sessionId)) return;
         const adapter = this.adapters.get(active.adapterId);
         if (!adapter?.isSessionAlive(sessionId)) return;
         const idleFor = Math.max(0, now.getTime() - active.lastProtocolResponseAt);
@@ -1304,30 +1313,43 @@ export class RuntimeHost {
 
         active.probeFailures += 1;
         if (active.probeFailures >= this.maxProbeFailures()) {
-          await adapter.cancel(sessionId).catch(() => undefined);
-          await this.finishAttempt(active, 'expired', {
-            error: responsive === null
-              ? 'Runtime session exceeded the bounded quiet CLI allowance'
-              : 'Runtime session stopped responding to health probes',
-            retryable: true,
-          }).catch(() => false);
-          this.activeSessions.delete(sessionId);
-          this.eventBus?.emit({
-            id: crypto.randomUUID(), type: 'task_failed', missionId: active.missionId || '',
-            taskId: active.taskId || '', agentInstanceId: active.session.agentInstanceId || sessionId,
-            agentProfileId: active.agentProfileId,
-            error: responsive === null
-              ? 'Runtime session exceeded the bounded quiet CLI allowance'
-              : 'Runtime session stopped responding to health probes',
-            timestamp: now.toISOString(),
-          });
+          this.finishingSessions.add(sessionId);
+          try {
+            await adapter.cancel(sessionId).catch(() => undefined);
+            const finished = await this.finishAttempt(active, 'expired', {
+              error: responsive === null
+                ? 'Runtime session exceeded the bounded quiet CLI allowance'
+                : 'Runtime session stopped responding to health probes',
+              retryable: true,
+            }).catch(() => false);
+            this.activeSessions.delete(sessionId);
+            if (finished) {
+              const failure = {
+                id: crypto.randomUUID(), type: 'task_failed', missionId: active.missionId || '',
+                taskId: active.taskId || '', agentInstanceId: active.session.agentInstanceId || sessionId,
+                agentProfileId: active.agentProfileId,
+                attemptId: active.attemptId,
+                error: responsive === null
+                  ? 'Runtime session exceeded the bounded quiet CLI allowance'
+                  : 'Runtime session stopped responding to health probes',
+                timestamp: now.toISOString(),
+              } as TaskFailed & { attemptId?: string };
+              this.eventBus?.emit(failure);
+              void this.emitRuntimeTelemetry(failure, active, 'failed').catch(() => undefined);
+            }
+          } finally {
+            this.finishingSessions.delete(sessionId);
+          }
         }
       }));
       const expired = await this.workspaceManager.expireStaleTaskAttempts(now.toISOString(), now.toISOString());
       for (const attempt of expired) {
         const sessionId = attempt.runtimeSessionId;
         const active = sessionId ? this.activeSessions.get(sessionId) : undefined;
-        if (active) {
+        // A runtime session id can be reused by a replacement attempt. Only
+        // cancel/remove the process that owns the expired durable attempt.
+        const ownsExpiredAttempt = Boolean(active && active.attemptId === attempt.id);
+        if (active && ownsExpiredAttempt && !this.finishingSessions.has(sessionId!)) {
           await this.adapters.get(active.adapterId)?.cancel(sessionId!).catch(() => undefined);
           this.activeSessions.delete(sessionId!);
         }
@@ -1335,8 +1357,9 @@ export class RuntimeHost {
           id: crypto.randomUUID(), type: 'task_failed', missionId: attempt.missionId,
           taskId: attempt.taskId, agentInstanceId: attempt.agentInstanceId,
           agentProfileId: attempt.agentProfileId || active?.agentProfileId,
+          attemptId: attempt.id,
           error: attempt.error || 'Runtime session timed out', timestamp: now.toISOString(),
-        });
+        } as TaskFailed & { attemptId?: string });
       }
       return expired.length;
     } finally {

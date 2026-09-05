@@ -265,6 +265,12 @@ export class Orchestrator {
   private unsubscribeEvents?: Unsubscribe;
   private applyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
 
+  /** Seed retry state recovered from durable task-attempt history. */
+  protected seedTaskRetryCount(taskId: string, retryCount: number): void {
+    const current = this.taskRetries.get(taskId) ?? 0;
+    this.taskRetries.set(taskId, Math.max(current, retryCount));
+  }
+
   constructor(
     config: OrchestratorConfig,
     eventBus?: LocalEventBus,
@@ -1465,7 +1471,12 @@ export class Orchestrator {
 
       console.warn(`[Orchestrator] Task ${taskId} failed (${error}). Retrying (${newCount}/${this.maxTaskRetries})...`);
 
-      const retryTask = this.workspaceManager ? await this.workspaceManager.getTask(taskId) : null;
+      // The failed attempt no longer occupies a worker slot. Leave the task
+      // ready if another worker currently owns capacity, rather than keeping
+      // the dead attempt running and blocking its own retry indefinitely.
+      const retryTask = this.workspaceManager
+        ? await this.workspaceManager.updateTask(taskId, { status: 'ready', assignedAgentId: null })
+        : null;
       if (!retryTask || (await this.capacityAllowedTasks(missionId, [retryTask])).length > 0) await this.assignTask(taskId);
       return;
     }

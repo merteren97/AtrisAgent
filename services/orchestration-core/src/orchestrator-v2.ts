@@ -356,25 +356,30 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     const task = await manager.getTask(event.taskId);
     if (!task || task.missionId !== event.missionId || !event.agentInstanceId) return null;
+    if (mission.planId && task.planId && task.planId !== mission.planId) return null;
 
     const taskAgentMatches = task.assignedAgentId === event.agentInstanceId;
     const listTaskAttempts = (manager as WorkspaceManager & {
       listTaskAttempts?: (taskId: string) => Promise<Array<{
+        id?: string;
         taskId: string;
         missionId: string;
         agentInstanceId: string;
         attemptNumber: number;
         status: string;
+        completedAt?: string | null;
       }>>;
     }).listTaskAttempts;
     let attemptAgentMatches = false;
     if (typeof listTaskAttempts === 'function') {
       let attempts: Array<{
+        id?: string;
         taskId: string;
         missionId: string;
         agentInstanceId: string;
         attemptNumber: number;
         status: string;
+        completedAt?: string | null;
       }>;
       try {
         attempts = await listTaskAttempts.call(manager, task.id);
@@ -384,7 +389,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       if (attempts.length > 0) {
         const latestAttempt = [...attempts].sort((left, right) => right.attemptNumber - left.attemptNumber)[0];
         const terminalAttemptStatus = event.type === 'task_completed' ? 'completed' : 'failed';
-        const validAttemptStatus = new Set(['claimed', 'running', terminalAttemptStatus]);
+        const validAttemptStatus = new Set(['claimed', 'running', terminalAttemptStatus,
+          ...(event.type === 'task_failed' ? ['expired'] : []),
+        ]);
         if (!latestAttempt
           || latestAttempt.taskId !== task.id
           || latestAttempt.missionId !== event.missionId
@@ -392,6 +399,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           || !validAttemptStatus.has(String(latestAttempt.status))) {
           return null;
         }
+        const eventAttemptId = (event as T & { attemptId?: string }).attemptId;
+        if (eventAttemptId && latestAttempt.id !== eventAttemptId) return null;
         attemptAgentMatches = true;
       }
     }
@@ -1674,6 +1683,46 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     });
   }
 
+  /** Recover a watchdog-expired latest attempt whose task row is still active. */
+  private async recoverExpiredTaskAttempts(missionId: string, planId?: string | null): Promise<void> {
+    const manager = this.v2WorkspaceManager;
+    if (!manager) return;
+    const listTaskAttempts = (manager as WorkspaceManager & {
+      listTaskAttempts?: (taskId: string) => Promise<Array<{
+        id: string; taskId: string; missionId: string; agentInstanceId: string;
+        attemptNumber: number; status: string; completedAt?: string | null; error?: string | null;
+      }>>;
+    }).listTaskAttempts;
+    if (typeof listTaskAttempts !== 'function') return;
+    const mission = await manager.getMission(missionId);
+    if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status)) || mission.status === 'blocked') return;
+    if (planId && mission.planId && planId !== mission.planId) return;
+    const activePlanId = mission.planId || planId || null;
+    const tasks = (await manager.listTasks(missionId)).filter((task) =>
+      (!activePlanId || task.planId === activePlanId) && ACTIVE_TASK_STATUSES.has(String(task.status)) && Boolean(task.assignedAgentId));
+    for (const task of tasks) {
+      const attempts = await listTaskAttempts.call(manager, task.id);
+      const latestAttempt = [...attempts].sort((left, right) => right.attemptNumber - left.attemptNumber)[0];
+      if (!latestAttempt || latestAttempt.taskId !== task.id || latestAttempt.missionId !== missionId
+        || latestAttempt.status !== 'expired' || latestAttempt.agentInstanceId !== task.assignedAgentId) continue;
+      const event = {
+        id: `expired-recovery-${latestAttempt.id}`,
+        type: 'task_failed' as const,
+        missionId,
+        taskId: task.id,
+        agentInstanceId: latestAttempt.agentInstanceId,
+        error: latestAttempt.error || 'Runtime session lease expired before completion was confirmed',
+        timestamp: latestAttempt.completedAt || new Date().toISOString(),
+        attemptId: latestAttempt.id,
+      } as TaskFailed & { attemptId: string };
+      // Seed the legacy retry counter from durable history so a gateway
+      // restart cannot reset the retry budget and loop forever on expiries.
+      this.seedTaskRetryCount(task.id, Math.max(0, latestAttempt.attemptNumber - 1));
+      this.trace('expired-task-attempt-recovered', { missionId, taskId: task.id, attemptId: latestAttempt.id });
+      await this.handleTaskFailed(event);
+    }
+  }
+
   private researchArtifactId(planId: string): string {
     return `research-context:${planId}`;
   }
@@ -2055,6 +2104,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   async reconcileMissionPlan(missionId: string, planId?: string | null): Promise<void> {
     const manager = this.v2WorkspaceManager;
     if (!manager) return;
+    // Recover durable watchdog expiries before evaluating a still-running task
+    // as a plan deadlock. This runs outside the mission queue because failure
+    // handling itself enqueues the mission.
+    await this.recoverExpiredTaskAttempts(missionId, planId);
     await this.enqueueMission(missionId, () => this.reconcileMissionPlanUnlocked(missionId, planId));
   }
 
@@ -2092,6 +2145,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     const planId = requestedPlanId || mission.planId || null;
+    if (mission.planId && planId !== mission.planId) return;
     const missionTasks = await manager.listTasks(missionId);
     const planTasks = planId ? missionTasks.filter((task) => task.planId === planId) : missionTasks;
     if (planTasks.length === 0) {

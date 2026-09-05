@@ -10,6 +10,7 @@ import { rankMemoryNodes } from './memory-retrieval';
 class FakeWorkspaceManager {
   mission: MissionSelect;
   tasks = new Map<string, TaskSelect>();
+  attempts = new Map<string, Array<any>>();
   doneUpdateCount = 0;
   throwOnSecondDoneUpdate = false;
   workerPoolPolicy: EffectiveWorkerPoolPolicy = DEFAULT_CORE_WORKER_POOL;
@@ -73,6 +74,10 @@ class FakeWorkspaceManager {
     const updated = { ...current, ...updates, updatedAt: new Date().toISOString() } as TaskSelect;
     this.tasks.set(id, updated);
     return updated;
+  }
+
+  async listTaskAttempts(taskId: string): Promise<any[]> {
+    return this.attempts.get(taskId) || [];
   }
 
   async resolveMissionWorkerPoolPolicy(): Promise<EffectiveWorkerPoolPolicy> {
@@ -1283,6 +1288,69 @@ async function runTests() {
     assert(manager.tasks.get('task')?.status === 'rejected' && manager.mission.status === 'failed'
       && events.some((event) => event.type === 'mission_failed'),
     'Durably correlated runless task_failed events retain the existing rejection/retry semantics');
+  }
+
+  // A watchdog persists an expired attempt before its runless failure event is
+  // delivered. The latest expired attempt is recoverable, while a duplicate
+  // reconciliation is fenced once the task/mission become terminal.
+  {
+    const missionId = 'mission-expired-attempt-recovery';
+    const planId = 'plan-expired-attempt-recovery';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('task', task({
+      id: 'task', missionId, planId, role: 'builder', status: 'running', assignedAgentId: 'agent-expired',
+    }));
+    manager.attempts.set('task', [{
+      id: 'attempt-expired', taskId: 'task', missionId, agentInstanceId: 'agent-expired',
+      attemptNumber: 4, status: 'expired', completedAt: new Date().toISOString(), error: 'lease expired',
+    }]);
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', maxTaskRetries: 3, workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    assert(manager.tasks.get('task')?.status === 'rejected' && manager.mission.status === 'failed'
+      && events.filter((event) => event.type === 'mission_failed').length === 1,
+    'Reconciliation recovers only the latest expired attempt into the bounded failure path');
+    await orchestrator.reconcileMissionPlan(missionId, planId);
+    assert(events.filter((event) => event.type === 'mission_failed').length === 1,
+      'Repeated reconciliation does not retry a terminal expired attempt');
+  }
+
+  // First expiry consumes no retry yet. A restart after the second expired
+  // attempt must not grant a fresh budget, and historical plans stay fenced.
+  {
+    const missionId = 'expiry-retry-budget';
+    const planId = 'current-expiry-plan';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('research', task({ id: 'research', missionId, planId, role: 'researcher', status: 'running', assignedAgentId: 'first-agent' }));
+    manager.attempts.set('research', [{ id: 'first-attempt', taskId: 'research', missionId, agentInstanceId: 'first-agent', attemptNumber: 1, status: 'expired' }]);
+    const bus = new LocalEventBus();
+    let dispatches = 0;
+    bus.on('task_created', () => { dispatches += 1; });
+    const config = { workspacePath: 'test', maxTaskRetries: 1, workspaceManager: manager as unknown as WorkspaceManager };
+    const first = new OrchestratorV2(config, bus, undefined, manager as unknown as WorkspaceManager);
+    await first.reconcileMissionPlan(missionId, planId);
+    const retryAgent = manager.tasks.get('research')?.assignedAgentId;
+    assert(dispatches === 1 && Boolean(retryAgent) && retryAgent !== 'first-agent', 'first expired attempt schedules exactly one allowed retry with a fresh agent');
+    await first.reconcileMissionPlan(missionId, planId);
+    assert(dispatches === 1, 'expired previous attempt cannot reschedule a newer active assignment');
+    first.unsubscribeFromEvents();
+    manager.tasks.set('old', task({ id: 'old', missionId, planId: 'historical-plan', role: 'researcher', status: 'running', assignedAgentId: 'old-agent' }));
+    manager.attempts.set('old', [{ id: 'old-attempt', taskId: 'old', missionId, agentInstanceId: 'old-agent', attemptNumber: 9, status: 'expired' }]);
+    const restarted = new OrchestratorV2(config, bus, undefined, manager as unknown as WorkspaceManager);
+    await restarted.reconcileMissionPlan(missionId, 'historical-plan');
+    assert(manager.mission.status === 'running' && manager.tasks.get('old')?.status === 'running', 'explicit historical plan reconciliation cannot fail the current run');
+    manager.attempts.set('research', [{ id: 'second-attempt', taskId: 'research', missionId, agentInstanceId: retryAgent!, attemptNumber: 2, status: 'expired' }]);
+    await restarted.reconcileMissionPlan(missionId, planId);
+    assert(manager.mission.status === 'failed' && dispatches === 1, 'durable second expiry exhausts max-one retry across an orchestrator restart');
+    restarted.unsubscribeFromEvents();
   }
 
   // Recovery: if read-only workers are already durably done but the final

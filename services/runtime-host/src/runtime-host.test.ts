@@ -601,6 +601,7 @@ async function runTests() {
     };
     let expiryCalls = 0;
     const manager: any = {
+      async finishTaskAttempt() { return true; },
       async expireStaleTaskAttempts() {
         expiryCalls += 1;
         return expiryCalls === 1 ? [staleAttempt] : [];
@@ -636,6 +637,69 @@ async function runTests() {
     await host.runSessionWatchdog(new Date(101));
     assert(probeCalls === 1 && heartbeatCalls === 1, 'watchdog renews a quiet session only after a positive responsiveness probe');
     (host as any).activeSessions.clear();
+    await host.stopAll();
+  }
+
+  // A late terminal event from an expired attempt cannot finish its replacement.
+  {
+    const eventBus = new LocalEventBus();
+    let finishCalls = 0;
+    const manager: any = {
+      async finishTaskAttempt() { finishCalls += 1; return true; },
+      async expireStaleTaskAttempts() { return []; },
+    };
+    const host = new RuntimeHost(eventBus, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'correlated', setEventBus() {}, isSessionAlive: () => true,
+      async cancel() {}, async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('replacement-session', {
+      adapterId: 'correlated',
+      session: { id: 'replacement-session', agentInstanceId: 'agent-same', runtimeSessionId: 'replacement-run' },
+      missionId: 'mission-correlation', taskId: 'task-correlation', attemptId: 'attempt-new',
+      queuedAt: 0, startedAt: 0, retryCount: 2, lastProtocolResponseAt: Date.now(), probeFailures: 0,
+    });
+    eventBus.emit({
+      id: 'late-old', type: 'task_failed', missionId: 'mission-correlation', taskId: 'task-correlation',
+      agentInstanceId: 'agent-same', attemptId: 'attempt-old', error: 'old process', timestamp: new Date().toISOString(),
+    } as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert(finishCalls === 0 && (host as any).activeSessions.has('replacement-session'), 'late terminal event with an old attempt id is ignored');
+    eventBus.emit({
+      id: 'matching-new', type: 'task_failed', missionId: 'mission-correlation', taskId: 'task-correlation',
+      agentInstanceId: 'agent-same', attemptId: 'attempt-new', error: 'new process', timestamp: new Date().toISOString(),
+    } as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert(finishCalls === 1 && !(host as any).activeSessions.has('replacement-session'), 'matching attempt id finishes the active session');
+    await host.stopAll();
+  }
+
+  // Persisted expiry must not cancel a replacement process that reuses a runtime id.
+  {
+    let cancelCalls = 0;
+    let expiryCalls = 0;
+    const manager: any = {
+      async finishTaskAttempt() { return true; },
+      async expireStaleTaskAttempts() {
+        expiryCalls += 1;
+        return expiryCalls === 1 ? [{ id: 'attempt-old', missionId: 'mission-reuse', taskId: 'task-reuse', agentInstanceId: 'agent-reuse', runtimeSessionId: 'reused-runtime', error: 'expired' }] : [];
+      },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'reuse', setEventBus() {}, isSessionAlive: () => false,
+      async cancel() { cancelCalls += 1; }, async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('reused-runtime', {
+      adapterId: 'reuse',
+      session: { id: 'reused-runtime', agentInstanceId: 'agent-reuse', runtimeSessionId: 'reused-runtime' },
+      missionId: 'mission-reuse', taskId: 'task-reuse', attemptId: 'attempt-new',
+      queuedAt: 0, startedAt: 0, retryCount: 2, lastProtocolResponseAt: Date.now(), probeFailures: 0,
+    });
+    await host.runSessionWatchdog(new Date('2026-01-01T00:00:00.000Z'));
+    assert(cancelCalls === 0 && (host as any).activeSessions.has('reused-runtime'), 'stale lease expiry does not cancel a replacement attempt');
     await host.stopAll();
   }
 
