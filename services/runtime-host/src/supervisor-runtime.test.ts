@@ -154,21 +154,49 @@ async function runTests() {
 
   // Restart resume is attempted only for an explicitly restart-safe provider; unsupported CLIs never receive a persisted ID.
   {
-    const persisted = { providerSessionId: 'persisted-provider', resumeCapability: 'restart', route, updatedAt: new Date().toISOString() };
+    const persisted = {
+      providerSessionId: 'persisted-provider', resumeCapability: 'restart', route,
+      agentProfileId: 'supervisor-specialist', updatedAt: new Date().toISOString(),
+    };
     const manager = makeManager(persisted);
     const supported = makeAdapter();
-    const host: any = new RuntimeHostV2(undefined, { workspaceManager: manager as any, watchdogInterval: 0 });
+    const host: any = new RuntimeHostV2(undefined, {
+      workspaceManager: manager as any,
+      watchdogInterval: 0,
+      agentProfiles: [{ id: 'supervisor-specialist', name: 'Supervisor Specialist', role: 'orchestrator', instructions: '', capabilities: [] }],
+    });
     configureHost(host, () => supported);
     await host.runSupervisorTurn({ missionId: 'conversation-restart', turnId: 'turn-restart', prompt: 'resume' });
-    assert(supported.state.probes === 1 && supported.state.spawns[0].providerSessionId === 'persisted-provider', 'restart-safe provider session is reattached only after health validation');
+    assert(supported.state.probes === 1 && supported.state.spawns[0].providerSessionId === 'persisted-provider'
+      && supported.state.spawns[0].agentProfileId === 'supervisor-specialist', 'restart-safe provider session and persisted agent profile are reattached only after health validation');
     await host.stopAll();
 
     const unsupported = makeAdapter({ reuseWhileAlive: false, resumeAfterRestart: false });
-    const unsupportedHost: any = new RuntimeHostV2(undefined, { workspaceManager: manager as any, watchdogInterval: 0 });
+    const unsupportedHost: any = new RuntimeHostV2(undefined, {
+      workspaceManager: manager as any,
+      watchdogInterval: 0,
+      agentProfiles: [{ id: 'supervisor-specialist', name: 'Supervisor Specialist', role: 'orchestrator', instructions: '', capabilities: [] }],
+    });
     configureHost(unsupportedHost, () => unsupported);
     await unsupportedHost.runSupervisorTurn({ missionId: 'conversation-restart', turnId: 'turn-unsupported', prompt: 'recover durably' });
     assert(unsupported.state.probes === 0 && unsupported.state.spawns[0].providerSessionId === undefined, 'unsupported Codex/Claude/Antigravity-style provider starts fresh from durable context instead of pretending resume');
     await unsupportedHost.stopAll();
+  }
+
+  // A persisted provider session must belong to the same account and specialist.
+  for (const mismatch of ['account', 'agent-profile']) {
+    const manager = makeManager({
+      providerSessionId: 'foreign-session', resumeCapability: 'restart',
+      route: { ...route, accountProfileId: mismatch === 'account' ? 'other-account' : route.accountProfileId },
+      agentProfileId: mismatch === 'agent-profile' ? 'old-specialist' : 'orchestrator',
+    });
+    const adapter = makeAdapter();
+    const host: any = new RuntimeHostV2(undefined, { workspaceManager: manager as any, watchdogInterval: 0 });
+    configureHost(host, () => adapter);
+    await host.runSupervisorTurn({ missionId: `mismatch-${mismatch}`, turnId: 'new-turn', prompt: 'fresh', agentProfileId: 'orchestrator', modelCatalogId: 'catalog-1', accountProfileId: 'profile-1' });
+    assert(adapter.state.spawns[0].providerSessionId === undefined && adapter.state.probes === 0,
+      `restart does not reuse a provider session after ${mismatch} changes`);
+    await host.stopAll();
   }
 
   // Idle TTL and mission cancellation both release reusable provider state.

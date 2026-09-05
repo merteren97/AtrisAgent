@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { Clock3, Send, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
+import { AgentProfileSelector } from './agent-profile-selector';
 import { buildComposerRouteOptions, parseAgentDirective } from '@/lib/agent-directive';
 import { useAccountStore } from '@/stores/account-store';
 import { useMissionStore, type StartMissionOptions, type TurnDelivery } from '@/stores/mission-store';
@@ -19,7 +20,7 @@ function QueuedTurnComposer() {
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const discoveredModels = useAccountStore((state) => state.discoveredModels);
   const serviceOnline = useAccountStore((state) => state.serviceOnline);
-  const { selectedModel, reasoningLevel, trustMode, teamTemplate, automationSettings, setActiveView } = useSettingsStore();
+  const { selectedModel, reasoningLevel, trustMode, teamTemplate, agentProfileIds, automationSettings, setActiveView } = useSettingsStore();
 
   const selectedModelObject = useMemo(
     () => discoveredModels.find((model) => model.catalogId === selectedModel),
@@ -64,6 +65,7 @@ function QueuedTurnComposer() {
 
     const options: StartMissionOptions = {
       teamTemplate,
+      agentProfileIds,
       trustMode,
       automationSettings,
       ...routeResolution.options,
@@ -111,8 +113,9 @@ function QueuedTurnComposer() {
               {reasoningLevel && reasoningLevel !== 'none' && selectedModelObject?.supportedReasoning.length ? <span className="shrink-0">· {reasoningLevel}</span> : null}
               {routeResolution.error ? <span className="shrink-0 text-amber-400">· {routeResolution.error}</span> : null}
             </div>
-            <div className="flex items-center gap-1">
-              <div className="flex rounded-md border border-border/70 bg-background/70 p-0.5" aria-label="Message delivery">
+              <div className="flex items-center gap-1">
+                <AgentProfileSelector />
+                <div className="flex rounded-md border border-border/70 bg-background/70 p-0.5" aria-label="Message delivery">
                 {(['steer', 'queue', 'stop_and_replan'] as TurnDelivery[]).map((mode) => <button key={mode} type="button" onClick={() => setDelivery(mode)} aria-pressed={delivery === mode}
                   className={delivery === mode ? 'rounded px-2 py-1 text-[9px] font-medium text-foreground bg-accent' : 'rounded px-2 py-1 text-[9px] text-muted-foreground hover:text-foreground'}>
                   {mode === 'stop_and_replan' ? 'Replan' : mode[0].toUpperCase() + mode.slice(1)}

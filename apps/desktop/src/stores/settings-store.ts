@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
 import { DEFAULT_TEAM_TEMPLATE_ID, normalizeStoredTeamTemplateId } from '@/lib/team-template-utils';
 
 export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts';
@@ -8,6 +9,18 @@ export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' |
 export type CloseBehavior = 'quit' | 'tray';
 export type UpdateBehavior = 'notify' | 'automatic';
 export type TimelineDetailMode = 'summary' | 'activity' | 'telemetry';
+export type AgentProfileSelections = Partial<Record<AgentRole, string>>;
+
+export function normalizeAgentProfileSelections(value: unknown): AgentProfileSelections {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  const selections: AgentProfileSelections = {};
+  for (const role of AGENT_ROLES) {
+    const profileId = record[role];
+    if (typeof profileId === 'string' && profileId.trim()) selections[role] = profileId.trim();
+  }
+  return selections;
+}
 
 interface SettingsState {
   hasSeenOnboarding: boolean;
@@ -20,6 +33,8 @@ interface SettingsState {
   /** Canonical lowercase reasoning value understood by runtime adapters. */
   reasoningLevel: string;
   teamTemplate: string;
+  /** Optional explicit named profile per fixed role; omitted roles use defaults. */
+  agentProfileIds: AgentProfileSelections;
   trustMode: TrustMode;
   closeBehavior: CloseBehavior;
   updateBehavior: UpdateBehavior;
@@ -44,6 +59,7 @@ interface SettingsState {
   setSelectedModel: (modelCatalogId: string) => void;
   setReasoningLevel: (level: string) => void;
   setTeamTemplate: (template: string) => void;
+  setAgentProfileId: (role: AgentRole, profileId?: string | null) => void;
   setTrustMode: (mode: TrustMode) => void;
   setCloseBehavior: (behavior: CloseBehavior) => void;
   setUpdateBehavior: (behavior: UpdateBehavior) => void;
@@ -71,6 +87,7 @@ export const useSettingsStore = create<SettingsState>()(
       selectedModel: '',
       reasoningLevel: 'medium',
       teamTemplate: DEFAULT_TEAM_TEMPLATE_ID,
+      agentProfileIds: {},
       trustMode: 'Balanced',
       closeBehavior: 'quit',
       updateBehavior: 'notify',
@@ -85,7 +102,7 @@ export const useSettingsStore = create<SettingsState>()(
       inspectorCollapsed: false,
       inspectorWidth: 320,
       inspectorExpanded: false,
-      inspectorTab: 'agents',
+      inspectorTab: 'plan',
       commandPaletteOpen: false,
       setHasSeenOnboarding: (value) => set({ hasSeenOnboarding: value }),
       setTelemetryOptIn: (value) => set({ telemetryOptIn: value }),
@@ -95,6 +112,13 @@ export const useSettingsStore = create<SettingsState>()(
       setSelectedModel: (model) => set({ selectedModel: model }),
       setReasoningLevel: (level) => set({ reasoningLevel: level.toLowerCase() }),
       setTeamTemplate: (template) => set({ teamTemplate: normalizeStoredTeamTemplateId(template) }),
+      setAgentProfileId: (role, profileId) => set((state) => {
+        const next = { ...state.agentProfileIds };
+        const normalized = profileId?.trim();
+        if (normalized) next[role] = normalized;
+        else delete next[role];
+        return { agentProfileIds: next };
+      }),
       setTrustMode: (mode) => set({ trustMode: mode }),
       setCloseBehavior: (behavior) => set({ closeBehavior: behavior }),
       setUpdateBehavior: (behavior) => set({ updateBehavior: behavior }),
@@ -119,7 +143,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 10,
+      version: 11,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
         const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
@@ -128,12 +152,13 @@ export const useSettingsStore = create<SettingsState>()(
           selectedModel: state.selectedModel?.includes(':') ? state.selectedModel : '',
           reasoningLevel: (state.reasoningLevel || 'medium').toLowerCase(),
           teamTemplate: normalizeStoredTeamTemplateId(state.teamTemplate),
+          agentProfileIds: normalizeAgentProfileSelections(state.agentProfileIds),
           closeBehavior: state.closeBehavior === 'tray' ? 'tray' : 'quit',
           updateBehavior: state.updateBehavior === 'automatic' ? 'automatic' : 'notify',
           timelineDetailMode: ['activity', 'telemetry'].includes(state.timelineDetailMode || '')
             ? state.timelineDetailMode
             : 'summary',
-          inspectorTab: validInspectorTabs.includes(state.inspectorTab as InspectorTab) ? state.inspectorTab : 'agents',
+          inspectorTab: validInspectorTabs.includes(state.inspectorTab as InspectorTab) ? state.inspectorTab : 'plan',
           inspectorExpanded: false,
           automationSettings: { fileWrite: null, gitCommit: null, packageInstall: null },
           // Direct role selection is now an advanced capability; normal missions always

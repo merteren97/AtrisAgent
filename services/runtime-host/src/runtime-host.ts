@@ -5,8 +5,13 @@ import type { LocalEventBus, Unsubscribe } from '@atris-agent-code/event-bus';
 import type { ApprovalRequested, TaskCompleted, TaskCreated, TaskFailed } from '@atris-agent-code/event-schema';
 import type {
   AgentSession,
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileResolution,
+  AgentProfileRoutePolicy,
   WorkerRequest,
   AgentRole,
+  EffectiveAttemptRoute,
   ModelDescriptor,
   AccountProfile,
   StartSessionRequest,
@@ -18,6 +23,12 @@ import type {
   CanonicalReasoning,
   RouteSelectionMode,
   EffectiveRoutingPreference,
+} from '@atris-agent-code/domain';
+import {
+  defaultAgentProfile,
+  mergeAgentProfiles,
+  parseAgentProfile,
+  resolveAgentProfile,
 } from '@atris-agent-code/domain';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { ActionBroker, type AutomationAction, type TrustProfile } from '@atris-agent-code/policy-engine';
@@ -40,7 +51,35 @@ export interface MissionRoutingPreference {
   scopeRole?: AgentRole | 'mission';
   /** Backward-compatible direct-agent role used by older callers. */
   targetRole?: AgentRole;
+  /** Optional named profile; the persisted core role still controls access. */
+  profileId?: string;
+  /** Alias accepted by newer clients. */
+  agentProfileId?: string;
+  profile?: AgentProfile | AgentProfilePatch;
 }
+
+export interface AgentDispatchTrace {
+  missionId: string;
+  taskId: string;
+  agentInstanceId: string;
+  role: AgentRole;
+  /** Canonical named profile identity. */
+  agentProfileId: string;
+  /** @deprecated Use agentProfileId. */
+  profileId: string;
+  profileName: string;
+  profileSource: AgentProfileResolution['source'];
+  route: EffectiveAttemptRoute;
+}
+
+export type AgentProfileResolver = (input: {
+  missionId: string;
+  taskId?: string;
+  role: AgentRole;
+  agentProfileId?: string;
+  profileId?: string;
+}) => Promise<AgentProfile | AgentProfilePatch | AgentProfileResolution | null | undefined>
+  | AgentProfile | AgentProfilePatch | AgentProfileResolution | null | undefined;
 
 export interface RuntimeHostConfig {
   maxConcurrentSessions?: number;
@@ -52,6 +91,16 @@ export interface RuntimeHostConfig {
   defaultAdapterId?: string;
   workspacePath?: string;
   workspaceManager?: WorkspaceManager;
+  /** Optional named profiles available to all workspaces using this host. */
+  agentProfiles?: AgentProfile[];
+  /** Global per-role profile defaults; legacy hosts may omit them. */
+  agentProfileDefaults?: Partial<Record<AgentRole, AgentProfile | AgentProfilePatch | string>>;
+  /** Workspace-scoped profile overrides keyed by workspace ID (or workspaceID:role). */
+  workspaceAgentProfileOverrides?: Record<string, AgentProfile | AgentProfilePatch | Record<string, unknown>>;
+  /** Optional integration hook for durable dispatch tracing. */
+  onAgentDispatch?: (trace: AgentDispatchTrace) => void | Promise<void>;
+  /** Optional profile resolver supplied by a persistence layer. */
+  resolveAgentProfile?: AgentProfileResolver;
 }
 
 interface TaskExecutionAccess {
@@ -66,7 +115,7 @@ function isUnverifiedCatalogRoute(model?: ModelDescriptor): boolean {
 }
 
 export class RuntimeHost {
-  private config: RuntimeHostConfig;
+  protected config: RuntimeHostConfig;
   private eventBus?: LocalEventBus;
   private workspaceManager?: WorkspaceManager;
   private adapters = new Map<string, BaseRuntimeAdapter>();
@@ -76,6 +125,11 @@ export class RuntimeHost {
     missionId?: string;
     taskId?: string;
     accountProfileId?: string;
+    agentProfileId?: string;
+    profileId?: string;
+    profileName?: string;
+    profileSource?: AgentProfileResolution['source'];
+    route?: EffectiveAttemptRoute;
     queuedAt: number;
     startedAt: number;
     retryCount: number;
@@ -93,6 +147,7 @@ export class RuntimeHost {
   private unsubscribeTaskTerminal?: Unsubscribe;
   private unsubscribeRuntimeActivity?: Unsubscribe;
   private missionRouting = new Map<string, MissionRoutingPreference>();
+  private dispatchTraces = new Map<string, AgentDispatchTrace>();
   private watchdog?: ReturnType<typeof setInterval>;
   private watchdogRunning = false;
   private finishingSessions = new Set<string>();
@@ -149,8 +204,226 @@ export class RuntimeHost {
     this.missionRouting.set(missionId, preference);
   }
 
+  setAgentProfiles(profiles: AgentProfile[]): void {
+    this.config.agentProfiles = profiles;
+  }
+
+  getLastDispatchTrace(missionId: string, taskId: string): AgentDispatchTrace | undefined {
+    const trace = this.dispatchTraces.get(`${missionId}:${taskId}`);
+    return trace ? { ...trace, route: { ...trace.route } } : undefined;
+  }
+
   clearMissionRoutingPreference(missionId: string, _preserveSupervisor = true): void {
     this.missionRouting.delete(missionId);
+  }
+
+  /**
+   * Resolve a named profile without allowing it to replace the persisted core
+   * role. Persistence layers can provide the optional resolver while legacy
+   * callers continue to receive the safe role baseline.
+   */
+  protected async resolveAgentProfileForDispatch(input: {
+    missionId: string;
+    taskId?: string;
+    role: AgentRole;
+    profileId?: string;
+    explicitProfile?: unknown;
+  }): Promise<AgentProfileResolution> {
+    const manager = this.workspaceManager as (WorkspaceManager & {
+      resolveAgentProfile?: (...args: any[]) => Promise<unknown> | unknown;
+    }) | undefined;
+    const explicitProfile = parseAgentProfile(input.explicitProfile, input.role);
+    const explicitRecord = input.explicitProfile && typeof input.explicitProfile === 'object' && !Array.isArray(input.explicitProfile)
+      ? input.explicitProfile as Record<string, unknown>
+      : undefined;
+    const explicitProfileId = explicitRecord
+      ? String(explicitRecord.id || explicitRecord.profileId || '').trim() || undefined
+      : undefined;
+    if (input.profileId && explicitProfile && explicitProfileId !== input.profileId) {
+      throw new Error(`Inline agent profile does not match requested profile '${input.profileId}' for fixed role '${input.role}'.`);
+    }
+    let workspaceId: string | undefined;
+    if (manager && typeof (manager as any).getMission === 'function') {
+      const mission = await manager.getMission(input.missionId);
+      workspaceId = mission?.workspaceId;
+    }
+
+    const configuredProfiles = this.config.agentProfiles || [];
+    const configuredById = input.profileId
+      ? configuredProfiles.find((candidate) => candidate.id === input.profileId)
+      : undefined;
+    // The role id is the stable legacy/default profile and is safe to recover
+    // without a named catalog entry. Any other requested id must be found.
+    const isRoleBaseline = input.profileId === input.role;
+    if (input.profileId && configuredById && configuredById.role !== input.role) {
+      throw new Error(`Agent profile '${input.profileId}' is assigned to fixed role '${configuredById.role}', not '${input.role}'.`);
+    }
+    const configuredDefault = this.config.agentProfileDefaults?.[input.role];
+    const templateProfile = typeof configuredDefault === 'string'
+      ? configuredProfiles.find((candidate) => candidate.id === configuredDefault)
+      : configuredDefault || (!input.profileId ? configuredProfiles.find((candidate) => candidate.role === input.role) : undefined);
+
+    const workspaceOverrides = this.config.workspaceAgentProfileOverrides;
+    const workspaceOverride = workspaceId && workspaceOverrides
+      ? workspaceOverrides[`${workspaceId}:${input.role}`] || workspaceOverrides[workspaceId]
+      : undefined;
+    const workspaceCandidate = this.profileCandidateForRole(workspaceOverride, input.role, input.profileId)
+      || this.profileCandidateForRole(
+        await manager?.resolveAgentProfile?.(input.missionId, input.role, input.taskId, input.profileId),
+        input.role,
+        input.profileId,
+      );
+
+    const resolverCandidate = await this.config.resolveAgentProfile?.({
+      missionId: input.missionId,
+      taskId: input.taskId,
+      role: input.role,
+      profileId: input.profileId,
+      agentProfileId: input.profileId,
+    });
+    const resolvedCandidate = this.profileCandidateForRole(resolverCandidate, input.role, input.profileId);
+    const requestedCandidate = explicitProfile
+      ? { ...explicitProfile, id: explicitProfile.id, role: input.role }
+      : input.profileId && !isRoleBaseline
+        ? configuredById
+        : undefined;
+
+    if (input.profileId && !isRoleBaseline && !configuredById && !workspaceCandidate && !resolvedCandidate && !explicitProfile) {
+      throw new Error(`Agent profile '${input.profileId}' was not found for fixed role '${input.role}'.`);
+    }
+
+    const resolution = resolveAgentProfile(input.role, {
+      teamTemplate: templateProfile as AgentProfile | AgentProfilePatch | undefined,
+      workspace: (resolvedCandidate || workspaceCandidate) as AgentProfile | AgentProfilePatch | undefined,
+      explicit: requestedCandidate as AgentProfile | AgentProfilePatch | undefined,
+      requestedProfileId: input.profileId,
+    });
+    if (input.profileId && resolution.profile.id !== input.profileId) {
+      throw new Error(`Agent profile '${input.profileId}' could not be resolved for fixed role '${input.role}'.`);
+    }
+    return resolution;
+  }
+
+  private profileCandidateForRole(
+    value: unknown,
+    role: AgentRole,
+    requestedProfileId?: string,
+  ): AgentProfile | AgentProfilePatch | undefined {
+    if (!value) return undefined;
+    if (typeof value === 'object' && !Array.isArray(value) && 'profile' in (value as Record<string, unknown>)) {
+      const wrapped = value as { profile?: unknown };
+      return this.profileCandidateForRole(wrapped.profile, role, requestedProfileId);
+    }
+    if (typeof value === 'object' && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      const roleScoped = record[role];
+      if (roleScoped) return this.profileCandidateForRole(roleScoped, role, requestedProfileId);
+      const defaults = record.profileDefaults;
+      if (defaults && typeof defaults === 'object' && !Array.isArray(defaults)) {
+        const candidate = (defaults as Record<string, unknown>)[role];
+        if (candidate) return this.profileCandidateForRole(candidate, role, requestedProfileId);
+      }
+      const profiles = [
+        ...(Array.isArray(record.agentProfiles) ? record.agentProfiles : []),
+        ...(Array.isArray(record.profiles) ? record.profiles : []),
+      ];
+      if (profiles.length) {
+        const selected = (requestedProfileId && profiles.find((candidate) => (candidate as any)?.id === requestedProfileId))
+          || profiles.find((candidate) => (candidate as any)?.role === role);
+        if (selected) return this.profileCandidateForRole(selected, role, requestedProfileId);
+      }
+    }
+    const parsed = parseAgentProfile(value, role);
+    if (!parsed) return undefined;
+    if (parsed.role !== role) {
+      throw new Error(`Agent profile '${parsed.id}' is assigned to fixed role '${parsed.role}', not '${role}'.`);
+    }
+    if (requestedProfileId && parsed.id !== requestedProfileId) return undefined;
+    return parsed;
+  }
+
+  protected profileRoutePolicy(profile: AgentProfile): AgentProfileRoutePolicy | undefined {
+    const preferred = profile.routePolicy;
+    const allowed = profile.allowedRoutePolicy;
+    if (!preferred) return allowed;
+    if (!allowed) return preferred;
+    const intersect = (left?: string[], right?: string[]): string[] | undefined => {
+      if (!left) return right;
+      if (!right) return left;
+      const rightSet = new Set(right);
+      return left.filter((value) => rightSet.has(value));
+    };
+    return {
+      ...preferred,
+      ...allowed,
+      allowedCatalogIds: intersect(preferred.allowedCatalogIds ?? preferred.allowedModelCatalogIds, allowed.allowedCatalogIds ?? allowed.allowedModelCatalogIds),
+      allowedModelCatalogIds: intersect(preferred.allowedModelCatalogIds ?? preferred.allowedCatalogIds, allowed.allowedModelCatalogIds ?? allowed.allowedCatalogIds),
+      allowedAccountProfileIds: intersect(preferred.allowedAccountProfileIds, allowed.allowedAccountProfileIds),
+      allowedRuntimeTypes: preferred.allowedRuntimeTypes && allowed.allowedRuntimeTypes
+        ? preferred.allowedRuntimeTypes.filter((value) => allowed.allowedRuntimeTypes?.includes(value))
+        : allowed.allowedRuntimeTypes ?? preferred.allowedRuntimeTypes,
+    };
+  }
+
+  protected constrainProfileRoutes(
+    profile: AgentProfile,
+    profiles: AccountProfile[],
+    models: ModelDescriptor[],
+  ): { profiles: AccountProfile[]; models: ModelDescriptor[] } {
+    const policy = this.profileRoutePolicy(profile);
+    if (!policy) return { profiles, models };
+    const allowedAccounts = policy.allowedAccountProfileIds;
+    const allowedRuntimes = policy.allowedRuntimeTypes;
+    const catalogAllowlists = [policy.allowedCatalogIds, policy.allowedModelCatalogIds]
+      .filter((value): value is string[] => Array.isArray(value));
+    const allowedCatalogs = catalogAllowlists.length ? catalogAllowlists : undefined;
+    const filteredProfiles = profiles.filter((candidate) => {
+      if (allowedAccounts && !allowedAccounts.includes(candidate.id)) return false;
+      if (allowedRuntimes && !allowedRuntimes.includes(candidate.runtimeType)) return false;
+      return true;
+    });
+    const accountIds = new Set(filteredProfiles.map((candidate) => candidate.id));
+    const filteredModels = models.filter((model) => {
+      if (!accountIds.has(model.accountProfileId)) return false;
+      if (allowedCatalogs && allowedCatalogs.some((allowlist) => !allowlist.includes(model.catalogId))) return false;
+      return true;
+    });
+    return { profiles: filteredProfiles, models: filteredModels };
+  }
+
+  protected profileRoutingPreference(
+    profile: AgentProfile,
+    source: AgentProfileResolution['source'],
+  ): EffectiveRoutingPreference | undefined {
+    const policy = profile.routePolicy || profile.allowedRoutePolicy;
+    if (!policy || (!policy.modelCatalogId && !policy.accountProfileId && !policy.reasoningLevel && !policy.fallbackCatalogIds?.length)) return undefined;
+    const preferenceSource = source === 'workspace' || source === 'team_template' ? source : 'scheduler';
+    return {
+      modelCatalogId: policy.modelCatalogId,
+      accountProfileId: policy.accountProfileId,
+      reasoningLevel: policy.reasoningLevel,
+      fallbackCatalogIds: [...new Set(policy.fallbackCatalogIds || [])],
+      selectionMode: policy.selectionMode || (policy.modelCatalogId ? 'fixed' : 'prefer'),
+      source: preferenceSource,
+    };
+  }
+
+  private async recordAgentDispatch(trace: AgentDispatchTrace): Promise<void> {
+    this.dispatchTraces.set(`${trace.missionId}:${trace.taskId}`, trace);
+    const manager = this.workspaceManager as (WorkspaceManager & {
+      recordAgentDispatch?: (value: AgentDispatchTrace) => Promise<void> | void;
+      persistAgentDispatch?: (value: AgentDispatchTrace) => Promise<void> | void;
+    }) | undefined;
+    const recorder = manager?.recordAgentDispatch || manager?.persistAgentDispatch;
+    try {
+      await recorder?.call(manager, trace);
+      await this.config.onAgentDispatch?.(trace);
+    } catch (error) {
+      // Dispatch tracing must never make a legacy runtime unavailable. The
+      // durable task-attempt route remains the source of truth when a hook is
+      // unavailable or temporarily fails.
+      console.warn('[RuntimeHost] Agent dispatch trace could not be persisted:', error instanceof Error ? error.message : String(error));
+    }
   }
 
   private subscribeToEventBus(eventBus: LocalEventBus): void {
@@ -167,6 +440,7 @@ export class RuntimeHost {
           missionId: event.missionId,
           taskId: event.taskId,
           agentInstanceId: event.agentInstanceId,
+          agentProfileId: (event as TaskCreated & Record<string, unknown>).agentProfileId as string | undefined,
           error: message,
           timestamp: new Date().toISOString(),
         });
@@ -206,6 +480,7 @@ export class RuntimeHost {
             type: 'agent_completed',
             missionId: event.missionId,
             agentInstanceId: sessionId,
+            agentProfileId: active.agentProfileId,
             summary: event.result,
             timestamp: new Date().toISOString(),
           });
@@ -230,6 +505,7 @@ export class RuntimeHost {
             missionId: event.missionId,
             taskId: event.taskId,
             agentInstanceId: sessionId,
+            agentProfileId: active.agentProfileId,
             error: event.error,
             timestamp: new Date().toISOString(),
           });
@@ -287,6 +563,10 @@ export class RuntimeHost {
       adapterId: string;
       session: AgentSession;
       accountProfileId?: string;
+      agentProfileId?: string;
+      profileId?: string;
+      profileName?: string;
+      profileSource?: AgentProfileResolution['source'];
       queuedAt: number;
       startedAt: number;
       retryCount: number;
@@ -313,6 +593,10 @@ export class RuntimeHost {
       agentInstanceId: active.session.agentInstanceId || active.session.id,
       adapterId: active.adapterId,
       accountProfileId: active.accountProfileId,
+      agentProfileId: active.agentProfileId,
+      profileId: active.profileId,
+      profileName: active.profileName,
+      profileSource: active.profileSource,
       attemptId: active.attemptId,
       outcome,
       usageAvailable: usage !== null,
@@ -534,6 +818,49 @@ export class RuntimeHost {
       console.warn(`[RuntimeHost] task_created role mismatch for ${event.taskId}: event=${eventRole}, persisted=${persistedRole}; using persisted role.`);
     }
     const role = persistedRole || eventRole || missionPreference?.targetRole || 'builder';
+    const taskRecord = task as (typeof task & Record<string, unknown>) | null;
+    const eventRecord = event as TaskCreated & Record<string, unknown>;
+    const profileId = String(
+      taskRecord?.agentProfileId
+      || taskRecord?.profileId
+      || eventRecord.agentProfileId
+      || eventRecord.profileId
+      || missionPreference?.agentProfileId
+      || missionPreference?.profileId
+      || '',
+    ).trim() || undefined;
+    const explicitProfile = taskRecord?.agentProfileId ? undefined : eventRecord.profile
+      || eventRecord.agentProfile
+      || taskRecord?.profile
+      || taskRecord?.agentProfile;
+    // Display metadata cannot manufacture a requested profile. An explicit
+    // profile id must resolve through a catalog/resolver or a matching inline
+    // profile object; otherwise dispatch fails closed.
+    const profileInline = explicitProfile || (!task && !profileId && (eventRecord.displayName || eventRecord.specialty || eventRecord.instructions || eventRecord.capabilities)
+      ? {
+          id: profileId,
+          role,
+          name: eventRecord.displayName || eventRecord.specialty,
+          specialty: eventRecord.specialty,
+          instructions: eventRecord.instructions,
+          capabilities: eventRecord.capabilities,
+          routePolicy: eventRecord.routePolicy,
+          allowedRoutePolicy: eventRecord.allowedRoutePolicy,
+        }
+      : undefined);
+    const profileResolution = await this.resolveAgentProfileForDispatch({
+      missionId: event.missionId,
+      taskId: event.taskId,
+      role,
+      profileId,
+      explicitProfile: profileInline,
+    });
+    const agentProfile = profileResolution.profile;
+    if (this.workspaceManager && task && profileId && !taskRecord?.agentProfileId && !taskRecord?.profileId) {
+      // Persist the resolved identity before creating the attempt whenever the
+      // task came from a legacy row that carried it only on the event.
+      await this.workspaceManager.updateTask(event.taskId, { agentProfileId: agentProfile.id });
+    }
     const executionAccess: TaskExecutionAccess = role === 'builder'
       ? { role, accessMode: 'workspace-write', requiresIsolatedWorktree: true }
       : { role, accessMode: 'read-only', requiresIsolatedWorktree: false };
@@ -549,10 +876,16 @@ export class RuntimeHost {
       selectionMode: event.routeSelectionMode || (event.modelCatalogId ? 'fixed' : 'prefer'),
       source: 'explicit',
     } : undefined;
-    const effectivePreference = eventPreference || await this.resolveEffectiveRoutingPreference(event.missionId, role);
+    const profilePreference = this.profileRoutingPreference(agentProfile, profileResolution.source);
+    const effectivePreference = eventPreference
+      || await this.resolveEffectiveRoutingPreference(event.missionId, role)
+      || profilePreference;
     const workerRequest: WorkerRequest = {
       role,
-      capabilities: (task?.requiredCapabilities as string[] | undefined) || [],
+      capabilities: [...new Set([
+        ...(((task?.requiredCapabilities as string[] | undefined) || [])),
+        ...agentProfile.capabilities,
+      ])],
       task: task?.description || event.title,
       priority: task?.priority || 'medium',
       requiresWorktree: executionAccess.requiresIsolatedWorktree,
@@ -568,10 +901,12 @@ export class RuntimeHost {
     // schedulerAuto controls automatic discovery only. A user/team/workspace policy
     // is an explicit route declaration and may intentionally target a profile that
     // has automatic scheduler selection disabled.
-    const profiles = effectivePreference
+    const routedProfiles = effectivePreference
       ? connectedProfiles
       : connectedProfiles.filter((profile) => profile.schedulerAuto !== false);
-    let models = this.catalogService.getCachedCatalog().filter((model) => profiles.some((profile) => profile.id === model.accountProfileId));
+    const constrainedCached = this.constrainProfileRoutes(agentProfile, routedProfiles, this.catalogService.getCachedCatalog());
+    const profiles = constrainedCached.profiles;
+    let models = constrainedCached.models;
     const configuredCatalogIds = new Set([
       ...(effectivePreference?.modelCatalogId ? [effectivePreference.modelCatalogId] : []),
       ...(effectivePreference?.fallbackCatalogIds || []),
@@ -580,6 +915,7 @@ export class RuntimeHost {
     if (models.length === 0 || selectedRouteMissing || models.some((model) => model.source === 'cached' || model.availability === 'unknown')) {
       models = await this.catalogService.discoverLiveModels(profiles);
     }
+    models = this.constrainProfileRoutes(agentProfile, profiles, models).models;
     const route = this.scheduler.resolveRoute(workerRequest, profiles, models);
     if (isUnverifiedCatalogRoute(route.model)) {
       throw new Error(
@@ -587,7 +923,7 @@ export class RuntimeHost {
       );
     }
     console.info(
-      `[RuntimeHost] ${role} route -> ${route.adapterId}/${route.profile?.profileName || 'profile'}/${route.model?.displayName || 'runtime-default'} (${route.reasons.join('; ') || 'scheduler'})`,
+      `[RuntimeHost] ${role}/${agentProfile.name} route -> ${route.adapterId}/${route.profile?.profileName || 'profile'}/${route.model?.displayName || 'runtime-default'} (${route.reasons.join('; ') || 'scheduler'})`,
     );
     const adapter = this.requireAdapter(route.adapterId as RuntimeType);
     const mission = this.workspaceManager ? await this.workspaceManager.getMission(event.missionId) : null;
@@ -606,7 +942,7 @@ export class RuntimeHost {
       action,
       profile: automationPolicy?.profile || 'review',
       overrides: automationPolicy?.overrides,
-      requiredCapabilities: task?.requiredCapabilities as string[] | undefined,
+      requiredCapabilities: workerRequest.capabilities,
       role,
        // QA validates the upstream Builder worktree with a read-only runtime
        // mode, so its allowlisted checks do not require an interactive prompt.
@@ -630,7 +966,11 @@ export class RuntimeHost {
     }
     const prompt = [
       `Task: ${event.title}`,
+      agentProfile.name !== `${role === 'qa' ? 'QA' : role.charAt(0).toUpperCase() + role.slice(1)} Agent`
+        ? `Agent profile: ${agentProfile.name}${agentProfile.specialty ? ` (${agentProfile.specialty})` : ''}`
+        : undefined,
       task?.description ? `Instructions:\n${task.description}` : undefined,
+      agentProfile.instructions ? `Profile instructions:\n${agentProfile.instructions}` : undefined,
       execution.promptContext,
       role === 'builder'
          ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
@@ -644,6 +984,19 @@ export class RuntimeHost {
     ].filter(Boolean).join('\n\n');
 
     const claimedAt = new Date().toISOString();
+    const routeSource = effectivePreference?.source
+      || (profileResolution.source === 'workspace' || profileResolution.source === 'team_template' ? profileResolution.source : 'scheduler');
+    const routeSnapshot: EffectiveAttemptRoute = {
+      adapterId: route.adapterId,
+      provider: route.profile?.provider,
+      accountProfileId: route.profile?.id,
+      modelCatalogId: route.model?.catalogId,
+      runtimeModelId: route.model?.runtimeModelId,
+      reasoningLevel: route.reasoningLevel,
+      source: routeSource,
+      selectionMode: effectivePreference?.selectionMode || 'auto',
+      agentProfileId: agentProfile.id,
+    };
     const attempt = this.workspaceManager ? await this.workspaceManager.claimTaskAttempt({
       taskId: event.taskId,
       missionId: event.missionId,
@@ -651,32 +1004,43 @@ export class RuntimeHost {
       worktreePath: execution.worktreePath ?? null,
       leaseExpiresAt: new Date(Date.parse(claimedAt) + this.sessionTimeoutMs()).toISOString(),
       now: claimedAt,
-      route: {
-        adapterId: route.adapterId,
-        provider: route.profile?.provider,
-        accountProfileId: route.profile?.id,
-        modelCatalogId: route.model?.catalogId,
-        runtimeModelId: route.model?.runtimeModelId,
-        reasoningLevel: route.reasoningLevel,
-        source: effectivePreference?.source || 'scheduler',
-        selectionMode: effectivePreference?.selectionMode || 'auto',
-      },
+      agentProfileId: agentProfile.id,
+      route: routeSnapshot,
     }) : undefined;
+    await this.recordAgentDispatch({
+      missionId: event.missionId,
+      taskId: event.taskId,
+      agentInstanceId: event.agentInstanceId || event.taskId,
+      role,
+      agentProfileId: agentProfile.id,
+      profileId: agentProfile.id,
+      profileName: agentProfile.name,
+      profileSource: profileResolution.source,
+      route: routeSnapshot,
+    });
     let session: AgentSession;
     try {
       session = await adapter.spawnAgent({
-      sessionId: event.agentInstanceId,
-      taskId: event.taskId,
-      missionId: event.missionId,
-      prompt,
-      role: executionAccess.role,
-      accessMode: executionAccess.accessMode,
-      model: route.model?.runtimeModelId,
-      reasoningLevel: route.reasoningLevel,
-      profileId: route.profile?.id,
-      isolated: executionAccess.requiresIsolatedWorktree,
-      worktreePath: execution.worktreePath,
-      cwd: execution.cwd,
+        sessionId: event.agentInstanceId,
+        taskId: event.taskId,
+        missionId: event.missionId,
+        prompt,
+        role: executionAccess.role,
+        accessMode: executionAccess.accessMode,
+        model: route.model?.runtimeModelId,
+        reasoningLevel: route.reasoningLevel,
+        profileId: route.profile?.id,
+        agentProfileId: agentProfile.id,
+        isolated: executionAccess.requiresIsolatedWorktree,
+        worktreePath: execution.worktreePath,
+        cwd: execution.cwd,
+        // Additive metadata for adapters/auditors that understand named
+        // profiles; older adapters safely ignore these fields.
+        profileName: agentProfile.name,
+        specialty: agentProfile.specialty,
+        profileInstructions: agentProfile.instructions,
+        profileCapabilities: agentProfile.capabilities,
+        allowedRoutePolicy: (agentProfile.allowedRoutePolicy || agentProfile.routePolicy) as Record<string, unknown> | undefined,
       });
     } catch (error) {
       if (attempt && this.workspaceManager) {
@@ -703,6 +1067,11 @@ export class RuntimeHost {
       missionId: event.missionId,
       taskId: event.taskId,
       accountProfileId: route.profile?.id,
+      agentProfileId: agentProfile.id,
+      profileId: agentProfile.id,
+      profileName: agentProfile.name,
+      profileSource: profileResolution.source,
+      route: routeSnapshot,
       queuedAt: queuedAtMs,
       startedAt,
         retryCount: attempt?.attemptNumber ?? 1,
@@ -946,6 +1315,7 @@ export class RuntimeHost {
           this.eventBus?.emit({
             id: crypto.randomUUID(), type: 'task_failed', missionId: active.missionId || '',
             taskId: active.taskId || '', agentInstanceId: active.session.agentInstanceId || sessionId,
+            agentProfileId: active.agentProfileId,
             error: responsive === null
               ? 'Runtime session exceeded the bounded quiet CLI allowance'
               : 'Runtime session stopped responding to health probes',
@@ -964,6 +1334,7 @@ export class RuntimeHost {
         this.eventBus?.emit({
           id: crypto.randomUUID(), type: 'task_failed', missionId: attempt.missionId,
           taskId: attempt.taskId, agentInstanceId: attempt.agentInstanceId,
+          agentProfileId: attempt.agentProfileId || active?.agentProfileId,
           error: attempt.error || 'Runtime session timed out', timestamp: now.toISOString(),
         });
       }

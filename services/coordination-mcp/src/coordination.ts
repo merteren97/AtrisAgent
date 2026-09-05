@@ -19,6 +19,10 @@ interface RuntimeAgentState {
   id: string;
   missionId: string;
   role: AgentRole | string;
+  /** Canonical named profile identity. */
+  agentProfileId?: string;
+  /** @deprecated Use agentProfileId. Kept for older MCP clients and rows. */
+  profileId?: string;
   displayName: string;
   specialty?: string;
   parentAgentId?: string | null;
@@ -68,12 +72,39 @@ export class CoordinationMCP {
   private hydrateDurableState(): void {
     if (!this.db) return;
     try {
-      const rows = (this.db.select().from(agentInstances) as any).all() as Array<Record<string, any>>;
+      let rows: Array<Record<string, any>>;
+      try {
+        rows = (this.db.select().from(agentInstances) as any).all() as Array<Record<string, any>>;
+      } catch {
+        // A standalone MCP database may be on the profile_id compatibility
+        // column before the canonical agent_profile_id migration runs.
+        rows = (this.db.select({
+          id: agentInstances.id,
+          missionId: agentInstances.missionId,
+          role: agentInstances.role,
+          profileId: agentInstances.profileId,
+          modelProfileId: agentInstances.modelProfileId,
+          status: agentInstances.status,
+          taskId: agentInstances.taskId,
+          parentAgentId: agentInstances.parentAgentId,
+          displayName: agentInstances.displayName,
+          specialty: agentInstances.specialty,
+          spawnReason: agentInstances.spawnReason,
+          statusMessage: agentInstances.statusMessage,
+          progress: agentInstances.progress,
+          workspaceMode: agentInstances.workspaceMode,
+          startedAt: agentInstances.startedAt,
+          completedAt: agentInstances.completedAt,
+          createdAt: agentInstances.createdAt,
+        }).from(agentInstances) as any).all() as Array<Record<string, any>>;
+      }
       for (const row of rows) {
         this.agentRegistry.set(row.id, {
           id: row.id,
           missionId: row.missionId,
           role: row.role,
+          agentProfileId: row.agentProfileId || row.profileId || undefined,
+          profileId: row.agentProfileId || row.profileId || undefined,
           displayName: row.displayName || this.defaultAgentName(row.role),
           specialty: row.specialty || undefined,
           parentAgentId: row.parentAgentId || null,
@@ -114,12 +145,18 @@ export class CoordinationMCP {
   }
 
   private saveAgentState(agent: RuntimeAgentState): void {
-    this.agentRegistry.set(agent.id, agent);
+    const agentProfileId = agent.agentProfileId || agent.profileId || undefined;
+    const normalizedAgent = { ...agent, agentProfileId, profileId: agentProfileId };
+    this.agentRegistry.set(agent.id, normalizedAgent);
     if (!this.db) return;
-    (this.db.insert(agentInstances).values({
+    const values = {
       id: agent.id,
       missionId: agent.missionId,
       role: agent.role as any,
+      // profile_id is the physical compatibility column used by existing
+      // coordination databases; the in-memory/API contract is canonical.
+      profileId: agentProfileId || null,
+      agentProfileId: agentProfileId || null,
       modelProfileId: agent.model || '',
       accountProfileId: '',
       runtimeAdapterId: '',
@@ -136,11 +173,14 @@ export class CoordinationMCP {
       startedAt: agent.startedAt || null,
       completedAt: agent.completedAt || null,
       createdAt: agent.createdAt,
-    }).onConflictDoUpdate({
+    };
+    const updates = {
       target: agentInstances.id,
       set: {
         missionId: agent.missionId,
         role: agent.role as any,
+        profileId: agentProfileId || null,
+        agentProfileId: agentProfileId || null,
         modelProfileId: agent.model || '',
         status: agent.status,
         taskId: agent.taskId || null,
@@ -154,7 +194,22 @@ export class CoordinationMCP {
         startedAt: agent.startedAt || null,
         completedAt: agent.completedAt || null,
       },
-    }) as any).run();
+    };
+    try {
+      (this.db.insert(agentInstances).values(values).onConflictDoUpdate(updates) as any).run();
+    } catch (error) {
+      // Standalone/older coordination stores may have profile_id but not the
+      // canonical column yet. Preserve the durable compatibility path until
+      // the next database migration instead of dropping the agent state.
+      const { agentProfileId: _canonicalInsert, ...legacyValues } = values;
+      const { set, ...legacyUpdates } = updates;
+      const { agentProfileId: _canonicalSet, ...legacySet } = set;
+      (this.db.insert(agentInstances).values(legacyValues).onConflictDoUpdate({
+        ...legacyUpdates,
+        set: legacySet,
+      }) as any).run();
+      void error;
+    }
   }
 
   private syncAgentEvent(event: AgentEvent): void {
@@ -167,6 +222,8 @@ export class CoordinationMCP {
         id: event.agentInstanceId,
         missionId: event.missionId,
         role: event.role,
+        agentProfileId: event.agentProfileId || event.profileId,
+        profileId: event.agentProfileId || event.profileId,
         displayName: event.displayName,
         specialty: event.specialty,
         parentAgentId: event.parentAgentId,
@@ -185,6 +242,8 @@ export class CoordinationMCP {
         id: event.agentInstanceId,
         missionId: event.missionId,
         role: event.role,
+        agentProfileId: event.agentProfileId || event.profileId || existing?.agentProfileId || existing?.profileId,
+        profileId: event.agentProfileId || event.profileId || existing?.agentProfileId || existing?.profileId,
         displayName: event.displayName || existing?.displayName || this.defaultAgentName(event.role),
         specialty: event.specialty || existing?.specialty,
         parentAgentId: event.parentAgentId ?? existing?.parentAgentId,
@@ -195,6 +254,17 @@ export class CoordinationMCP {
         spawnReason: event.spawnReason || existing?.spawnReason,
         createdAt: existing?.createdAt || event.timestamp,
         startedAt: event.timestamp,
+      });
+      return;
+    }
+
+    if (existing && (event.type === 'task_created' || event.type === 'task_assigned' || event.type === 'task_claimed')
+      && 'agentProfileId' in event && event.agentProfileId) {
+      this.saveAgentState({
+        ...existing,
+        agentProfileId: event.agentProfileId,
+        profileId: event.agentProfileId,
+        taskId: 'taskId' in event ? event.taskId : existing.taskId,
       });
       return;
     }
@@ -260,6 +330,7 @@ export class CoordinationMCP {
 
     const agentInstanceId = crypto.randomUUID();
     const role = request.role;
+    const agentProfileId = String(request.agentProfileId || request.profileId || '').trim() || undefined;
     const displayName = request.displayName?.trim() || request.specialty?.trim() || this.defaultAgentName(role);
     const workspaceMode: AgentWorkspaceMode = request.workspaceMode
       || (role === 'builder' ? 'isolated_worktree' : role === 'orchestrator' ? 'shared' : 'read_only');
@@ -270,6 +341,7 @@ export class CoordinationMCP {
       missionId: request.missionId,
       role,
       modelProfileId: request.modelCatalogId || request.modelProfileId,
+      agentProfileId,
       parentAgentId: request.parentAgentId || null,
       displayName,
       specialty: request.specialty,
@@ -282,11 +354,13 @@ export class CoordinationMCP {
     if (request.taskId) {
       task = await this.requireTask(request.taskId);
       if (task.missionId !== request.missionId) throw new Error('Cannot assign a sub-agent to a task from another mission.');
-      task = await this.workspaceManager.updateTask(task.id, {
+      const taskUpdates: Parameters<WorkspaceManager['updateTask']>[1] = {
         assignedAgentId: agentInstanceId,
         assignedRole: role,
         status: 'planned',
-      });
+      };
+      if (agentProfileId !== undefined) taskUpdates.agentProfileId = agentProfileId;
+      task = await this.workspaceManager.updateTask(task.id, taskUpdates);
     } else {
       task = await this.workspaceManager.createTask({
         missionId: request.missionId,
@@ -296,6 +370,7 @@ export class CoordinationMCP {
         priority: request.priority || 'medium',
         assignedAgentId: agentInstanceId,
         assignedRole: role,
+        agentProfileId,
         requiredCapabilities: request.capabilities || [],
         dependsOn: [],
       });
@@ -305,6 +380,8 @@ export class CoordinationMCP {
       id: agentInstanceId,
       missionId: request.missionId,
       role,
+      agentProfileId,
+      profileId: agentProfileId,
       displayName,
       specialty: request.specialty,
       parentAgentId: request.parentAgentId || null,
@@ -323,6 +400,8 @@ export class CoordinationMCP {
       agentInstanceId,
       parentAgentId: request.parentAgentId || null,
       role,
+      agentProfileId,
+      profileId: agentProfileId,
       displayName,
       specialty: request.specialty,
       spawnReason: request.spawnReason.trim(),
@@ -338,6 +417,7 @@ export class CoordinationMCP {
       taskId: task.id,
       agentInstanceId,
       role,
+      agentProfileId,
       timestamp,
     });
     this.eventBus?.emit({
@@ -349,6 +429,8 @@ export class CoordinationMCP {
       assignedRole: role,
       agentInstanceId,
       parentAgentId: request.parentAgentId || null,
+      agentProfileId,
+      profileId: agentProfileId,
       displayName,
       specialty: request.specialty,
       spawnReason: request.spawnReason.trim(),
@@ -517,7 +599,8 @@ export class CoordinationMCP {
     await this.workspaceManager!.updateTask(taskId, {
       status: 'running', assignedAgentId: agentId, assignedRole: (role as any) || task.assignedRole || 'builder',
     });
-    this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_claimed', missionId: task.missionId, taskId, agentInstanceId: agentId, worktreePath: null, timestamp: new Date().toISOString() });
+    const taskProfileId = (task as any).agentProfileId || (task as any).profileId || undefined;
+    this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_claimed', missionId: task.missionId, taskId, agentInstanceId: agentId, agentProfileId: taskProfileId, worktreePath: null, timestamp: new Date().toISOString() });
     return { success: true, taskId };
   }
 
@@ -533,9 +616,9 @@ export class CoordinationMCP {
   async submitResult(taskId: string, resultSummary: string, _reviewPack?: unknown, _artifactsList?: string[], status: 'done' | 'failed' = 'done'): Promise<void> {
     const task = await this.requireTask(taskId);
     if (status === 'done') {
-      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_completed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, result: resultSummary, timestamp: new Date().toISOString() });
+      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_completed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, agentProfileId: (task as any).agentProfileId || (task as any).profileId || undefined, result: resultSummary, timestamp: new Date().toISOString() });
     } else {
-      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_failed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, error: resultSummary, timestamp: new Date().toISOString() });
+      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_failed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, agentProfileId: (task as any).agentProfileId || (task as any).profileId || undefined, error: resultSummary, timestamp: new Date().toISOString() });
     }
   }
 

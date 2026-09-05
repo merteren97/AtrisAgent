@@ -100,6 +100,71 @@ async function runTests() {
       assert(listRes.status === 200 && Array.isArray(listBody) && listBody.some((w: any) => w.id === createdWorkspaceId), 'GET /api/workspaces returns array containing created workspace');
     }
 
+    // 2b. Agent profile catalog CRUD and scoped binding behavior
+    {
+      const unauthenticated = await fetch(`${baseUrl}/api/agent-profiles`);
+      assert(unauthenticated.status === 401, 'agent profile catalog requires authenticated Premium access');
+
+      const createRes = await authorizedFetch(`${baseUrl}/api/agent-profiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Gateway Builder Profile',
+          role: 'builder',
+          instructions: 'Build safely and report verification.',
+          capabilities: ['coding', 'verification'],
+        }),
+      });
+      const created = await createRes.json();
+      assert(createRes.status === 201 && typeof created.id === 'string' && created.role === 'builder'
+        && created.instructions === 'Build safely and report verification.'
+        && created.secret === undefined && created.configDir === undefined,
+      'POST /api/agent-profiles creates a safe fixed-role catalog record');
+
+      const profileId = created.id as string;
+      const listRes = await authorizedFetch(`${baseUrl}/api/agent-profiles`);
+      const listed = await listRes.json();
+      assert(listRes.status === 200 && listed.some((profile: any) => profile.id === profileId),
+        'GET /api/agent-profiles returns the created profile');
+
+      const patchRes = await authorizedFetch(`${baseUrl}/api/agent-profiles/${encodeURIComponent(profileId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: 'Gateway integration profile' }),
+      });
+      const patched = await patchRes.json();
+      assert(patchRes.status === 200 && patched.id === profileId && patched.role === 'builder'
+        && patched.description === 'Gateway integration profile',
+      'PATCH /api/agent-profiles updates mutable fields while preserving fixed role');
+
+      const wrongRoleBinding = await authorizedFetch(`${baseUrl}/api/workspaces/${encodeURIComponent(createdWorkspaceId)}/agent-profile-bindings/reviewer`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profileId, isDefault: true }),
+      });
+      const wrongRoleBody = await wrongRoleBinding.json();
+      assert(wrongRoleBinding.status === 400 && wrongRoleBody.code === 'AGENT_PROFILE_ROLE_MISMATCH',
+        'scoped binding rejects a profile assigned to the wrong fixed role');
+
+      const bindRes = await authorizedFetch(`${baseUrl}/api/workspaces/${encodeURIComponent(createdWorkspaceId)}/agent-profile-bindings/builder`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profileId, isDefault: true }),
+      });
+      const binding = await bindRes.json();
+      const bindingsRes = await authorizedFetch(`${baseUrl}/api/workspaces/${encodeURIComponent(createdWorkspaceId)}/agent-profile-bindings`);
+      const bindings = await bindingsRes.json();
+      assert(bindRes.status === 200 && binding.profileId === profileId && binding.role === 'builder'
+        && bindingsRes.status === 200 && bindings.some((item: any) => item.profileId === profileId && item.isDefault === true),
+      'workspace-scoped profile binding persists and serializes safely');
+
+      const archiveRes = await authorizedFetch(`${baseUrl}/api/agent-profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' });
+      const archived = await archiveRes.json();
+      const hiddenRes = await authorizedFetch(`${baseUrl}/api/agent-profiles/${encodeURIComponent(profileId)}`);
+      assert(archiveRes.status === 200 && archived.archivedAt && hiddenRes.status === 404,
+        'DELETE /api/agent-profiles soft-archives and hides the profile by default');
+    }
+
     // 3. POST & GET /api/missions
     let createdMissionId = '';
     {
@@ -444,6 +509,33 @@ async function runTests() {
       const nextPageRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}/events?cursor=${encodeURIComponent(nextCursor || '')}&limit=1`);
       const nextPage = await nextPageRes.json();
       assert(nextPage.length === 1 && nextPage[0]?.id === thirdEventId, 'mission event cursor resumes from the previous page without duplicates');
+
+      const paginationMissionResponse = await authorizedFetch(`${baseUrl}/api/missions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Cursor pagination CORS mission' }),
+      });
+      const paginationMission = await paginationMissionResponse.json();
+      for (let index = 0; index < 501; index += 1) {
+        eventBus.emit({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: paginationMission.id,
+          agentInstanceId: 'pagination-agent', progress: `page-${index}`, timestamp: new Date().toISOString() });
+      }
+      const originHeaders = { Origin: 'http://127.0.0.1:1420' };
+      const boundedPageResponse = await authorizedFetch(`${baseUrl}/api/missions/${paginationMission.id}/events?limit=500`, { headers: originHeaders });
+      const boundedPage = await boundedPageResponse.json();
+      const boundedCursor = boundedPageResponse.headers.get('X-Next-Cursor');
+      const exposedHeaders = boundedPageResponse.headers.get('Access-Control-Expose-Headers') || '';
+      assert(boundedPageResponse.status === 200 && boundedPage.length === 500
+        && boundedPageResponse.headers.get('Access-Control-Allow-Origin') === originHeaders.Origin
+        && boundedPageResponse.headers.get('X-Has-More') === 'true'
+        && Boolean(boundedCursor) && /(^|,\s*)x-next-cursor(,|$)/i.test(exposedHeaders)
+        && /(^|,\s*)x-has-more(,|$)/i.test(exposedHeaders),
+      'Origin responses expose cursor headers for bounded mission event pages');
+      const finalPageResponse = await authorizedFetch(`${baseUrl}/api/missions/${paginationMission.id}/events?cursor=${encodeURIComponent(boundedCursor || '')}&limit=500`, { headers: originHeaders });
+      const finalPage = await finalPageResponse.json();
+      assert(finalPageResponse.status === 200 && finalPage.length === 1 && finalPageResponse.headers.get('X-Has-More') === 'false'
+        && !finalPageResponse.headers.get('X-Next-Cursor'),
+      'Mission event cursor retrieves the remainder after a 500-row page');
 
       const replayReceived = await new Promise<boolean>((resolve) => {
         const request = http.get(`${baseUrl}/api/events/stream?missionId=${createdMissionId}&afterSequence=${first.sequence}`,

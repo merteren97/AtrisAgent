@@ -15,7 +15,18 @@ import { hasExplicitImplementationIntent, Orchestrator } from '@atris-agent-code
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { MergeCoordinator } from '@atris-agent-code/merge-coordinator';
 import { ActionBroker } from '@atris-agent-code/policy-engine';
-import { resolveWorkerPoolPolicy } from '@atris-agent-code/domain';
+import {
+  AGENT_ROLES,
+  isAgentRole,
+  normalizeAgentProfile,
+  resolveWorkerPoolPolicy,
+} from '@atris-agent-code/domain';
+import type {
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileRoutePolicy,
+  AgentRole,
+} from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AtrisAuthService, extractBearerHeader, installAuthRoutes } from './auth';
 import {
@@ -456,6 +467,9 @@ const allowedOrigins = new Set([
   'https://tauri.localhost',
 ]);
 app.use(cors({
+  // Mission event history is cursor-paged at 500 rows. Browsers only expose
+  // these response headers to the desktop client when CORS opts in explicitly.
+  exposedHeaders: ['X-Next-Cursor', 'X-Has-More'],
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) callback(null, true);
     else callback(new Error(`Origin ${origin} is not allowed by the local AtrisAgent service.`));
@@ -509,6 +523,299 @@ function normalizeFallbackCatalogIds(value: unknown, primaryCatalogId?: string):
   ));
 }
 
+type AgentProfileIdMap = Partial<Record<AgentRole, string>>;
+type GatewayError = Error & { statusCode?: number; code?: string };
+type AgentProfileRecord = AgentProfile & {
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  archivedAt?: string | null;
+};
+type AgentProfileBinding = {
+  scopeType?: string;
+  scopeId?: string;
+  role?: AgentRole;
+  profileId?: string;
+  isDefault?: boolean;
+  override?: AgentProfilePatch | null;
+};
+
+const PROFILE_ROUTE_POLICY_KEYS = [
+  'selectionMode',
+  'modelCatalogId',
+  'accountProfileId',
+  'reasoningLevel',
+  'fallbackCatalogIds',
+  'allowedCatalogIds',
+  'allowedModelCatalogIds',
+  'allowedAccountProfileIds',
+  'allowedRuntimeTypes',
+] as const;
+const PROFILE_SELECTION_MODES = new Set(['auto', 'prefer', 'fixed']);
+const PROFILE_REASONING_LEVELS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const PROFILE_RUNTIME_TYPES = new Set(['codex', 'claude_code', 'antigravity', 'opencode']);
+const PROFILE_SCOPE_TYPES = new Set(['global', 'workspace', 'team_template']);
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function profileClientError(message: string, code = 'INVALID_AGENT_PROFILE'): GatewayError {
+  const error = new Error(message) as GatewayError;
+  error.statusCode = 400;
+  error.code = code;
+  return error;
+}
+
+function profileStoreError(message: string): GatewayError {
+  const error = new Error(message) as GatewayError;
+  error.statusCode = 503;
+  error.code = 'PROFILE_STORE_UNAVAILABLE';
+  return error;
+}
+
+function profileErrorStatus(error: unknown): number | undefined {
+  const status = Number((error as GatewayError | undefined)?.statusCode);
+  return Number.isInteger(status) && status >= 400 && status <= 599 ? status : undefined;
+}
+
+function profileField(record: Record<string, any>, camel: string, snake: string): unknown {
+  return record[camel] !== undefined ? record[camel] : record[snake];
+}
+
+function cleanProfileString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function safeProfileRoutePolicy(value: unknown): AgentProfileRoutePolicy | undefined {
+  if (!isRecord(value)) return undefined;
+  const policy: AgentProfileRoutePolicy = {};
+  const selectionMode = cleanProfileString(value.selectionMode);
+  if (selectionMode && PROFILE_SELECTION_MODES.has(selectionMode)) policy.selectionMode = selectionMode as AgentProfileRoutePolicy['selectionMode'];
+  for (const key of ['modelCatalogId', 'accountProfileId'] as const) {
+    const item = cleanProfileString(value[key]);
+    if (item) policy[key] = item;
+  }
+  const reasoningLevel = cleanProfileString(value.reasoningLevel);
+  if (reasoningLevel && PROFILE_REASONING_LEVELS.has(reasoningLevel)) policy.reasoningLevel = reasoningLevel as AgentProfileRoutePolicy['reasoningLevel'];
+  for (const key of ['fallbackCatalogIds', 'allowedCatalogIds', 'allowedModelCatalogIds', 'allowedAccountProfileIds'] as const) {
+    if (!Array.isArray(value[key])) continue;
+    policy[key] = Array.from(new Set(value[key]
+      .filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+      .map((item: string) => item.trim()))) as never;
+  }
+  if (Array.isArray(value.allowedRuntimeTypes)) {
+    policy.allowedRuntimeTypes = Array.from(new Set(value.allowedRuntimeTypes
+      .filter((item: unknown): item is string => typeof item === 'string' && PROFILE_RUNTIME_TYPES.has(item)))) as never;
+  }
+  return Object.keys(policy).length > 0 ? policy : undefined;
+}
+
+function safeAgentProfile(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const nested = isRecord(value.profile) ? value.profile : {};
+  const source = { ...nested, ...value };
+  const id = cleanProfileString(profileField(source, 'id', 'profile_id'));
+  const roleValue = cleanProfileString(profileField(source, 'role', 'agent_role'))?.toLowerCase();
+  if (!id || !roleValue || !isAgentRole(roleValue)) return null;
+  const output: Record<string, unknown> = {
+    id,
+    name: cleanProfileString(source.name) || cleanProfileString(source.displayName) || `${roleValue} Agent`,
+    role: roleValue,
+    instructions: typeof source.instructions === 'string' ? source.instructions : '',
+    capabilities: Array.isArray(source.capabilities)
+      ? Array.from(new Set(source.capabilities.filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim())).map((item: string) => item.trim())))
+      : [],
+  };
+  for (const key of ['specialty', 'description'] as const) {
+    const item = cleanProfileString(source[key]);
+    if (item) output[key] = item;
+  }
+  const routePolicy = safeProfileRoutePolicy(source.routePolicy);
+  const allowedRoutePolicy = safeProfileRoutePolicy(source.allowedRoutePolicy);
+  if (routePolicy) output.routePolicy = routePolicy;
+  if (allowedRoutePolicy) output.allowedRoutePolicy = allowedRoutePolicy;
+  for (const key of ['createdAt', 'updatedAt', 'archivedAt'] as const) {
+    const item = profileField(source, key, key.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`));
+    if (item !== undefined) output[key] = item ?? null;
+  }
+  return output;
+}
+
+function safeProfileOverride(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  const output: Record<string, unknown> = {};
+  for (const key of ['name', 'instructions', 'specialty', 'description'] as const) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && typeof value[key] === 'string') output[key] = value[key].trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'capabilities') && Array.isArray(value.capabilities)) {
+    output.capabilities = Array.from(new Set(value.capabilities
+      .filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+      .map((item: string) => item.trim())));
+  }
+  const routePolicy = safeProfileRoutePolicy(value.routePolicy);
+  const allowedRoutePolicy = safeProfileRoutePolicy(value.allowedRoutePolicy);
+  if (routePolicy) output.routePolicy = routePolicy;
+  if (allowedRoutePolicy) output.allowedRoutePolicy = allowedRoutePolicy;
+  return Object.keys(output).length > 0 ? output : undefined;
+}
+
+function safeProfileBinding(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const scopeType = cleanProfileString(profileField(value, 'scopeType', 'scope_type'))?.toLowerCase();
+  const scopeId = cleanProfileString(profileField(value, 'scopeId', 'scope_id'));
+  const roleValue = cleanProfileString(profileField(value, 'role', 'agent_role'))?.toLowerCase();
+  const profileId = cleanProfileString(profileField(value, 'profileId', 'profile_id'));
+  if (!scopeType || !PROFILE_SCOPE_TYPES.has(scopeType) || !scopeId || !roleValue || !isAgentRole(roleValue) || !profileId) return null;
+  const output: Record<string, unknown> = { scopeType, scopeId, role: roleValue, profileId };
+  const isDefault = value.isDefault ?? value.is_default;
+  if (typeof isDefault === 'boolean' || isDefault === 0 || isDefault === 1) output.isDefault = Boolean(isDefault);
+  const override = safeProfileOverride(value.override ?? value.profileOverride ?? value.profile_override);
+  if (override) output.override = override;
+  return output;
+}
+
+function normalizeAgentProfileIds(value: unknown): AgentProfileIdMap | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw profileClientError('agentProfileIds must be an object keyed by fixed agent roles.');
+  const result: AgentProfileIdMap = {};
+  const seen = new Set<AgentRole>();
+  for (const [rawRole, rawId] of Object.entries(value)) {
+    const role = rawRole.toLowerCase();
+    if (!isAgentRole(role)) throw profileClientError(`Unknown agent profile role '${rawRole}'.`);
+    const canonicalRole = role as AgentRole;
+    if (seen.has(canonicalRole)) throw profileClientError(`Duplicate agent profile role '${rawRole}'.`);
+    if (typeof rawId !== 'string' || !rawId.trim()) throw profileClientError(`Agent profile ID for role '${canonicalRole}' must be a non-empty string.`);
+    seen.add(canonicalRole);
+    result[canonicalRole] = rawId.trim();
+  }
+  return result;
+}
+
+function normalizeProfileRoutePolicyInput(value: unknown, key: string): AgentProfileRoutePolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw profileClientError(`${key} must be an object.`);
+  const policy = safeProfileRoutePolicy(value);
+  for (const field of PROFILE_ROUTE_POLICY_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(value, field) || value[field] === undefined) continue;
+    if (['selectionMode', 'modelCatalogId', 'accountProfileId', 'reasoningLevel'].includes(field)
+      && typeof value[field] !== 'string') throw profileClientError(`${key}.${field} must be a string.`);
+    if (['fallbackCatalogIds', 'allowedCatalogIds', 'allowedModelCatalogIds', 'allowedAccountProfileIds', 'allowedRuntimeTypes'].includes(field)
+      && (!Array.isArray(value[field]) || value[field].some((item: unknown) => typeof item !== 'string' || !item.trim()))) {
+      throw profileClientError(`${key}.${field} must be an array of non-empty strings.`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'selectionMode')
+    && (typeof value.selectionMode !== 'string' || !PROFILE_SELECTION_MODES.has(value.selectionMode.trim()))) {
+    throw profileClientError(`${key}.selectionMode is invalid.`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'reasoningLevel')
+    && (typeof value.reasoningLevel !== 'string' || !PROFILE_REASONING_LEVELS.has(value.reasoningLevel.trim().toLowerCase()))) {
+    throw profileClientError(`${key}.reasoningLevel is invalid.`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'allowedRuntimeTypes')
+    && Array.isArray(value.allowedRuntimeTypes)
+    && value.allowedRuntimeTypes.some((item: unknown) => typeof item !== 'string' || !PROFILE_RUNTIME_TYPES.has(item))) {
+    throw profileClientError(`${key}.allowedRuntimeTypes contains an unknown runtime.`);
+  }
+  return policy;
+}
+
+function normalizeAgentProfileInput(value: unknown, fallbackRole?: AgentRole, id?: string): AgentProfile {
+  if (!isRecord(value)) throw profileClientError('Agent profile must be a JSON object.');
+  const rawRole = value.role ?? fallbackRole;
+  if (!isAgentRole(rawRole)) throw profileClientError('Agent profile role must be one of the fixed core roles.');
+  const role = String(rawRole).toLowerCase() as AgentRole;
+  const profileId = id || cleanProfileString(value.id) || cleanProfileString(value.profileId) || crypto.randomUUID();
+  if (value.id !== undefined && (typeof value.id !== 'string' || !value.id.trim())) throw profileClientError('Agent profile id must be a non-empty string.');
+  if (value.profileId !== undefined && (typeof value.profileId !== 'string' || !value.profileId.trim())) throw profileClientError('Agent profile id must be a non-empty string.');
+  if (value.name !== undefined && (typeof value.name !== 'string' || !value.name.trim())) throw profileClientError('Agent profile name must be a non-empty string.');
+  normalizeProfileRoutePolicyInput(value.routePolicy, 'routePolicy');
+  normalizeProfileRoutePolicyInput(value.allowedRoutePolicy, 'allowedRoutePolicy');
+  try {
+    return normalizeAgentProfile({ ...value, id: profileId, role }, role);
+  } catch (error) {
+    throw profileClientError(error instanceof Error ? error.message : 'Agent profile is invalid.');
+  }
+}
+
+function normalizeAgentProfilePatch(value: unknown, current: AgentProfile): AgentProfilePatch {
+  if (!isRecord(value)) throw profileClientError('Agent profile patch must be a JSON object.');
+  if (Object.prototype.hasOwnProperty.call(value, 'role')) {
+    if (!isAgentRole(value.role) || String(value.role).toLowerCase() !== current.role) {
+      throw profileClientError(`Agent profile role is immutable and must remain '${current.role}'.`, 'PROFILE_ROLE_IMMUTABLE');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'id') || Object.prototype.hasOwnProperty.call(value, 'profileId')) {
+    const requestedId = value.id ?? value.profileId;
+    if (typeof requestedId !== 'string' || requestedId.trim() !== current.id) {
+      throw profileClientError('Agent profile id is immutable.', 'PROFILE_ID_IMMUTABLE');
+    }
+  }
+  const merged = normalizeAgentProfile({ ...current, ...value, id: current.id, role: current.role }, current.role);
+  const patch: AgentProfilePatch = {};
+  for (const key of ['name', 'instructions', 'capabilities', 'specialty', 'description', 'routePolicy', 'allowedRoutePolicy'] as const) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) patch[key] = merged[key] as never;
+  }
+  return patch;
+}
+
+async function listStoredAgentProfiles(includeArchived = false): Promise<unknown[]> {
+  const result = await workspaceManager.listAgentProfiles({ includeArchived });
+  return result;
+}
+
+async function getStoredAgentProfile(id: string, includeArchived = false): Promise<unknown | null> {
+  return await workspaceManager.getAgentProfile(id, { includeArchived }) ?? null;
+}
+
+async function callStoredProfileMutation(name: 'createAgentProfile' | 'updateAgentProfile' | 'archiveAgentProfile', ...args: any[]): Promise<unknown> {
+  if (name === 'createAgentProfile') return workspaceManager.createAgentProfile(args[0]);
+  if (name === 'updateAgentProfile') return workspaceManager.updateAgentProfile(args[0], args[1]);
+  return workspaceManager.archiveAgentProfile(args[0]);
+}
+
+async function listStoredAgentProfileBindings(scopeType: string, scopeId: string): Promise<unknown[]> {
+  return workspaceManager.listAgentProfileBindings({ scopeType: scopeType as any, scopeId });
+}
+
+async function listStoredAgentProfileBindingsIfAvailable(scopeType: string, scopeId: string): Promise<unknown[]> {
+  return listStoredAgentProfileBindings(scopeType, scopeId);
+}
+
+async function bindStoredAgentProfile(input: Record<string, unknown>): Promise<unknown> {
+  return workspaceManager.bindAgentProfile(input as any);
+}
+
+async function unbindStoredAgentProfile(scopeType: string, scopeId: string, role: AgentRole): Promise<unknown> {
+  return workspaceManager.unbindAgentProfile(scopeType as any, scopeId, role);
+}
+
+async function resolveStoredAgentProfileForMission(missionId: string, role: AgentRole, profileId?: string): Promise<unknown> {
+  return workspaceManager.resolveAgentProfileForMission(missionId, role, undefined, profileId as string);
+}
+
+async function validateAgentProfileIds(
+  profileIds: AgentProfileIdMap | undefined,
+  missionId?: string,
+): Promise<AgentProfileIdMap | undefined> {
+  if (profileIds === undefined) return undefined;
+  for (const role of AGENT_ROLES) {
+    const id = profileIds[role];
+    if (!id) continue;
+    const stored = missionId
+      ? await resolveStoredAgentProfileForMission(missionId, role, id)
+      : await getStoredAgentProfile(id);
+    const profileValue = isRecord(stored) && isRecord(stored.profile) ? stored.profile : stored;
+    const safe = safeAgentProfile(profileValue);
+    if (!safe) throw profileClientError(`Agent profile '${id}' was not found for fixed role '${role}'.`, 'AGENT_PROFILE_NOT_FOUND');
+    if (String(safe.role) !== role) throw profileClientError(`Agent profile '${id}' is assigned to fixed role '${safe.role}', not '${role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+    if (safe.archivedAt) throw profileClientError(`Agent profile '${id}' is archived and cannot be selected.`, 'AGENT_PROFILE_ARCHIVED');
+    const resolvedId = String(safe.id);
+    if (resolvedId !== id) throw profileClientError(`Agent profile '${id}' could not be resolved for fixed role '${role}'.`, 'AGENT_PROFILE_NOT_FOUND');
+  }
+  return profileIds;
+}
+
 const ACTIVE_MISSION_STATUSES = new Set([
   'planning',
   'ready',
@@ -545,6 +852,7 @@ function normalizeMissionStartOptions(body: Record<string, any>, automationPolic
   const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId.trim()
     ? body.modelCatalogId.trim()
     : typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
+  const agentProfileIds = normalizeAgentProfileIds(body.agentProfileIds);
   return {
     modelCatalogId,
     accountProfileId: typeof body.accountProfileId === 'string' && body.accountProfileId.trim() ? body.accountProfileId.trim() : undefined,
@@ -557,6 +865,7 @@ function normalizeMissionStartOptions(body: Record<string, any>, automationPolic
     command: body.command,
     teamTemplate: body.teamTemplate,
     executionMode: body.executionMode,
+    agentProfileIds,
     automationPolicy,
     clientMessageId: body.clientMessageId,
   };
@@ -1171,11 +1480,14 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     const commandId = crypto.randomUUID();
     const now = new Date().toISOString();
     const requestedOptions = req.body?.options && typeof req.body.options === 'object' ? req.body.options : {};
+    const agentProfileIds = normalizeAgentProfileIds(requestedOptions.agentProfileIds);
     const turnOptions = {
       ...requestedOptions,
       modelCatalogId: requestedOptions.modelCatalogId || requestedOptions.model || undefined,
+      agentProfileIds,
     };
     delete turnOptions.model;
+    await validateAgentProfileIds(agentProfileIds, missionId);
     const queuedImplementationFollowUp = active && delivery === 'steer' && activeRunIsResearchOnly(missionId)
       && hasExplicitImplementationIntent({
         userMessage: content,
@@ -1295,6 +1607,8 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       ...(queuedImplementationFollowUp || queuedRoutingFollowUp ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
     });
   } catch (error: any) {
+    const profileStatus = profileErrorStatus(error);
+    if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: error?.message || 'Invalid agent profile selection.' });
     if (String(error?.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
       const missionId = routeParam(req.params.id);
       const key = String(req.header('Idempotency-Key') || '').trim();
@@ -1322,16 +1636,14 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
+    const startOptions = normalizeMissionStartOptions(req.body || {});
+    await validateAgentProfileIds(startOptions.agentProfileIds, missionId);
     await configureMissionRouting(missionId, req.body || {});
-    res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, {
-      modelCatalogId: req.body?.modelCatalogId,
-      reasoningLevel: req.body?.reasoningLevel,
-      targetRole: req.body?.targetRole,
-      command: req.body?.command,
-      clientMessageId: req.body?.clientMessageId,
-    })));
+    res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, startOptions)));
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
+    const profileStatus = profileErrorStatus(error);
+    if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: message });
     if (error?.code === 'TURN_ALREADY_RUNNING') {
       return void res.status(409).json({ code: 'TURN_ALREADY_RUNNING', error: message });
     }
@@ -1365,12 +1677,13 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
     }
     if (isDeletionFenced('workspace', targetWorkspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
 
-    const startOptions = {
+    const startOptions: Record<string, any> = {
       ...normalizeMissionStartOptions(req.body || {}, automationPolicy),
       // Keep workspace scope in the idempotency fingerprint without relying on
       // the generated mission id, which would make retries impossible to match.
       workspaceId: targetWorkspaceId,
     };
+    await validateAgentProfileIds(startOptions.agentProfileIds, undefined);
     const idempotencyKey = missionStartIdempotencyKey(req.header('Idempotency-Key') || req.body?.clientMessageId);
     const result = await createQueuedMissionStart({
       workspaceId: targetWorkspaceId,
@@ -1385,6 +1698,8 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
     res.status(result.duplicate ? 200 : 202).json(result);
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
+    const profileStatus = profileErrorStatus(error);
+    if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: message });
     const status = /^Invalid automation override:/.test(message)
       || error?.code === 'IDEMPOTENCY_KEY_REUSED'
       || error?.code === 'IDEMPOTENCY_RECORD_INVALID' ? 400 : 500;
@@ -1528,6 +1843,202 @@ app.get('/api/models', async (req, res) => {
   }
 });
 
+function normalizeProfileBindingInput(
+  value: unknown,
+  defaults: { scopeType?: string; scopeId?: string; role?: string } = {},
+): Record<string, unknown> {
+  if (!isRecord(value)) throw profileClientError('Agent profile binding must be a JSON object.');
+  const scopeType = String(defaults.scopeType ?? value.scopeType ?? value.scope_type ?? '').trim().toLowerCase();
+  const scopeId = String(defaults.scopeId ?? value.scopeId ?? value.scope_id ?? '').trim();
+  const rawRole = String(defaults.role ?? value.role ?? value.agentRole ?? '').trim().toLowerCase();
+  const profileId = String(value.profileId ?? value.profile_id ?? value.agentProfileId ?? '').trim();
+  if (!PROFILE_SCOPE_TYPES.has(scopeType)) throw profileClientError('Binding scopeType must be global, workspace, or team_template.');
+  if (!scopeId) throw profileClientError('Binding scopeId is required.');
+  if (!isAgentRole(rawRole)) throw profileClientError('Binding role must be one of the fixed core roles.');
+  if (!profileId) throw profileClientError('Binding profileId is required.');
+  const rawOverride = value.override ?? value.profileOverride ?? value.profile_override;
+  if (rawOverride !== undefined && !isRecord(rawOverride)) throw profileClientError('Binding override must be an object.');
+  if (isRecord(rawOverride) && rawOverride.role !== undefined
+    && (!isAgentRole(rawOverride.role) || String(rawOverride.role).toLowerCase() !== rawRole)) {
+    throw profileClientError(`Binding override role must remain '${rawRole}'.`, 'PROFILE_ROLE_IMMUTABLE');
+  }
+  return {
+    scopeType,
+    scopeId,
+    role: rawRole,
+    profileId,
+    isDefault: value.isDefault === true,
+    ...(safeProfileOverride(rawOverride) ? { override: safeProfileOverride(rawOverride) } : {}),
+  };
+}
+
+async function validateProfileForRole(profileId: string, role: AgentRole): Promise<Record<string, unknown>> {
+  const stored = await getStoredAgentProfile(profileId);
+  const safe = safeAgentProfile(stored);
+  if (!safe) throw profileClientError(`Agent profile '${profileId}' was not found.`, 'AGENT_PROFILE_NOT_FOUND');
+  if (safe.role !== role) throw profileClientError(`Agent profile '${profileId}' is assigned to fixed role '${safe.role}', not '${role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+  if (safe.archivedAt) throw profileClientError(`Agent profile '${profileId}' is archived and cannot be selected.`, 'AGENT_PROFILE_ARCHIVED');
+  return safe;
+}
+
+async function validateProfileBindingScope(scopeType: string, scopeId: string): Promise<void> {
+  if (scopeType === 'workspace') {
+    if (!await workspaceManager.getWorkspace(scopeId)) throw profileClientError('Workspace not found.', 'BINDING_SCOPE_NOT_FOUND');
+    return;
+  }
+  if (scopeType === 'team_template') {
+    if (!db.select().from((schema as any).teamTemplates).where(eq((schema as any).teamTemplates.id, scopeId)).get()) {
+      throw profileClientError('Team template not found.', 'BINDING_SCOPE_NOT_FOUND');
+    }
+  }
+}
+
+async function sendAgentProfileList(res: Response, includeArchived = false): Promise<void> {
+  const rows = await listStoredAgentProfiles(includeArchived);
+  res.json(rows.map(safeAgentProfile).filter((profile): profile is Record<string, unknown> => Boolean(profile)));
+}
+
+async function sendAgentProfileBindings(res: Response, scopeType: string, scopeId: string): Promise<void> {
+  const rows = await listStoredAgentProfileBindings(scopeType, scopeId);
+  res.json(rows.map(safeProfileBinding).filter((binding): binding is Record<string, unknown> => Boolean(binding)));
+}
+
+async function createOrUpdateAgentProfileBinding(res: Response, value: unknown, defaults: { scopeType?: string; scopeId?: string; role?: string } = {}): Promise<void> {
+  const binding = normalizeProfileBindingInput(value, defaults);
+  await validateProfileBindingScope(String(binding.scopeType), String(binding.scopeId));
+  await validateProfileForRole(String(binding.profileId), binding.role as AgentRole);
+  const result = await bindStoredAgentProfile(binding);
+  const safe = safeProfileBinding(result);
+  if (!safe) throw profileStoreError('Profile binding was saved but could not be reloaded safely.');
+  res.status(200).json(safe);
+}
+
+async function removeAgentProfileBinding(res: Response, scopeType: string, scopeId: string, role: string): Promise<void> {
+  if (!PROFILE_SCOPE_TYPES.has(scopeType) || !isAgentRole(role)) throw profileClientError('Invalid profile binding scope or role.');
+  await validateProfileBindingScope(scopeType, scopeId);
+  await unbindStoredAgentProfile(scopeType, scopeId, role as AgentRole);
+  res.json({ success: true, scopeType, scopeId, role: role.toLowerCase() });
+}
+
+// Named profiles are global resources. Every route below is protected by the
+// AtrisHub session/Premium middleware installed above; only the safe projection
+// leaves this process and no credentials or runtime config are serialized.
+app.get('/api/agent-profiles/bindings', async (req, res) => {
+  try {
+    const scopeType = String(req.query.scopeType || req.query.scope_type || '').trim().toLowerCase();
+    const scopeId = String(req.query.scopeId || req.query.scope_id || '').trim();
+    if (!PROFILE_SCOPE_TYPES.has(scopeType) || !scopeId) throw profileClientError('scopeType and scopeId are required to list profile bindings.');
+    await validateProfileBindingScope(scopeType, scopeId);
+    await sendAgentProfileBindings(res, scopeType, scopeId);
+  } catch (error: any) {
+    const status = profileErrorStatus(error) || 500;
+    res.status(status).json({ code: error?.code, error: error?.message || 'Failed to list agent profile bindings' });
+  }
+});
+
+app.put('/api/agent-profiles/bindings', async (req, res) => {
+  try { await createOrUpdateAgentProfileBinding(res, req.body); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to save agent profile binding' }); }
+});
+app.post('/api/agent-profiles/bindings', async (req, res) => {
+  try { await createOrUpdateAgentProfileBinding(res, req.body); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to save agent profile binding' }); }
+});
+app.delete('/api/agent-profiles/bindings', async (req, res) => {
+  try {
+    const scopeType = String(req.query.scopeType || req.body?.scopeType || '').trim().toLowerCase();
+    const scopeId = String(req.query.scopeId || req.body?.scopeId || '').trim();
+    const role = String(req.query.role || req.body?.role || '').trim().toLowerCase();
+    await removeAgentProfileBinding(res, scopeType, scopeId, role);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to remove agent profile binding' }); }
+});
+
+app.get('/api/agent-profiles', async (req, res) => {
+  try { await sendAgentProfileList(res, req.query.includeArchived === 'true'); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to list agent profiles' }); }
+});
+
+app.post('/api/agent-profiles', async (req, res) => {
+  try {
+    const profile = normalizeAgentProfileInput(req.body);
+    const created = await callStoredProfileMutation('createAgentProfile', profile);
+    const safe = safeAgentProfile(created);
+    if (!safe) throw profileStoreError('Agent profile was saved but could not be reloaded safely.');
+    res.status(201).json(safe);
+  } catch (error: any) {
+    const message = error?.message || 'Failed to create agent profile';
+    const status = profileErrorStatus(error) || (String(error?.code).includes('UNIQUE') ? 409 : 500);
+    res.status(status).json({ code: error?.code, error: message });
+  }
+});
+
+app.get('/api/agent-profiles/:id', async (req, res) => {
+  try {
+    const profile = await getStoredAgentProfile(routeParam(req.params.id), req.query.includeArchived === 'true');
+    const safe = safeAgentProfile(profile);
+    if (!safe || (safe.archivedAt && req.query.includeArchived !== 'true')) return void res.status(404).json({ error: 'Agent profile not found.' });
+    res.json(safe);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to get agent profile' }); }
+});
+
+app.patch('/api/agent-profiles/:id', async (req, res) => {
+  try {
+    const id = routeParam(req.params.id);
+    const existing = await getStoredAgentProfile(id, true);
+    const safeExisting = safeAgentProfile(existing);
+    if (!safeExisting) return void res.status(404).json({ error: 'Agent profile not found.' });
+    if (safeExisting.archivedAt) return void res.status(409).json({ code: 'AGENT_PROFILE_ARCHIVED', error: 'Archived agent profiles cannot be edited.' });
+    const patch = normalizeAgentProfilePatch(req.body, safeExisting as unknown as AgentProfile);
+    const updated = await callStoredProfileMutation('updateAgentProfile', id, patch);
+    const safe = safeAgentProfile(updated);
+    if (!safe) throw profileStoreError('Agent profile was updated but could not be reloaded safely.');
+    res.json(safe);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to update agent profile' }); }
+});
+
+app.delete('/api/agent-profiles/:id', async (req, res) => {
+  try {
+    const id = routeParam(req.params.id);
+    const existing = await getStoredAgentProfile(id, true);
+    const safeExisting = safeAgentProfile(existing);
+    if (!safeExisting) return void res.status(404).json({ error: 'Agent profile not found.' });
+    if (safeExisting.archivedAt) return res.json(safeExisting);
+    const archived = await callStoredProfileMutation('archiveAgentProfile', id);
+    const safe = safeAgentProfile(archived);
+    if (!safe) throw profileStoreError('Agent profile was archived but could not be reloaded safely.');
+    res.json(safe);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to archive agent profile' }); }
+});
+
+async function nestedProfileBindingsGet(req: Request, res: Response, scopeType: 'workspace' | 'team_template'): Promise<void> {
+  try {
+    const scopeId = routeParam(req.params.id);
+    await validateProfileBindingScope(scopeType, scopeId);
+    await sendAgentProfileBindings(res, scopeType, scopeId);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to list agent profile bindings' }); }
+}
+
+async function nestedProfileBindingPut(req: Request, res: Response, scopeType: 'workspace' | 'team_template'): Promise<void> {
+  try { await createOrUpdateAgentProfileBinding(res, req.body, { scopeType, scopeId: routeParam(req.params.id), role: routeParam(req.params.role) }); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to save agent profile binding' }); }
+}
+
+async function nestedProfileBindingDelete(req: Request, res: Response, scopeType: 'workspace' | 'team_template'): Promise<void> {
+  try { await removeAgentProfileBinding(res, scopeType, routeParam(req.params.id), routeParam(req.params.role).toLowerCase()); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to remove agent profile binding' }); }
+}
+
+for (const scopeType of ['workspace', 'team_template'] as const) {
+  const prefix = scopeType === 'workspace' ? '/api/workspaces' : '/api/team-templates';
+  app.get(`${prefix}/:id/agent-profile-bindings`, (req, res) => void nestedProfileBindingsGet(req, res, scopeType));
+  app.get(`${prefix}/:id/agent-profiles`, (req, res) => void nestedProfileBindingsGet(req, res, scopeType));
+  app.put(`${prefix}/:id/agent-profile-bindings/:role`, (req, res) => void nestedProfileBindingPut(req, res, scopeType));
+  app.put(`${prefix}/:id/agent-profiles/:role`, (req, res) => void nestedProfileBindingPut(req, res, scopeType));
+  app.post(`${prefix}/:id/agent-profile-bindings/:role`, (req, res) => void nestedProfileBindingPut(req, res, scopeType));
+  app.delete(`${prefix}/:id/agent-profile-bindings/:role`, (req, res) => void nestedProfileBindingDelete(req, res, scopeType));
+  app.delete(`${prefix}/:id/agent-profiles/:role`, (req, res) => void nestedProfileBindingDelete(req, res, scopeType));
+}
+
 const validRoles = new Set(['orchestrator', 'builder', 'reviewer', 'researcher', 'qa']);
 const validReasoning = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const validSelectionModes = new Set(['auto', 'prefer', 'fixed']);
@@ -1541,14 +2052,31 @@ function normalizeTeamRoles(roles: Array<Record<string, unknown>>): any[] {
     seen.add(id);
     return true;
   }).map((role) => {
+    const canonicalRole = String(role.role).toLowerCase() as AgentRole;
     const modelCatalogId = String(role.modelCatalogId || role.modelProfileId || '').trim();
     const fallbackCatalogIds = normalizeFallbackCatalogIds(role.fallbackCatalogIds, modelCatalogId);
     const preferredReasoning = validReasoning.has(String(role.preferredReasoning)) ? String(role.preferredReasoning) : undefined;
     const routeSelectionMode = validSelectionModes.has(String(role.routeSelectionMode))
       ? String(role.routeSelectionMode)
       : modelCatalogId ? 'prefer' : 'auto';
+    const rawProfile = role.profile ?? role.agentProfile;
+    let profile: Record<string, unknown> | undefined;
+    if (rawProfile !== undefined) {
+      if (!isRecord(rawProfile)) throw profileClientError(`Profile for role '${canonicalRole}' must be an object.`);
+      const profileId = cleanProfileString(role.profileId)
+        || cleanProfileString(role.agentProfileId)
+        || cleanProfileString(rawProfile.id)
+        || cleanProfileString(rawProfile.profileId);
+      if (!profileId) throw profileClientError(`Profile for role '${canonicalRole}' must include a profileId.`);
+      profile = safeAgentProfile({ ...rawProfile, id: profileId, role: rawProfile.role ?? canonicalRole }) ?? undefined;
+      if (!profile) throw profileClientError(`Profile for role '${canonicalRole}' is invalid.`);
+      if (profile.role !== canonicalRole) throw profileClientError(`Profile for role '${canonicalRole}' is assigned to fixed role '${profile.role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+    }
+    const profileId = cleanProfileString(role.profileId)
+      || cleanProfileString(role.agentProfileId)
+      || (profile ? String(profile.id) : undefined);
     return {
-      role: String(role.role).toLowerCase(),
+      role: canonicalRole,
       modelProfileId: modelCatalogId,
       modelCatalogId,
       accountProfileId: String(role.accountProfileId || '').trim(),
@@ -1557,11 +2085,70 @@ function normalizeTeamRoles(roles: Array<Record<string, unknown>>): any[] {
       routeSelectionMode,
       defaultCapabilities: Array.isArray(role.defaultCapabilities) ? role.defaultCapabilities.map(String) : [],
       accessLevel: String(role.accessLevel || 'read'),
+      ...(profileId ? { profileId, agentProfileId: profileId } : {}),
+      ...(profile ? { profile } : {}),
+      ...(typeof role.isDefault === 'boolean' ? { isDefault: role.isDefault } : {}),
     };
   });
 }
 
-function readTeamTemplate(templateId: string): any | null {
+type NormalizedTemplateProfileFields = {
+  agentProfiles?: Record<string, unknown>[];
+  profiles?: Record<string, unknown>[];
+  profileDefaults?: Partial<Record<AgentRole, string>>;
+  defaultProfileIds?: Partial<Record<AgentRole, string>>;
+};
+
+function normalizeTemplateProfileFields(value: unknown): NormalizedTemplateProfileFields {
+  if (!isRecord(value)) return {};
+  const result: NormalizedTemplateProfileFields = {};
+  for (const key of ['agentProfiles', 'profiles'] as const) {
+    if (value[key] === undefined) continue;
+    if (!Array.isArray(value[key])) throw profileClientError(`${key} must be an array.`);
+    const profiles: Record<string, unknown>[] = [];
+    for (const item of value[key]) {
+      if (!isRecord(item)) throw profileClientError(`${key} entries must be objects.`);
+      const id = cleanProfileString(item.id) || cleanProfileString(item.profileId);
+      if (!id) throw profileClientError(`${key} entries must include a profile id.`);
+      const profile = safeAgentProfile({ ...item, id });
+      if (!profile) throw profileClientError(`${key} contains an invalid agent profile.`);
+      profiles.push(profile);
+    }
+    result[key] = profiles;
+  }
+  for (const key of ['profileDefaults', 'defaultProfileIds'] as const) {
+    if (value[key] === undefined) continue;
+    if (!isRecord(value[key])) throw profileClientError(`${key} must be an object keyed by fixed agent roles.`);
+    const ids: Partial<Record<AgentRole, string>> = {};
+    for (const [rawRole, rawValue] of Object.entries(value[key])) {
+      const role = rawRole.toLowerCase();
+      if (!isAgentRole(role)) throw profileClientError(`Unknown agent profile role '${rawRole}'.`);
+      const id = typeof rawValue === 'string'
+        ? rawValue.trim()
+        : isRecord(rawValue)
+          ? cleanProfileString(rawValue.id) || cleanProfileString(rawValue.profileId) || ''
+          : '';
+      if (!id) throw profileClientError(`${key}.${role} must identify an agent profile.`);
+      ids[role as AgentRole] = id;
+    }
+    result[key] = ids;
+  }
+  return result;
+}
+
+function profileIdForTemplateRole(
+  role: AgentRole,
+  roleEntry: Record<string, unknown> | undefined,
+  profileFields: NormalizedTemplateProfileFields,
+): string | undefined {
+  return cleanProfileString(roleEntry?.profileId)
+    || cleanProfileString(roleEntry?.agentProfileId)
+    || profileFields.defaultProfileIds?.[role]
+    || profileFields.profileDefaults?.[role]
+    || (profileFields.agentProfiles || profileFields.profiles || []).find((profile) => profile.role === role)?.id as string | undefined;
+}
+
+async function readTeamTemplate(templateId: string): Promise<any | null> {
   const template = db.select().from((schema as any).teamTemplates)
     .where(eq((schema as any).teamTemplates.id, templateId)).get() as any;
   if (!template) return null;
@@ -1572,6 +2159,21 @@ function readTeamTemplate(templateId: string): any | null {
     eq((schema as any).executionPolicies.scopeId, templateId),
   )).all() as any[];
   const byRole = new Map(policies.map((policy) => [policy.role, policy]));
+  const profileBindings = await listStoredAgentProfileBindingsIfAvailable('team_template', templateId);
+  const bindingsByRole = new Map<string, Record<string, unknown>>();
+  for (const binding of profileBindings) {
+    const safeBinding = safeProfileBinding(binding);
+    if (safeBinding?.role) bindingsByRole.set(String(safeBinding.role), safeBinding);
+  }
+  const boundProfileRows = await Promise.all([...bindingsByRole.values()].map(async (binding) => {
+    try { return safeAgentProfile(await getStoredAgentProfile(String(binding.profileId))); }
+    catch { return null; }
+  }));
+  const boundProfiles = boundProfileRows.filter((profile): profile is Record<string, unknown> => Boolean(profile));
+  const profileDefaults: Partial<Record<AgentRole, string>> = {};
+  for (const binding of bindingsByRole.values()) {
+    if (binding.isDefault === true && binding.role && binding.profileId) profileDefaults[binding.role as AgentRole] = String(binding.profileId);
+  }
   const workerPolicy = resolveWorkerPoolPolicy(template);
   return {
     ...template,
@@ -1579,6 +2181,7 @@ function readTeamTemplate(templateId: string): any | null {
     workerPools: workerPolicy.pools,
     roles: roles.map((role) => {
       const policy = byRole.get(role.role) as any;
+      const binding = bindingsByRole.get(String(role.role));
       return {
         ...role,
         modelCatalogId: policy?.modelCatalogId || role.modelProfileId || '',
@@ -1586,13 +2189,37 @@ function readTeamTemplate(templateId: string): any | null {
         fallbackCatalogIds: policy?.fallbackCatalogIds || [],
         preferredReasoning: policy?.reasoningLevel || undefined,
         routeSelectionMode: policy?.selectionMode || (role.modelProfileId ? 'prefer' : 'auto'),
+        ...(binding?.profileId ? { profileId: binding.profileId, agentProfileId: binding.profileId } : {}),
+        ...(binding?.override ? { profile: binding.override } : {}),
       };
     }),
+    ...(boundProfiles.length ? { agentProfiles: boundProfiles, profiles: boundProfiles } : {}),
+    ...(Object.keys(profileDefaults).length ? { profileDefaults, defaultProfileIds: profileDefaults } : {}),
   };
 }
 
-function replaceTemplateRoles(templateId: string, inputRoles: any[]): void {
+async function replaceTemplateRoles(templateId: string, inputRoles: any[], inputProfileFields: unknown = {}): Promise<void> {
   const roles = normalizeTeamRoles(inputRoles);
+  const profileFields = normalizeTemplateProfileFields(inputProfileFields);
+  const profileIdsByRole = new Map<AgentRole, string>();
+  for (const role of roles) {
+    const profileId = profileIdForTemplateRole(role.role as AgentRole, role, profileFields);
+    if (profileId) profileIdsByRole.set(role.role as AgentRole, profileId);
+  }
+  const hasProfileData = profileIdsByRole.size > 0
+    || Object.keys(profileFields.profileDefaults || {}).length > 0
+    || Object.keys(profileFields.defaultProfileIds || {}).length > 0;
+  const hasBindingStore = true;
+  if (hasProfileData && !hasBindingStore) throw profileStoreError('Agent profile bindings are unavailable.');
+  if (hasBindingStore) {
+    for (const [role, profileId] of profileIdsByRole) {
+      const stored = await getStoredAgentProfile(profileId);
+      const safe = safeAgentProfile(stored);
+      if (!safe) throw profileClientError(`Agent profile '${profileId}' was not found.`, 'AGENT_PROFILE_NOT_FOUND');
+      if (safe.role !== role) throw profileClientError(`Agent profile '${profileId}' is assigned to fixed role '${safe.role}', not '${role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+      if (safe.archivedAt) throw profileClientError(`Agent profile '${profileId}' is archived and cannot be bound.`, 'AGENT_PROFILE_ARCHIVED');
+    }
+  }
   db.delete((schema as any).teamRoles).where(eq((schema as any).teamRoles.templateId, templateId)).run();
   db.delete((schema as any).executionPolicies).where(and(
     eq((schema as any).executionPolicies.scopeType, 'team_template'),
@@ -1622,22 +2249,42 @@ function replaceTemplateRoles(templateId: string, inputRoles: any[]): void {
       updatedAt: new Date().toISOString(),
     }).run();
   }
+  if (hasBindingStore) {
+    for (const role of AGENT_ROLES) await unbindStoredAgentProfile('team_template', templateId, role);
+    for (const role of roles) {
+      const profileId = profileIdsByRole.get(role.role as AgentRole);
+      if (!profileId) continue;
+      const isDefault = role.isDefault === true
+        || profileFields.defaultProfileIds?.[role.role as AgentRole] === profileId
+        || profileFields.profileDefaults?.[role.role as AgentRole] === profileId;
+      await bindStoredAgentProfile({
+        scopeType: 'team_template',
+        scopeId: templateId,
+        role: role.role,
+        profileId,
+        isDefault,
+        override: safeProfileOverride(role.profile),
+      });
+    }
+  }
 }
 
-app.get('/api/team-templates', (_req, res) => {
+app.get('/api/team-templates', async (_req, res) => {
   try {
     const templates = db.select().from((schema as any).teamTemplates).all() as any[];
-    res.json(templates.map((template) => readTeamTemplate(template.id)));
+    res.json(await Promise.all(templates.map((template) => readTeamTemplate(template.id))));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to fetch team templates' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to fetch team templates' });
   }
 });
 
-app.post('/api/team-templates', (req, res) => {
+app.post('/api/team-templates', async (req, res) => {
   try {
     const name = String(req.body?.name || '').trim();
     const description = String(req.body?.description || '').trim();
     const roles = normalizeTeamRoles(req.body?.roles || []);
+    const profileFields = normalizeTemplateProfileFields(req.body || {});
     if (!name) return void res.status(400).json({ error: 'Template name is required.' });
     if (!roles.length) return void res.status(400).json({ error: 'Select at least one valid agent role.' });
     const duplicate = (db.select().from((schema as any).teamTemplates).all() as any[])
@@ -1650,21 +2297,25 @@ app.post('/api/team-templates', (req, res) => {
       const workerPolicy = resolveWorkerPoolPolicy(req.body);
       db.insert((schema as any).teamTemplates).values({ id, name, description, maxParallelAgents: workerPolicy.maxParallelAgents,
         workerPools: workerPolicy.pools, isDefault: false, createdAt: now }).run();
-      replaceTemplateRoles(id, roles);
     })();
-    res.status(201).json(readTeamTemplate(id));
+    await replaceTemplateRoles(id, roles, profileFields);
+    res.status(201).json(await readTeamTemplate(id));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to create team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to create team template' });
   }
 });
 
-app.patch('/api/team-templates/:id', (req, res) => {
+app.patch('/api/team-templates/:id', async (req, res) => {
   try {
-    const template = readTeamTemplate(req.params.id);
+    const template = await readTeamTemplate(req.params.id);
     if (!template) return void res.status(404).json({ error: 'Team template not found.' });
     const name = String(req.body?.name ?? template.name).trim();
     const description = String(req.body?.description ?? template.description).trim();
     const roles = req.body?.roles === undefined ? template.roles : normalizeTeamRoles(req.body.roles);
+    const profileFields = req.body?.roles === undefined
+      ? normalizeTemplateProfileFields(template)
+      : normalizeTemplateProfileFields(req.body || {});
     if (!name) return void res.status(400).json({ error: 'Template name is required.' });
     if (!roles.length) return void res.status(400).json({ error: 'Select at least one valid agent role.' });
     const duplicate = (db.select().from((schema as any).teamTemplates).all() as any[])
@@ -1675,17 +2326,18 @@ app.patch('/api/team-templates/:id', (req, res) => {
       const workerPolicy = resolveWorkerPoolPolicy(req.body?.maxParallelAgents === undefined && req.body?.workerPools === undefined ? template : req.body);
       db.update((schema as any).teamTemplates).set({ name, description, maxParallelAgents: workerPolicy.maxParallelAgents, workerPools: workerPolicy.pools })
         .where(eq((schema as any).teamTemplates.id, req.params.id)).run();
-      replaceTemplateRoles(req.params.id, roles);
     })();
-    res.json(readTeamTemplate(req.params.id));
+    await replaceTemplateRoles(req.params.id, roles, profileFields);
+    res.json(await readTeamTemplate(req.params.id));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to update team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to update team template' });
   }
 });
 
-app.post('/api/team-templates/:id/default', (req, res) => {
+app.post('/api/team-templates/:id/default', async (req, res) => {
   try {
-    if (!readTeamTemplate(req.params.id)) return void res.status(404).json({ error: 'Team template not found.' });
+    if (!await readTeamTemplate(req.params.id)) return void res.status(404).json({ error: 'Team template not found.' });
     sqlite.transaction(() => {
       for (const template of db.select().from((schema as any).teamTemplates).all() as any[]) {
         db.update((schema as any).teamTemplates)
@@ -1693,17 +2345,19 @@ app.post('/api/team-templates/:id/default', (req, res) => {
           .where(eq((schema as any).teamTemplates.id, template.id)).run();
       }
     })();
-    res.json(readTeamTemplate(req.params.id));
+    res.json(await readTeamTemplate(req.params.id));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to set the default team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to set the default team template' });
   }
 });
 
-app.delete('/api/team-templates/:id', (req, res) => {
+app.delete('/api/team-templates/:id', async (req, res) => {
   try {
-    const template = readTeamTemplate(req.params.id);
+    const template = await readTeamTemplate(req.params.id);
     if (!template) return void res.status(404).json({ error: 'Team template not found.' });
     if (template.isDefault) return void res.status(409).json({ error: 'The default template cannot be deleted. Set another template as default first.' });
+    for (const role of AGENT_ROLES) await unbindStoredAgentProfile('team_template', req.params.id, role);
     sqlite.transaction(() => {
       db.delete((schema as any).executionPolicies).where(and(
         eq((schema as any).executionPolicies.scopeType, 'team_template'),
@@ -1714,7 +2368,8 @@ app.delete('/api/team-templates/:id', (req, res) => {
     })();
     res.json({ success: true });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to delete team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to delete team template' });
   }
 });
 

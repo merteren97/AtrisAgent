@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
+import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
+import { ApiError, apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
 
 export type MissionStatus =
@@ -31,7 +32,33 @@ export interface Mission {
   taskCount?: number;
   description?: string;
   planId?: string | null;
+  deletionState?: ConversationDeletionState;
 }
+
+export type ConversationDeletionState = {
+  status: 'pending' | 'retryable';
+  operationId?: string;
+  phase?: string;
+  progress?: Record<string, unknown>;
+  error?: string | null;
+};
+
+export interface ConversationDeletionResponse {
+  success?: boolean;
+  operationId?: string;
+  targetType?: 'mission' | 'workspace';
+  targetId?: string;
+  removeMemory?: boolean;
+  phase?: string;
+  status?: 'pending' | 'running' | 'retryable' | 'completed';
+  progress?: Record<string, unknown>;
+  retryable?: boolean;
+  error?: string | null;
+}
+
+export type ConversationDeletionResult =
+  | { status: 'completed' | 'not_found'; operationId?: string }
+  | (ConversationDeletionState & { status: 'pending' | 'retryable' });
 
 export interface TaskItem {
   id: string;
@@ -84,6 +111,8 @@ export interface StartMissionOptions {
   routeRole?: string;
   /** Normal selection targets Orchestrator; advanced directives can target another role. */
   routeScope?: 'mission' | 'role';
+  /** Explicit named profile IDs by fixed role; omitted roles use durable defaults. */
+  agentProfileIds?: Partial<Record<AgentRole, string>>;
   command?: string;
   automationSettings?: { fileWrite: boolean | null; gitCommit: boolean | null; packageInstall: boolean | null };
 }
@@ -162,7 +191,7 @@ interface MissionState {
   sendMissionCommand: (missionId: string, request: string, delivery: TurnDelivery, options?: StartMissionOptions) => Promise<void>;
   drainQueuedTurn: (missionId: string) => Promise<void>;
   setTransportStatus: (status: EventTransportStatus, error?: string | null) => void;
-  deleteMission: (id: string) => Promise<void>;
+  deleteMission: (id: string) => Promise<ConversationDeletionResult>;
   addMission: (mission: Mission) => void;
   setActiveMission: (id: string) => void;
   clearActiveMission: () => void;
@@ -181,6 +210,49 @@ interface MissionState {
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
 let commandQueueRequestId = 0;
+const missionStateRequestIds = new Map<string, number>();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function deletionResultFromResponse(status: number, payload: unknown): ConversationDeletionResult {
+  const data = isRecord(payload) ? payload as ConversationDeletionResponse : {};
+  const operationId = typeof data.operationId === 'string' ? data.operationId : undefined;
+  if (status === 404) return { status: 'not_found', operationId };
+  if (status === 503 || data.status === 'retryable' || data.retryable === true) {
+    return {
+      status: 'retryable',
+      operationId,
+      phase: typeof data.phase === 'string' ? data.phase : undefined,
+      progress: isRecord(data.progress) ? data.progress : undefined,
+      error: typeof data.error === 'string' && data.error.trim() ? data.error : 'Conversation deletion needs to be retried.',
+    };
+  }
+  if (status === 202 || data.status === 'pending' || data.status === 'running') {
+    return {
+      status: 'pending',
+      operationId,
+      phase: typeof data.phase === 'string' ? data.phase : undefined,
+      progress: isRecord(data.progress) ? data.progress : undefined,
+      error: typeof data.error === 'string' ? data.error : null,
+    };
+  }
+  if (status >= 200 && status < 300 && (status === 200 || data.status === 'completed' || data.success === true)) {
+    return { status: 'completed', operationId };
+  }
+  return { status: 'retryable', operationId, error: `Conversation deletion returned an unexpected status (${status}).` };
+}
+
+function deletionStateFromResult(result: Extract<ConversationDeletionResult, { status: 'pending' | 'retryable' }>): ConversationDeletionState {
+  return {
+    status: result.status,
+    operationId: result.operationId,
+    phase: result.phase,
+    progress: result.progress,
+    error: result.error,
+  };
+}
 
 const KNOWN_MISSION_STATUSES = new Set<MissionStatus>([
   'draft', 'queued', 'starting', 'planning', 'ready', 'running', 'waiting_for_approval', 'blocked',
@@ -284,7 +356,8 @@ export function projectMissionStatusFromEvent(
   return next;
 }
 
-async function fetchMissionEvents(missionId: string): Promise<Array<Record<string, any>>> {
+/** Load the complete durable event history through the cursor contract. */
+export async function fetchMissionEvents(missionId: string): Promise<Array<Record<string, any>>> {
   const events: Array<Record<string, any>> = [];
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
@@ -296,11 +369,14 @@ async function fetchMissionEvents(missionId: string): Promise<Array<Record<strin
     );
     events.push(...response.data);
     const next = response.headers.get('X-Next-Cursor') || undefined;
+    const hasMore = response.headers.get('X-Has-More') === 'true';
+    if (hasMore && !next) throw new Error('Mission event history has more pages, but the next cursor was not exposed.');
     if (!next || response.data.length === 0) break;
     if (seenCursors.has(next)) throw new Error('Mission event cursor repeated during hydration.');
     seenCursors.add(next);
     cursor = next;
   }
+  if (cursor && seenCursors.size >= 100) throw new Error('Mission event history exceeds the 100 pages hydration safety limit.');
   return events;
 }
 
@@ -535,7 +611,28 @@ export function reconcileApprovalTimeline(items: TimelineItem[]): TimelineItem[]
   });
 }
 
-function requestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions, clientMessageId?: string): Record<string, unknown> {
+export function normalizeAgentProfileIds(value: unknown): Partial<Record<AgentRole, string>> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  const selections: Partial<Record<AgentRole, string>> = {};
+  for (const role of AGENT_ROLES) {
+    const profileId = record[role];
+    if (typeof profileId === 'string' && profileId.trim()) selections[role] = profileId.trim();
+  }
+  return selections;
+}
+
+function normalizeMissionOptions(options?: StartMissionOptions): StartMissionOptions | undefined {
+  if (!options) return undefined;
+  const agentProfileIds = normalizeAgentProfileIds(options.agentProfileIds);
+  return {
+    ...options,
+    agentProfileIds: Object.keys(agentProfileIds).length > 0 ? agentProfileIds : undefined,
+  };
+}
+
+export function buildMissionRequestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions, clientMessageId?: string): Record<string, unknown> {
+  const agentProfileIds = normalizeAgentProfileIds(options?.agentProfileIds);
   return {
     request,
     title: request,
@@ -548,6 +645,7 @@ function requestBody(request: string, workspaceId: string | undefined, options?:
     targetRole: options?.targetRole,
     routeRole: options?.routeRole,
     routeScope: options?.routeScope,
+    agentProfileIds: Object.keys(agentProfileIds).length > 0 ? agentProfileIds : undefined,
     command: options?.command,
     automationSettings: options?.automationSettings,
     clientMessageId,
@@ -582,14 +680,19 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const query = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : '';
       const fetched = await apiRequest<Mission[]>(`/missions${query}`);
       const current = get().activeMissionId;
-      const nextActive = current && fetched.some((mission) => mission.id === current)
+      const previousMissions = new Map(get().missions.map((mission) => [mission.id, mission]));
+      const reconciled = fetched.map((mission) => {
+        const deletionState = previousMissions.get(mission.id)?.deletionState;
+        return deletionState ? { ...mission, deletionState } : mission;
+      });
+      const nextActive = current && reconciled.some((mission) => mission.id === current)
         ? current
-        : fetched[0]?.id || null;
+        : reconciled[0]?.id || null;
       const changedMission = current !== nextActive;
 
       if (changedMission) useAgentStore.getState().setSelectedAgent(null);
       set({
-        missions: fetched,
+        missions: reconciled,
         activeMissionId: nextActive,
         loading: false,
         ...(changedMission ? { timeline: [], activeTasks: [], hydratedMissionId: null } : {}),
@@ -619,6 +722,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
 
   fetchMissionState: async (missionId) => {
+    const requestId = (missionStateRequestIds.get(missionId) || 0) + 1;
+    missionStateRequestIds.set(missionId, requestId);
     if (get().activeMissionId === missionId) set({ missionStateLoading: true, missionStateError: null });
     try {
       const [state, events] = await Promise.all([
@@ -626,14 +731,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         fetchMissionEvents(missionId),
       ]);
 
+      // Selecting another conversation starts a newer request. Do not let a
+      // slower response hydrate its agents/timeline over the current mission.
+      if (missionStateRequestIds.get(missionId) !== requestId || get().activeMissionId !== missionId) return;
+
       const restoredTimeline = restoreMissionTimeline(state.mission, events);
 
-      useAgentStore.getState().hydrateMissionFromEvents(missionId, events);
+      // The event request is a snapshot. SSE may have delivered later agent
+      // events while it was in flight; replay those too before replacing the
+      // agent projection, just as the timeline below retains live-only items.
+      const persistedEventIds = new Set(events.map((event) => event.id));
+      const liveAgentEvents = get().timeline.flatMap((item) => {
+        const event = item.metadata;
+        return event?.missionId === missionId && typeof event.type === 'string'
+          && !persistedEventIds.has(event.id) ? [event] : [];
+      });
+      useAgentStore.getState().hydrateMissionFromEvents(missionId, [...events, ...liveAgentEvents]);
 
       set((current) => {
         const missions = state.mission
           ? current.missions.some((mission) => mission.id === missionId)
-            ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission! } : mission)
+            ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission!, ...(mission.deletionState ? { deletionState: mission.deletionState } : {}) } : mission)
             : [state.mission!, ...current.missions]
           : current.missions;
 
@@ -662,7 +780,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       });
 
     } catch (error: any) {
-      if (get().activeMissionId === missionId) {
+      if (missionStateRequestIds.get(missionId) === requestId && get().activeMissionId === missionId) {
         set({
           missionStateLoading: false,
           missionStateError: error?.message || 'Failed to load mission state.',
@@ -678,7 +796,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       if (!state.mission) throw new Error('Conversation was not found.');
       set((current) => ({
         missions: current.missions.some((mission) => mission.id === missionId)
-          ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission! } : mission)
+          ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission!, ...(mission.deletionState ? { deletionState: mission.deletionState } : {}) } : mission)
           : [state.mission!, ...current.missions],
         error: null,
       }));
@@ -708,6 +826,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
+        agentProfileIds: normalizeAgentProfileIds(options?.agentProfileIds),
         clientMessageId,
       },
     };
@@ -725,7 +844,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const response = await apiRequestWithHeaders<MissionStartResponse>('/missions/start', {
         method: 'POST',
-        body: JSON.stringify(requestBody(trimmed, workspaceId, options, clientMessageId)),
+        body: JSON.stringify(buildMissionRequestBody(trimmed, workspaceId, options, clientMessageId)),
       });
       const data = response.data;
       if (missionStartDisposition(response.status, data) !== 'accepted') {
@@ -830,6 +949,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
+        agentProfileIds: normalizeAgentProfileIds(options?.agentProfileIds),
         clientMessageId,
       },
     };
@@ -846,7 +966,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const response = await apiRequestWithHeaders<MissionStartResponse>(`/missions/${missionId}/start`, {
         method: 'POST',
-        body: JSON.stringify(requestBody(trimmed, mission.workspaceId, options, clientMessageId)),
+        body: JSON.stringify(buildMissionRequestBody(trimmed, mission.workspaceId, options, clientMessageId)),
       });
       const data = response.data;
       if (missionStartDisposition(response.status, data) !== 'accepted') {
@@ -925,6 +1045,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   sendMissionCommand: async (missionId, request, delivery, options) => {
     const trimmed = request.trim();
     if (!trimmed) return;
+    const safeOptions = normalizeMissionOptions(options);
     const queueId = crypto.randomUUID();
     const queuedAt = new Date().toISOString();
     const userMessage: TimelineItem = {
@@ -942,6 +1063,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         command: options?.command,
         modelCatalogId: options?.model,
         reasoningLevel: options?.reasoningLevel,
+        agentProfileIds: normalizeAgentProfileIds(safeOptions?.agentProfileIds),
       },
     };
     const queuedCard: TimelineItem = {
@@ -955,7 +1077,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     };
     set((state) => ({
       error: null,
-      queuedTurns: delivery === 'queue' ? [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options, queuedAt }] : state.queuedTurns,
+      queuedTurns: delivery === 'queue' ? [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options: safeOptions, queuedAt }] : state.queuedTurns,
       timeline: [...state.timeline, userMessage, queuedCard],
     }));
 
@@ -963,7 +1085,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const durable = await apiRequest<Record<string, any>>(`/missions/${missionId}/messages`, {
         method: 'POST',
         headers: { 'Idempotency-Key': queueId },
-        body: JSON.stringify({ content: trimmed, delivery, options }),
+        body: JSON.stringify({ content: trimmed, delivery, options: safeOptions }),
       });
       const turnId = String(durable.turnId || durable.turn?.id || durable.commandId || durable.command?.id || durable.id || queueId);
       set((state) => ({
@@ -992,7 +1114,18 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
   deleteMission: async (id) => {
     try {
-      await apiRequest(`/missions/${id}`, { method: 'DELETE' });
+      const response = await apiRequestWithHeaders<ConversationDeletionResponse>(`/missions/${id}`, { method: 'DELETE' });
+      const result = deletionResultFromResponse(response.status, response.data);
+      if (result.status === 'pending' || result.status === 'retryable') {
+        set((state) => ({
+          missions: state.missions.map((mission) => mission.id === id
+            ? { ...mission, deletionState: deletionStateFromResult(result) }
+            : mission),
+          error: result.status === 'retryable' ? result.error || 'Conversation deletion needs to be retried.' : null,
+        }));
+        return result;
+      }
+
       useAgentStore.getState().clearMissionAgents(id);
       set((state) => {
         const wasActive = state.activeMissionId === id;
@@ -1010,8 +1143,42 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           } : {}),
         };
       });
-    } catch (error: any) {
-      const message = error?.message || 'Conversation deletion failed.';
+      return result;
+    } catch (error: unknown) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 503)) {
+        const result = deletionResultFromResponse(error.status, error.details);
+        if (result.status === 'not_found') {
+          useAgentStore.getState().clearMissionAgents(id);
+          set((state) => {
+            const wasActive = state.activeMissionId === id;
+            return {
+              missions: state.missions.filter((mission) => mission.id !== id),
+              queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
+              commandQueue: state.commandQueue.filter((command) => command.missionId !== id),
+              error: null,
+              ...(wasActive ? {
+                activeMissionId: null,
+                hydratedMissionId: null,
+                timeline: [],
+                activeTasks: [],
+                pendingMissionStart: null,
+              } : {}),
+            };
+          });
+          return result;
+        }
+        if (result.status === 'retryable') {
+          set((state) => ({
+            missions: state.missions.map((mission) => mission.id === id
+              ? { ...mission, deletionState: deletionStateFromResult(result) }
+              : mission),
+            error: result.error || 'Conversation deletion needs to be retried.',
+          }));
+          return result;
+        }
+      }
+
+      const message = error instanceof Error ? error.message : 'Conversation deletion failed.';
       set({ error: message });
       throw new Error(message);
     }

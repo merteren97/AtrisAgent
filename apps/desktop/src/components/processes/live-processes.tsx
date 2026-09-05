@@ -9,9 +9,23 @@ import { useAgentStore } from '@/stores/agent-store';
 import { useMissionStore } from '@/stores/mission-store';
 
 const BOTTOM_THRESHOLD = 32;
+const COMPACT_CONTENT_LENGTH = 480;
 
 function nearBottom(viewport: HTMLElement): boolean {
   return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= BOTTOM_THRESHOLD;
+}
+
+function ProcessContent({ content }: { content: string }) {
+  if (content.length <= COMPACT_CONTENT_LENGTH) return <span className="whitespace-pre-wrap break-words">{content}</span>;
+  return (
+    <details className="group">
+      <summary className="cursor-pointer list-none text-foreground/90 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <span className="whitespace-pre-wrap break-words">{content.slice(0, COMPACT_CONTENT_LENGTH).trimEnd()}…</span>
+        <span className="ml-2 text-[10px] text-primary group-open:hidden">Show full output</span>
+      </summary>
+      <span className="mt-2 block whitespace-pre-wrap break-words border-l border-border pl-3 text-foreground/90">{content}</span>
+    </details>
+  );
 }
 
 export function LiveProcesses() {
@@ -105,7 +119,7 @@ export function LiveProcesses() {
                   <div key={item.id} className={`grid grid-cols-[4.5rem_4.5rem_minmax(0,1fr)] gap-2 border-b border-border/40 py-1.5 last:border-0 ${item.category === 'output' ? 'my-1 rounded-md bg-muted/20 px-2' : ''}`}>
                     <time className="tabular-nums text-muted-foreground">{item.timestamp}</time>
                     <Badge variant="outline" className={`h-5 justify-center rounded px-1 text-[8px] uppercase ${item.category === 'error' ? 'border-destructive/30 text-destructive' : item.category === 'tool' ? 'text-amber-400' : item.category === 'output' ? 'text-primary' : 'text-muted-foreground'}`}>{item.category}</Badge>
-                    <span className="min-w-0 whitespace-pre-wrap break-words"><span className="mr-2 text-muted-foreground">{item.label}</span>{item.content}</span>
+                    <div className="min-w-0"><span className="mr-2 text-muted-foreground">{item.label}</span><ProcessContent content={item.content} /></div>
                   </div>
                 ))}
               </div>

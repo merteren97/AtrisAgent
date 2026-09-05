@@ -1,9 +1,8 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Shield, CheckCircle2, XCircle, Loader2, RefreshCw } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
-import { useMissionStore } from '@/stores/mission-store';
-import { apiRequest } from '@/lib/api-client';
+import { fetchMissionEvents, useMissionStore } from '@/stores/mission-store';
 
 interface CheckEvent { id: string; type: 'check_completed'; taskId: string; checkName: string; passed: boolean; summary: string; timestamp: string }
 
@@ -12,19 +11,28 @@ export function ChecksTab() {
   const [checks, setChecks] = useState<CheckEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadIdRef = useRef(0);
 
   const load = async () => {
     if (!activeMissionId) { setChecks([]); return; }
+    const requestMissionId = activeMissionId;
+    const requestId = ++loadIdRef.current;
     setLoading(true); setError(null);
     try {
-      const events = await apiRequest<Array<Record<string, unknown>>>(`/missions/${activeMissionId}/events`);
+      const events = await fetchMissionEvents(requestMissionId);
+      if (requestId !== loadIdRef.current || useMissionStore.getState().activeMissionId !== requestMissionId) return;
       setChecks(events.filter((event) => event.type === 'check_completed').map((event) => event as unknown as CheckEvent));
     } catch (cause: any) {
-      setError(cause?.message || 'Check results could not be loaded.');
-    } finally { setLoading(false); }
+      if (requestId === loadIdRef.current && useMissionStore.getState().activeMissionId === requestMissionId) setError(cause?.message || 'Check results could not be loaded.');
+    } finally { if (requestId === loadIdRef.current) setLoading(false); }
   };
 
-  useEffect(() => { void load(); }, [activeMissionId]);
+  useEffect(() => {
+    setChecks([]);
+    setError(null);
+    void load();
+    return () => { loadIdRef.current += 1; };
+  }, [activeMissionId]);
   const passed = checks.filter((check) => check.passed).length;
 
   if (!activeMissionId) return <Empty text="Select a mission to see its QA checks." />;

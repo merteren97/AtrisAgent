@@ -105,6 +105,7 @@ function task(params: {
   title?: string;
   dependsOn?: string[];
   assignedAgentId?: string | null;
+  agentProfileId?: string | null;
 }): TaskSelect {
   const now = new Date().toISOString();
   return {
@@ -116,6 +117,7 @@ function task(params: {
     status: params.status,
     priority: 'medium',
     assignedAgentId: params.assignedAgentId ?? null,
+    agentProfileId: params.agentProfileId ?? null,
     assignedRole: params.role,
     requiredCapabilities: [],
     dependsOn: params.dependsOn || [],
@@ -338,6 +340,82 @@ async function runTests() {
     assert(completion.status === 'completed', 'restart recovery durably closes the completion fence');
   }
 
+  // Recovery and direct legacy publication must fail closed when the durable
+  // mission has been deleted. A stale completion row must not create an orphan
+  // mission_completed or mission_failed event.
+  {
+    const deletedMissionId = 'mission-deleted-before-recovery';
+    const completion = {
+      missionId: deletedMissionId,
+      planId: 'plan-deleted-before-recovery',
+      status: 'event_pending',
+      summary: 'stale completion row',
+      tasksCompleted: 1,
+      totalTasks: 1,
+      createdAt: new Date().toISOString(),
+      completedAt: null,
+    };
+    const db = new CompletionFenceDb();
+    db.completions.push(completion);
+    const manager = new FakeWorkspaceManager('mission-still-live', 'plan-still-live');
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      db as any,
+      manager as unknown as WorkspaceManager,
+    );
+
+    orchestrator.emitMissionCompleted({
+      missionId: deletedMissionId,
+      summary: 'orphan publication attempt',
+      tasksCompleted: 1,
+      totalTasks: 1,
+    });
+    await orchestrator.recoverPendingCompletions();
+
+    assert(completion.status === 'event_pending'
+      && !events.some((event) => event.type === 'mission_completed' || event.type === 'mission_failed'),
+    'Deleted missions suppress both direct and recovered orphan terminal events');
+  }
+
+  // A durable task profile is forwarded to every orchestrator-owned task/agent
+  // lifecycle event without changing the fixed-role assignment boundary.
+  {
+    const missionId = 'mission-profile-event-forwarding';
+    const planId = 'plan-profile-event-forwarding';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('profiled-task', task({
+      id: 'profiled-task',
+      missionId,
+      planId,
+      role: 'researcher',
+      status: 'planned',
+      agentProfileId: 'profile-researcher-primary',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.assignTask('profiled-task');
+    const lifecycleEvents = events.filter((event) =>
+      (event.type === 'task_assigned' || event.type === 'agent_spawned' || event.type === 'task_created')
+      && event.taskId === 'profiled-task');
+    assert(lifecycleEvents.length === 3
+      && lifecycleEvents.every((event) => (
+        event.type === 'task_assigned' || event.type === 'agent_spawned' || event.type === 'task_created'
+      ) && event.agentProfileId === 'profile-researcher-primary'),
+    'Durable agentProfileId is forwarded through task_assigned, agent_spawned, and task_created');
+  }
+
   // Direct conversational turns use the same durable completion fence before
   // their terminal event, and their user message is emitted once with turnId.
   {
@@ -389,7 +467,7 @@ async function runTests() {
       manager as unknown as WorkspaceManager,
     );
 
-    const result = await orchestrator.startMission(missionId, 'Create a plan only', { turnId });
+    const result = await orchestrator.startMission(missionId, 'Plan only: research', { turnId });
     assert(userMessages.length === 1 && userMessages[0]?.turnId === turnId,
       'plan-only turn emits one user_message with turnId');
     assert(taskCreated === 0 && completionRowAtEvent?.missionId === missionId && completionRowAtEvent?.planId === result.planId
@@ -635,13 +713,13 @@ async function runTests() {
       && reviewEvent.findings.length <= 4_000
       && !reviewEvent.findings.includes('secret-quality-token'),
     'Reviewer rejection emits a bounded, redacted, correlated review_completed verdict');
-    assert(manager.tasks.get('reviewer')?.status === 'rejected' && manager.mission.status === 'blocked',
-      'Reviewer rejection persists a rejected task and blocks the mission');
+    assert(manager.tasks.get('reviewer')?.status === 'rejected' && manager.mission.status === 'failed',
+      'Reviewer rejection persists a rejected task and fails the mission consistently with mission_failed');
     assert(manager.tasks.get('qa')?.status === 'cancelled'
       && !events.some((event) => event.type === 'verification_started')
       && !events.some((event) => event.type === 'mission_completed'),
     'Reviewer rejection cancels the pending QA lane and cannot complete the mission');
-    assert(applyErrors.length === 1 && applyCalls === 0 && manager.mission.status === 'blocked',
+    assert(applyErrors.length === 1 && applyCalls === 0 && manager.mission.status === 'failed',
       'Reviewer rejection remains ineligible for apply');
   }
 
@@ -664,24 +742,39 @@ async function runTests() {
     );
     await orchestrator.handleTaskCompleted({
       id: crypto.randomUUID(), type: 'task_completed', missionId, taskId: 'reviewer', agentInstanceId: 'agent-reviewer',
-      result: JSON.stringify({ type: 'quality_result', version: 1, role: 'reviewer', verdict: 'pass', summary: 'Reviewed changes.', evidence: ['diff inspected'] }),
+      result: `[legacy_compatibility_fallback] Waiting for build process to complete.\n${JSON.stringify({ type: 'quality_result', version: 1, role: 'reviewer', verdict: 'pass', summary: 'Production build passed with zero errors.', findings: ['No blocking findings.'], evidence: ['409 Conflict response was observed during an unrelated probe.', 'src/error-boundary.tsx', 'diff inspected'] })}`,
       timestamp: new Date().toISOString(),
     });
     assert(manager.tasks.get('reviewer')?.status === 'done'
       && events.some((event) => event.type === 'review_completed' && event.approved),
     'Valid structured Reviewer envelope passes and remains adapter-compatible as text');
 
+    const contradictoryManager = new FakeWorkspaceManager('mission-contradictory-envelope', 'plan-contradictory-envelope');
+    contradictoryManager.tasks.set('reviewer', task({ id: 'reviewer', missionId: 'mission-contradictory-envelope', planId: 'plan-contradictory-envelope', role: 'reviewer', status: 'running', assignedAgentId: 'agent-contradictory' }));
+    const contradictoryOrchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: contradictoryManager as unknown as WorkspaceManager },
+      new LocalEventBus(), undefined, contradictoryManager as unknown as WorkspaceManager,
+    );
+    await contradictoryOrchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(), type: 'task_completed', missionId: 'mission-contradictory-envelope', taskId: 'reviewer', agentInstanceId: 'agent-contradictory',
+      result: JSON.stringify({ type: 'quality_result', version: 1, role: 'reviewer', verdict: 'pass', summary: 'Build passed.', findings: ['Tests failed with a blocking error.'], evidence: ['src/error-boundary.tsx'] }),
+      timestamp: new Date().toISOString(),
+    });
+    assert(contradictoryManager.tasks.get('reviewer')?.status === 'rejected' && contradictoryManager.mission.status === 'failed',
+      'Structured pass with contradictory judgment findings remains fail-closed');
+
     const invalidManager = new FakeWorkspaceManager('mission-invalid-envelope', 'plan-invalid-envelope');
-    invalidManager.tasks.set('qa', task({ id: 'qa', missionId: 'mission-invalid-envelope', planId: 'plan-invalid-envelope', role: 'qa', status: 'running' }));
+    invalidManager.tasks.set('qa', task({ id: 'qa', missionId: 'mission-invalid-envelope', planId: 'plan-invalid-envelope', role: 'qa', status: 'running', assignedAgentId: 'agent-invalid' }));
     const invalidOrchestrator = new OrchestratorV2(
       { workspacePath: 'test', workspaceManager: invalidManager as unknown as WorkspaceManager },
       new LocalEventBus(), undefined, invalidManager as unknown as WorkspaceManager,
     );
     await invalidOrchestrator.handleTaskCompleted({
       id: crypto.randomUUID(), type: 'task_completed', missionId: 'mission-invalid-envelope', taskId: 'qa',
+      agentInstanceId: 'agent-invalid',
       result: '{"type":"quality_result","version":1,"role":"qa","verdict":"pass"}', timestamp: new Date().toISOString(),
     });
-    assert(invalidManager.tasks.get('qa')?.status === 'rejected' && invalidManager.mission.status === 'blocked',
+    assert(invalidManager.tasks.get('qa')?.status === 'rejected' && invalidManager.mission.status === 'failed',
       'Malformed structured quality envelope fails closed');
   }
 
@@ -726,8 +819,8 @@ async function runTests() {
     assert(reviewEvent?.approved === false
       && reviewEvent.findings.includes('No explicit pass')
       && manager.tasks.get('reviewer')?.status === 'rejected'
-      && manager.mission.status === 'blocked',
-    'Ambiguous Reviewer output is emitted as a non-approval and blocks the mission');
+      && manager.mission.status === 'failed',
+    'Ambiguous Reviewer output is emitted as a non-approval and fails the mission consistently with mission_failed');
     assert(manager.tasks.get('qa')?.status === 'cancelled'
       && !events.some((event) => event.type === 'verification_started'),
     'Ambiguous Reviewer output cancels the pending QA lane');
@@ -783,8 +876,8 @@ async function runTests() {
     assert(verificationEvent?.passed === false
       && verificationEvent.findingCount > 0
       && manager.tasks.get('qa')?.status === 'rejected'
-      && manager.mission.status === 'blocked',
-    'Failed QA checks emit a failed verification_completed verdict and block the mission');
+      && manager.mission.status === 'failed',
+    'Failed QA checks emit a failed verification_completed verdict and fail the mission consistently with mission_failed');
     assert(!events.some((event) => event.type === 'mission_completed') && applyCalls === 0,
       'Failed QA checks cannot reach mission completion or apply');
   }
@@ -846,8 +939,8 @@ async function runTests() {
       && verificationEvent.runId === runId
       && verificationEvent.summary.includes('No explicit QA pass'),
     'Empty QA output emits an ambiguous, correlated verification_completed failure');
-    assert(manager.tasks.get('qa')?.status === 'rejected' && manager.mission.status === 'blocked',
-      'Ambiguous QA output persists a rejected task and blocks the mission');
+    assert(manager.tasks.get('qa')?.status === 'rejected' && manager.mission.status === 'failed',
+      'Ambiguous QA output persists a rejected task and fails the mission consistently with mission_failed');
     assert(!events.some((event) => event.type === 'mission_completed') && applyCalls === 0,
       'Ambiguous QA output cannot reach mission completion or apply');
   }
@@ -890,12 +983,13 @@ async function runTests() {
       timestamp: new Date().toISOString(),
     });
 
-    assert(manager.mission.status === 'blocked'
+    assert(manager.mission.status === 'failed'
       && manager.tasks.get('reviewer')?.status === 'rejected'
       && manager.tasks.get('builder')?.status === 'cancelled'
       && manager.tasks.get('qa')?.status === 'cancelled',
-    'Failed quality gates cancel running sibling lanes and preserve the rejected gate');
-    assert(!events.some((event) => event.type === 'task_created' || event.type === 'mission_completed'),
+    'Failed quality gates fail the mission, cancel running sibling lanes, and preserve the rejected gate');
+    assert(events.some((event) => event.type === 'mission_failed')
+      && !events.some((event) => event.type === 'task_created' || event.type === 'mission_completed'),
       'Quality failure emits no downstream dispatch or completion event');
   }
 
@@ -1084,6 +1178,111 @@ async function runTests() {
     assert(manager.mission.status === 'running'
       && !events.some((event) => event.type === 'task_created' || event.type === 'mission_completed'),
     'Late task completions are fenced before legacy handling or downstream dispatch');
+  }
+
+  // Missing runId terminal events must not inherit the in-memory lifecycle when
+  // the durable task is assigned to another agent. A matching assignment is
+  // sufficient to process the active attempt, while the source event remains
+  // unpromoted until the orchestrator has checked that correlation.
+  {
+    const missionId = 'mission-runless-terminal-correlation';
+    const planId = 'plan-runless-terminal-correlation';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, activeRunId: 'run-current-correlation' };
+    manager.tasks.set('task', task({
+      id: 'task', missionId, planId, role: 'researcher', status: 'running', assignedAgentId: 'agent-correct',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+    (orchestrator as any).lifecycleByMission.set(missionId, {
+      turnId: 'turn-stale-correlation',
+      runId: 'run-stale-correlation',
+    });
+
+    orchestrator.emitEvent({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'task',
+      agentInstanceId: 'agent-wrong',
+      result: 'uncorrelated completion',
+      timestamp: new Date().toISOString(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const sourceEvent = events.find((event) => event.type === 'task_completed');
+    assert(sourceEvent?.runId === undefined && manager.tasks.get('task')?.status === 'running'
+      && !events.some((event) => event.type === 'mission_completed'),
+    'Runless terminal events are not promoted or applied without durable task/agent correlation');
+
+    await orchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(),
+      type: 'task_completed',
+      missionId,
+      taskId: 'task',
+      agentInstanceId: 'agent-correct',
+      result: 'correlated completion',
+      timestamp: new Date().toISOString(),
+    });
+    assert(manager.tasks.get('task')?.status === 'done' && manager.mission.status === 'completed',
+      'Durable task/agent correlation allows a runless terminal event to complete the active attempt');
+  }
+
+  // The same correlation fence applies to task_failed events before the base
+  // retry/rejection logic can mutate a mission.
+  {
+    const missionId = 'mission-runless-failure-correlation';
+    const planId = 'plan-runless-failure-correlation';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.tasks.set('task', task({
+      id: 'task', missionId, planId, role: 'builder', status: 'running', assignedAgentId: 'agent-correct',
+    }));
+    const eventBus = new LocalEventBus();
+    const events: AgentEvent[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    const orchestrator = new OrchestratorV2(
+      {
+        workspacePath: 'test',
+        maxTaskRetries: 0,
+        workspaceManager: manager as unknown as WorkspaceManager,
+      },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    await orchestrator.handleTaskFailed({
+      id: crypto.randomUUID(),
+      type: 'task_failed',
+      missionId,
+      taskId: 'task',
+      agentInstanceId: 'agent-wrong',
+      error: 'wrong runtime session',
+      timestamp: new Date().toISOString(),
+    });
+    assert(manager.tasks.get('task')?.status === 'running' && manager.mission.status === 'running'
+      && !events.some((event) => event.type === 'mission_failed'),
+    'Runless task_failed events from another agent are ignored before retry state changes');
+
+    await orchestrator.handleTaskFailed({
+      id: crypto.randomUUID(),
+      type: 'task_failed',
+      missionId,
+      taskId: 'task',
+      agentInstanceId: 'agent-correct',
+      error: 'active runtime failed',
+      timestamp: new Date().toISOString(),
+    });
+    assert(manager.tasks.get('task')?.status === 'rejected' && manager.mission.status === 'failed'
+      && events.some((event) => event.type === 'mission_failed'),
+    'Durably correlated runless task_failed events retain the existing rejection/retry semantics');
   }
 
   // Recovery: if read-only workers are already durably done but the final

@@ -13,6 +13,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   KeyRound,
+  UsersRound,
   History,
   BarChart2,
   Brain,
@@ -22,6 +23,7 @@ import {
   Ban,
   SquarePen,
   MoreHorizontal,
+  Trash2,
   LogOut,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -30,6 +32,7 @@ import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
 import { ConversationDeleteDialog } from '../history/ConversationDeleteDialog';
@@ -75,6 +78,8 @@ function SidebarItem({ icon, label, badge, isActive, onClick, collapsed }: Sideb
 }
 
 function missionStateIcon(mission: Mission) {
+  if (mission.deletionState?.status === 'pending') return <Loader2 className="h-3 w-3 animate-spin text-amber-400" />;
+  if (mission.deletionState?.status === 'retryable') return <AlertCircle className="h-3 w-3 text-destructive" />;
   if (['running', 'planning', 'applying', 'verifying', 'revising'].includes(mission.status)) {
     return <Loader2 className="h-3 w-3 animate-spin text-primary" />;
   }
@@ -83,6 +88,18 @@ function missionStateIcon(mission: Mission) {
   if (mission.status === 'cancelled') return <Ban className="h-3 w-3 text-muted-foreground" />;
   if (['failed', 'blocked'].includes(mission.status)) return <AlertCircle className="h-3 w-3 text-destructive" />;
   return <Circle className="h-2.5 w-2.5 text-muted-foreground" />;
+}
+
+export function conversationDeleteActionLabel(mission: Pick<Mission, 'deletionState'>): string {
+  if (mission.deletionState?.status === 'pending') return 'Check deletion status…';
+  if (mission.deletionState?.status === 'retryable') return 'Retry conversation deletion…';
+  return 'Delete conversation…';
+}
+
+export function conversationDeleteStatusLabel(mission: Pick<Mission, 'deletionState'>): string | null {
+  if (mission.deletionState?.status === 'pending') return 'Deleting…';
+  if (mission.deletionState?.status === 'retryable') return 'Delete failed · retry';
+  return null;
 }
 
 function agentRoleIcon(role: string) {
@@ -279,6 +296,10 @@ export function Sidebar() {
     }
   };
 
+  const dialogMission = pendingDeleteMission
+    ? missions.find((mission) => mission.id === pendingDeleteMission.id) || pendingDeleteMission
+    : null;
+
   const currentWidth = sidebarCollapsed ? 48 : sidebarWidth;
 
   return (
@@ -429,30 +450,43 @@ export function Sidebar() {
                     const isActiveMission = mission.id === activeMissionId;
                     const missionAgents = isActiveMission ? activeMissionAgents : [];
                     const missionCancelled = mission.status === 'cancelled';
-                    const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
+                     const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
+                     const deletionStatusLabel = conversationDeleteStatusLabel(mission);
+                     const deletionActionLabel = conversationDeleteActionLabel(mission);
+                     const deletionPending = mission.deletionState?.status === 'pending';
                      return (
-                      <div key={mission.id} className="group/conversation mb-0.5">
-                        <div className={`flex items-center rounded-md transition-colors ${isActiveMission ? 'bg-primary/[0.07] text-sidebar-foreground' : 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
+                       <div key={mission.id} className="group/conversation mb-0.5">
+                         <ContextMenu>
+                           <ContextMenuTrigger asChild>
+                             <div
+                               className={`flex items-center rounded-md transition-colors ${isActiveMission ? 'bg-primary/[0.07] text-sidebar-foreground' : 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}
+                               aria-busy={deletionPending || undefined}
+                             >
                           <button
                             type="button"
                             onClick={() => handleMissionSelect(mission.id)}
-                            className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-[11px]"
-                            title={`${mission.title} · ${mission.status}`}
+                             disabled={deletionPending}
+                             className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-[11px] disabled:cursor-wait disabled:opacity-80"
+                             title={`${mission.title} · ${deletionStatusLabel || mission.status}`}
                           >
                             <span className="flex h-4 w-4 shrink-0 items-center justify-center">{missionStateIcon(mission)}</span>
                             <span className="min-w-0 flex-1 truncate text-left">{mission.title}</span>
-                            {isActiveMission && missionAgents.length > 0 && (
-                              <span className="shrink-0 text-[9px] text-sidebar-muted">
-                                {runningAgents > 0 ? `${runningAgents} active` : `${missionAgents.length} agents`}
-                              </span>
-                            )}
+                             {deletionStatusLabel ? (
+                               <span className={`shrink-0 text-[9px] ${mission.deletionState?.status === 'retryable' ? 'text-destructive' : 'text-amber-400'}`}>
+                                 {deletionStatusLabel}
+                               </span>
+                             ) : isActiveMission && missionAgents.length > 0 ? (
+                               <span className="shrink-0 text-[9px] text-sidebar-muted">
+                                 {runningAgents > 0 ? `${runningAgents} active` : `${missionAgents.length} agents`}
+                               </span>
+                             ) : null}
                           </button>
 
                           <DropdownMenu>
                             <DropdownMenuTrigger asChild>
                               <button
                                 type="button"
-                                className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted transition-colors hover:bg-sidebar hover:text-sidebar-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground"
+                                 className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-70 transition-all hover:bg-sidebar hover:text-sidebar-foreground hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground data-[state=open]:opacity-100 group-hover/conversation:opacity-100"
                                 aria-label={`Conversation actions for ${mission.title}`}
                                 title="Conversation actions"
                               >
@@ -465,12 +499,26 @@ export function Sidebar() {
                                 onSelect={() => {
                                   setPendingDeleteMission(mission);
                                 }}
-                              >
-                                Delete conversation…
+                               >
+                                 <Trash2 className="h-3.5 w-3.5" />
+                                 {deletionActionLabel}
                               </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
+                           </DropdownMenuContent>
+                         </DropdownMenu>
+                              </div>
+                            </ContextMenuTrigger>
+                            <ContextMenuContent className="w-52">
+                              <ContextMenuItem
+                                variant="destructive"
+                                onSelect={() => {
+                                  setPendingDeleteMission(mission);
+                                }}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                {deletionActionLabel}
+                              </ContextMenuItem>
+                            </ContextMenuContent>
+                          </ContextMenu>
 
                         {isActiveMission && rootAgents.length > 0 && (
                           <div className="ml-2 mt-0.5 border-l border-sidebar-border/50 pl-1">
@@ -499,6 +547,7 @@ export function Sidebar() {
 
       <Separator className="bg-sidebar-border" />
       <div className="space-y-0.5 px-2 py-2">
+        <SidebarItem collapsed={sidebarCollapsed} icon={<UsersRound className="h-3.5 w-3.5 text-violet-400" />} label="Agents" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
         <SidebarItem collapsed={sidebarCollapsed} icon={<KeyRound className="h-3.5 w-3.5 text-amber-500" />} label="Accounts" isActive={activeView === 'accounts'} onClick={() => setActiveView('accounts')} />
         <SidebarItem collapsed={sidebarCollapsed} icon={<Settings className="h-3.5 w-3.5 text-muted-foreground" />} label="Settings" isActive={activeView === 'settings'} onClick={() => setActiveView('settings')} />
       </div>
@@ -561,7 +610,7 @@ export function Sidebar() {
 
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
-      <ConversationDeleteDialog mission={pendingDeleteMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />
+      <ConversationDeleteDialog mission={dialogMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />
     </aside>
   );
 }

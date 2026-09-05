@@ -774,6 +774,50 @@ async function runTests() {
     }
   }
 
+  // An explicit persisted profile id must resolve to a known profile. Human
+  // readable task metadata must not silently manufacture a new profile.
+  {
+    let claimCalls = 0;
+    let spawnCalls = 0;
+    const manager: any = {
+      async getTask() {
+        return {
+          missionId: 'mission-profile-guard', assignedRole: 'researcher', agentProfileId: 'missing-profile',
+          description: 'Profile guard', priority: 'medium', requiredCapabilities: [], assignedAgentId: null,
+        };
+      },
+      async getMission() { return { workspaceId: 'workspace-profile-guard', automationPolicy: null }; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+      async claimTaskAttempt() { claimCalls += 1; return { id: 'attempt-profile-guard', attemptNumber: 1 }; },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'codex', runtimeType: 'codex', name: 'Profile guard test', setEventBus() {}, configureProfile() {},
+      async spawnAgent() { spawnCalls += 1; return { id: 'never-started' }; },
+      async shutdown() {}, async cancel() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-guard', provider: 'openai', runtimeType: 'codex', profileName: 'Guard', authStatus: 'connected',
+      allowedRoles: ['researcher'], schedulerAuto: true,
+    }];
+    let errorMessage = '';
+    try {
+      await host.handleTaskCreated({
+        id: 'event-profile-guard', type: 'task_created', missionId: 'mission-profile-guard', taskId: 'task-profile-guard',
+        agentInstanceId: 'agent-profile-guard', assignedRole: 'researcher', title: 'Friendly metadata',
+        displayName: 'Friendly metadata', instructions: 'This must not become an implicit profile.',
+        agentProfileId: 'researcher', profile: { id: 'researcher', role: 'researcher', name: 'Event override', capabilities: [], instructions: '' },
+        timestamp: new Date().toISOString(),
+      } as any);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    assert(errorMessage.includes("Agent profile 'missing-profile'") && errorMessage.includes('not found'), 'unknown persisted agent profile id fails closed before route selection');
+    assert(claimCalls === 0 && spawnCalls === 0, 'unknown persisted agent profile cannot claim a task or spawn a provider process');
+    await host.stopAll();
+  }
+
   // A stale cached route must be refreshed and then rejected before any task
   // claim or provider spawn if the runtime still cannot verify it live.
   {

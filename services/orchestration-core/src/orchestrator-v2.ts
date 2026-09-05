@@ -15,7 +15,7 @@ import {
   redactSensitiveValue,
   type LocalEventBus,
 } from '@atris-agent-code/event-bus';
-import type { AgentEvent, TaskCompleted } from '@atris-agent-code/event-schema';
+import type { AgentEvent, TaskCompleted, TaskFailed } from '@atris-agent-code/event-schema';
 import type {
   AgentRole,
   OrchestratorDecision,
@@ -23,6 +23,8 @@ import type {
   QualityResultEnvelope,
   PostApplyVerificationResult,
 } from '@atris-agent-code/domain';
+import { parseQualityResultEnvelope } from '@atris-agent-code/domain';
+import { resolveAutomationAction } from '@atris-agent-code/policy-engine';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator as LegacyOrchestrator } from './orchestrator';
 import type {
@@ -47,6 +49,7 @@ const TERMINAL_TASK_STATUSES = new Set(['done', 'superseded']);
 const TASK_COMPLETION_FENCE_STATUSES = new Set(['cancelled', 'rejected', 'superseded', 'done']);
 const FAILED_TASK_STATUSES = new Set(['rejected']);
 const ACTIVE_TASK_STATUSES = new Set(['claimed', 'running', 'review', 'revision_requested', 'verified', 'applied']);
+const RUNTIME_TERMINAL_EVENT_TYPES = new Set<AgentEvent['type']>(['task_completed', 'task_failed']);
 const SCHEDULABLE_MISSION_STATUSES = new Set(['ready', 'running', 'revising', 'reviewing', 'verifying']);
 const RECONCILABLE_MISSION_STATUSES = new Set([...SCHEDULABLE_MISSION_STATUSES, 'reviewing', 'verifying']);
 const MAX_CONTEXT_EVENTS = 24;
@@ -62,29 +65,6 @@ interface QualityVerdict {
   summary: string;
   findingCount: number;
   reason: 'approved' | 'failed' | 'ambiguous';
-}
-
-function parseQualityEnvelope(rawResult: unknown): QualityResultEnvelope | null | 'invalid' {
-  if (typeof rawResult !== 'string' && (typeof rawResult !== 'object' || rawResult === null)) return null;
-  let value: unknown = rawResult;
-  if (typeof rawResult === 'string') {
-    const trimmed = rawResult.trim();
-    const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    const candidate = fenced?.[1] || trimmed;
-    if (!candidate.startsWith('{')) return null;
-    try { value = JSON.parse(candidate); } catch { return 'invalid'; }
-  }
-  if (!value || typeof value !== 'object') return 'invalid';
-  const envelope = value as Partial<QualityResultEnvelope>;
-  if (envelope.type !== 'quality_result' || envelope.version !== 1
-    || (envelope.role !== 'reviewer' && envelope.role !== 'qa')
-    || (envelope.verdict !== 'pass' && envelope.verdict !== 'fail')
-    || typeof envelope.summary !== 'string' || !envelope.summary.trim()
-    || (envelope.findings !== undefined && (!Array.isArray(envelope.findings) || envelope.findings.some((item) => typeof item !== 'string')))
-    || (envelope.evidence !== undefined && (!Array.isArray(envelope.evidence) || envelope.evidence.some((item) => typeof item !== 'string')))) {
-    return 'invalid';
-  }
-  return envelope as QualityResultEnvelope;
 }
 
 interface QualityEmissionResult {
@@ -161,13 +141,18 @@ function inferQualityVerdict(
 ): QualityVerdict | null {
   if (role !== 'reviewer' && role !== 'qa') return null;
 
-  const envelope = parseQualityEnvelope(rawResult);
+  const envelope = parseQualityResultEnvelope(rawResult);
   if (envelope === 'invalid' || (envelope && envelope.role !== role)) {
     return { passed: false, summary: 'Invalid or mismatched structured quality result.', findingCount: 1, reason: 'ambiguous' };
   }
   if (envelope) {
     const detail = [envelope.summary, ...(envelope.findings || []), ...(envelope.evidence || [])].join('\n');
-    const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(detail);
+    // Evidence is supporting material and commonly contains path names such
+    // as `error-boundary.tsx` or raw command output. Only the summary/findings
+    // express the quality judgment; scanning evidence creates false failures
+    // for an otherwise explicit structured pass.
+    const judgment = [envelope.summary, ...(envelope.findings || [])].join('\n');
+    const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(judgment);
     const passed = envelope.verdict === 'pass' && !contradictory;
     return {
       passed,
@@ -204,6 +189,8 @@ interface StartMissionOptionsV2 {
   reasoningLevel?: string;
   targetRole?: string;
   command?: string;
+  /** Trusted, pre-validated named profile selection keyed by fixed role. */
+  agentProfileIds?: Partial<Record<AgentRole, string>>;
   rawModelPlanOutput?: string;
   turnId?: string;
   runId?: string;
@@ -273,6 +260,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         ? task.dependsOn.filter((dependencyId): dependencyId is string => typeof dependencyId === 'string')
         : [],
       agentInstanceId: task.assignedAgentId || null,
+      agentProfileId: task.agentProfileId || null,
     };
   }
 
@@ -312,7 +300,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       }
     }
     if (lifecycle?.turnId && !event.turnId) event = { ...event, turnId: lifecycle.turnId };
-    if (lifecycle?.runId && !event.runId) event = { ...event, runId: lifecycle.runId };
+    if (lifecycle?.runId && !event.runId && !RUNTIME_TERMINAL_EVENT_TYPES.has(event.type)) {
+      event = { ...event, runId: lifecycle.runId };
+    }
     super.emitEvent(event);
   }
 
@@ -344,14 +334,86 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     return mission;
   }
 
+  private isRunFenceError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /orchestration run was cancelled|cancelled or stale run|action belongs to a stale run|decision belongs to a cancelled or stale run/i.test(message);
+  }
+
+  /**
+   * A runtime terminal event without runId is only actionable when its durable
+   * task/agent assignment (and, when available, the latest durable attempt)
+   * identifies the active attempt. The in-memory lifecycle is useful for
+   * decorating derived events, but is not enough to promote an uncorrelated
+   * terminal signal into the current run.
+   */
+  private async correlateRunlessTerminalEvent<T extends TaskCompleted | TaskFailed>(event: T): Promise<T | null> {
+    if (!this.v2WorkspaceManager) return event;
+
+    const manager = this.v2WorkspaceManager;
+    const mission = await manager.getMission(event.missionId);
+    if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status)) || mission.status === 'blocked') return null;
+    if (event.runId) return event;
+
+    const task = await manager.getTask(event.taskId);
+    if (!task || task.missionId !== event.missionId || !event.agentInstanceId) return null;
+
+    const taskAgentMatches = task.assignedAgentId === event.agentInstanceId;
+    const listTaskAttempts = (manager as WorkspaceManager & {
+      listTaskAttempts?: (taskId: string) => Promise<Array<{
+        taskId: string;
+        missionId: string;
+        agentInstanceId: string;
+        attemptNumber: number;
+        status: string;
+      }>>;
+    }).listTaskAttempts;
+    let attemptAgentMatches = false;
+    if (typeof listTaskAttempts === 'function') {
+      let attempts: Array<{
+        taskId: string;
+        missionId: string;
+        agentInstanceId: string;
+        attemptNumber: number;
+        status: string;
+      }>;
+      try {
+        attempts = await listTaskAttempts.call(manager, task.id);
+      } catch {
+        return null;
+      }
+      if (attempts.length > 0) {
+        const latestAttempt = [...attempts].sort((left, right) => right.attemptNumber - left.attemptNumber)[0];
+        const terminalAttemptStatus = event.type === 'task_completed' ? 'completed' : 'failed';
+        const validAttemptStatus = new Set(['claimed', 'running', terminalAttemptStatus]);
+        if (!latestAttempt
+          || latestAttempt.taskId !== task.id
+          || latestAttempt.missionId !== event.missionId
+          || latestAttempt.agentInstanceId !== event.agentInstanceId
+          || !validAttemptStatus.has(String(latestAttempt.status))) {
+          return null;
+        }
+        attemptAgentMatches = true;
+      }
+    }
+
+    if (!taskAgentMatches && !attemptAgentMatches) return null;
+    if (!ACTIVE_TASK_STATUSES.has(String(task.status))) return null;
+
+    // Only a durable mission activeRunId can identify the run to inherit. If
+    // it is absent, preserve the missing runId and let task/agent correlation
+    // alone authorize the state transition without inventing run identity.
+    return mission.activeRunId ? { ...event, runId: mission.activeRunId } : event;
+  }
+
   protected override async assertTaskCompletionCurrent(event: TaskCompleted): Promise<void> {
-    const lifecycle = this.lifecycleByMission.get(event.missionId);
-    await this.assertMissionActionCurrent(event.missionId, event.runId || lifecycle?.runId);
+    await this.assertMissionActionCurrent(event.missionId, event.runId);
   }
 
   private async canPublishCompletion(missionId: string): Promise<boolean> {
-    const mission = this.v2WorkspaceManager ? await this.v2WorkspaceManager.getMission(missionId) : null;
-    return !mission || !['failed', 'cancelled', 'blocked'].includes(String(mission.status));
+    if (!this.v2WorkspaceManager) return true;
+    const mission = await this.v2WorkspaceManager.getMission(missionId);
+    if (!mission) return false;
+    return !['failed', 'cancelled', 'blocked'].includes(String(mission.status));
   }
 
   private async preserveCancelledRunFence(missionId: string, runId: string | undefined): Promise<void> {
@@ -382,40 +444,52 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   override async assignTask(taskId: string, agentRole?: AgentRole): Promise<TaskSelect> {
     const task = this.v2WorkspaceManager ? await this.v2WorkspaceManager.getTask(taskId) : null;
     const lifecycle = task ? this.lifecycleByMission.get(task.missionId) : undefined;
-    if (lifecycle?.runId && this.cancelledRunIds.has(lifecycle.runId)) {
-      throw new Error('The orchestration run was cancelled.');
-    }
-    const assignedTask = await super.assignTask(taskId, agentRole);
-    const role = assignedTask.assignedRole || agentRole || 'builder';
-    const assignedLifecycle = this.lifecycleByMission.get(assignedTask.missionId);
-    const traceDetails = {
-      missionId: assignedTask.missionId,
-      turnId: assignedLifecycle?.turnId,
-      runId: assignedLifecycle?.runId,
-      planId: assignedTask.planId || undefined,
-      ...this.taskTraceDetails(assignedTask),
-    };
-
-    if (role === 'reviewer') {
-      if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(assignedTask.missionId, { status: 'reviewing' });
-      this.trace('review-dispatched', traceDetails);
-    } else if (role === 'qa') {
-      if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(assignedTask.missionId, { status: 'verifying' });
-      this.emitEvent({
-        id: crypto.randomUUID(),
-        type: 'verification_started',
+    try {
+      if (lifecycle?.runId && this.cancelledRunIds.has(lifecycle.runId)) {
+        throw new Error('The orchestration run was cancelled.');
+      }
+      const assignedTask = await super.assignTask(taskId, agentRole);
+      const role = assignedTask.assignedRole || agentRole || 'builder';
+      const assignedLifecycle = this.lifecycleByMission.get(assignedTask.missionId);
+      const traceDetails = {
         missionId: assignedTask.missionId,
-        ...assignedLifecycle,
-        taskId: assignedTask.id,
-        reviewerAgentId: assignedTask.assignedAgentId || undefined,
-        timestamp: new Date().toISOString(),
-      });
-      this.trace('qa-dispatched', traceDetails);
-    } else {
-      this.trace('task-dispatched', traceDetails);
-    }
+        turnId: assignedLifecycle?.turnId,
+        runId: assignedLifecycle?.runId,
+        planId: assignedTask.planId || undefined,
+        ...this.taskTraceDetails(assignedTask),
+      };
 
-    return assignedTask;
+      if (role === 'reviewer') {
+        if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(assignedTask.missionId, { status: 'reviewing' });
+        this.trace('review-dispatched', traceDetails);
+      } else if (role === 'qa') {
+        if (this.v2WorkspaceManager) await this.v2WorkspaceManager.updateMission(assignedTask.missionId, { status: 'verifying' });
+        this.emitEvent({
+          id: crypto.randomUUID(),
+          type: 'verification_started',
+          missionId: assignedTask.missionId,
+          ...assignedLifecycle,
+          taskId: assignedTask.id,
+          reviewerAgentId: assignedTask.assignedAgentId || undefined,
+          timestamp: new Date().toISOString(),
+        });
+        this.trace('qa-dispatched', traceDetails);
+      } else {
+        this.trace('task-dispatched', traceDetails);
+      }
+
+      return assignedTask;
+    } catch (error) {
+      if (task && !this.isRunFenceError(error)) {
+        await this.transitionMissionDiagnostic({
+          missionId: task.missionId,
+          taskId,
+          status: 'failed',
+          reason: `Task dispatch failed before execution for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      throw error;
+    }
   }
 
   override emitMissionCompleted(params: { missionId?: string; summary: string; tasksCompleted: number; totalTasks: number }): void {
@@ -426,6 +500,13 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         tasksCompleted: params.tasksCompleted,
         totalTasks: params.totalTasks,
       });
+      return;
+    }
+    // V2 completion events must come from completeDurably after a live mission
+    // and durable completion row have been checked. Keep the legacy fallback
+    // for manager-less orchestration, where no durable mission exists to fence.
+    if (this.v2WorkspaceManager) {
+      this.trace('completion-suppressed-without-durable-fence', { missionId });
       return;
     }
     const lifecycle = this.lifecycleByMission.get(missionId);
@@ -457,6 +538,13 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     totalTasks: number;
   }): Promise<any | null> {
     if (!this.v2Db) return null;
+    if (!(await this.canPublishCompletion(params.missionId))) {
+      this.trace('completion-intent-suppressed-for-missing-or-terminal-mission', {
+        missionId: params.missionId,
+        planId: params.planId,
+      });
+      return null;
+    }
     const existing = await this.getCompletion(params.missionId, params.planId);
     if (existing) return existing;
     const lifecycle = this.lifecycleByMission.get(params.missionId);
@@ -476,6 +564,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
   private async completeDurably(params: { missionId: string; planId: string; summary: string;
     tasksCompleted: number; totalTasks: number }): Promise<void> {
+    if (!(await this.canPublishCompletion(params.missionId))) {
+      this.trace('completion-suppressed-for-missing-or-terminal-mission', { missionId: params.missionId, planId: params.planId });
+      return;
+    }
     const existing = await this.getCompletion(params.missionId, params.planId);
     const lifecycle = this.lifecycleByMission.get(params.missionId);
     if (existing?.status === 'completed') {
@@ -539,6 +631,13 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     for (const completion of pending.filter((row) => row.status !== 'completed')) {
       try {
         const mission = this.v2WorkspaceManager ? await this.v2WorkspaceManager.getMission(completion.missionId) : null;
+        if (!mission) {
+          this.trace('completion-recovery-skipped-for-missing-mission', {
+            missionId: completion.missionId,
+            planId: completion.planId,
+          });
+          continue;
+        }
         if (mission && ['failed', 'cancelled', 'blocked'].includes(String(mission.status))) {
           this.trace('completion-recovery-skipped-for-terminal-mission', {
             missionId: completion.missionId,
@@ -569,6 +668,24 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         await this.completeDurably({ missionId: completion.missionId, planId: completion.planId, summary,
           tasksCompleted: completion.tasksCompleted, totalTasks: completion.totalTasks });
       } catch (error) {
+        let missionStillExists = false;
+        try {
+          missionStillExists = Boolean(this.v2WorkspaceManager && await this.v2WorkspaceManager.getMission(completion.missionId));
+        } catch {
+          missionStillExists = false;
+        }
+        if (missionStillExists) {
+          await this.transitionMissionDiagnostic({
+            missionId: completion.missionId,
+            status: 'failed',
+            reason: `Completion reconciliation failed for plan ${completion.planId}: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        } else {
+          this.trace('completion-recovery-diagnostic-suppressed-for-missing-mission', {
+            missionId: completion.missionId,
+            planId: completion.planId,
+          });
+        }
         this.trace('completion-recovery-deferred', {
           missionId: completion.missionId,
           planId: completion.planId,
@@ -738,6 +855,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const reusableResearchBundle = loaded.priorResearchBundle && isPriorResearchImplementationFollowUp(context)
       ? loaded.priorResearchBundle
       : null;
+    // Validate configured identity outside the model fallback: a missing or
+    // archived specialist must not silently become the baseline orchestrator.
+    const supervisorProfiles = await this.resolveTaskProfileIds(missionId, ['orchestrator'], options?.agentProfileIds);
+    const supervisorProfileId = supervisorProfiles.orchestrator || options?.agentProfileIds?.orchestrator || 'orchestrator';
     const runner = getSupervisorTurnRunner();
     if (runner) {
       try {
@@ -750,6 +871,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           prompt: buildSupervisorDecisionPrompt(context),
           modelCatalogId: options?.modelCatalogId,
           reasoningLevel: options?.reasoningLevel,
+          agentProfileId: supervisorProfileId,
         });
         const parsed = parseSupervisorDecision(raw, turnId);
         if (parsed) {
@@ -822,6 +944,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     decision: OrchestratorDecision;
     previousPlanId?: string | null;
     hasPriorConversation: boolean;
+    agentProfileIds?: Partial<Record<AgentRole, string>>;
   }): Promise<{
     missionId: string;
     planId: string;
@@ -856,6 +979,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     });
     const createdTasks: TaskSelect[] = [];
     const idsByIndex = new Map<number, string>();
+    const agentProfileIds = await this.resolveTaskProfileIds(params.missionId, taskSpecs.map((task) => task.role), params.agentProfileIds);
 
     for (let index = 0; index < taskSpecs.length; index += 1) {
       const spec = taskSpecs[index];
@@ -873,6 +997,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         status: 'planned',
         priority: spec.priority,
         assignedRole: spec.role,
+        agentProfileId: agentProfileIds[spec.role],
         requiredCapabilities: spec.requiredCapabilities,
         dependsOn: dependencies,
         targetDescriptor: spec.targetDescriptor,
@@ -887,17 +1012,67 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       tasks: createdTasks.map((task) => this.taskTraceDetails(task)),
     });
 
-    await manager.updateMission(params.missionId, {
-      planId,
-      status: 'completed',
-      completedAt: new Date().toISOString(),
-    });
-    this.planActions.set(planId, 'plan_only');
+    const mission = await manager.getMission(params.missionId);
+    const builderTasks = createdTasks.filter((task) => task.assignedRole === 'builder');
+    const automationPolicy = mission?.automationPolicy;
+    // A missing policy is treated as approval-required for a plan-only Builder
+    // lane. Older missions may not have a policy snapshot, and silently
+    // executing their plan would bypass the user's current safety setting.
+    const planDecision = automationPolicy
+      ? resolveAutomationAction(automationPolicy.profile, 'plan', automationPolicy.overrides)
+      : 'ask';
+    const autoContinue = builderTasks.length === 0
+      || (!params.decision.needsUserApproval && (planDecision === 'auto' || planDecision === 'review'));
+
+    if (builderTasks.length > 0 && planDecision === 'deny') {
+      const reason = 'Mission policy denies Builder execution for this plan.';
+      await this.transitionMissionDiagnostic({
+        missionId: params.missionId,
+        taskId: builderTasks[0]?.id,
+        status: 'failed',
+        reason,
+      });
+      throw new Error(reason);
+    }
+
+    this.planActions.set(planId, autoContinue && builderTasks.length > 0 ? 'execute' : 'plan_only');
     this.emitPlanGenerated({
       missionId: params.missionId,
       planId,
       taskCount: createdTasks.length,
-      summary: `Prepared a ${createdTasks.length}-step plan without starting execution.`,
+      summary: autoContinue && builderTasks.length > 0
+        ? `Prepared and started a ${createdTasks.length}-step plan under the mission automation policy.`
+        : `Prepared a ${createdTasks.length}-step plan without starting execution.`,
+    });
+
+    if (builderTasks.length > 0 && !autoContinue) {
+      await manager.updateMission(params.missionId, {
+        planId,
+        status: 'waiting_for_approval',
+        completedAt: null,
+      });
+      await this.emitApprovalRequested({
+        missionId: params.missionId,
+        approvalType: 'plan',
+        description: `Plan with ${createdTasks.length} tasks is ready. Approve before Builder execution begins.`,
+      });
+      return { missionId: params.missionId, planId, tasks: createdTasks, structuredPlan };
+    }
+
+    if (builderTasks.length > 0 && autoContinue) {
+      await manager.updateMission(params.missionId, {
+        planId,
+        status: 'running',
+        completedAt: null,
+      });
+      await this.reconcileMissionPlan(params.missionId, planId);
+      return { missionId: params.missionId, planId, tasks: createdTasks, structuredPlan };
+    }
+
+    await manager.updateMission(params.missionId, {
+      planId,
+      status: 'completed',
+      completedAt: new Date().toISOString(),
     });
     await this.completeDurably({
       missionId: params.missionId,
@@ -949,7 +1124,21 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       throw new Error('The current conversation turn is still executing. Finish or stop it before starting another turn.');
     }
 
-    const { decision, hasPriorConversation, priorResearchBundle } = await this.decideTurn(missionId, turnId, request, options);
+    let decision: OrchestratorDecision;
+    let hasPriorConversation: boolean;
+    let priorResearchBundle: ResearchContextBundle | null;
+    try {
+      ({ decision, hasPriorConversation, priorResearchBundle } = await this.decideTurn(missionId, turnId, request, options));
+    } catch (error) {
+      if (!this.isRunFenceError(error)) {
+        await this.transitionMissionDiagnostic({
+          missionId,
+          status: 'failed',
+          reason: `Supervisor pre-dispatch decision failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      throw error;
+    }
     await this.ensureRunIsCurrent(missionId, options?.runId);
     this.trace('turn-decision', {
       missionId,
@@ -975,22 +1164,44 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     if (decision.action === 'plan_only') {
       await this.ensureRunIsCurrent(missionId, options?.runId);
-      return this.createPlanOnlyTurn({
-        missionId,
-        turnId,
-        request,
-        decision,
-        previousPlanId,
-        hasPriorConversation,
-      });
+      try {
+        return await this.createPlanOnlyTurn({
+          missionId,
+          turnId,
+          request,
+          decision,
+          previousPlanId,
+          hasPriorConversation,
+          agentProfileIds: options?.agentProfileIds,
+        });
+      } catch (error) {
+        if (!this.isRunFenceError(error)) {
+          await this.transitionMissionDiagnostic({
+            missionId,
+            status: 'failed',
+            reason: `Plan-only pre-dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        throw error;
+      }
     }
 
-    const taskPlan = decisionToTaskPlan(decision).map((task) => task.role === 'builder' && priorResearchBundle
-      ? {
-          ...task,
-          description: `${task.description}\n\n${RESEARCH_CONTEXT_START}\nReuse this completed research from prior plan ${priorResearchBundle.planId}. Preserve provenance and verify conflicts/uncertainty:\n${JSON.stringify(priorResearchBundle)}\n${RESEARCH_CONTEXT_END}`,
-        }
-      : task);
+    let taskPlan: StructuredTaskPlan[];
+    try {
+      taskPlan = decisionToTaskPlan(decision).map((task) => task.role === 'builder' && priorResearchBundle
+        ? {
+            ...task,
+            description: `${task.description}\n\n${RESEARCH_CONTEXT_START}\nReuse this completed research from prior plan ${priorResearchBundle.planId}. Preserve provenance and verify conflicts/uncertainty:\n${JSON.stringify(priorResearchBundle)}\n${RESEARCH_CONTEXT_END}`,
+          }
+        : task);
+    } catch (error) {
+      await this.transitionMissionDiagnostic({
+        missionId,
+        status: 'failed',
+        reason: `Execution plan could not be normalized before dispatch: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      throw error;
+    }
     const normalizedPlanId = crypto.randomUUID();
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.trace('plan-normalized', {
@@ -1023,6 +1234,13 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       await this.ensureRunIsCurrent(missionId, options?.runId);
     } catch (error) {
       await this.preserveCancelledRunFence(missionId, options?.runId);
+      if (!this.isRunFenceError(error)) {
+        await this.transitionMissionDiagnostic({
+          missionId,
+          status: 'failed',
+          reason: `Execution pre-dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
       throw error;
     }
     this.planActions.set(result.planId, decision.action);
@@ -1119,8 +1337,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     verdict: QualityVerdict,
   ): Promise<void> {
     if (this.v2WorkspaceManager) {
-      await this.v2WorkspaceManager.updateMission(event.missionId, { status: 'blocked' });
       const now = new Date().toISOString();
+      // mission_failed is a terminal event. Persist the same terminal semantic
+      // so the durable mission cannot remain blocked while the UI observes it
+      // as failed. Rejected gate tasks retain the existing retry/revision path.
+      await this.v2WorkspaceManager.updateMission(event.missionId, { status: 'failed', completedAt: now });
       const planTasks = await this.v2WorkspaceManager.listTasks(event.missionId);
       const cancelledTaskIds: string[] = [];
       for (const planTask of planTasks.filter((candidate) => candidate.planId === task.planId)) {
@@ -1288,6 +1509,17 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     await this.enqueueMission(event.missionId, async () => {
+      const correlatedEvent = await this.correlateRunlessTerminalEvent(event);
+      if (!correlatedEvent) {
+        this.trace('uncorrelated-terminal-event-ignored', {
+          missionId: event.missionId,
+          taskId: event.taskId,
+          type: event.type,
+          agentInstanceId: event.agentInstanceId,
+        });
+        return;
+      }
+      event = correlatedEvent;
       const currentMission = await manager.getMission(event.missionId);
       if (!currentMission || TERMINAL_MISSION_STATUSES.has(String(currentMission.status))) {
         this.trace('terminal-mission-completion-ignored', { missionId: event.missionId, status: currentMission?.status || 'missing', taskId: event.taskId });
@@ -1298,7 +1530,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         return;
       }
       const lifecycle = this.lifecycleByMission.get(event.missionId);
-      const currentRunId = lifecycle?.runId || currentMission.activeRunId || undefined;
+      const currentRunId = currentMission.activeRunId || lifecycle?.runId || undefined;
       if ((event.runId && this.cancelledRunIds.has(event.runId))
         || (currentRunId && this.cancelledRunIds.has(currentRunId))) {
         this.trace('cancelled-run-completion-ignored', {
@@ -1418,6 +1650,27 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       }
 
       if (legacyError) throw legacyError;
+    });
+  }
+
+  override async handleTaskFailed(event: TaskFailed): Promise<void> {
+    if (!this.v2WorkspaceManager) {
+      await super.handleTaskFailed(event);
+      return;
+    }
+
+    await this.enqueueMission(event.missionId, async () => {
+      const correlatedEvent = await this.correlateRunlessTerminalEvent(event);
+      if (!correlatedEvent) {
+        this.trace('uncorrelated-terminal-event-ignored', {
+          missionId: event.missionId,
+          taskId: event.taskId,
+          type: event.type,
+          agentInstanceId: event.agentInstanceId,
+        });
+        return;
+      }
+      await super.handleTaskFailed(correlatedEvent);
     });
   }
 
@@ -1706,6 +1959,17 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       idempotencyKey?: string;
     },
   ): Promise<void> {
+    if (approvalType === 'plan' && approved) {
+      const mission = await this.v2WorkspaceManager?.getMission(missionId);
+      if (mission?.planId && this.planActions.get(mission.planId) === 'plan_only') {
+        // A plan-only turn becomes a normal execution turn only after the
+        // existing Chat approval gate is accepted. Without this transition,
+        // later completion reconciliation still treats the approved plan as a
+        // read-only preview.
+        this.planActions.set(mission.planId, 'execute');
+      }
+    }
+
     if (approvalType !== 'apply' || !approved) {
       await super.handleApprovalDecision(missionId, approvalType, approved, options);
       return;
@@ -1795,6 +2059,21 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   }
 
   private async reconcileMissionPlanUnlocked(missionId: string, requestedPlanId?: string | null): Promise<void> {
+    try {
+      await this.reconcileMissionPlanCore(missionId, requestedPlanId);
+    } catch (error) {
+      if (!this.isRunFenceError(error)) {
+        await this.transitionMissionDiagnostic({
+          missionId,
+          status: 'failed',
+          reason: `Mission reconciliation failed before dispatch could complete: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async reconcileMissionPlanCore(missionId: string, requestedPlanId?: string | null): Promise<void> {
     const manager = this.v2WorkspaceManager;
     if (!manager) return;
 

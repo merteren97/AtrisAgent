@@ -2,10 +2,12 @@ import { LocalEventBus, registerSupervisorTurnRunner } from '@atris-agent-code/e
 import type { MissionSelect, TaskSelect } from '@atris-agent-code/database';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { OrchestratorV2 } from './orchestrator-v2';
+import { DEFAULT_CORE_WORKER_POOL } from './worker-pool';
 
 class FakeWorkspaceManager {
   mission: MissionSelect;
   tasks = new Map<string, TaskSelect>();
+  profileDefaults: Record<string, string> = {};
 
   constructor(params: { missionId: string; description: string; status?: MissionSelect['status']; planId?: string | null }) {
     const now = new Date().toISOString();
@@ -73,6 +75,7 @@ class FakeWorkspaceManager {
       dependsOn: input.dependsOn || [],
       worktreeId: input.worktreeId || null,
       targetDescriptor: input.targetDescriptor || null,
+      agentProfileId: input.agentProfileId || null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,
@@ -87,6 +90,15 @@ class FakeWorkspaceManager {
     const updated = { ...task, ...updates, updatedAt: new Date().toISOString() } as TaskSelect;
     this.tasks.set(id, updated);
     return updated;
+  }
+
+  async resolveMissionWorkerPoolPolicy() {
+    return DEFAULT_CORE_WORKER_POOL;
+  }
+
+  async resolveAgentProfileForMission(input: { role: string; profileId?: string }) {
+    if (input.profileId === 'missing-profile') throw new Error('Agent profile missing-profile not found.');
+    return { profile: { id: input.profileId || this.profileDefaults[input.role] || input.role, role: input.role }, source: 'explicit' };
   }
 }
 
@@ -294,9 +306,17 @@ async function runTests() {
   {
     const missionId = 'conversation-plan-only';
     const manager = new FakeWorkspaceManager({ missionId, description: 'Plan a refactor.' });
+    manager.mission = {
+      ...manager.mission,
+      automationPolicy: { profile: 'ask', strategy: 'standard', overrides: {} },
+    };
     const eventBus = new LocalEventBus();
     let taskCreatedCount = 0;
+    let planApprovals = 0;
     eventBus.on('task_created', () => { taskCreatedCount += 1; });
+    eventBus.on('approval_requested', (event) => {
+      if (event.approvalType === 'plan') planApprovals += 1;
+    });
     registerSupervisorTurnRunner(async () => JSON.stringify({
       action: 'plan_only',
       response: 'Plan hazır; execution başlatılmadı.',
@@ -309,11 +329,94 @@ async function runTests() {
       manager as unknown as WorkspaceManager,
     );
 
-    const result = await orchestrator.startMission(missionId, 'Bunun için sadece plan oluştur.', { command: 'plan' });
+    const result = await orchestrator.startMission(missionId, 'Bunun için sadece plan oluştur.', {
+      command: 'plan',
+      agentProfileIds: {
+        builder: 'frontend-builder',
+        reviewer: 'security-reviewer',
+        qa: 'release-qa',
+      },
+    });
     assert(result.tasks.length === 3, 'plan-only Builder lane includes planned Builder + Reviewer + QA graph');
+    assert(
+      result.tasks.find((task) => task.assignedRole === 'builder')?.agentProfileId === 'frontend-builder'
+        && result.tasks.find((task) => task.assignedRole === 'reviewer')?.agentProfileId === 'security-reviewer'
+        && result.tasks.find((task) => task.assignedRole === 'qa')?.agentProfileId === 'release-qa',
+      'trusted per-role profile selections are materialized on matching fixed-role tasks',
+    );
     assert(taskCreatedCount === 0, 'plan-only turn starts no runtime worker');
     assert(result.tasks.every((task) => task.status === 'planned'), 'plan-only tasks remain planned for inspection');
-    assert(manager.mission.status === 'completed', 'plan-only conversation remains available for a follow-up execute request');
+    assert(manager.mission.status === 'waiting_for_approval' && planApprovals === 1, 'plan-only Builder execution requests approval under the ask policy');
+    await orchestrator.handleApprovalDecision(missionId, 'plan', true);
+    assert(taskCreatedCount === 1 && manager.mission.status === 'running', 'approving the plan in Chat converts the preview into execution and dispatches the Builder');
+    assert((orchestrator as unknown as { planActions: Map<string, string> }).planActions.get(result.planId) === 'execute',
+      'approved plan-only execution keeps execute semantics for terminal reconciliation');
+  }
+
+  // An explicitly auto-approved plan-only Builder lane may continue into the
+  // normal scheduler path instead of stopping at a completed preview.
+  {
+    const missionId = 'conversation-plan-only-auto';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Auto-run the prepared plan.' });
+    manager.mission = {
+      ...manager.mission,
+      automationPolicy: { profile: 'auto', strategy: 'standard', overrides: {} },
+    };
+    const eventBus = new LocalEventBus();
+    let taskCreatedCount = 0;
+    let planApprovals = 0;
+    eventBus.on('task_created', () => { taskCreatedCount += 1; });
+    eventBus.on('approval_requested', (event) => {
+      if (event.approvalType === 'plan') planApprovals += 1;
+    });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'plan_only',
+      response: 'Auto-approved plan.',
+      delegations: [{ id: 'b-auto', role: 'builder', objective: 'Refactor the scanner.', requiredCapabilities: ['implementation'] }],
+    }));
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    const result = await orchestrator.startMission(missionId, 'Prepare and continue the refactor.', { command: 'plan' });
+    assert(result.tasks.length === 3 && taskCreatedCount === 1, 'auto-approved plan-only Builder lane dispatches its dependency-free Builder');
+    assert(planApprovals === 0 && manager.mission.status === 'running', 'auto-approved plan-only lane continues without a chat approval gate');
+  }
+
+  // Default identities are pinned before dispatch, and bad explicit identities
+  // cannot be swallowed by the supervisor's rule-based fallback.
+  {
+    const missionId = 'profile-defaults';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Prepare a plan.' });
+    manager.profileDefaults = { orchestrator: 'planning-specialist', builder: 'default-builder' };
+    let supervisorProfileId: string | undefined;
+    registerSupervisorTurnRunner(async (request) => {
+      supervisorProfileId = request.agentProfileId;
+      return JSON.stringify({ action: 'plan_only', response: 'Ready.', delegations: [{ id: 'b', role: 'builder', objective: 'Implement change.', requiredCapabilities: ['implementation'] }] });
+    });
+    const orchestrator = new OrchestratorV2({ workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager }, new LocalEventBus(), undefined, manager as unknown as WorkspaceManager);
+    const result = await orchestrator.startMission(missionId, 'Prepare a plan.', { command: 'plan' });
+    assert(supervisorProfileId === 'planning-specialist', 'resolved default orchestrator identity reaches the supervisor runner');
+    assert(result.tasks.find((task) => task.assignedRole === 'builder')?.agentProfileId === 'default-builder', 'default Builder identity is pinned on durable tasks');
+  }
+  for (const role of ['orchestrator', 'builder']) {
+    const missionId = `invalid-profile-${role}`;
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Prepare a plan.' });
+    let runnerCalls = 0;
+    registerSupervisorTurnRunner(async () => {
+      runnerCalls += 1;
+      return JSON.stringify({ action: 'plan_only', response: 'Ready.', delegations: [{ id: 'b', role: 'builder', objective: 'Implement change.', requiredCapabilities: ['implementation'] }] });
+    });
+    const orchestrator = new OrchestratorV2({ workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager }, new LocalEventBus(), undefined, manager as unknown as WorkspaceManager);
+    let rejected = false;
+    try {
+      await orchestrator.startMission(missionId, 'Prepare a plan.', { command: 'plan', agentProfileIds: { [role]: 'missing-profile' } });
+    } catch { rejected = true; }
+    assert(rejected && manager.tasks.size === 0 && manager.mission.status === 'failed', `invalid ${role} identity fails durably before partial task materialization`);
+    if (role === 'orchestrator') assert(runnerCalls === 0, 'invalid supervisor identity cannot enter model fallback');
   }
 
   registerSupervisorTurnRunner(null);

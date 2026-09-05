@@ -1,12 +1,36 @@
-import type { AgentRole } from './agent';
+import type {
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileRoutePolicy,
+  AgentProfileResolution,
+  AgentRole,
+} from './agent';
+import { resolveAgentProfile } from './agent';
 import type { CanonicalReasoning } from './model-profile';
 import type { RouteSelectionMode } from './execution-policy';
+
+export type AgentProfileDefaults = Partial<Record<AgentRole, AgentProfile | AgentProfilePatch | string>>;
+
+/** Workspace-scoped overrides intentionally have the same shape as template defaults. */
+export interface WorkspaceAgentProfileOverrides {
+  profileDefaults?: AgentProfileDefaults;
+  agentProfiles?: AgentProfile[];
+  profiles?: AgentProfile[];
+  defaultProfileIds?: Partial<Record<AgentRole, string>>;
+}
 
 export interface TeamTemplate {
   id: string;
   name: string;
   description: string;
   roles: TeamRole[];
+  /** Named profile catalog shared by missions using this template. */
+  agentProfiles?: AgentProfile[];
+  /** Per-core-role defaults; old templates omit this field safely. */
+  profileDefaults?: AgentProfileDefaults;
+  /** Compatibility alias for profileDefaults used by early profile clients. */
+  profiles?: AgentProfile[];
+  defaultProfileIds?: Partial<Record<AgentRole, string>>;
   /** Optional v2 scheduler policy. Legacy templates remain valid without it. */
   workerPools?: WorkerPoolPolicy[];
   /** Global concurrent worker ceiling for this template. The Orchestrator is not counted as a worker. */
@@ -29,6 +53,118 @@ export interface TeamRole {
   preferredReasoning?: CanonicalReasoning;
   defaultCapabilities: string[];
   accessLevel: 'read' | 'write' | 'tests_and_build' | 'orchestration';
+  /** Optional named specialist selected for this fixed security role. */
+  profileId?: string;
+  profile?: AgentProfile | AgentProfilePatch;
+  instructions?: string;
+  capabilities?: string[];
+  routePolicy?: AgentProfileRoutePolicy;
+  allowedRoutePolicy?: AgentProfileRoutePolicy;
+}
+
+function profileFromCollection(
+  role: AgentRole,
+  collection?: {
+    roles?: TeamRole[];
+    profileDefaults?: AgentProfileDefaults;
+    agentProfiles?: AgentProfile[];
+    profiles?: AgentProfile[];
+    defaultProfileIds?: Partial<Record<AgentRole, string>>;
+  } | AgentProfile | AgentProfilePatch | null,
+  requestedProfileId?: string,
+): AgentProfile | AgentProfilePatch | undefined {
+  if (!collection) return undefined;
+  if ('role' in collection && !('roles' in collection)) {
+    const direct = collection as AgentProfile | AgentProfilePatch;
+    if (!requestedProfileId) return direct;
+    const directId = typeof direct.id === 'string'
+      ? direct.id
+      : typeof (direct as AgentProfilePatch & { profileId?: unknown }).profileId === 'string'
+        ? (direct as AgentProfilePatch & { profileId: string }).profileId
+        : undefined;
+    if (directId !== requestedProfileId) return undefined;
+    if (direct.role !== undefined && direct.role !== role) {
+      throw new Error(`Agent profile '${requestedProfileId}' is assigned to fixed role '${direct.role}', not '${role}'.`);
+    }
+    return direct;
+  }
+
+  const source = collection as {
+    roles?: TeamRole[];
+    profileDefaults?: AgentProfileDefaults;
+    agentProfiles?: AgentProfile[];
+    profiles?: AgentProfile[];
+    defaultProfileIds?: Partial<Record<AgentRole, string>>;
+  };
+  const profiles = [...(source.agentProfiles || []), ...(source.profiles || [])];
+  const roleEntry = source.roles?.find((entry) => entry.role === role);
+  const selectedId = requestedProfileId
+    || roleEntry?.profileId
+    || source.defaultProfileIds?.[role]
+    || (typeof source.profileDefaults?.[role] === 'string' ? source.profileDefaults[role] as string : undefined);
+  const selected = selectedId ? profiles.find((profile) => profile.id === selectedId && profile.role === role) : undefined;
+  const requestedWrongRole = requestedProfileId
+    ? profiles.find((profile) => profile.id === requestedProfileId && profile.role !== role)
+    : undefined;
+  if (requestedWrongRole) {
+    throw new Error(`Agent profile '${requestedProfileId}' is assigned to fixed role '${requestedWrongRole.role}', not '${role}'.`);
+  }
+  const configuredDefault = source.profileDefaults?.[role];
+  const defaultCandidate = typeof configuredDefault === 'string'
+    ? profiles.find((profile) => profile.id === configuredDefault && profile.role === role)
+    : configuredDefault;
+  const inline = roleEntry?.profile || (roleEntry ? {
+    role,
+    id: roleEntry.profileId,
+    name: roleEntry.profileId,
+    instructions: roleEntry.instructions,
+    capabilities: roleEntry.capabilities || roleEntry.defaultCapabilities,
+    routePolicy: roleEntry.routePolicy,
+    allowedRoutePolicy: roleEntry.allowedRoutePolicy,
+  } : undefined);
+  if (requestedProfileId) {
+    if (selected) return selected;
+    if (roleEntry?.profileId === requestedProfileId) return inline;
+    if (typeof configuredDefault !== 'string' && configuredDefault && configuredDefault.id === requestedProfileId) {
+      return configuredDefault;
+    }
+    // A workspace/template patch without an id may refine the already
+    // selected requested profile. The final requested-id check still rejects
+    // a patch that attempts to replace that identity.
+    if (typeof configuredDefault !== 'string' && configuredDefault && !configuredDefault.id) {
+      return configuredDefault;
+    }
+    return undefined;
+  }
+  return selected || defaultCandidate || inline || profiles.find((profile) => profile.role === role);
+}
+
+/**
+ * Resolve a named profile while keeping role precedence and security explicit.
+ * Workspace overrides are applied after the template defaults; an explicit
+ * task/profile selection is applied last.
+ */
+export function resolveTemplateAgentProfile(
+  role: AgentRole,
+  template?: TeamTemplate | AgentProfile | AgentProfilePatch | null,
+  workspaceOverride?: WorkspaceAgentProfileOverrides | AgentProfile | AgentProfilePatch | null,
+  explicit?: AgentProfile | AgentProfilePatch | null,
+  requestedProfileId?: string,
+): AgentProfileResolution {
+  const templateCandidate = profileFromCollection(role, template, requestedProfileId);
+  const workspaceCandidate = profileFromCollection(role, workspaceOverride, requestedProfileId);
+  if (requestedProfileId) {
+    const explicitId = explicit && (explicit.id === requestedProfileId || (explicit as AgentProfilePatch & { profileId?: string }).profileId === requestedProfileId);
+    if (!templateCandidate && !workspaceCandidate && !explicitId) {
+      throw new Error(`Agent profile '${requestedProfileId}' was not found for fixed role '${role}'.`);
+    }
+  }
+  return resolveAgentProfile(role, {
+    teamTemplate: templateCandidate,
+    workspace: workspaceCandidate,
+    explicit,
+    requestedProfileId,
+  });
 }
 
 export interface WorkerPoolPolicy {

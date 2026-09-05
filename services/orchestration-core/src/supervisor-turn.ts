@@ -17,15 +17,32 @@ const ROLE_LIMITS: Record<OrchestratorDelegation['role'], number> = {
 };
 const MAX_INITIAL_PARALLEL_DELEGATIONS = 4;
 
+const PROJECT_NAME_PATTERN = '[a-z0-9][a-z0-9._-]*';
+
+function isNewSiblingProjectRequest(message: string): boolean {
+  return [
+    // English requests that explicitly introduce a new child project/folder.
+    new RegExp(`\\b(?:brand[- ]new|new)\\s+(?:[^\\n,;]+\\s+)?(?:folder|project|directory)\\b`, 'i'),
+    new RegExp(`\\b(?:create|build|make|install|set\\s+up|scaffold)\\s+(?:a[n]?\\s+)?(?:brand[- ]new\\s+|new\\s+)?(?:[^\\n,;]+\\s+)?(?:folder|project|directory)\\b`, 'i'),
+    // Turkish equivalents, including the common postposed form
+    // "AtrisTask klasörü içine kurulacak".
+    new RegExp(`\\b(?:yeni(?:\\s+bir)?\\s+)?[^\\n,;]+\\s+(?:klas(?:ör|or)(?:ü|u)?|proje(?:si|sı)?|dizin(?:i|ı)?)\\b`, 'iu'),
+    new RegExp(`\\b(?:klas(?:ör|or)(?:ü|u)?|proje(?:si|sı)?|dizin(?:i|ı)?)\\s+(?:içine|icine|içerisine|icerisine|içinde|icinde|altına|altina|altında|altinda)\\b`, 'iu'),
+  ].some((pattern) => pattern.test(message));
+}
+
 export function inferExplicitBuilderTarget(message: string): Extract<BuilderTargetDescriptor, { kind: 'new_sibling_project' }> | undefined {
-  if (!/\b(?:under|inside|in)\s+(?:this\s+|the\s+)?workspace\b/i.test(message)) return undefined;
   const patterns = [
-    /\b(?:brand[- ]new|new)\s+[`"']?([a-z0-9][a-z0-9._-]*)[`"']?\s+(?:folder|project|directory)\b/i,
-    /\b(?:brand[- ]new|new)\s+(?:folder|project|directory)\s+(?:named|called)\s+[`"']?([a-z0-9][a-z0-9._-]*)[`"']?/i,
+    new RegExp(`\\b(?:brand[- ]new|new)\\s+["']?(${PROJECT_NAME_PATTERN})["']?\\s+(?:folder|project|directory)\\b`, 'i'),
+    new RegExp(`\\b(?:brand[- ]new|new)\\s+(?:folder|project|directory)\\s+(?:named|called)\\s+["']?(${PROJECT_NAME_PATTERN})["']?`, 'i'),
+    new RegExp(`\\b(?:create|build|make|install|set\\s+up|scaffold)\\s+(?:a[n]?\\s+)?(?:brand[- ]new\\s+|new\\s+)?["']?(${PROJECT_NAME_PATTERN})["']?\\s+(?:folder|project|directory)\\b`, 'i'),
+    new RegExp(`\\b(${PROJECT_NAME_PATTERN})\\s+(?:klas(?:ör|or)(?:ü|u)?|proje(?:si|sı)?|dizin(?:i|ı)?)\\s+(?:içine|icine|içerisine|icerisine|içinde|icinde|altına|altina|altında|altinda)\\s+(?:kurul(?:acak|uyor|ur)?|oluştur(?:ulacak|uluyor|ulur)?|olustur(?:ulacak|uluyor|ulur)?|yerleştir(?:ilecek|iliyor)?|yerlestir(?:ilecek|iliyor)?)\\b`, 'iu'),
+    new RegExp(`\\b(?:yeni(?:\\s+bir)?\\s+)?["']?(${PROJECT_NAME_PATTERN})["']?\\s+(?:klas(?:ör|or)(?:ü|u)?|proje(?:si|sı)?|dizin(?:i|ı)?)\\s+(?:oluştur(?:ulacak|uluyor|ulur)?|olustur(?:ulacak|uluyor|ulur)?|kur(?:ulacak|uluyor|ulur)?|yap(?:ılacak|iliyor|ılır)?|yapilacak|yapiliyor|yapilir)\\b`, 'iu'),
   ];
   for (const pattern of patterns) {
     const candidate = message.match(pattern)?.[1];
     if (!candidate) continue;
+    if (candidate.toLocaleLowerCase('tr-TR') === 'yeni') continue;
     try {
       return { kind: 'new_sibling_project', projectName: validateDirectChildProjectName(candidate) };
     } catch {
@@ -39,8 +56,7 @@ function normalizeBuilderTargets(delegations: OrchestratorDelegation[], userMess
   const explicitTarget = inferExplicitBuilderTarget(userMessage);
   if (!explicitTarget
     && delegations.some((item) => item.role === 'builder')
-    && /\b(?:brand[- ]new|new)\s+(?:[`"']?\S+[`"']?\s+)?(?:folder|project|directory)\b/i.test(userMessage)
-    && /\b(?:under|inside|in)\s+(?:this\s+|the\s+)?workspace\b/i.test(userMessage)) {
+    && isNewSiblingProjectRequest(userMessage)) {
     throw new Error('New sibling project target is missing or unsafe; provide one direct-child project name.');
   }
   const targeted = explicitTarget
@@ -259,6 +275,7 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- Direct response and clarification remain valid for simple turns. Do not create workers when they are unnecessary.',
     '- Split independent research topics into multiple researcher delegations with no dependencies and the same preferredParallelGroup.',
     '- For execute, Builder dependencies should reference only research that is actually required.',
+    '- When the user explicitly names a new child project in English or Turkish (for example, "Create AtrisTask under this workspace" or "AtrisTask klasörü içine kurulacak"), preserve that name as the Builder new-sibling target. Ask for a direct-child name when the wording is ambiguous.',
     '- Never invent completed work. If current code/evidence must be inspected, delegate it.',
     '- Keep delegations focused; each objective should be independently understandable.',
     '',

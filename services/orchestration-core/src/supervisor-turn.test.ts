@@ -221,6 +221,8 @@ function runTests() {
   }), 'turn-unsafe-target');
   assert(unsafeParsedTarget?.delegations?.[0]?.targetDescriptor === undefined, 'unsafe model target metadata is discarded instead of becoming a path');
   assert(inferExplicitBuilderTarget('Create a brand-new AtrisTask project under this workspace')?.projectName === 'AtrisTask', 'explicit new sibling wording deterministically extracts AtrisTask');
+  assert(inferExplicitBuilderTarget('AtrisTask klasörü içine kurulacak')?.projectName === 'AtrisTask', 'Turkish new sibling wording deterministically extracts AtrisTask');
+  assert(inferExplicitBuilderTarget('Create a new AtrisTask folder')?.projectName === 'AtrisTask', 'English new sibling wording does not require an explicit workspace suffix');
   let unsafeExplicitTargetError = '';
   try {
     normalizeSupervisorDecision({
@@ -231,6 +233,16 @@ function runTests() {
     unsafeExplicitTargetError = error instanceof Error ? error.message : String(error);
   }
   assert(unsafeExplicitTargetError.includes('missing or unsafe'), 'explicit unsafe new sibling wording fails before Builder dispatch');
+  let ambiguousTurkishTargetError = '';
+  try {
+    normalizeSupervisorDecision({
+      turnId: 'turn-explicit-ambiguous-tr', action: 'execute',
+      delegations: [{ id: 'builder-explicit-ambiguous-tr', role: 'builder', objective: 'Kur', requiredCapabilities: [] }],
+    }, { turnId: 'turn-explicit-ambiguous-tr', userMessage: 'Yeni klasör içine kurulacak', conversationContext: '', workspaceContext: '' }, { reusePriorResearch: true });
+  } catch (error) {
+    ambiguousTurkishTargetError = error instanceof Error ? error.message : String(error);
+  }
+  assert(ambiguousTurkishTargetError.includes('missing or unsafe'), 'ambiguous Turkish new sibling wording fails before Builder dispatch');
   const duplicateTarget = normalizeSupervisorDecision({
     turnId: 'turn-duplicate-target', action: 'execute', delegations: [
       { id: 'build-a', role: 'builder', objective: 'Create A', requiredCapabilities: [] },

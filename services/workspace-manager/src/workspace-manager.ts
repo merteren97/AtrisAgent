@@ -6,6 +6,8 @@ import {
   taskAttempts,
   worktrees,
   agentInstances,
+  agentProfiles,
+  agentProfileBindings,
   teamRoles,
   teamTemplates,
   executionPolicies,
@@ -21,6 +23,8 @@ import {
   type WorktreeSelect,
   type WorktreeInsert,
   type ExecutionPolicyScope,
+  type AgentProfileSelect,
+  type AgentProfileBindingSelect,
   type AtrisDatabase,
 } from '@atris-agent-code/database';
 import path from 'path';
@@ -42,8 +46,25 @@ import type {
   EffectiveAttemptRoute,
   EffectiveWorkerPoolPolicy,
   BuilderTargetDescriptor,
+  AgentProfileSource,
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileRecord,
+  AgentProfileBindingOverride,
+  AgentProfileBindingRecord,
+  AgentProfileCreateInput,
+  AgentProfileUpdateInput,
+  AgentProfileResolution,
+  AgentProfileResolutionRequest,
+  AgentProfileScopeType,
 } from '@atris-agent-code/domain';
-import { resolveWorkerPoolPolicy } from '@atris-agent-code/domain';
+import {
+  defaultAgentProfile,
+  isAgentRole,
+  mergeAgentProfiles,
+  normalizeAgentProfile,
+  resolveWorkerPoolPolicy,
+} from '@atris-agent-code/domain';
 
 export interface CreateWorkspaceInput {
   name: string;
@@ -75,6 +96,8 @@ export interface CreateTaskInput {
   priority?: TaskPriority;
   assignedAgentId?: string | null;
   assignedRole?: AgentRole | null;
+  /** Canonical named profile selected for the task. */
+  agentProfileId?: string | null;
   requiredCapabilities?: string[];
   dependsOn?: string[];
   worktreeId?: string | null;
@@ -90,6 +113,8 @@ export interface ClaimTaskAttemptInput {
   leaseExpiresAt: string;
   now?: string;
   id?: string;
+  /** Canonical named profile snapshot for this attempt. */
+  agentProfileId?: string | null;
   route: {
     adapterId: string;
     provider?: string | null;
@@ -99,11 +124,15 @@ export interface ClaimTaskAttemptInput {
     reasoningLevel?: CanonicalReasoning | null;
     source: RoutingPreferenceSource;
     selectionMode: RouteSelectionMode;
+    agentProfileId?: string | null;
   };
 }
 
 export interface SupervisorSessionMetadata {
   providerSessionId?: string;
+  agentProfileId?: string;
+  agentProfileName?: string;
+  agentProfileSource?: AgentProfileSource;
   resumeCapability: 'none' | 'live' | 'restart';
   route: ClaimTaskAttemptInput['route'];
   updatedAt: string;
@@ -114,12 +143,175 @@ export interface ReserveAgentCapacityInput {
   missionId: string;
   role: AgentRole;
   modelProfileId?: string;
+  /** Canonical named profile identity; DB keeps profile_id for legacy rows. */
+  agentProfileId?: string | null;
   parentAgentId?: string | null;
   displayName: string;
   specialty?: string | null;
   spawnReason: string;
   workspaceMode: string;
   createdAt: string;
+}
+
+/** Public persistence DTO aliases exported by WorkspaceManager. */
+export type CreateAgentProfileInput = AgentProfileCreateInput;
+export type UpdateAgentProfileInput = AgentProfileUpdateInput;
+
+export interface ListAgentProfilesOptions {
+  role?: AgentRole;
+  includeArchived?: boolean;
+}
+
+export interface CreateAgentProfileBindingInput {
+  id?: string;
+  scopeType: AgentProfileScopeType;
+  scopeId: string;
+  /** When omitted, the profile's immutable role is used. */
+  role?: AgentRole;
+  profileId?: string;
+  agentProfileId?: string;
+  override?: AgentProfileBindingOverride;
+  /** Compatibility aliases accepted at the persistence boundary. */
+  overrides?: AgentProfileBindingOverride;
+  profileOverride?: AgentProfileBindingOverride;
+  isDefault?: boolean;
+}
+
+export interface UpdateAgentProfileBindingInput {
+  scopeType?: AgentProfileScopeType;
+  scopeId?: string;
+  /** The binding role is immutable; a differing value is rejected. */
+  role?: AgentRole;
+  profileId?: string;
+  agentProfileId?: string;
+  override?: AgentProfileBindingOverride | null;
+  overrides?: AgentProfileBindingOverride | null;
+  profileOverride?: AgentProfileBindingOverride | null;
+  isDefault?: boolean;
+}
+
+export interface ListAgentProfileBindingsOptions {
+  scopeType?: AgentProfileScopeType;
+  scopeId?: string;
+  role?: AgentRole;
+  profileId?: string;
+  agentProfileId?: string;
+  /** Include bindings whose global profile has been soft archived. */
+  includeArchivedProfiles?: boolean;
+}
+
+export interface UnbindAgentProfileInput {
+  scopeType: AgentProfileScopeType;
+  scopeId: string;
+  role?: AgentRole;
+  profileId?: string;
+  agentProfileId?: string;
+}
+
+export interface ResolveAgentProfileInput extends AgentProfileResolutionRequest {
+  taskId?: string;
+  explicitProfileId?: string | null;
+  explicitProfile?: AgentProfile | AgentProfilePatch | null;
+}
+
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function canonicalRole(value: unknown, label: string): AgentRole {
+  if (!isAgentRole(value)) throw new Error(`${label} must be one of the fixed core agent roles.`);
+  return String(value).toLowerCase() as AgentRole;
+}
+
+function canonicalScope(value: unknown): AgentProfileScopeType {
+  if (value === 'global' || value === 'workspace' || value === 'team_template') return value;
+  throw new Error("Agent profile binding scope must be 'global', 'workspace', or 'team_template'.");
+}
+
+function profileRecordFromRow(row: AgentProfileSelect): AgentProfileRecord {
+  const role = canonicalRole(row.role, 'Persisted agent profile role');
+  const profile = normalizeAgentProfile({
+    id: row.id,
+    name: row.name,
+    role,
+    instructions: row.instructions,
+    capabilities: row.capabilities,
+    specialty: row.specialty,
+    description: row.description,
+    ...(row.routePolicy === null || row.routePolicy === undefined ? {} : { routePolicy: row.routePolicy }),
+    ...(row.allowedRoutePolicy === null || row.allowedRoutePolicy === undefined ? {} : { allowedRoutePolicy: row.allowedRoutePolicy }),
+  }, role);
+  return {
+    ...profile,
+    isDefault: Boolean(row.isDefault),
+    archivedAt: row.archivedAt ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function bindingRecordFromRow(row: AgentProfileBindingSelect): AgentProfileBindingRecord {
+  return {
+    id: row.id,
+    scopeType: canonicalScope(row.scopeType),
+    scopeId: row.scopeId,
+    role: canonicalRole(row.role, 'Persisted agent profile binding role'),
+    profileId: row.profileId,
+    isDefault: Boolean(row.isDefault),
+    override: row.override ?? undefined,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+/** Normalize a binding patch and reject attempts to smuggle identity/role. */
+function normalizeBindingOverride(
+  value: unknown,
+  base: AgentProfile,
+): AgentProfileBindingOverride | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Agent profile binding override must be an object.');
+  }
+  const input = value as Record<string, unknown>;
+  for (const key of ['id', 'profileId', 'agentProfileId']) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) {
+      const attempted = nonEmpty(input[key]);
+      if (attempted !== base.id) throw new Error('Agent profile binding cannot change profile identity.');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'role')) {
+    const attemptedRole = canonicalRole(input.role, 'Agent profile binding override role');
+    if (attemptedRole !== base.role) throw new Error(`Agent profile binding role '${attemptedRole}' cannot override fixed role '${base.role}'.`);
+  }
+
+  const patch: AgentProfileBindingOverride = {};
+  const fields: Array<keyof AgentProfileBindingOverride> = [
+    'name', 'instructions', 'capabilities', 'specialty', 'description', 'routePolicy', 'allowedRoutePolicy',
+  ];
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(input, field)) {
+      (patch as Record<string, unknown>)[field] = input[field];
+    }
+  }
+  // Run the same strict parser used for global records. mergeAgentProfiles
+  // intersects route allowlists, making an override a narrowing constraint.
+  const normalized = normalizeAgentProfile({
+    ...base,
+    ...patch,
+    id: base.id,
+    role: base.role,
+  }, base.role);
+  mergeAgentProfiles(base, patch);
+  return {
+    ...(Object.prototype.hasOwnProperty.call(input, 'name') ? { name: normalized.name } : {}),
+    ...(Object.prototype.hasOwnProperty.call(input, 'instructions') ? { instructions: normalized.instructions } : {}),
+    ...(Object.prototype.hasOwnProperty.call(input, 'capabilities') ? { capabilities: normalized.capabilities } : {}),
+    ...(Object.prototype.hasOwnProperty.call(input, 'specialty') ? { specialty: normalized.specialty } : {}),
+    ...(Object.prototype.hasOwnProperty.call(input, 'description') ? { description: normalized.description } : {}),
+    ...(Object.prototype.hasOwnProperty.call(input, 'routePolicy') ? { routePolicy: normalized.routePolicy } : {}),
+    ...(Object.prototype.hasOwnProperty.call(input, 'allowedRoutePolicy') ? { allowedRoutePolicy: normalized.allowedRoutePolicy } : {}),
+  };
 }
 
 export class WorkspaceManager {
@@ -173,6 +365,434 @@ export class WorkspaceManager {
   async listWorkspaces(): Promise<WorkspaceSelect[]> {
     return await this.db.select().from(workspaces);
   }
+
+  // -----------------------------------------------------------------------
+  // Durable Agent Profile catalog and scoped bindings
+  // -----------------------------------------------------------------------
+
+  /** Create a global Agent Profile catalog record. */
+  async createAgentProfile(input: CreateAgentProfileInput): Promise<AgentProfileRecord> {
+    const id = nonEmpty(input.id) ?? crypto.randomUUID();
+    const normalized = normalizeAgentProfile({ ...input, id }, input.role);
+    const now = new Date().toISOString();
+    const archivedAt = input.archivedAt ?? null;
+    const isDefault = Boolean(input.isDefault) && !archivedAt;
+
+    if (isDefault) {
+      await this.db.update(agentProfiles)
+        .set({ isDefault: false })
+        .where(and(eq(agentProfiles.role, normalized.role), eq(agentProfiles.isDefault, true)));
+    }
+    await this.db.insert(agentProfiles).values({
+      id: normalized.id,
+      name: normalized.name,
+      role: normalized.role,
+      instructions: normalized.instructions,
+      capabilities: normalized.capabilities,
+      specialty: normalized.specialty ?? null,
+      description: normalized.description ?? null,
+      routePolicy: normalized.routePolicy ?? null,
+      allowedRoutePolicy: normalized.allowedRoutePolicy ?? null,
+      isDefault,
+      archivedAt,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const created = await this.getAgentProfile(id, { includeArchived: true });
+    if (!created) throw new Error(`Failed to retrieve newly created agent profile "${id}"`);
+    return created;
+  }
+
+  /** Get a global profile; archived rows are hidden unless explicitly asked for. */
+  async getAgentProfile(
+    id: string,
+    options?: { includeArchived?: boolean } | boolean,
+  ): Promise<AgentProfileRecord | null> {
+    const profileId = nonEmpty(id);
+    if (!profileId) return null;
+    const includeArchived = typeof options === 'boolean' ? options : Boolean(options?.includeArchived);
+    const rows = await this.db.select().from(agentProfiles).where(eq(agentProfiles.id, profileId));
+    const row = rows[0];
+    if (!row || (!includeArchived && row.archivedAt !== null)) return null;
+    return profileRecordFromRow(row);
+  }
+
+  /** List global profiles, excluding soft-archived records by default. */
+  async listAgentProfiles(options?: ListAgentProfilesOptions | boolean): Promise<AgentProfileRecord[]> {
+    const normalizedOptions: ListAgentProfilesOptions = typeof options === 'boolean'
+      ? { includeArchived: options }
+      : options ?? {};
+    const rows = normalizedOptions.role
+      ? await this.db.select().from(agentProfiles).where(eq(agentProfiles.role, canonicalRole(normalizedOptions.role, 'Agent profile role')))
+      : await this.db.select().from(agentProfiles);
+    return rows
+      .filter((row) => normalizedOptions.includeArchived || row.archivedAt === null)
+      .map(profileRecordFromRow);
+  }
+
+  /** Update mutable catalog fields while preserving the fixed ID and role. */
+  async updateAgentProfile(id: string, updates: UpdateAgentProfileInput): Promise<AgentProfileRecord> {
+    const existing = await this.getAgentProfile(id, { includeArchived: true });
+    if (!existing) throw new Error(`Agent profile "${id}" was not found.`);
+    if (updates.id !== undefined && nonEmpty(updates.id) !== existing.id) {
+      throw new Error('Agent profile identity is immutable.');
+    }
+    if (updates.role !== undefined && canonicalRole(updates.role, 'Agent profile role') !== existing.role) {
+      throw new Error(`Agent profile role '${updates.role}' cannot change from fixed role '${existing.role}'.`);
+    }
+
+    const candidate = normalizeAgentProfile({
+      ...existing,
+      ...updates,
+      id: existing.id,
+      role: existing.role,
+    }, existing.role);
+    const archivedAt = updates.archivedAt === undefined ? existing.archivedAt : updates.archivedAt;
+    const isDefault = archivedAt ? false : updates.isDefault === undefined ? existing.isDefault : Boolean(updates.isDefault);
+    if (isDefault) {
+      await this.db.update(agentProfiles)
+        .set({ isDefault: false })
+        .where(and(eq(agentProfiles.role, existing.role), eq(agentProfiles.isDefault, true)));
+    }
+    const updatedAt = new Date().toISOString();
+    await this.db.update(agentProfiles).set({
+      name: candidate.name,
+      instructions: candidate.instructions,
+      capabilities: candidate.capabilities,
+      specialty: candidate.specialty ?? null,
+      description: candidate.description ?? null,
+      routePolicy: candidate.routePolicy ?? null,
+      allowedRoutePolicy: candidate.allowedRoutePolicy ?? null,
+      isDefault,
+      archivedAt: archivedAt ?? null,
+      updatedAt,
+    }).where(eq(agentProfiles.id, existing.id));
+    const result = await this.getAgentProfile(existing.id, { includeArchived: true });
+    if (!result) throw new Error(`Failed to retrieve updated agent profile "${existing.id}"`);
+    return result;
+  }
+
+  /** Soft archive a profile and remove it from all default slots. */
+  async archiveAgentProfile(id: string, archivedAt = new Date().toISOString()): Promise<AgentProfileRecord> {
+    const existing = await this.getAgentProfile(id, { includeArchived: true });
+    if (!existing) throw new Error(`Agent profile "${id}" was not found.`);
+    await this.db.update(agentProfiles).set({ isDefault: false, archivedAt, updatedAt: archivedAt })
+      .where(eq(agentProfiles.id, existing.id));
+    // Keep default bindings intact so a stale/archived default is observable
+    // and resolution fails closed rather than silently selecting a fallback.
+    const archived = await this.getAgentProfile(existing.id, { includeArchived: true });
+    if (!archived) throw new Error(`Failed to archive agent profile "${existing.id}"`);
+    return archived;
+  }
+
+  /** Restore a soft-archived profile without implicitly claiming a default slot. */
+  async restoreAgentProfile(id: string, options: { isDefault?: boolean } = {}): Promise<AgentProfileRecord> {
+    const existing = await this.getAgentProfile(id, { includeArchived: true });
+    if (!existing) throw new Error(`Agent profile "${id}" was not found.`);
+    const isDefault = Boolean(options.isDefault);
+    if (isDefault) {
+      await this.db.update(agentProfiles)
+        .set({ isDefault: false })
+        .where(and(eq(agentProfiles.role, existing.role), eq(agentProfiles.isDefault, true)));
+    }
+    const updatedAt = new Date().toISOString();
+    await this.db.update(agentProfiles).set({ archivedAt: null, isDefault, updatedAt })
+      .where(eq(agentProfiles.id, existing.id));
+    const restored = await this.getAgentProfile(existing.id, { includeArchived: true });
+    if (!restored) throw new Error(`Failed to restore agent profile "${existing.id}"`);
+    return restored;
+  }
+
+  /** Profile deletion is intentionally a soft archive. */
+  async deleteAgentProfile(id: string): Promise<AgentProfileRecord> {
+    return this.archiveAgentProfile(id);
+  }
+
+  /** Return one binding by durable ID. */
+  async getAgentProfileBinding(id: string): Promise<AgentProfileBindingRecord | null> {
+    const bindingId = nonEmpty(id);
+    if (!bindingId) return null;
+    const rows = await this.db.select().from(agentProfileBindings).where(eq(agentProfileBindings.id, bindingId));
+    const row = rows[0];
+    return row ? bindingRecordFromRow(row) : null;
+  }
+
+  /** List bindings by scope/role/profile, hiding archived profile targets by default. */
+  async listAgentProfileBindings(options: ListAgentProfileBindingsOptions = {}): Promise<AgentProfileBindingRecord[]> {
+    let rows = await this.db.select().from(agentProfileBindings);
+    const scopeType = options.scopeType === undefined ? undefined : canonicalScope(options.scopeType);
+    const role = options.role === undefined ? undefined : canonicalRole(options.role, 'Agent profile binding role');
+    const profileId = nonEmpty(options.profileId ?? options.agentProfileId);
+    rows = rows.filter((row) => (scopeType === undefined || row.scopeType === scopeType)
+      && (options.scopeId === undefined || row.scopeId === options.scopeId)
+      && (role === undefined || row.role === role)
+      && (profileId === undefined || row.profileId === profileId));
+    if (!options.includeArchivedProfiles) {
+      const activeIds = new Set((await this.listAgentProfiles()).map((profile) => profile.id));
+      rows = rows.filter((row) => activeIds.has(row.profileId));
+    }
+    return rows.map(bindingRecordFromRow);
+  }
+
+  /**
+   * Bind a global profile to a workspace or team template. Binding identity and
+   * role are validated before persistence; allowlists are narrowed on resolve.
+   */
+  async bindAgentProfile(input: CreateAgentProfileBindingInput): Promise<AgentProfileBindingRecord> {
+    const scopeType = canonicalScope(input.scopeType);
+    const scopeId = nonEmpty(input.scopeId);
+    if (!scopeId) throw new Error('Agent profile binding scopeId must be non-empty.');
+    const profileId = nonEmpty(input.profileId ?? input.agentProfileId);
+    if (!profileId) throw new Error('Agent profile binding requires a profileId.');
+    const profile = await this.getAgentProfile(profileId, { includeArchived: true });
+    if (!profile) throw new Error(`Agent profile "${profileId}" was not found.`);
+    if (profile.archivedAt !== null) throw new Error(`Agent profile "${profileId}" is archived and cannot be bound.`);
+    const role = input.role === undefined ? profile.role : canonicalRole(input.role, 'Agent profile binding role');
+    if (role !== profile.role) {
+      throw new Error(`Agent profile "${profileId}" has fixed role '${profile.role}', not '${role}'.`);
+    }
+    const rawOverride = input.override ?? input.overrides ?? input.profileOverride;
+    const override = normalizeBindingOverride(rawOverride, profile);
+    const isDefault = Boolean(input.isDefault);
+    const existingRows = await this.db.select().from(agentProfileBindings).where(and(
+      eq(agentProfileBindings.scopeType, scopeType),
+      eq(agentProfileBindings.scopeId, scopeId),
+      eq(agentProfileBindings.profileId, profileId),
+    ));
+    const existing = existingRows[0];
+    if (existing) {
+      if (existing.role !== role) throw new Error('Agent profile binding role is immutable.');
+      return this.updateAgentProfileBinding(existing.id, { override, isDefault });
+    }
+    if (isDefault) {
+      await this.db.update(agentProfileBindings).set({ isDefault: false, updatedAt: new Date().toISOString() })
+        .where(and(eq(agentProfileBindings.scopeType, scopeType), eq(agentProfileBindings.scopeId, scopeId), eq(agentProfileBindings.role, role)));
+    }
+    const now = new Date().toISOString();
+    await this.db.insert(agentProfileBindings).values({
+      id: nonEmpty(input.id) ?? crypto.randomUUID(),
+      scopeType,
+      scopeId,
+      role,
+      profileId,
+      override: override ?? null,
+      isDefault,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const createdRows = await this.db.select().from(agentProfileBindings).where(and(
+      eq(agentProfileBindings.scopeType, scopeType),
+      eq(agentProfileBindings.scopeId, scopeId),
+      eq(agentProfileBindings.profileId, profileId),
+    ));
+    const created = createdRows[0];
+    if (!created) throw new Error(`Failed to retrieve newly created agent profile binding for "${profileId}"`);
+    return bindingRecordFromRow(created);
+  }
+
+  /** Update a binding while keeping its role and target profile role aligned. */
+  async updateAgentProfileBinding(id: string, updates: UpdateAgentProfileBindingInput): Promise<AgentProfileBindingRecord> {
+    const existing = await this.getAgentProfileBinding(id);
+    if (!existing) throw new Error(`Agent profile binding "${id}" was not found.`);
+    const scopeType = updates.scopeType === undefined ? existing.scopeType : canonicalScope(updates.scopeType);
+    const scopeId = updates.scopeId === undefined ? existing.scopeId : nonEmpty(updates.scopeId);
+    if (!scopeId) throw new Error('Agent profile binding scopeId must be non-empty.');
+    if (updates.role !== undefined && canonicalRole(updates.role, 'Agent profile binding role') !== existing.role) {
+      throw new Error(`Agent profile binding role '${updates.role}' cannot change from fixed role '${existing.role}'.`);
+    }
+    const profileId = nonEmpty(updates.profileId ?? updates.agentProfileId) ?? existing.profileId;
+    const profile = await this.getAgentProfile(profileId, { includeArchived: true });
+    if (!profile) throw new Error(`Agent profile "${profileId}" was not found.`);
+    if (profile.archivedAt !== null) throw new Error(`Agent profile "${profileId}" is archived and cannot be bound.`);
+    if (profile.role !== existing.role) {
+      throw new Error(`Agent profile "${profileId}" has fixed role '${profile.role}', not '${existing.role}'.`);
+    }
+    const overrideProvided = Object.prototype.hasOwnProperty.call(updates, 'override')
+      || Object.prototype.hasOwnProperty.call(updates, 'overrides')
+      || Object.prototype.hasOwnProperty.call(updates, 'profileOverride');
+    const rawOverride = updates.override ?? updates.overrides ?? updates.profileOverride;
+    const override = overrideProvided
+      ? normalizeBindingOverride(rawOverride, profile)
+      : existing.override;
+    const isDefault = updates.isDefault === undefined ? existing.isDefault : Boolean(updates.isDefault);
+    if (isDefault) {
+      await this.db.update(agentProfileBindings).set({ isDefault: false, updatedAt: new Date().toISOString() })
+        .where(and(eq(agentProfileBindings.scopeType, scopeType), eq(agentProfileBindings.scopeId, scopeId), eq(agentProfileBindings.role, existing.role)));
+    }
+    const updatedAt = new Date().toISOString();
+    await this.db.update(agentProfileBindings).set({
+      scopeType,
+      scopeId,
+      profileId,
+      override: override ?? null,
+      isDefault,
+      updatedAt,
+    }).where(eq(agentProfileBindings.id, existing.id));
+    const updated = await this.getAgentProfileBinding(existing.id);
+    if (!updated) throw new Error(`Failed to retrieve updated agent profile binding "${existing.id}"`);
+    return updated;
+  }
+
+  /** Remove a scope binding; global catalog records are left untouched. */
+  async unbindAgentProfile(
+    binding: string | UnbindAgentProfileInput,
+    scopeId?: string,
+    role?: AgentRole,
+  ): Promise<boolean> {
+    if (typeof binding === 'string') {
+      if (scopeId === undefined) {
+        const existing = await this.getAgentProfileBinding(binding);
+        if (!existing) return false;
+        await this.db.delete(agentProfileBindings).where(eq(agentProfileBindings.id, existing.id));
+        return true;
+      }
+      const scopeType = canonicalScope(binding);
+      const canonicalScopeId = nonEmpty(scopeId);
+      const canonicalBindingRole = canonicalRole(role, 'Agent profile binding role');
+      if (!canonicalScopeId) return false;
+      const rows = await this.db.select({ id: agentProfileBindings.id }).from(agentProfileBindings).where(and(
+        eq(agentProfileBindings.scopeType, scopeType),
+        eq(agentProfileBindings.scopeId, canonicalScopeId),
+        eq(agentProfileBindings.role, canonicalBindingRole),
+      ));
+      if (!rows.length) return false;
+      await this.db.delete(agentProfileBindings).where(and(
+        eq(agentProfileBindings.scopeType, scopeType),
+        eq(agentProfileBindings.scopeId, canonicalScopeId),
+        eq(agentProfileBindings.role, canonicalBindingRole),
+      ));
+      return true;
+    }
+    const scopeType = canonicalScope(binding.scopeType);
+    const bindingScopeId = nonEmpty(binding.scopeId);
+    const profileId = nonEmpty(binding.profileId) ?? nonEmpty(binding.agentProfileId);
+    const bindingRole = binding.role === undefined ? undefined : canonicalRole(binding.role, 'Agent profile binding role');
+    if (!bindingScopeId || (!profileId && !bindingRole)) return false;
+    const predicates = [
+      eq(agentProfileBindings.scopeType, scopeType),
+      eq(agentProfileBindings.scopeId, bindingScopeId),
+      ...(profileId ? [eq(agentProfileBindings.profileId, profileId)] : []),
+      ...(bindingRole ? [eq(agentProfileBindings.role, bindingRole)] : []),
+    ];
+    const rows = await this.db.select({ id: agentProfileBindings.id }).from(agentProfileBindings).where(and(...predicates));
+    if (!rows[0]) return false;
+    await this.db.delete(agentProfileBindings).where(and(...predicates));
+    return true;
+  }
+
+  /**
+   * Resolve a durable profile for a mission or explicit workspace/team scope.
+   * A requested profile never falls through to another identity; malformed,
+   * missing, wrong-role, or archived requests fail closed.
+   */
+  async resolveAgentProfileForMission(input: ResolveAgentProfileInput): Promise<AgentProfileResolution>;
+  async resolveAgentProfileForMission(missionId: string, role: AgentRole, profileId?: string): Promise<AgentProfileResolution>;
+  async resolveAgentProfileForMission(missionId: string, role: AgentRole, taskId: string | undefined, profileId: string): Promise<AgentProfileResolution>;
+  async resolveAgentProfileForMission(
+    inputOrMissionId: ResolveAgentProfileInput | string,
+    role?: AgentRole,
+    taskId?: string,
+    profileId?: string,
+  ): Promise<AgentProfileResolution> {
+    // The public/API three-argument form uses its third value as profileId;
+    // the four-argument compatibility form reserves it for legacy taskId.
+    const requestedProfileId = profileId === undefined ? taskId : profileId;
+    return this.resolveAgentProfile(inputOrMissionId as any, role as any, undefined, requestedProfileId);
+  }
+
+  /**
+   * RuntimeHost's optional resolver calls this positional form. The object form
+   * is the typed API used by API/desktop integrations.
+   */
+  async resolveAgentProfile(input: ResolveAgentProfileInput): Promise<AgentProfileResolution>;
+  async resolveAgentProfile(missionId: string, role: AgentRole, taskId?: string, profileId?: string): Promise<AgentProfileResolution>;
+  async resolveAgentProfile(
+    inputOrMissionId: ResolveAgentProfileInput | string,
+    roleOrOptions?: AgentRole,
+    _taskId?: string,
+    positionalProfileId?: string,
+  ): Promise<AgentProfileResolution> {
+    const input: ResolveAgentProfileInput = typeof inputOrMissionId === 'string'
+      ? {
+          missionId: inputOrMissionId,
+          role: roleOrOptions as AgentRole,
+          profileId: positionalProfileId,
+        }
+      : inputOrMissionId;
+    const role = canonicalRole(input.role, 'Agent profile resolution role');
+    const mission = input.missionId ? await this.getMission(input.missionId) : null;
+    const workspaceId = nonEmpty(input.workspaceId ?? mission?.workspaceId);
+    const teamTemplateId = nonEmpty(input.teamTemplateId ?? mission?.teamTemplateId);
+    const requestedProfileId = nonEmpty(input.explicitProfileId)
+      ?? nonEmpty(input.profileId)
+      ?? nonEmpty(input.agentProfileId)
+      ?? nonEmpty(input.requestedProfileId);
+
+    if (input.explicitProfile) {
+      const explicit = normalizeAgentProfile(input.explicitProfile, role);
+      if (explicit.role !== role) throw new Error(`Explicit agent profile role '${explicit.role}' does not match '${role}'.`);
+      if (requestedProfileId && explicit.id !== requestedProfileId) {
+        throw new Error(`Explicit agent profile identity does not match requested profile '${requestedProfileId}'.`);
+      }
+      return { profile: explicit, source: 'explicit' };
+    }
+
+    const resolveBinding = async (scopeType: AgentProfileScopeType, scopeId: string | undefined, requestedId?: string): Promise<AgentProfileResolution | undefined> => {
+      if (!scopeId) return undefined;
+      const bindings = await this.listAgentProfileBindings({ scopeType, scopeId, role, includeArchivedProfiles: true });
+      const binding = bindings.find((candidate) => candidate.isDefault);
+      if (!binding || (requestedId && binding.profileId !== requestedId)) return undefined;
+      const bound = await this.getAgentProfile(binding.profileId, { includeArchived: true });
+      if (!bound) throw new Error(`Agent profile binding '${binding.id}' references a missing profile.`);
+      if (bound.archivedAt !== null) throw new Error(`Agent profile binding '${binding.id}' references an archived profile.`);
+      if (bound.role !== role || binding.role !== role) {
+        throw new Error(`Agent profile binding '${binding.id}' failed fixed-role validation.`);
+      }
+      const merged = mergeAgentProfiles(bound, binding.override as AgentProfilePatch | undefined);
+      return {
+        profile: merged,
+        source: requestedId ? 'explicit' : scopeType === 'workspace' ? 'workspace' : scopeType === 'team_template' ? 'team_template' : 'default',
+      };
+    };
+
+    if (requestedProfileId) {
+      const requested = await this.getAgentProfile(requestedProfileId, { includeArchived: true });
+      // Legacy role IDs remain safe baseline identities in pre-catalog data.
+      if (!requested && requestedProfileId === role) return { profile: defaultAgentProfile(role), source: 'default' };
+      if (!requested) throw new Error(`Agent profile '${requestedProfileId}' was not found for fixed role '${role}'.`);
+      if (requested.archivedAt !== null) throw new Error(`Agent profile '${requestedProfileId}' is archived and cannot be resolved.`);
+      if (requested.role !== role) {
+        throw new Error(`Agent profile '${requestedProfileId}' is assigned to fixed role '${requested.role}', not '${role}'.`);
+      }
+      const refined = await resolveBinding('workspace', workspaceId, requestedProfileId)
+        ?? await resolveBinding('team_template', teamTemplateId, requestedProfileId)
+        ?? await resolveBinding('global', 'global', requestedProfileId);
+      return refined ?? { profile: requested, source: 'explicit' };
+    }
+
+    const workspaceResolution = await resolveBinding('workspace', workspaceId);
+    if (workspaceResolution) return workspaceResolution;
+    const templateResolution = await resolveBinding('team_template', teamTemplateId);
+    if (templateResolution) return templateResolution;
+    const globalBindingResolution = await resolveBinding('global', 'global');
+    if (globalBindingResolution) return globalBindingResolution;
+
+    const globalDefaults = (await this.listAgentProfiles({ role })).filter((profile) => profile.isDefault);
+    const globalDefault = globalDefaults[0];
+    if (globalDefault) return { profile: globalDefault, source: 'default' };
+    return { profile: defaultAgentProfile(role), source: 'default' };
+  }
+
+  // Short aliases make the catalog API discoverable without creating a second
+  // persistence path. They intentionally retain the same validation rules.
+  createProfile(input: CreateAgentProfileInput): Promise<AgentProfileRecord> { return this.createAgentProfile(input); }
+  getProfile(id: string, options?: { includeArchived?: boolean } | boolean): Promise<AgentProfileRecord | null> { return this.getAgentProfile(id, options); }
+  listProfiles(options?: ListAgentProfilesOptions): Promise<AgentProfileRecord[]> { return this.listAgentProfiles(options); }
+  updateProfile(id: string, updates: UpdateAgentProfileInput): Promise<AgentProfileRecord> { return this.updateAgentProfile(id, updates); }
+  archiveProfile(id: string): Promise<AgentProfileRecord> { return this.archiveAgentProfile(id); }
+  bindProfile(input: CreateAgentProfileBindingInput): Promise<AgentProfileBindingRecord> { return this.bindAgentProfile(input); }
+  listProfileBindings(options?: ListAgentProfileBindingsOptions): Promise<AgentProfileBindingRecord[]> { return this.listAgentProfileBindings(options); }
+  unbindProfile(binding: string | Pick<CreateAgentProfileBindingInput, 'scopeType' | 'scopeId' | 'profileId' | 'agentProfileId'>): Promise<boolean> { return this.unbindAgentProfile(binding); }
 
   /**
    * Create a mission record only. Runtime lifecycle events are emitted by the
@@ -257,7 +877,7 @@ export class WorkspaceManager {
         throw new Error(`Mission ${input.role} parallel-agent limit reached (${roleLimit}). Wait for an active ${input.role} agent to complete before spawning another.`);
       }
 
-      tx.insert(agentInstances).values({
+      const agentRecord: typeof agentInstances.$inferInsert = {
         id: input.id,
         missionId: input.missionId,
         role: input.role,
@@ -271,7 +891,20 @@ export class WorkspaceManager {
         spawnReason: input.spawnReason,
         workspaceMode: input.workspaceMode,
         createdAt: input.createdAt,
-      }).run();
+      };
+      // Keep compatibility with pre-profile standalone databases while using
+      // the durable profile_id column whenever a profile was selected.
+      if (input.agentProfileId !== undefined) {
+        agentRecord.profileId = input.agentProfileId || null;
+        agentRecord.agentProfileId = input.agentProfileId || null;
+      }
+      try {
+        tx.insert(agentInstances).values(agentRecord).run();
+      } catch (error) {
+        if (input.agentProfileId === undefined) throw error;
+        const { agentProfileId: _canonical, ...legacyAgentRecord } = agentRecord;
+        tx.insert(agentInstances).values(legacyAgentRecord).run();
+      }
     });
   }
 
@@ -395,6 +1028,7 @@ export class WorkspaceManager {
       createdAt: now,
       updatedAt: now,
     };
+    if (input.agentProfileId !== undefined) newTask.agentProfileId = input.agentProfileId || null;
 
     await this.db.insert(tasks).values(newTask);
     const result = await this.getTask(newTask.id);
@@ -429,6 +1063,7 @@ export class WorkspaceManager {
         reasoningLevel: attempt.routeReasoningLevel,
         source: attempt.routeSource,
         selectionMode: attempt.routeSelectionMode,
+        agentProfileId: attempt.agentProfileId,
       } };
     });
   }
@@ -500,6 +1135,8 @@ export class WorkspaceManager {
         claimedAt: now,
         startedAt: now,
       };
+      const agentProfileId = input.agentProfileId ?? input.route.agentProfileId;
+      if (agentProfileId !== undefined) attempt.agentProfileId = agentProfileId || null;
       tx.insert(taskAttempts).values(attempt).run();
       const created = tx.select().from(taskAttempts).where(eq(taskAttempts.id, attempt.id)).get();
       if (!created) throw new Error(`Failed to retrieve claimed task attempt "${attempt.id}"`);

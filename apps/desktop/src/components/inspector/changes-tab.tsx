@@ -74,6 +74,7 @@ export function ChangesTab() {
         </div>
       </div>
       <div className="border-b border-border bg-muted/20 p-3 text-xs">
+        <p className="mb-2 text-[11px] leading-relaxed text-muted-foreground">Worker output preview. Builder completion does not mean these files have been applied to the project; application follows the required quality checks and approval policy.</p>
         <p className="font-medium">{selected.builderSummary}</p>
         <div className="mt-2 flex flex-wrap gap-1.5">
           <Badge variant="outline">{selected.changedFiles.length} files</Badge>

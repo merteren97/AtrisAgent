@@ -23,6 +23,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
 import { TeamTemplateSelector } from './team-template-selector';
+import { AgentProfileSelector } from './agent-profile-selector';
 import { TrustModeSelector } from './trust-mode-selector';
 import { useMissionStore } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -79,6 +80,7 @@ export function ChatComposer() {
     trustMode,
     automationSettings,
     teamTemplate,
+    agentProfileIds,
     setSelectedRole,
     setSelectedModel,
     setReasoningLevel,
@@ -182,6 +184,7 @@ export function ChatComposer() {
 
     const options = {
       teamTemplate,
+      agentProfileIds,
       trustMode,
       automationSettings,
       ...routeResolution.options,
@@ -437,7 +440,7 @@ export function ChatComposer() {
                   <div className="space-y-2 border-t border-border bg-muted/15 p-3" onClick={(event) => event.stopPropagation()}>
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Team & autonomy</span>
-                      <div className="flex items-center gap-1"><TeamTemplateSelector /><TrustModeSelector /></div>
+                      <div className="flex flex-wrap items-center justify-end gap-1"><TeamTemplateSelector /><AgentProfileSelector /><TrustModeSelector /></div>
                     </div>
                     {selectedModelObject && (
                       <div className="flex items-center justify-between gap-2">

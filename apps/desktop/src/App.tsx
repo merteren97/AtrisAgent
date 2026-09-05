@@ -152,7 +152,7 @@ function WorkspaceApp() {
                <Tabs value={missionSurface} onValueChange={(value) => setMissionSurface(value as 'chat' | 'processes')} className="shrink-0 gap-0 border-b border-border bg-background px-3">
                  <TabsList variant="line" className="h-9">
                    <TabsTrigger value="chat" className="h-8 px-3 text-xs">Chat</TabsTrigger>
-                   <TabsTrigger value="processes" className="h-8 px-3 text-xs">Live Processes</TabsTrigger>
+                   <TabsTrigger value="processes" className="h-8 px-3 text-xs">Diagnostics</TabsTrigger>
                  </TabsList>
                </Tabs>
              ) : null}

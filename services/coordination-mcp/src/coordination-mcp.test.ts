@@ -75,6 +75,8 @@ async function runTests() {
         ON resource_leases(resource_type, resource_id) WHERE status = 'active';
       CREATE TABLE agent_instances (
         id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, role TEXT NOT NULL,
+        profile_id TEXT,
+        agent_profile_id TEXT,
         model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '',
         session_id TEXT, status TEXT DEFAULT 'idle', task_id TEXT, parent_agent_id TEXT,
         display_name TEXT, specialty TEXT, spawn_reason TEXT, status_message TEXT, progress INTEGER,
@@ -113,6 +115,7 @@ async function runTests() {
     durableBus.emit({
       id: crypto.randomUUID(), type: 'agent_spawned', missionId: 'durable-mission',
       agentInstanceId: 'durable-agent', parentAgentId: null, role: 'researcher',
+      agentProfileId: 'durable-researcher',
       displayName: 'Durable Researcher', specialty: 'Recovery', spawnReason: 'Verify restart state',
       taskId: null, model: 'research-model', workspaceMode: 'read_only', timestamp: new Date().toISOString(),
     } as any);
@@ -121,7 +124,11 @@ async function runTests() {
       content: 'Persist this handoff.', kind: 'handoff',
     });
     const restartedCoordination = new CoordinationMCP({ db, workspacePath: os.tmpdir() });
-    assert(restartedCoordination.listAgents('durable-mission')[0]?.displayName === 'Durable Researcher', 'agent registry survives a CoordinationMCP restart');
+    assert(restartedCoordination.listAgents('durable-mission')[0]?.displayName === 'Durable Researcher'
+      && restartedCoordination.listAgents('durable-mission')[0]?.agentProfileId === 'durable-researcher'
+      && restartedCoordination.listAgents('durable-mission')[0]?.profileId === 'durable-researcher', 'agent registry and named profile survive a CoordinationMCP restart');
+    const persistedAgent = sqlite.prepare('SELECT profile_id, agent_profile_id FROM agent_instances WHERE id = ?').get('durable-agent') as { profile_id: string; agent_profile_id: string };
+    assert(persistedAgent.profile_id === 'durable-researcher' && persistedAgent.agent_profile_id === 'durable-researcher', 'CoordinationMCP persists both canonical and compatibility profile identity columns');
     assert(restartedCoordination.readAgentMessages('durable-agent', true, false)[0]?.kind === 'handoff', 'agent mailbox survives a CoordinationMCP restart');
     sqlite.close();
   }
@@ -195,8 +202,12 @@ async function runTests() {
 
     const eventBus = new LocalEventBus();
     const terminalEvents: any[] = [];
+    const spawnedEvents: any[] = [];
+    const createdEvents: any[] = [];
     eventBus.on('task_completed', (event) => { terminalEvents.push(event); });
     eventBus.on('task_failed', (event) => { terminalEvents.push(event); });
+    eventBus.on('agent_spawned', (event) => { spawnedEvents.push(event); });
+    eventBus.on('task_created', (event) => { createdEvents.push(event); });
     const coordination = new CoordinationMCP({ workspacePath: path.join(os.tmpdir(), 'atris-packaged-runtime-data'), workspaceManager, eventBus });
 
     const ctx = await coordination.getWorkspaceContext(undefined, 'm-100');
@@ -226,6 +237,7 @@ async function runTests() {
       missionId: 'm-100',
       parentAgentId: 'builder-agent-1',
       role: 'researcher',
+      agentProfileId: 'research-specialist',
       instruction: 'Inspect authentication boundaries and summarize relevant files.',
       displayName: 'Auth Scout',
       specialty: 'Authentication research',
@@ -233,7 +245,8 @@ async function runTests() {
       workspaceMode: 'read_only',
     });
     assert(spawned.status === 'scheduled' && Boolean(spawned.agentInstanceId), 'spawnAgent creates a scheduled durable child agent');
-    assert(coordination.listAgents('m-100').some((agent) => agent.id === spawned.agentInstanceId && agent.parentAgentId === 'builder-agent-1'), 'spawnAgent preserves parent/child lineage');
+    assert(coordination.listAgents('m-100').some((agent) => agent.id === spawned.agentInstanceId && agent.parentAgentId === 'builder-agent-1' && agent.agentProfileId === 'research-specialist'), 'spawnAgent preserves parent/child lineage and named profile');
+    assert(spawnedEvents.at(-1)?.agentProfileId === 'research-specialist' && createdEvents.at(-1)?.agentProfileId === 'research-specialist', 'spawnAgent carries canonical named profile identity through lifecycle events');
 
     const message = await coordination.sendAgentMessage({
       missionId: 'm-100',

@@ -59,33 +59,111 @@ async function runTests() {
       PRAGMA foreign_keys = ON;
       CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, git_initialized INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT, last_team_template_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', team_template_id TEXT NOT NULL DEFAULT '', plan_id TEXT, execution_mode TEXT NOT NULL DEFAULT 'balanced', automation_policy TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
-      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, target_descriptor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
-      CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, route_adapter_id TEXT, route_provider TEXT, route_account_profile_id TEXT, route_model_catalog_id TEXT, route_runtime_model_id TEXT, route_reasoning_level TEXT, route_source TEXT, route_selection_mode TEXT, provider_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, agent_profile_id TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, target_descriptor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, agent_profile_id TEXT, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, route_adapter_id TEXT, route_provider TEXT, route_account_profile_id TEXT, route_model_catalog_id TEXT, route_runtime_model_id TEXT, route_reasoning_level TEXT, route_source TEXT, route_selection_mode TEXT, provider_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
       CREATE UNIQUE INDEX idx_task_attempts_task_number ON task_attempts(task_id, attempt_number);
       CREATE TABLE team_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', max_parallel_agents INTEGER, worker_pools TEXT, is_default INTEGER DEFAULT 0, created_at TEXT NOT NULL);
       CREATE TABLE team_roles (id TEXT PRIMARY KEY, template_id TEXT NOT NULL REFERENCES team_templates(id), role TEXT NOT NULL, model_profile_id TEXT, account_profile_id TEXT, default_capabilities TEXT NOT NULL, access_level TEXT NOT NULL);
+      CREATE TABLE agent_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, instructions TEXT NOT NULL DEFAULT '', capabilities TEXT NOT NULL DEFAULT '[]', specialty TEXT, description TEXT, route_policy TEXT, allowed_route_policy TEXT, is_default INTEGER NOT NULL DEFAULT 0, archived_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE UNIQUE INDEX idx_agent_profiles_role_default ON agent_profiles(role) WHERE is_default = 1 AND archived_at IS NULL;
+      CREATE TABLE agent_profile_bindings (id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, role TEXT NOT NULL, profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE RESTRICT, override TEXT, is_default INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE UNIQUE INDEX idx_agent_profile_bindings_scope_role_profile ON agent_profile_bindings(scope_type, scope_id, role, profile_id);
+      CREATE UNIQUE INDEX idx_agent_profile_bindings_scope_role_default ON agent_profile_bindings(scope_type, scope_id, role) WHERE is_default = 1;
+      CREATE TRIGGER trg_agent_profile_bindings_profile_role BEFORE INSERT ON agent_profile_bindings WHEN (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) IS NULL OR (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) <> NEW.role BEGIN SELECT RAISE(ABORT, 'Agent profile binding role must match profile role'); END;
       CREATE TABLE execution_policies (id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, role TEXT NOT NULL, model_catalog_id TEXT, account_profile_id TEXT, reasoning_level TEXT, fallback_catalog_ids TEXT NOT NULL, selection_mode TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE conversation_turns (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, content TEXT NOT NULL, delivery TEXT NOT NULL, options TEXT, status TEXT NOT NULL DEFAULT 'queued', idempotency_key TEXT, request_hash TEXT, command_id TEXT, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT);
-      CREATE TABLE agent_instances (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, role TEXT NOT NULL, model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '', session_id TEXT, status TEXT DEFAULT 'idle', task_id TEXT, parent_agent_id TEXT, display_name TEXT, specialty TEXT, spawn_reason TEXT, status_message TEXT, progress INTEGER, workspace_mode TEXT, started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE agent_instances (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, role TEXT NOT NULL, profile_id TEXT, agent_profile_id TEXT, model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '', session_id TEXT, status TEXT DEFAULT 'idle', task_id TEXT, parent_agent_id TEXT, display_name TEXT, specialty TEXT, spawn_reason TEXT, status_message TEXT, progress INTEGER, workspace_mode TEXT, started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL);
     `);
     const attemptManager = new WorkspaceManager(drizzle(sqlite, { schema }) as unknown as AtrisDatabase);
-    const attemptWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
-    const attemptMission = await attemptManager.createMission({ id: 'attempt-mission', workspaceId: attemptWorkspace.id, title: 'Parallel research' });
+
+    const globalBuilder = await attemptManager.createAgentProfile({
+      id: 'profile-global-builder',
+      name: 'Global Builder',
+      role: 'builder',
+      instructions: 'Build safely',
+      capabilities: ['implementation'],
+      allowedRoutePolicy: { allowedCatalogIds: ['catalog-safe', 'catalog-safe-2'] },
+      isDefault: true,
+    });
+    const teamBuilder = await attemptManager.createAgentProfile({
+      id: 'profile-team-builder',
+      name: 'Team Builder',
+      role: 'builder',
+      instructions: 'Build for this team',
+      capabilities: ['implementation', 'testing'],
+    });
+    const workspaceBuilder = await attemptManager.createAgentProfile({
+      id: 'profile-workspace-builder',
+      name: 'Workspace Builder',
+      role: 'builder',
+      instructions: 'Build in this workspace',
+      capabilities: ['implementation', 'refactor'],
+    });
+    assert(globalBuilder.isDefault && globalBuilder.role === 'builder', 'global Agent Profile catalog records preserve fixed roles and defaults');
+    assert((await attemptManager.listAgentProfiles()).length === 3, 'active Agent Profile catalog records are listable');
+    await attemptManager.bindAgentProfile({
+      id: 'binding-team-builder', scopeType: 'team_template', scopeId: 'profile-team-template',
+      profileId: teamBuilder.id, isDefault: true,
+    });
+    const workspaceBinding = await attemptManager.bindAgentProfile({
+      id: 'binding-workspace-builder', scopeType: 'workspace', scopeId: 'attempt-workspace',
+      profileId: workspaceBuilder.id, isDefault: true,
+      override: { allowedRoutePolicy: { allowedCatalogIds: ['catalog-safe'] } },
+    });
+    assert(workspaceBinding.isDefault && workspaceBinding.role === 'builder', 'workspace/team Agent Profile bindings persist fixed role and default state');
+    const profileWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
+    const attemptMission = await attemptManager.createMission({ id: 'attempt-mission', workspaceId: profileWorkspace.id, title: 'Parallel research', teamTemplateId: 'profile-team-template' });
+    const workspaceResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' });
+    assert(workspaceResolution.source === 'workspace' && workspaceResolution.profile.id === workspaceBuilder.id
+      && workspaceResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.join(',') === 'catalog-safe',
+      'workspace binding wins resolution precedence and cannot broaden profile route allowlists');
+    const explicitResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder', profileId: globalBuilder.id });
+    assert(explicitResolution.source === 'explicit' && explicitResolution.profile.id === globalBuilder.id
+      && explicitResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.length === 2, 'explicit named profiles bypass lower-scope bindings without losing their identity');
+    await attemptManager.archiveAgentProfile(workspaceBuilder.id);
+    let archivedWorkspaceRejected = false;
+    try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' }); } catch { archivedWorkspaceRejected = true; }
+    assert(archivedWorkspaceRejected, 'archived workspace defaults fail closed instead of falling through');
+    await attemptManager.archiveAgentProfile(teamBuilder.id);
+    await attemptManager.unbindAgentProfile('binding-workspace-builder');
+    let archivedTeamRejected = false;
+    try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' }); } catch { archivedTeamRejected = true; }
+    assert(archivedTeamRejected, 'archived team defaults fail closed instead of falling through');
+    await attemptManager.archiveAgentProfile(globalBuilder.id);
+    await attemptManager.unbindAgentProfile('binding-team-builder');
+    let archivedGlobalRejected = false;
+    try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder', profileId: globalBuilder.id }); } catch { archivedGlobalRejected = true; }
+    assert(archivedGlobalRejected, 'archived explicit profiles fail closed');
+    assert((await attemptManager.listAgentProfiles()).length === 0 && (await attemptManager.listAgentProfiles({ includeArchived: true })).length === 3,
+      'Agent Profile archive is soft and hidden from active catalog reads');
+    let roleMutationRejected = false;
+    try { await attemptManager.updateAgentProfile(globalBuilder.id, { role: 'reviewer' }); } catch { roleMutationRejected = true; }
+    assert(roleMutationRejected, 'Agent Profile roles are immutable');
+    let wrongRoleRejected = false;
+    try { await attemptManager.bindAgentProfile({ scopeType: 'workspace', scopeId: 'attempt-workspace', profileId: globalBuilder.id, role: 'reviewer' }); } catch { wrongRoleRejected = true; }
+    assert(wrongRoleRejected, 'bindings reject wrong-role assignments');
+    sqlite.prepare('DELETE FROM agent_profile_bindings').run();
+    sqlite.prepare('DELETE FROM agent_profiles').run();
+    const attemptWorkspace = profileWorkspace;
     const attemptTasks = await Promise.all([0, 1, 2].map((index) => attemptManager.createTask({
       id: `attempt-task-${index}`,
       missionId: attemptMission.id,
       title: `Research ${index}`,
       assignedRole: 'researcher',
+      agentProfileId: index === 0 ? 'research-specialist' : undefined,
     })));
     const claimedAttempts = await Promise.all(attemptTasks.map((task, index) => attemptManager.claimTaskAttempt({
       taskId: task.id,
       missionId: attemptMission.id,
       agentInstanceId: `researcher-${index}`,
+      agentProfileId: index === 0 ? 'research-specialist' : undefined,
       leaseExpiresAt: '2026-08-30T01:05:00.000Z',
       now: '2026-08-30T01:00:00.000Z',
-      route: { adapterId: 'codex', provider: 'openai', accountProfileId: 'profile-explicit', modelCatalogId: 'catalog-explicit', runtimeModelId: 'gpt-5', reasoningLevel: 'high', source: 'explicit', selectionMode: 'fixed' },
+      route: { adapterId: 'codex', provider: 'openai', accountProfileId: 'profile-explicit', modelCatalogId: 'catalog-explicit', runtimeModelId: 'gpt-5', reasoningLevel: 'high', source: 'explicit', selectionMode: 'fixed', agentProfileId: index === 0 ? 'research-specialist' : undefined },
     })));
     assert(claimedAttempts.length === 3 && claimedAttempts.every((attempt) => attempt.attemptNumber === 1), 'parallel task attempts are claimed through a synchronous SQLite transaction');
+    assert(claimedAttempts[0].agentProfileId === 'research-specialist'
+      && attemptTasks[0].agentProfileId === 'research-specialist', 'agent profile identity is persisted on the task and its attempt snapshot');
     const retryAttempt = await attemptManager.claimTaskAttempt({
       taskId: attemptTasks[0].id,
       missionId: attemptMission.id,

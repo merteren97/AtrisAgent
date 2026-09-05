@@ -25,6 +25,12 @@ export function MissionStateStrip() {
   const projectedError = projectMissionError(visibleError, timeline);
   const lifecycle = projectMissionLifecycle(mission?.status || 'starting', { pending: Boolean(pendingMissionStart) });
   const title = mission?.title || pendingMissionStart?.request || 'New mission';
+  const attentionTask = activeTasks.find((task) => ['blocked', 'failed', 'rejected'].includes(task.status));
+  const attentionLabel = mission?.status === 'waiting_for_approval'
+    ? 'Approval needed in chat'
+    : attentionTask
+      ? `${mission?.status === 'blocked' ? 'Blocked' : 'Needs attention'}: ${attentionTask.title}`
+      : null;
 
   return (
     <section className="flex shrink-0 items-center gap-3 border-b border-border/70 bg-card/35 px-3 py-1.5" aria-label="Mission and connection status" role="status">
@@ -32,6 +38,13 @@ export function MissionStateStrip() {
         {title}
       </div>
       <div className="flex shrink-0 items-center gap-2 text-[10px] text-muted-foreground">
+        {attentionLabel && !visibleError ? (
+          <span className="flex max-w-80 items-center gap-1 truncate text-amber-400" title={attentionLabel} aria-label={attentionLabel}>
+            <AlertCircle className="h-3 w-3 shrink-0" />
+            <span className="truncate md:hidden">{mission?.status === 'waiting_for_approval' ? 'Approval' : 'Blocked'}</span>
+            <span className="hidden truncate md:inline">{attentionLabel}</span>
+          </span>
+        ) : null}
         {visibleError ? (
           <span className="flex max-w-72 items-center gap-1 truncate text-destructive" title={projectedError?.action || visibleError} role="alert">
             <AlertCircle className="h-3 w-3 shrink-0" />

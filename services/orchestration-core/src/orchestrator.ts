@@ -356,6 +356,7 @@ export class Orchestrator {
     title: string;
     assignedRole?: string | null;
     agentInstanceId?: string;
+    agentProfileId?: string | null;
     targetDescriptor?: BuilderTargetDescriptor;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
@@ -367,6 +368,7 @@ export class Orchestrator {
       title: params.title,
       assignedRole: params.assignedRole ?? null,
       agentInstanceId: params.agentInstanceId,
+      agentProfileId: params.agentProfileId || undefined,
       targetDescriptor: params.targetDescriptor,
       timestamp: new Date().toISOString(),
     });
@@ -377,6 +379,7 @@ export class Orchestrator {
     taskId: string;
     agentInstanceId?: string;
     role: string;
+    agentProfileId?: string | null;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
     this.emitEvent({
@@ -386,6 +389,7 @@ export class Orchestrator {
       taskId: params.taskId,
       agentInstanceId: params.agentInstanceId ?? '',
       role: params.role,
+      agentProfileId: params.agentProfileId || undefined,
       timestamp: new Date().toISOString(),
     });
   }
@@ -591,6 +595,82 @@ export class Orchestrator {
   }
 
   /**
+   * Persist a diagnostic terminal/non-progressing state before surfacing a
+   * preflight or scheduler error. Runtime event subscribers are intentionally
+   * best-effort, so an exception must not leave a mission looking runnable.
+   */
+  protected async transitionMissionDiagnostic(params: {
+    missionId: string;
+    reason: string;
+    status?: 'failed';
+    taskId?: string | null;
+  }): Promise<void> {
+    const status = params.status || 'failed';
+    const now = new Date().toISOString();
+    let mission: MissionSelect | null = null;
+    try {
+      mission = this.workspaceManager
+        ? await this.workspaceManager.getMission(params.missionId)
+        : this.inMemoryMissions.get(params.missionId) || null;
+    } catch (error) {
+      console.error('[Orchestrator] Failed to read mission while recording a diagnostic transition:', error);
+    }
+
+    // A nested error handler (for example assignTask inside reconciliation)
+    // may observe the same already-persisted state. Do not emit duplicate
+    // failure events in that case.
+    if (mission && (TERMINAL_MISSION_STATUSES.has(String(mission.status)) || mission.status === status)) return;
+
+    if (params.taskId) {
+      try {
+        const task = this.workspaceManager
+          ? await this.workspaceManager.getTask(params.taskId)
+          : this.inMemoryTasks.get(params.taskId) || null;
+        if (task && !TERMINAL_TASK_STATUSES.has(String(task.status)) && task.status !== 'blocked') {
+          if (this.workspaceManager) {
+            await this.workspaceManager.updateTask(params.taskId, { status: 'blocked', completedAt: null });
+          }
+          this.inMemoryTasks.set(params.taskId, {
+            ...task,
+            status: 'blocked',
+            completedAt: null,
+            updatedAt: now,
+          });
+        }
+      } catch (error) {
+        console.error('[Orchestrator] Failed to persist the task diagnostic state:', error);
+      }
+    }
+
+    try {
+      if (this.workspaceManager) {
+        await this.workspaceManager.updateMission(params.missionId, {
+          status,
+          completedAt: status === 'failed' ? now : null,
+        });
+      }
+    } catch (error) {
+      console.error('[Orchestrator] Failed to persist the mission diagnostic state:', error);
+    }
+
+    const cachedMission = this.inMemoryMissions.get(params.missionId);
+    if (cachedMission) {
+      this.inMemoryMissions.set(params.missionId, {
+        ...cachedMission,
+        status,
+        completedAt: status === 'failed' ? now : null,
+        updatedAt: now,
+      });
+    }
+
+    this.emitMissionFailed({
+      missionId: params.missionId,
+      reason: params.reason,
+      failedTaskId: params.taskId,
+    });
+  }
+
+  /**
    * Generate structured plan and repair if invalid.
    */
   generateStructuredPlan(request: string, modelOutput?: string): StructuredPlan {
@@ -613,6 +693,27 @@ export class Orchestrator {
    * mission is started again after a terminal turn, a new planId is created and
    * all execution decisions are scoped to that plan instead of reusing old tasks.
    */
+  protected async resolveTaskProfileIds(
+    missionId: string,
+    roles: AgentRole[],
+    requested: Partial<Record<AgentRole, string>> = {},
+  ): Promise<Partial<Record<AgentRole, string>>> {
+    const resolved: Partial<Record<AgentRole, string>> = {};
+    for (const role of new Set(roles)) {
+      const resolver = this.workspaceManager?.resolveAgentProfileForMission;
+      if (typeof resolver !== 'function') {
+        if (requested[role]) throw new Error('Named agent profiles require durable profile resolution.');
+        continue;
+      }
+      const result = await this.workspaceManager!.resolveAgentProfileForMission({ missionId, role, profileId: requested[role] });
+      if (result.profile.role !== role || (requested[role] && result.profile.id !== requested[role])) {
+        throw new Error(`Agent profile selection does not match fixed role '${role}'.`);
+      }
+      if (result.profile.id !== role) resolved[role] = result.profile.id;
+    }
+    return resolved;
+  }
+
   async startMission(
     missionId: string,
     request: string,
@@ -621,6 +722,8 @@ export class Orchestrator {
       reasoningLevel?: string;
       targetRole?: string;
       command?: string;
+      /** Trusted, pre-validated named profile selection keyed by fixed role. */
+      agentProfileIds?: Partial<Record<AgentRole, string>>;
       rawModelPlanOutput?: string;
       researchContextPlanId?: string;
     }
@@ -755,6 +858,9 @@ export class Orchestrator {
     }
 
     const createdTasks: TaskSelect[] = [];
+    // Resolve all roles before inserting any task, so invalid defaults cannot
+    // leave a partially materialized graph or launch a different specialist.
+    const agentProfileIds = await this.resolveTaskProfileIds(missionId, structuredPlan.tasks.map((task) => task.role), options?.agentProfileIds);
     const taskIndexToIds: Map<number, string[]> = new Map();
 
     // Allocate every task ID before resolving dependencies so forward edges
@@ -803,6 +909,7 @@ export class Orchestrator {
             status: 'planned',
             priority: taskSpec.priority,
             assignedRole: taskSpec.role,
+            agentProfileId: agentProfileIds[taskSpec.role],
             requiredCapabilities: taskSpec.requiredCapabilities,
             dependsOn: dependsOnTaskIds,
             worktreeId,
@@ -823,6 +930,7 @@ export class Orchestrator {
             dependsOn: dependsOnTaskIds,
             worktreeId,
             targetDescriptor: taskSpec.targetDescriptor ?? null,
+            agentProfileId: agentProfileIds[taskSpec.role] || null,
             createdAt: now,
             updatedAt: now,
             completedAt: null,
@@ -882,7 +990,11 @@ export class Orchestrator {
     const planDecision = currentAutomationPolicy
       ? resolveAutomationAction(currentAutomationPolicy.profile, 'plan', currentAutomationPolicy.overrides)
       : null;
-    if (planDecision === 'deny') throw new Error('Mission policy denies plan execution.');
+    if (planDecision === 'deny') {
+      const reason = 'Mission policy denies plan execution.';
+      await this.transitionMissionDiagnostic({ missionId, status: 'failed', reason });
+      throw new Error(reason);
+    }
     const autoApproved = planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
       'plan', `Approve execution plan with ${createdTasks.length} tasks for: ${request}`);
 
@@ -930,11 +1042,33 @@ export class Orchestrator {
     }
 
     // Start first ready task(s); a plan without roots was failed before Running.
+    // Target preflight and capacity resolution are part of dispatch. Any
+    // exception is persisted before it can be swallowed by an event subscriber.
     if (firstTasks.length > 0) {
-      const dispatchableFirstTasks = await this.capacityAllowedTasks(missionId, firstTasks);
-      console.info(`[Orchestrator] Mission ${missionId} plan ${planId} dispatching root task(s): ${dispatchableFirstTasks.map((task) => task.id).join(', ')}`);
-      for (const taskToStart of dispatchableFirstTasks) {
-        await this.assignTask(taskToStart.id, taskToStart.assignedRole ?? 'researcher');
+      try {
+        const dispatchableFirstTasks = await this.capacityAllowedTasks(missionId, firstTasks);
+        console.info(`[Orchestrator] Mission ${missionId} plan ${planId} dispatching root task(s): ${dispatchableFirstTasks.map((task) => task.id).join(', ')}`);
+        for (const taskToStart of dispatchableFirstTasks) {
+          try {
+            await this.assignTask(taskToStart.id, taskToStart.assignedRole ?? 'researcher');
+          } catch (error) {
+            await this.transitionMissionDiagnostic({
+              missionId,
+              taskId: taskToStart.id,
+              status: 'failed',
+              reason: `Initial task dispatch failed before execution for task ${taskToStart.id}: ${error instanceof Error ? error.message : String(error)}`,
+            });
+            throw error;
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        await this.transitionMissionDiagnostic({
+          missionId,
+          status: 'failed',
+          reason: `Mission dispatch failed before execution: ${reason}`,
+        });
+        throw error;
       }
     }
 
@@ -961,7 +1095,17 @@ export class Orchestrator {
 
     const roleToAssign = agentRole ?? task?.assignedRole ?? 'builder';
     if (this.workspaceManager && task && roleToAssign === 'builder') {
-      await this.workspaceManager.preflightTaskTarget?.(taskId);
+      try {
+        await this.workspaceManager.preflightTaskTarget?.(taskId);
+      } catch (error) {
+        await this.transitionMissionDiagnostic({
+          missionId: task.missionId,
+          taskId,
+          status: 'failed',
+          reason: `Builder target preflight failed before execution for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        throw error;
+      }
     }
     const agentInstanceId = crypto.randomUUID();
 
@@ -992,6 +1136,7 @@ export class Orchestrator {
       taskId,
       role: roleToAssign,
       agentInstanceId,
+      agentProfileId: task?.agentProfileId,
     });
 
     this.emitEvent({
@@ -1000,6 +1145,7 @@ export class Orchestrator {
       missionId,
       agentInstanceId,
       role: roleToAssign,
+      agentProfileId: task?.agentProfileId || undefined,
       displayName: `${displayRole} Agent`,
       spawnReason: `Orchestrator scheduled task: ${title}`,
       taskId,
@@ -1013,6 +1159,7 @@ export class Orchestrator {
       title,
       assignedRole: roleToAssign,
       agentInstanceId,
+      agentProfileId: task?.agentProfileId,
       targetDescriptor: task?.targetDescriptor ?? undefined,
     });
 
@@ -1029,6 +1176,7 @@ export class Orchestrator {
       priority: 'medium',
       assignedAgentId: agentInstanceId,
       assignedRole: roleToAssign,
+      agentProfileId: null,
       requiredCapabilities: [],
       dependsOn: [],
       worktreeId: null,

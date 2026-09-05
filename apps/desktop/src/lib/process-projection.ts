@@ -18,13 +18,21 @@ export interface ProcessStreamItem {
   id: string;
   timestamp: string;
   category: ProcessCategory;
+  eventType: string;
   label: string;
   content: string;
+  outcome?: string;
 }
 
 const TOOL_EVENTS = new Set(['agent_tool_call', 'tool_call_started', 'tool_call_completed', 'process_tool_started', 'process_tool_completed']);
 const OUTPUT_EVENTS = new Set(['text_delta', 'agent_thought', 'agent_progressed', 'process_output_delta']);
 const ERROR_EVENTS = new Set(['agent_error', 'task_failed', 'process_failed']);
+const TERMINAL_SUCCESS_EVENTS = new Set(['task_completed', 'agent_completed', 'runtime_telemetry', 'completed']);
+
+function isSuccessfulTerminal(item: ProcessStreamItem): boolean {
+  return TERMINAL_SUCCESS_EVENTS.has(item.eventType)
+    && (item.eventType !== 'runtime_telemetry' || item.outcome !== 'failed');
+}
 
 function metadataString(item: TimelineItem, key: string): string | undefined {
   const value = item.metadata?.[key];
@@ -42,7 +50,9 @@ function streamItem(item: TimelineItem): ProcessStreamItem {
   return {
     id: item.id,
     timestamp,
-    category: ERROR_EVENTS.has(eventType)
+    eventType,
+    outcome: metadataString(item, 'outcome'),
+    category: ERROR_EVENTS.has(eventType) || (eventType === 'runtime_telemetry' && metadataString(item, 'outcome') === 'failed')
       ? 'error'
       : TOOL_EVENTS.has(eventType)
         ? 'tool'
@@ -58,6 +68,12 @@ function appendStreamItem(stream: ProcessStreamItem[], item: ProcessStreamItem):
   const previous = stream[stream.length - 1];
   if (previous && previous.category === 'output' && item.category === 'output' && previous.label === item.label) {
     previous.content += item.content;
+    return;
+  }
+  if (previous && isSuccessfulTerminal(previous) && isSuccessfulTerminal(item)) {
+    previous.eventType = 'completed';
+    previous.label = 'completed';
+    if (item.eventType === 'agent_completed' && item.content.trim()) previous.content = item.content;
     return;
   }
   stream.push(item);

@@ -54,6 +54,14 @@ assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('a
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_resource_leases_active_resource'").get() as { count: number }).count, 1);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'agent_messages'").get() as { count: number }).count, 1);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_instances') WHERE name IN ('task_id', 'parent_agent_id', 'display_name', 'specialty', 'spawn_reason', 'status_message', 'progress', 'workspace_mode', 'started_at', 'completed_at')").get() as { count: number }).count, 10);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_instances') WHERE name = 'profile_id'").get() as { count: number }).count, 1);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_instances') WHERE name = 'agent_profile_id'").get() as { count: number }).count, 1);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('tasks') WHERE name = 'agent_profile_id'").get() as { count: number }).count, 1);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('task_attempts') WHERE name = 'agent_profile_id'").get() as { count: number }).count, 1);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('agent_profiles', 'agent_profile_bindings')").get() as { count: number }).count, 2);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_profiles') WHERE name IN ('id', 'name', 'role', 'instructions', 'capabilities', 'specialty', 'description', 'route_policy', 'allowed_route_policy', 'is_default', 'archived_at', 'created_at', 'updated_at')").get() as { count: number }).count, 13);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_profile_bindings') WHERE name IN ('id', 'scope_type', 'scope_id', 'role', 'profile_id', 'override', 'is_default', 'created_at', 'updated_at')").get() as { count: number }).count, 9);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name IN ('idx_agent_profiles_role_default', 'idx_agent_profile_bindings_scope_role_profile', 'idx_agent_profile_bindings_scope_role_default')").get() as { count: number }).count, 3);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('task_attempts') WHERE name IN ('runtime_session_id', 'heartbeat_at', 'lease_expires_at', 'retryable', 'claimed_at')").get() as { count: number }).count, 5);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('task_attempts') WHERE name IN ('route_adapter_id', 'route_provider', 'route_account_profile_id', 'route_model_catalog_id', 'route_runtime_model_id', 'route_reasoning_level', 'route_source', 'route_selection_mode', 'provider_session_id')").get() as { count: number }).count, 9);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('team_templates') WHERE name IN ('max_parallel_agents', 'worker_pools')").get() as { count: number }).count, 2);
@@ -77,6 +85,26 @@ assert.equal((sqlite.prepare("SELECT status FROM approvals WHERE id = 'approval-
 assert.throws(() => sqlite.prepare(`INSERT INTO mission_events
   (id, mission_id, type, payload, sequence, schema_version, created_at) VALUES ('duplicate-sequence', 'mission-1', 'x', '{}', 1, 1, 'now')`).run());
 
+sqlite.prepare(`INSERT INTO agent_profiles
+  (id, name, role, instructions, capabilities, is_default, created_at, updated_at)
+  VALUES ('global-builder', 'Global Builder', 'builder', '', '[]', 1, 'now', 'now')`).run();
+assert.throws(() => sqlite.prepare(`INSERT INTO agent_profiles
+  (id, name, role, instructions, capabilities, is_default, created_at, updated_at)
+  VALUES ('second-builder', 'Second Builder', 'builder', '', '[]', 1, 'now', 'now')`).run());
+sqlite.prepare(`INSERT INTO agent_profile_bindings
+  (id, scope_type, scope_id, role, profile_id, is_default, created_at, updated_at)
+  VALUES ('workspace-builder', 'workspace', 'workspace-1', 'builder', 'global-builder', 1, 'now', 'now')`).run();
+assert.throws(() => sqlite.prepare(`INSERT INTO agent_profile_bindings
+  (id, scope_type, scope_id, role, profile_id, is_default, created_at, updated_at)
+  VALUES ('workspace-builder-2', 'workspace', 'workspace-1', 'builder', 'global-builder', 1, 'now', 'now')`).run());
+assert.throws(() => sqlite.prepare(`INSERT INTO agent_profile_bindings
+  (id, scope_type, scope_id, role, profile_id, is_default, created_at, updated_at)
+  VALUES ('wrong-role-binding', 'workspace', 'workspace-1', 'reviewer', 'global-builder', 0, 'now', 'now')`).run());
+assert.throws(() => sqlite.prepare("UPDATE agent_profiles SET role = 'reviewer' WHERE id = 'global-builder'").run());
+sqlite.prepare("DELETE FROM missions WHERE id = 'mission-1'").run();
+sqlite.prepare("DELETE FROM workspaces WHERE id = 'workspace-1'").run();
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM agent_profiles WHERE id = 'global-builder'").get() as { count: number }).count, 1);
+
 sqlite.close();
 
 const sqliteWithoutApprovals = new Database(':memory:');
@@ -90,6 +118,7 @@ sqliteWithoutApprovals.exec(`
 `);
 assert.doesNotThrow(() => migrateDatabase(sqliteWithoutApprovals as any));
 assert.equal(sqliteWithoutApprovals.pragma('user_version', { simple: true }), DATABASE_SCHEMA_VERSION);
+assert.equal((sqliteWithoutApprovals.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('agent_profiles', 'agent_profile_bindings')").get() as { count: number }).count, 2);
 sqliteWithoutApprovals.close();
 
 console.log('[PASS] migrations preserve data, backfill stable sequences, enforce uniqueness, and are idempotent');

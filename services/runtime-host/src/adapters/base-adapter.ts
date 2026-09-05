@@ -40,6 +40,13 @@ export interface SpawnAgentOptions {
   mcpServerScript?: string;
   mcpConfigPath?: string;
   profileId?: string;
+  /** Optional named profile metadata; account profileId remains provider routing identity. */
+  agentProfileId?: string;
+  profileName?: string;
+  specialty?: string;
+  profileInstructions?: string;
+  profileCapabilities?: string[];
+  allowedRoutePolicy?: Record<string, unknown>;
   providerSessionId?: string;
   preserveProviderSession?: boolean;
 }

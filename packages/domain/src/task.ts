@@ -63,6 +63,8 @@ export interface Task {
   priority: TaskPriority;
   assignedAgentId: string | null;
   assignedRole: AgentRole | null;
+  /** Named profile selected for this task; assignedRole remains authoritative. */
+  agentProfileId?: string | null;
   requiredCapabilities: string[];
   dependsOn: string[]; // task IDs
   worktreeId: string | null;
@@ -82,6 +84,7 @@ export interface EffectiveAttemptRoute {
   reasoningLevel?: CanonicalReasoning | null;
   source: RoutingPreferenceSource;
   selectionMode: RouteSelectionMode;
+  agentProfileId?: string | null;
 }
 
 export interface TaskDependency {
@@ -94,6 +97,8 @@ export interface TaskAttempt {
   taskId: string;
   missionId: string;
   agentInstanceId: string;
+  /** Named profile selected for this attempt; assigned role remains authoritative. */
+  agentProfileId?: string | null;
   attemptNumber: number;
   status: 'claimed' | 'running' | 'completed' | 'failed' | 'cancelled' | 'expired' | 'reviewing' | 'verified' | 'applied';
   worktreePath?: string | null;

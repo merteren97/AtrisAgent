@@ -69,6 +69,13 @@ export interface TaskCreated extends BaseEvent {
   assignedRole: string | null;
   agentInstanceId?: string;
   parentAgentId?: string | null;
+  /** Named profile identity; assignedRole remains the fixed security boundary. */
+  profileId?: string;
+  /** Canonical named profile identity; profileId is a compatibility alias. */
+  agentProfileId?: string;
+  /** Optional inline profile metadata for trusted producers. */
+  profile?: Record<string, unknown>;
+  agentProfile?: Record<string, unknown>;
   displayName?: string;
   specialty?: string;
   spawnReason?: string;
@@ -89,6 +96,7 @@ export interface TaskAssigned extends BaseEvent {
   taskId: string;
   agentInstanceId: string;
   role: string;
+  agentProfileId?: string;
 }
 
 export interface TaskClaimed extends BaseEvent {
@@ -96,6 +104,7 @@ export interface TaskClaimed extends BaseEvent {
   taskId: string;
   agentInstanceId: string;
   worktreePath?: string | null;
+  agentProfileId?: string;
 }
 
 export interface TaskSplit extends BaseEvent {
@@ -118,6 +127,8 @@ export interface AgentStarted extends BaseEvent {
   role: string;
   model: string;
   parentAgentId?: string | null;
+  profileId?: string;
+  agentProfileId?: string;
   displayName?: string;
   specialty?: string;
   spawnReason?: string;
@@ -130,6 +141,8 @@ export interface AgentSpawned extends BaseEvent {
   agentInstanceId: string;
   parentAgentId?: string | null;
   role: string;
+  profileId?: string;
+  agentProfileId?: string;
   displayName: string;
   specialty?: string;
   spawnReason: string;
@@ -196,6 +209,7 @@ export interface AgentCompleted extends BaseEvent {
   type: 'agent_completed';
   agentInstanceId: string;
   summary?: string;
+  agentProfileId?: string;
 }
 
 export interface AgentCancelled extends BaseEvent {
@@ -203,6 +217,7 @@ export interface AgentCancelled extends BaseEvent {
   agentInstanceId: string;
   taskId?: string | null;
   reason?: string;
+  agentProfileId?: string;
 }
 
 export interface TextDelta extends BaseEvent {
@@ -409,6 +424,7 @@ export interface TaskCompleted extends BaseEvent {
   taskId: string;
   result?: string;
   agentInstanceId?: string;
+  agentProfileId?: string;
 }
 
 export interface TaskFailed extends BaseEvent {
@@ -417,6 +433,7 @@ export interface TaskFailed extends BaseEvent {
   error: string;
   exitCode?: number | null;
   agentInstanceId?: string;
+  agentProfileId?: string;
 }
 
 export interface AgentThought extends BaseEvent {
@@ -442,6 +459,7 @@ export interface AgentError extends BaseEvent {
   taskId: string;
   error: string;
   agentInstanceId?: string;
+  agentProfileId?: string;
 }
 
 export interface RuntimeTelemetry extends BaseEvent {
@@ -450,6 +468,10 @@ export interface RuntimeTelemetry extends BaseEvent {
   agentInstanceId: string;
   adapterId: string;
   accountProfileId?: string;
+  profileId?: string;
+  agentProfileId?: string;
+  profileName?: string;
+  profileSource?: string;
   attemptId?: string;
   outcome: 'completed' | 'failed';
   usageAvailable: boolean;

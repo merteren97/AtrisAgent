@@ -38,6 +38,7 @@ interface SupervisorSession {
   adapterId: RuntimeType;
   providerSessionId: string;
   profileId?: string;
+  agentProfileId?: string;
   cwd: string;
   busy: boolean;
   lastUsedAt: number;
@@ -193,6 +194,15 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   }
 
   async runSupervisorTurn(request: SupervisorTurnRuntimeRequest): Promise<string> {
+    const persistedSupervisor = await this.v2WorkspaceManager?.getLatestSupervisorSessionMetadata(request.missionId);
+    const agentProfileId = String(request.agentProfileId || request.profileId || persistedSupervisor?.agentProfileId || '').trim() || undefined;
+    const agentProfile = await this.resolveAgentProfileForDispatch({
+      missionId: request.missionId,
+      role: 'orchestrator',
+      profileId: agentProfileId,
+      explicitProfile: request.agentProfile || request.profile,
+    });
+    const profilePreference = this.profileRoutingPreference(agentProfile.profile, agentProfile.source);
     const preference = await this.resolveSupervisorPreference(request.missionId);
     const mergedPreference: EffectiveRoutingPreference | undefined = request.modelCatalogId
       || request.accountProfileId
@@ -206,16 +216,18 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
           selectionMode: request.selectionMode || preference?.selectionMode || (request.modelCatalogId ? 'fixed' : 'prefer'),
           source: 'explicit',
         }
-      : preference;
+      : preference || profilePreference;
 
     const profileManager = this.getAccountProfileManager();
     const catalog = this.getModelCatalogService();
     const connectedProfiles = (await profileManager.getProfiles()).filter((profile) => profile.authStatus === 'connected');
-    const profiles = mergedPreference
+    const routedProfiles = mergedPreference
       ? connectedProfiles
       : connectedProfiles.filter((profile) => profile.schedulerAuto !== false);
+    const constrainedCached = this.constrainProfileRoutes(agentProfile.profile, routedProfiles, catalog.getCachedCatalog());
+    const profiles = constrainedCached.profiles;
 
-    let models = catalog.getCachedCatalog().filter((model) => profiles.some((profile) => profile.id === model.accountProfileId));
+    let models = constrainedCached.models;
     const requiredCatalogIds = new Set([
       ...(mergedPreference?.modelCatalogId ? [mergedPreference.modelCatalogId] : []),
       ...(mergedPreference?.fallbackCatalogIds || []),
@@ -229,10 +241,11 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     ) {
       models = await catalog.discoverLiveModels(profiles);
     }
+    models = this.constrainProfileRoutes(agentProfile.profile, profiles, models).models;
 
     const workerRequest: WorkerRequest = {
       role: 'orchestrator',
-      capabilities: ['planning', 'evaluation', 'delegation', 'conversation'],
+      capabilities: [...new Set(['planning', 'evaluation', 'delegation', 'conversation', ...agentProfile.profile.capabilities])],
       task: request.prompt,
       priority: 'high',
       requiresWorktree: false,
@@ -257,6 +270,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     let continuityRejected = false;
     if (continuity?.busy) throw new Error('A supervisor turn is already in flight for this conversation.');
     if (continuity && (continuity.adapterId !== route.adapterId || continuity.profileId !== route.profile?.id
+      || continuity.agentProfileId !== agentProfile.profile.id
       || !(await continuity.adapter.probeProviderSession(continuity.providerSessionId, { profileId: continuity.profileId, cwd: continuity.cwd })))) {
       await this.discardSupervisorSession(request.missionId);
       continuity = undefined;
@@ -267,13 +281,15 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     if (route.profile) adapter.configureProfile(route.profile);
     const capabilities = adapter.getSessionContinuityCapabilities();
     if (!continuity && !continuityRejected && capabilities.resumeAfterRestart) {
-      const persisted = await this.v2WorkspaceManager?.getLatestSupervisorSessionMetadata(request.missionId);
+      const persisted = persistedSupervisor;
       if (persisted?.providerSessionId && persisted.resumeCapability === 'restart'
         && persisted.route.adapterId === route.adapterId
+        && persisted.route.accountProfileId === route.profile?.id
+        && (persisted.agentProfileId || 'orchestrator') === agentProfile.profile.id
         && await adapter.probeProviderSession(persisted.providerSessionId, { profileId: route.profile?.id, cwd })) {
         continuity = {
           adapter, adapterId: route.adapterId as RuntimeType, providerSessionId: persisted.providerSessionId,
-          profileId: route.profile?.id, cwd, busy: false, lastUsedAt: Date.now(),
+          profileId: route.profile?.id, agentProfileId: agentProfile.profile.id, cwd, busy: false, lastUsedAt: Date.now(),
         };
         this.supervisorSessions.set(request.missionId, continuity);
       }
@@ -374,16 +390,26 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
 
     try {
       try {
-        emitObservation({ type: 'process_started', model: route.model?.displayName || route.model?.runtimeModelId, phase: 'turn' });
+        emitObservation({ type: 'process_started', model: route.model?.displayName || route.model?.runtimeModelId, phase: 'turn', agentProfileId: agentProfile.profile.id, agentProfileName: agentProfile.profile.name });
         const spawned = await adapter.spawnAgent({
           sessionId,
           taskId: syntheticTaskId,
           missionId: syntheticMissionId,
-          prompt: request.prompt,
+          prompt: [
+            `Agent profile: ${agentProfile.profile.name}${agentProfile.profile.specialty ? ` (${agentProfile.profile.specialty})` : ''}`,
+            agentProfile.profile.instructions ? `Profile instructions:\n${agentProfile.profile.instructions}` : undefined,
+            request.prompt,
+          ].filter(Boolean).join('\n\n'),
           role: 'orchestrator',
           model: route.model?.runtimeModelId,
           reasoningLevel: route.reasoningLevel,
           profileId: route.profile?.id,
+          agentProfileId: agentProfile.profile.id,
+          profileName: agentProfile.profile.name,
+          specialty: agentProfile.profile.specialty,
+          profileInstructions: agentProfile.profile.instructions,
+          profileCapabilities: agentProfile.profile.capabilities,
+          allowedRoutePolicy: (agentProfile.profile.allowedRoutePolicy || agentProfile.profile.routePolicy) as Record<string, unknown> | undefined,
           isolated: false,
           cwd,
           enableCoordinationMcp: false,
@@ -393,12 +419,15 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
         if (capabilities.reuseWhileAlive) {
           const reusable = continuity || {
             adapter, adapterId: route.adapterId as RuntimeType, providerSessionId: spawned.runtimeSessionId || spawned.id,
-            profileId: route.profile?.id, cwd, busy: true, lastUsedAt: Date.now(),
+            profileId: route.profile?.id, agentProfileId: agentProfile.profile.id, cwd, busy: true, lastUsedAt: Date.now(),
           };
           this.supervisorSessions.set(request.missionId, reusable);
           continuity = reusable;
           await this.v2WorkspaceManager?.saveSupervisorSessionMetadata(request.turnId, {
             providerSessionId: reusable.providerSessionId,
+            agentProfileId: agentProfile.profile.id,
+            agentProfileName: agentProfile.profile.name,
+            agentProfileSource: agentProfile.source,
             resumeCapability: capabilities.resumeAfterRestart ? 'restart' : 'live',
             route: {
               adapterId: route.adapterId, provider: route.profile?.provider, accountProfileId: route.profile?.id,
@@ -417,6 +446,9 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
               reasoningLevel: route.reasoningLevel, source: mergedPreference?.source || 'scheduler',
               selectionMode: mergedPreference?.selectionMode || 'auto',
             },
+            agentProfileId: agentProfile.profile.id,
+            agentProfileName: agentProfile.profile.name,
+            agentProfileSource: agentProfile.source,
             updatedAt: new Date().toISOString(),
           });
         }

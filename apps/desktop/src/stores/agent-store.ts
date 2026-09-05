@@ -50,14 +50,52 @@ function mergeDefined<T extends object>(current: T, patch: Partial<T>): T {
   return { ...current, ...defined };
 }
 
+const TERMINAL_AGENT_STATUSES = new Set<AgentStatus>(['completed', 'failed', 'cancelled']);
+
+function mergeAgent(current: AgentInstance, patch: Partial<AgentInstance>): AgentInstance {
+  // Agent IDs identify attempts. A retry gets a new ID; buffered progress or
+  // duplicate startup events must not revive an already terminal attempt.
+  if (TERMINAL_AGENT_STATUSES.has(current.status) && patch.status && !TERMINAL_AGENT_STATUSES.has(patch.status)) return current;
+  return mergeDefined(current, patch);
+}
+
 function applyEvent(map: Map<string, AgentInstance>, missionId: string, event: Record<string, any>): void {
   const agentId = event.agentInstanceId as string | undefined;
   const existing = agentId ? map.get(agentId) : undefined;
   const timestamp = event.timestamp as string | undefined;
 
+  // Durable replay can contain assignment/task records before the runtime
+  // startup event (or when startup was emitted while the desktop was offline).
+  // Keep the assigned role visible so later agents are not lost on hydration.
+  if ((event.type === 'task_assigned' || event.type === 'task_created') && agentId && !existing) {
+    const role = event.role || event.assignedRole;
+    if (typeof role === 'string' && role.trim()) {
+      map.set(agentId, {
+        id: agentId,
+        missionId,
+        role,
+        model: event.model || event.modelCatalogId || 'Scheduler selected',
+        status: 'idle',
+        parentAgentId: event.parentAgentId ?? null,
+        displayName: event.displayName || defaultName(role),
+        specialty: event.specialty,
+        taskId: event.taskId ?? null,
+        spawnReason: event.spawnReason,
+        workspaceMode: event.workspaceMode,
+        progress: 0,
+        unreadMessages: 0,
+        createdAt: timestamp,
+        lastActivityAt: timestamp,
+      });
+      return;
+    }
+  }
+
   // Cancellation is terminal for the local projection even if a buffered
   // runtime event is replayed after the process was asked to stop.
   if (existing?.status === 'cancelled' && event.type !== 'agent_cancelled') return;
+  if (existing && TERMINAL_AGENT_STATUSES.has(existing.status)
+    && ['agent_spawned', 'agent_started', 'agent_progressed', 'agent_waiting', 'agent_resumed'].includes(event.type)) return;
 
   if (event.type === 'agent_spawned' && agentId) {
     map.set(agentId, {
@@ -131,7 +169,7 @@ function applyEvent(map: Map<string, AgentInstance>, missionId: string, event: R
     map.set(agentId, { ...existing, status: 'waiting', statusMessage: event.reason, lastActivityAt: timestamp });
   } else if (event.type === 'agent_resumed') {
     map.set(agentId, { ...existing, status: 'running', statusMessage: event.reason || 'Resumed', lastActivityAt: timestamp });
-  } else if (event.type === 'agent_completed') {
+  } else if (event.type === 'agent_completed' || event.type === 'task_completed') {
     map.set(agentId, { ...existing, status: 'completed', statusMessage: event.summary || 'Completed', progress: 100, completedAt: timestamp, lastActivityAt: timestamp });
   } else if (event.type === 'agent_error') {
     map.set(agentId, { ...existing, statusMessage: event.error || 'Runtime diagnostic', lastActivityAt: timestamp });
@@ -167,17 +205,17 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     const exists = state.agents.some((item) => item.id === agent.id);
     return {
       agents: exists
-        ? state.agents.map((item) => item.id === agent.id ? mergeDefined(item, agent) : item)
+        ? state.agents.map((item) => item.id === agent.id ? mergeAgent(item, agent) : item)
         : [...state.agents, agent],
     };
   }),
 
   patchAgent: (id, patch) => set((state) => ({
-    agents: state.agents.map((agent) => agent.id === id ? mergeDefined(agent, patch) : agent),
+    agents: state.agents.map((agent) => agent.id === id ? mergeAgent(agent, patch) : agent),
   })),
 
   updateAgentStatus: (id, status) => set((state) => ({
-    agents: state.agents.map((agent) => agent.id === id ? { ...agent, status } : agent),
+    agents: state.agents.map((agent) => agent.id === id ? mergeAgent(agent, { status }) : agent),
   })),
 
   removeAgent: (id) => set((state) => ({

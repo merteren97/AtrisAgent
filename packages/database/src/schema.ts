@@ -13,6 +13,9 @@ import type {
   ApprovalStatus,
   ArtifactType,
   CanonicalReasoning,
+  AgentProfileRoutePolicy,
+  AgentProfileBindingOverride,
+  AgentProfileScopeType,
 } from '@atris-agent-code/domain';
 
 export const workspaces = sqliteTable('workspaces', {
@@ -117,6 +120,8 @@ export const tasks = sqliteTable('tasks', {
   priority: text('priority').$type<TaskPriority>().notNull().default('medium'),
   assignedAgentId: text('assigned_agent_id'),
   assignedRole: text('assigned_role').$type<AgentRole>(),
+  /** Canonical named profile identity; assignedRole remains authoritative. */
+  agentProfileId: text('agent_profile_id'),
   requiredCapabilities: text('required_capabilities', { mode: 'json' }).$type<string[]>().notNull(),
   dependsOn: text('depends_on', { mode: 'json' }).$type<string[]>().notNull(),
   worktreeId: text('worktree_id'),
@@ -145,6 +150,8 @@ export const taskAttempts = sqliteTable('task_attempts', {
     .notNull()
     .references(() => missions.id, { onDelete: 'cascade' }),
   agentInstanceId: text('agent_instance_id').notNull(),
+  /** Snapshot of the named profile used for this attempt. */
+  agentProfileId: text('agent_profile_id'),
   attemptNumber: integer('attempt_number').notNull().default(1),
   status: text('status').$type<import('@atris-agent-code/domain').TaskAttempt['status']>().notNull().default('running'),
   worktreePath: text('worktree_path'),
@@ -199,12 +206,42 @@ export const modelProfiles = sqliteTable('model_profiles', {
   isSubscription: integer('is_subscription', { mode: 'boolean' }).default(false),
 });
 
+/**
+ * Global, reusable Agent Profile catalog. Scope is represented by
+ * agentProfileBindings below so deleting a workspace or team template never
+ * deletes the profile itself.
+ */
+export const agentProfiles = sqliteTable('agent_profiles', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  role: text('role').$type<AgentRole>().notNull(),
+  instructions: text('instructions').notNull().default(''),
+  capabilities: text('capabilities', { mode: 'json' }).$type<string[]>().notNull().default([]),
+  specialty: text('specialty'),
+  description: text('description'),
+  routePolicy: text('route_policy', { mode: 'json' }).$type<AgentProfileRoutePolicy>(),
+  allowedRoutePolicy: text('allowed_route_policy', { mode: 'json' }).$type<AgentProfileRoutePolicy>(),
+  isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  archivedAt: text('archived_at'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => ({
+  /** At most one active global default may exist for each fixed role. */
+  roleDefaultUnique: uniqueIndex('idx_agent_profiles_role_default')
+    .on(table.role)
+    .where(sql`${table.isDefault} = 1 AND ${table.archivedAt} IS NULL`),
+}));
+
 export const agentInstances = sqliteTable('agent_instances', {
   id: text('id').primaryKey(),
   missionId: text('mission_id')
     .notNull()
     .references(() => missions.id, { onDelete: 'cascade' }),
   role: text('role').$type<AgentRole>().notNull(),
+  /** Named profile identity; role remains the fixed security boundary. */
+  profileId: text('profile_id'),
+  /** Canonical named profile identity; profileId is retained for legacy rows. */
+  agentProfileId: text('agent_profile_id'),
   modelProfileId: text('model_profile_id').default(''),
   accountProfileId: text('account_profile_id').default(''),
   runtimeAdapterId: text('runtime_adapter_id').default(''),
@@ -258,6 +295,34 @@ export const teamRoles = sqliteTable('team_roles', {
   defaultCapabilities: text('default_capabilities', { mode: 'json' }).$type<string[]>().notNull(),
   accessLevel: text('access_level').notNull().default('read'),
 });
+
+/**
+ * Reusable profile bindings for global, workspace and team-template scopes. The
+ * scopeId is deliberately not a foreign key: old databases may not have one
+ * of the scope tables yet, and orphaned bindings are harmless while the
+ * global catalog remains durable. WorkspaceManager resolves only live scopes.
+ */
+export const agentProfileBindings = sqliteTable('agent_profile_bindings', {
+  id: text('id').primaryKey(),
+  scopeType: text('scope_type').$type<AgentProfileScopeType>().notNull(),
+  scopeId: text('scope_id').notNull(),
+  role: text('role').$type<AgentRole>().notNull(),
+  profileId: text('profile_id')
+    .notNull()
+    .references(() => agentProfiles.id, { onDelete: 'restrict' }),
+  override: text('override', { mode: 'json' }).$type<AgentProfileBindingOverride>(),
+  isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => ({
+  /** A profile is bound at most once for a role in a given scope. */
+  scopeRoleProfileUnique: uniqueIndex('idx_agent_profile_bindings_scope_role_profile')
+    .on(table.scopeType, table.scopeId, table.role, table.profileId),
+  /** At most one active default may exist per fixed role and scope. */
+  scopeRoleDefaultUnique: uniqueIndex('idx_agent_profile_bindings_scope_role_default')
+    .on(table.scopeType, table.scopeId, table.role)
+    .where(sql`${table.isDefault} = 1`),
+}));
 
 export const resourceLeases = sqliteTable('resource_leases', {
   id: text('id').primaryKey(),
@@ -482,6 +547,12 @@ export type AccountProfileInsert = typeof accountProfiles.$inferInsert;
 
 export type ModelProfileSelect = typeof modelProfiles.$inferSelect;
 export type ModelProfileInsert = typeof modelProfiles.$inferInsert;
+
+export type AgentProfileSelect = typeof agentProfiles.$inferSelect;
+export type AgentProfileInsert = typeof agentProfiles.$inferInsert;
+
+export type AgentProfileBindingSelect = typeof agentProfileBindings.$inferSelect;
+export type AgentProfileBindingInsert = typeof agentProfileBindings.$inferInsert;
 
 export type TeamTemplateSelect = typeof teamTemplates.$inferSelect;
 export type TeamTemplateInsert = typeof teamTemplates.$inferInsert;

@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 17;
+export const DATABASE_SCHEMA_VERSION = 20;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -393,5 +393,145 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
       }
     }
     sqlite.exec('PRAGMA user_version = 17');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 18) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'agent_instances') && !hasColumn(sqlite, 'agent_instances', 'profile_id')) {
+      sqlite.exec('ALTER TABLE agent_instances ADD COLUMN profile_id TEXT');
+    }
+    sqlite.exec('PRAGMA user_version = 18');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 19) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'agent_instances') && !hasColumn(sqlite, 'agent_instances', 'agent_profile_id')) {
+      sqlite.exec('ALTER TABLE agent_instances ADD COLUMN agent_profile_id TEXT');
+    }
+    if (hasTable(sqlite, 'tasks') && !hasColumn(sqlite, 'tasks', 'agent_profile_id')) {
+      sqlite.exec('ALTER TABLE tasks ADD COLUMN agent_profile_id TEXT');
+    }
+    if (hasTable(sqlite, 'task_attempts') && !hasColumn(sqlite, 'task_attempts', 'agent_profile_id')) {
+      sqlite.exec('ALTER TABLE task_attempts ADD COLUMN agent_profile_id TEXT');
+    }
+    sqlite.exec('PRAGMA user_version = 19');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 20) sqlite.transaction(() => {
+    // Agent Profiles are global catalog records. Scope is held by the binding
+    // table below rather than by a workspace/team foreign key, so catalog
+    // records survive deletion of either scope.
+    if (!hasTable(sqlite, 'agent_profiles')) {
+      sqlite.exec(`CREATE TABLE agent_profiles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('orchestrator', 'builder', 'reviewer', 'researcher', 'qa')),
+        instructions TEXT NOT NULL DEFAULT '',
+        capabilities TEXT NOT NULL DEFAULT '[]',
+        specialty TEXT,
+        description TEXT,
+        route_policy TEXT,
+        allowed_route_policy TEXT,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        archived_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`);
+    } else {
+      const columns: Array<[string, string]> = [
+        ['name', "TEXT NOT NULL DEFAULT ''"],
+        ['role', "TEXT NOT NULL DEFAULT 'builder'"],
+        ['instructions', "TEXT NOT NULL DEFAULT ''"],
+        ['capabilities', "TEXT NOT NULL DEFAULT '[]'"],
+        ['specialty', 'TEXT'],
+        ['description', 'TEXT'],
+        ['route_policy', 'TEXT'],
+        ['allowed_route_policy', 'TEXT'],
+        ['is_default', 'INTEGER NOT NULL DEFAULT 0'],
+        ['archived_at', 'TEXT'],
+        ['created_at', "TEXT NOT NULL DEFAULT ''"],
+        ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+      ];
+      for (const [name, definition] of columns) {
+        if (!hasColumn(sqlite, 'agent_profiles', name)) sqlite.exec(`ALTER TABLE agent_profiles ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    sqlite.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_role_default
+        ON agent_profiles(role) WHERE is_default = 1 AND archived_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_agent_profiles_role_active
+        ON agent_profiles(role, archived_at, created_at);
+      CREATE TRIGGER IF NOT EXISTS trg_agent_profiles_role_immutable
+        BEFORE UPDATE OF role ON agent_profiles
+        WHEN OLD.role <> NEW.role
+        BEGIN SELECT RAISE(ABORT, 'Agent profile role is immutable'); END;
+    `);
+
+    // Binding scope IDs intentionally have no FK to workspace/team tables:
+    // deployments can migrate with either table absent, and stale bindings
+    // must never make a global profile disappear. A profile FK still prevents
+    // hard deletion of a referenced profile; WorkspaceManager archives it.
+    if (!hasTable(sqlite, 'agent_profile_bindings')) {
+      sqlite.exec(`CREATE TABLE agent_profile_bindings (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL CHECK (scope_type IN ('global', 'workspace', 'team_template')),
+        scope_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('orchestrator', 'builder', 'reviewer', 'researcher', 'qa')),
+        profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE RESTRICT,
+        override TEXT,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`);
+    } else {
+      const columns: Array<[string, string]> = [
+        ['scope_type', "TEXT NOT NULL DEFAULT 'workspace'"],
+        ['scope_id', "TEXT NOT NULL DEFAULT ''"],
+        ['role', "TEXT NOT NULL DEFAULT 'builder'"],
+        ['profile_id', "TEXT NOT NULL DEFAULT ''"],
+        ['override', 'TEXT'],
+        ['is_default', 'INTEGER NOT NULL DEFAULT 0'],
+        ['created_at', "TEXT NOT NULL DEFAULT ''"],
+        ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+      ];
+      for (const [name, definition] of columns) {
+        if (!hasColumn(sqlite, 'agent_profile_bindings', name)) sqlite.exec(`ALTER TABLE agent_profile_bindings ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    sqlite.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profile_bindings_scope_role_profile
+        ON agent_profile_bindings(scope_type, scope_id, role, profile_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profile_bindings_scope_role_default
+        ON agent_profile_bindings(scope_type, scope_id, role) WHERE is_default = 1;
+      CREATE INDEX IF NOT EXISTS idx_agent_profile_bindings_profile
+        ON agent_profile_bindings(profile_id);
+      CREATE INDEX IF NOT EXISTS idx_agent_profile_bindings_scope_role
+        ON agent_profile_bindings(scope_type, scope_id, role, is_default);
+      CREATE TRIGGER IF NOT EXISTS trg_agent_profile_bindings_role_immutable
+        BEFORE UPDATE OF role ON agent_profile_bindings
+        WHEN OLD.role <> NEW.role
+        BEGIN SELECT RAISE(ABORT, 'Agent profile binding role is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_agent_profile_bindings_profile_role
+        BEFORE INSERT ON agent_profile_bindings
+        WHEN (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) IS NULL
+          OR (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) <> NEW.role
+        BEGIN SELECT RAISE(ABORT, 'Agent profile binding role must match profile role'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_agent_profile_bindings_profile_role_update
+        BEFORE UPDATE OF profile_id, role ON agent_profile_bindings
+        WHEN (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) IS NULL
+          OR (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) <> NEW.role
+        BEGIN SELECT RAISE(ABORT, 'Agent profile binding role must match profile role'); END;
+      PRAGMA user_version = 20;
+    `);
+    // Scope rows may be removed independently of this generic binding table.
+    // Clean those bindings while leaving global catalog records intact.
+    if (hasTable(sqlite, 'workspaces')) {
+      sqlite.exec(`CREATE TRIGGER IF NOT EXISTS trg_agent_profile_bindings_workspace_delete
+        AFTER DELETE ON workspaces
+        BEGIN DELETE FROM agent_profile_bindings WHERE scope_type = 'workspace' AND scope_id = OLD.id; END;`);
+    }
+    if (hasTable(sqlite, 'team_templates')) {
+      sqlite.exec(`CREATE TRIGGER IF NOT EXISTS trg_agent_profile_bindings_team_template_delete
+        AFTER DELETE ON team_templates
+        BEGIN DELETE FROM agent_profile_bindings WHERE scope_type = 'team_template' AND scope_id = OLD.id; END;`);
+    }
   })();
 }
