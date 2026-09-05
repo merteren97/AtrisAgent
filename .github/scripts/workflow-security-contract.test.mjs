@@ -86,7 +86,7 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /ubuntu-22\.04/, "release.yml must build the Linux desktop package on the supported baseline");
   assert.match(release, /bundles:\s*nsis,msi/, "release.yml must publish NSIS and MSI bundles");
   assert.match(release, /bundles:\s*appimage,deb/, "release.yml must publish AppImage and Debian bundles");
-  assert.match(release, /needs:\s*build/, "release publishing must wait for every platform build");
+  assert.match(release, /needs:\s*(?:build|\[[^\]]*build[^\]]*\])/, "release publishing must wait for every platform build");
   assert.match(release, /permissions:\s*\n\s*contents:\s*write/, "release publishing requires narrowly-scoped contents write permission");
   assert.match(release, /retention-days:\s*3/, "temporary release artifacts must use short retention");
 
@@ -96,6 +96,17 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /normalized_tag="v\$\{RELEASE_TAG:1\}"/, "release tags must be canonicalized to a lowercase v prefix");
   assert.match(release, /echo "RELEASE_TAG=\$normalized_tag" >> "\$GITHUB_ENV"/, "canonical release tags must flow to later build and publish steps");
   assert.match(release, /group:\s*atris-agent-release\s*$/m, "only one release workflow may execute at a time regardless of input casing");
+  assert.match(release, /environment:\s*production-release/, "publication must use the protected production environment");
+  assert.match(release, /actions\/workflows\/ci\.yml\/runs\?head_sha=\$EXPECTED_SHA&status=success/, "release readiness must require successful CI for the exact SHA");
+  assert.match(release, /ref:\s*\$\{\{ inputs\.expected_sha \}\}/, "build and publication must checkout the accepted exact SHA");
+  assert.match(release, /packaged_clean_install:/, "packaged clean-install acceptance must be explicit");
+  assert.match(release, /updater_round_trip:/, "updater round-trip acceptance must be explicit");
+  assert.match(release, /production_entitlement:/, "production entitlement acceptance must be explicit");
+  assert.match(release, /interactive_visual_keyboard:/, "interactive visual and keyboard acceptance must be explicit");
+  assert.match(release, /signing_key_fingerprint:/, "the approved signing-key fingerprint must be explicit");
+  assert.doesNotMatch(release, /--clobber/, "immutable release publication must never replace assets");
+  assert.match(release, /Release \$RELEASE_TAG already exists/, "existing releases must fail closed");
+  assert.match(release, /Tag \$RELEASE_TAG already exists/, "existing tags must fail closed");
 });
 
 test("release publishing requires a complete signed Tauri updater configuration", () => {
@@ -130,6 +141,9 @@ test("release publishing requires a complete signed Tauri updater configuration"
   assert.match(release, /generate-updater-manifest\.mjs/, "stable releases must generate the updater manifest");
   assert.match(release, /latest\.json/, "stable releases must publish the static GitHub updater manifest");
   assert.match(release, /\.sig/, "release artifacts must include updater signatures");
+  assert.match(release, /validate-release-assets\.mjs/, "publication must enforce the exact versioned artifact allowlist");
+  assert.match(release, /tauri signer verify/, "publication must cryptographically verify each updater signature pair");
+  assert.match(release, /SHA256SUMS/, "publication must include hash evidence");
 });
 
 test("Windows runtime checks include an installed-style path with spaces", () => {

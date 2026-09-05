@@ -1,4 +1,4 @@
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+export type ApprovalStatus = 'pending' | 'processing' | 'approved' | 'rejected' | 'failed' | 'reconcile_required';
 export type ApprovalType =
   | 'plan'
   | 'plan_step'
@@ -27,6 +27,10 @@ export interface Approval {
   description: string;
   status: ApprovalStatus;
   decidedBy: 'user' | 'orchestrator' | null;
+  requestedDecision?: 'approved' | 'rejected' | null;
+  claimedAt?: string | null;
+  attemptCount?: number;
+  executionError?: string | null;
   createdAt: string;
   decidedAt: string | null;
 }

@@ -1,4 +1,5 @@
-import { sqliteTable, text, integer, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real, primaryKey, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
 import type {
   MissionStatus,
   ExecutionMode,
@@ -12,6 +13,9 @@ import type {
   ApprovalStatus,
   ArtifactType,
   CanonicalReasoning,
+  AgentProfileRoutePolicy,
+  AgentProfileBindingOverride,
+  AgentProfileScopeType,
 } from '@atris-agent-code/domain';
 
 export const workspaces = sqliteTable('workspaces', {
@@ -116,9 +120,12 @@ export const tasks = sqliteTable('tasks', {
   priority: text('priority').$type<TaskPriority>().notNull().default('medium'),
   assignedAgentId: text('assigned_agent_id'),
   assignedRole: text('assigned_role').$type<AgentRole>(),
+  /** Canonical named profile identity; assignedRole remains authoritative. */
+  agentProfileId: text('agent_profile_id'),
   requiredCapabilities: text('required_capabilities', { mode: 'json' }).$type<string[]>().notNull(),
   dependsOn: text('depends_on', { mode: 'json' }).$type<string[]>().notNull(),
   worktreeId: text('worktree_id'),
+  targetDescriptor: text('target_descriptor', { mode: 'json' }).$type<import('@atris-agent-code/domain').BuilderTargetDescriptor>(),
   createdAt: text('created_at').notNull(),
   updatedAt: text('updated_at').notNull(),
   completedAt: text('completed_at'),
@@ -143,15 +150,33 @@ export const taskAttempts = sqliteTable('task_attempts', {
     .notNull()
     .references(() => missions.id, { onDelete: 'cascade' }),
   agentInstanceId: text('agent_instance_id').notNull(),
+  /** Snapshot of the named profile used for this attempt. */
+  agentProfileId: text('agent_profile_id'),
   attemptNumber: integer('attempt_number').notNull().default(1),
-  status: text('status').notNull().default('running'),
+  status: text('status').$type<import('@atris-agent-code/domain').TaskAttempt['status']>().notNull().default('running'),
   worktreePath: text('worktree_path'),
+  runtimeSessionId: text('runtime_session_id'),
+  routeAdapterId: text('route_adapter_id'),
+  routeProvider: text('route_provider'),
+  routeAccountProfileId: text('route_account_profile_id'),
+  routeModelCatalogId: text('route_model_catalog_id'),
+  routeRuntimeModelId: text('route_runtime_model_id'),
+  routeReasoningLevel: text('route_reasoning_level').$type<CanonicalReasoning>(),
+  routeSource: text('route_source').$type<import('@atris-agent-code/domain').RoutingPreferenceSource>(),
+  routeSelectionMode: text('route_selection_mode').$type<import('@atris-agent-code/domain').RouteSelectionMode>(),
+  providerSessionId: text('provider_session_id'),
+  heartbeatAt: text('heartbeat_at'),
+  leaseExpiresAt: text('lease_expires_at'),
+  retryable: integer('retryable', { mode: 'boolean' }).notNull().default(false),
+  claimedAt: text('claimed_at').notNull(),
   startedAt: text('started_at').notNull(),
   completedAt: text('completed_at'),
   error: text('error'),
   resultSummary: text('result_summary'),
   reviewPack: text('review_pack', { mode: 'json' }).$type<Record<string, unknown>>(),
-});
+}, (table) => ({
+  taskAttemptNumber: uniqueIndex('idx_task_attempts_task_number').on(table.taskId, table.attemptNumber),
+}));
 
 export const accountProfiles = sqliteTable('account_profiles', {
   id: text('id').primaryKey(),
@@ -181,24 +206,80 @@ export const modelProfiles = sqliteTable('model_profiles', {
   isSubscription: integer('is_subscription', { mode: 'boolean' }).default(false),
 });
 
+/**
+ * Global, reusable Agent Profile catalog. Scope is represented by
+ * agentProfileBindings below so deleting a workspace or team template never
+ * deletes the profile itself.
+ */
+export const agentProfiles = sqliteTable('agent_profiles', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  role: text('role').$type<AgentRole>().notNull(),
+  instructions: text('instructions').notNull().default(''),
+  capabilities: text('capabilities', { mode: 'json' }).$type<string[]>().notNull().default([]),
+  specialty: text('specialty'),
+  description: text('description'),
+  routePolicy: text('route_policy', { mode: 'json' }).$type<AgentProfileRoutePolicy>(),
+  allowedRoutePolicy: text('allowed_route_policy', { mode: 'json' }).$type<AgentProfileRoutePolicy>(),
+  isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  archivedAt: text('archived_at'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => ({
+  /** At most one active global default may exist for each fixed role. */
+  roleDefaultUnique: uniqueIndex('idx_agent_profiles_role_default')
+    .on(table.role)
+    .where(sql`${table.isDefault} = 1 AND ${table.archivedAt} IS NULL`),
+}));
+
 export const agentInstances = sqliteTable('agent_instances', {
   id: text('id').primaryKey(),
   missionId: text('mission_id')
     .notNull()
     .references(() => missions.id, { onDelete: 'cascade' }),
   role: text('role').$type<AgentRole>().notNull(),
+  /** Named profile identity; role remains the fixed security boundary. */
+  profileId: text('profile_id'),
+  /** Canonical named profile identity; profileId is retained for legacy rows. */
+  agentProfileId: text('agent_profile_id'),
   modelProfileId: text('model_profile_id').default(''),
   accountProfileId: text('account_profile_id').default(''),
   runtimeAdapterId: text('runtime_adapter_id').default(''),
   sessionId: text('session_id'),
   status: text('status').default('idle'),
+  taskId: text('task_id'),
+  parentAgentId: text('parent_agent_id'),
+  displayName: text('display_name'),
+  specialty: text('specialty'),
+  spawnReason: text('spawn_reason'),
+  statusMessage: text('status_message'),
+  progress: integer('progress'),
+  workspaceMode: text('workspace_mode'),
+  startedAt: text('started_at'),
+  completedAt: text('completed_at'),
   createdAt: text('created_at').notNull(),
+});
+
+export const agentMessages = sqliteTable('agent_messages', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id')
+    .notNull()
+    .references(() => missions.id, { onDelete: 'cascade' }),
+  fromAgentId: text('from_agent_id').notNull(),
+  toAgentId: text('to_agent_id').notNull(),
+  content: text('content').notNull(),
+  createdAt: text('created_at').notNull(),
+  readAt: text('read_at'),
+  kind: text('kind').$type<'message' | 'handoff' | 'review_request' | 'summary'>().notNull().default('message'),
+  replyToMessageId: text('reply_to_message_id'),
 });
 
 export const teamTemplates = sqliteTable('team_templates', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   description: text('description').notNull().default(''),
+  maxParallelAgents: integer('max_parallel_agents'),
+  workerPools: text('worker_pools', { mode: 'json' }).$type<import('@atris-agent-code/domain').WorkerPoolPolicy[]>(),
   isDefault: integer('is_default', { mode: 'boolean' }).default(false),
   createdAt: text('created_at').notNull(),
 });
@@ -215,6 +296,34 @@ export const teamRoles = sqliteTable('team_roles', {
   accessLevel: text('access_level').notNull().default('read'),
 });
 
+/**
+ * Reusable profile bindings for global, workspace and team-template scopes. The
+ * scopeId is deliberately not a foreign key: old databases may not have one
+ * of the scope tables yet, and orphaned bindings are harmless while the
+ * global catalog remains durable. WorkspaceManager resolves only live scopes.
+ */
+export const agentProfileBindings = sqliteTable('agent_profile_bindings', {
+  id: text('id').primaryKey(),
+  scopeType: text('scope_type').$type<AgentProfileScopeType>().notNull(),
+  scopeId: text('scope_id').notNull(),
+  role: text('role').$type<AgentRole>().notNull(),
+  profileId: text('profile_id')
+    .notNull()
+    .references(() => agentProfiles.id, { onDelete: 'restrict' }),
+  override: text('override', { mode: 'json' }).$type<AgentProfileBindingOverride>(),
+  isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => ({
+  /** A profile is bound at most once for a role in a given scope. */
+  scopeRoleProfileUnique: uniqueIndex('idx_agent_profile_bindings_scope_role_profile')
+    .on(table.scopeType, table.scopeId, table.role, table.profileId),
+  /** At most one active default may exist per fixed role and scope. */
+  scopeRoleDefaultUnique: uniqueIndex('idx_agent_profile_bindings_scope_role_default')
+    .on(table.scopeType, table.scopeId, table.role)
+    .where(sql`${table.isDefault} = 1`),
+}));
+
 export const resourceLeases = sqliteTable('resource_leases', {
   id: text('id').primaryKey(),
   resourceType: text('resource_type').notNull(),
@@ -224,7 +333,11 @@ export const resourceLeases = sqliteTable('resource_leases', {
   heartbeatAt: text('heartbeat_at').notNull(),
   status: text('status').default('active'),
   metadata: text('metadata', { mode: 'json' }).$type<Record<string, unknown>>(),
-});
+}, (table) => ({
+  activeResource: uniqueIndex('idx_resource_leases_active_resource')
+    .on(table.resourceType, table.resourceId)
+    .where(sql`${table.status} = 'active'`),
+}));
 
 export const approvals = sqliteTable('approvals', {
   id: text('id').primaryKey(),
@@ -237,9 +350,41 @@ export const approvals = sqliteTable('approvals', {
   description: text('description').notNull().default(''),
   status: text('status').$type<ApprovalStatus>().default('pending'),
   decidedBy: text('decided_by'),
+  requestedDecision: text('requested_decision').$type<'approved' | 'rejected'>(),
+  claimedAt: text('claimed_at'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  executionError: text('execution_error'),
   createdAt: text('created_at').notNull(),
   decidedAt: text('decided_at'),
 });
+
+export const approvalOperations = sqliteTable('approval_operations', {
+  approvalId: text('approval_id').primaryKey().references(() => approvals.id, { onDelete: 'cascade' }),
+  decision: text('decision').$type<'approved' | 'rejected'>().notNull(),
+  status: text('status').$type<'applying' | 'completed' | 'reconcile_required'>().notNull(),
+  operationType: text('operation_type').notNull().default('approval'),
+  resourceId: text('resource_id'),
+  idempotencyKey: text('idempotency_key'),
+  result: text('result', { mode: 'json' }).$type<Record<string, unknown>>(),
+  startedAt: text('started_at').notNull(),
+  completedAt: text('completed_at'),
+  reconciledAt: text('reconciled_at'),
+  reconcileAttempts: integer('reconcile_attempts').notNull().default(0),
+  error: text('error'),
+});
+
+export const missionCompletions = sqliteTable('mission_completions', {
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  planId: text('plan_id').notNull(),
+  runId: text('run_id'),
+  turnId: text('turn_id'),
+  status: text('status').$type<'synthesis_pending' | 'event_pending' | 'completed'>().notNull(),
+  summary: text('summary'),
+  tasksCompleted: integer('tasks_completed').notNull(),
+  totalTasks: integer('total_tasks').notNull(),
+  createdAt: text('created_at').notNull(),
+  completedAt: text('completed_at'),
+}, (table) => [primaryKey({ columns: [table.missionId, table.planId] })]);
 
 export const artifacts = sqliteTable('artifacts', {
   id: text('id').primaryKey(),
@@ -270,6 +415,70 @@ export const usageSnapshots = sqliteTable('usage_snapshots', {
   recordedAt: text('recorded_at').notNull(),
 });
 
+export const runtimeTelemetry = sqliteTable('runtime_telemetry', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  taskId: text('task_id').notNull(),
+  agentInstanceId: text('agent_instance_id').notNull(),
+  adapterId: text('adapter_id').notNull(),
+  accountProfileId: text('account_profile_id'),
+  attemptId: text('attempt_id'),
+  outcome: text('outcome').$type<'completed' | 'failed'>().notNull(),
+  usageAvailable: integer('usage_available', { mode: 'boolean' }).notNull().default(false),
+  usageSource: text('usage_source').$type<'provider_reported' | 'unavailable'>().notNull().default('unavailable'),
+  inputTokens: integer('input_tokens').notNull().default(0),
+  outputTokens: integer('output_tokens').notNull().default(0),
+  cost: real('cost'),
+  currency: text('currency'),
+  queueWaitMs: integer('queue_wait_ms').notNull().default(0),
+  durationMs: integer('duration_ms').notNull().default(0),
+  retryCount: integer('retry_count').notNull().default(1),
+  workerUtilization: real('worker_utilization').notNull().default(0),
+  recordedAt: text('recorded_at').notNull(),
+});
+
+export const applyVerificationOperations = sqliteTable('apply_verification_operations', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  planId: text('plan_id').notNull(),
+  runId: text('run_id'),
+  idempotencyKey: text('idempotency_key').notNull(),
+  applyPhase: text('apply_phase').$type<'pending' | 'in_progress' | 'applied' | 'blocked'>().notNull().default('pending'),
+  verificationPhase: text('verification_phase').$type<'pending' | 'running' | 'blocked' | 'completed'>().notNull().default('pending'),
+  builderTaskIds: text('builder_task_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  appliedTaskIds: text('applied_task_ids', { mode: 'json' }).$type<string[]>().notNull(),
+  verificationPassed: integer('verification_passed', { mode: 'boolean' }),
+  summary: text('summary'),
+  evidence: text('evidence', { mode: 'json' }).$type<string[]>(),
+  error: text('error'),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+  completedAt: text('completed_at'),
+}, (table) => ({
+  missionPlan: uniqueIndex('idx_apply_verification_mission_plan').on(table.missionId, table.planId),
+  idempotency: uniqueIndex('idx_apply_verification_idempotency').on(table.idempotencyKey),
+}));
+
+export const deletionOperations = sqliteTable('deletion_operations', {
+  id: text('id').primaryKey(),
+  targetType: text('target_type').$type<'mission' | 'workspace'>().notNull(),
+  targetId: text('target_id').notNull(),
+  removeMemory: integer('remove_memory', { mode: 'boolean' }).notNull().default(false),
+  phase: text('phase').notNull().default('stop'),
+  status: text('status').$type<'pending' | 'running' | 'retryable' | 'completed'>().notNull().default('pending'),
+  manifest: text('manifest', { mode: 'json' }).$type<string[]>().notNull(),
+  progress: text('progress', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  error: text('error'),
+  ownerToken: text('owner_token'),
+  leaseExpiresAt: text('lease_expires_at'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+  completedAt: text('completed_at'),
+}, (table) => ({
+  target: uniqueIndex('idx_deletion_operations_target').on(table.targetType, table.targetId),
+}));
+
 export const worktrees = sqliteTable('worktrees', {
   id: text('id').primaryKey(),
   missionId: text('mission_id')
@@ -279,6 +488,12 @@ export const worktrees = sqliteTable('worktrees', {
   branchName: text('branch_name').notNull(),
   path: text('path').notNull(),
   status: text('status').notNull().default('active'),
+  isolationKind: text('isolation_kind').$type<'workspace-git' | 'nested-git' | 'mirror' | 'new-sibling'>(),
+  canonicalContainer: text('canonical_container'),
+  targetName: text('target_name'),
+  targetPath: text('target_path'),
+  appliedOperationKey: text('applied_operation_key'),
+  targetDescriptor: text('target_descriptor', { mode: 'json' }).$type<import('@atris-agent-code/domain').BuilderTargetDescriptor>(),
   createdAt: text('created_at').notNull(),
 });
 
@@ -324,12 +539,20 @@ export type TaskAttemptInsert = typeof taskAttempts.$inferInsert;
 
 export type AgentInstanceSelect = typeof agentInstances.$inferSelect;
 export type AgentInstanceInsert = typeof agentInstances.$inferInsert;
+export type AgentMessageSelect = typeof agentMessages.$inferSelect;
+export type AgentMessageInsert = typeof agentMessages.$inferInsert;
 
 export type AccountProfileSelect = typeof accountProfiles.$inferSelect;
 export type AccountProfileInsert = typeof accountProfiles.$inferInsert;
 
 export type ModelProfileSelect = typeof modelProfiles.$inferSelect;
 export type ModelProfileInsert = typeof modelProfiles.$inferInsert;
+
+export type AgentProfileSelect = typeof agentProfiles.$inferSelect;
+export type AgentProfileInsert = typeof agentProfiles.$inferInsert;
+
+export type AgentProfileBindingSelect = typeof agentProfileBindings.$inferSelect;
+export type AgentProfileBindingInsert = typeof agentProfileBindings.$inferInsert;
 
 export type TeamTemplateSelect = typeof teamTemplates.$inferSelect;
 export type TeamTemplateInsert = typeof teamTemplates.$inferInsert;
@@ -342,12 +565,22 @@ export type ResourceLeaseInsert = typeof resourceLeases.$inferInsert;
 
 export type ApprovalSelect = typeof approvals.$inferSelect;
 export type ApprovalInsert = typeof approvals.$inferInsert;
+export type ApprovalOperationSelect = typeof approvalOperations.$inferSelect;
+export type ApprovalOperationInsert = typeof approvalOperations.$inferInsert;
+export type MissionCompletionSelect = typeof missionCompletions.$inferSelect;
+export type MissionCompletionInsert = typeof missionCompletions.$inferInsert;
 
 export type ArtifactSelect = typeof artifacts.$inferSelect;
 export type ArtifactInsert = typeof artifacts.$inferInsert;
 
 export type UsageSnapshotSelect = typeof usageSnapshots.$inferSelect;
 export type UsageSnapshotInsert = typeof usageSnapshots.$inferInsert;
+export type RuntimeTelemetrySelect = typeof runtimeTelemetry.$inferSelect;
+export type RuntimeTelemetryInsert = typeof runtimeTelemetry.$inferInsert;
+export type ApplyVerificationOperationSelect = typeof applyVerificationOperations.$inferSelect;
+export type ApplyVerificationOperationInsert = typeof applyVerificationOperations.$inferInsert;
+export type DeletionOperationSelect = typeof deletionOperations.$inferSelect;
+export type DeletionOperationInsert = typeof deletionOperations.$inferInsert;
 
 export type WorktreeSelect = typeof worktrees.$inferSelect;
 export type WorktreeInsert = typeof worktrees.$inferInsert;

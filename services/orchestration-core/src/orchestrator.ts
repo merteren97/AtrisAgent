@@ -1,14 +1,24 @@
 import type { LocalEventBus, Unsubscribe } from '@atris-agent-code/event-bus';
-import type { AtrisDatabase, TaskSelect, MissionSelect, TaskAttemptInsert } from '@atris-agent-code/database';
-import { approvals as approvalsTable, taskAttempts as taskAttemptsTable } from '@atris-agent-code/database';
+import type { AtrisDatabase, TaskSelect, MissionSelect } from '@atris-agent-code/database';
+import { approvals as approvalsTable } from '@atris-agent-code/database';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import type {
   AgentEvent,
   TaskCompleted,
   TaskFailed,
 } from '@atris-agent-code/event-schema';
-import type { ExecutionMode, AgentRole, MissionStatus } from '@atris-agent-code/domain';
+import type {
+  ExecutionMode,
+  AgentRole,
+  MissionStatus,
+  PostApplyVerificationContext,
+  PostApplyVerificationResult,
+  ApplyVerificationOperationResult,
+  BuilderTargetDescriptor,
+} from '@atris-agent-code/domain';
+import { parseBuilderTargetDescriptor } from '@atris-agent-code/domain';
 import { PolicyEngine, resolveAutomationAction } from '@atris-agent-code/policy-engine';
+import { allocateWorkerBatch } from './worker-pool';
 
 export interface OrchestratorConfig {
   workspacePath: string;
@@ -19,7 +29,9 @@ export interface OrchestratorConfig {
   db?: AtrisDatabase;
   workspaceManager?: WorkspaceManager;
   maxTaskRetries?: number;
-  applyTaskChanges?: (taskId: string) => Promise<{ success: boolean; output?: string; filesChanged?: number; checkpointId?: string }>;
+  applyTaskChanges?: (taskId: string, operation?: ApplyTaskChangesContext) => Promise<{ success: boolean; output?: string; filesChanged?: number; checkpointId?: string }>;
+  postApplyVerification?: (context: PostApplyVerificationContext) => Promise<PostApplyVerificationResult>;
+  executeApplyVerificationOperation?: (context: PostApplyVerificationContext) => Promise<ApplyVerificationOperationResult>;
 }
 
 export interface StructuredTaskPlan {
@@ -30,6 +42,7 @@ export interface StructuredTaskPlan {
   requiredCapabilities: string[];
   dependsOnIndices?: number[];
   dependsOn?: string[];
+  targetDescriptor?: BuilderTargetDescriptor;
 }
 
 export interface StructuredPlan {
@@ -55,6 +68,7 @@ export const StructuredPlanJSONSchema = {
           priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
           requiredCapabilities: { type: 'array', items: { type: 'string' } },
           dependsOnIndices: { type: 'array', items: { type: 'number' } },
+          targetDescriptor: { type: 'object' },
         },
         required: ['title', 'description', 'role', 'priority', 'requiredCapabilities'],
       },
@@ -64,6 +78,27 @@ export const StructuredPlanJSONSchema = {
 };
 
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+export interface ApplyTaskChangesContext {
+  operationId?: string;
+  idempotencyKey?: string;
+}
+const TERMINAL_TASK_STATUSES = new Set(['done', 'superseded', 'cancelled', 'rejected']);
+const ACTIVE_TASK_STATUSES = new Set(['claimed', 'running', 'review', 'revision_requested', 'verified', 'applied']);
+
+function applyOperationForTask(
+  missionId: string,
+  planId: string | null | undefined,
+  taskId: string,
+  options?: ApplyTaskChangesContext,
+): ApplyTaskChangesContext {
+  const operationId = options?.operationId || `apply-verify:${missionId}:${planId || 'unknown'}`;
+  const baseKey = options?.idempotencyKey || operationId;
+  const taskSuffix = `:task:${taskId}`;
+  return {
+    operationId,
+    idempotencyKey: baseKey.endsWith(taskSuffix) ? baseKey : `${baseKey}${taskSuffix}`,
+  };
+}
 
 /**
  * Generate default rule-based task template.
@@ -186,7 +221,14 @@ export function validateAndRepairPlan(rawPlan: any, userRequest: string): Struct
 
       let dependsOnIndices: number[] = [];
       if (Array.isArray(task?.dependsOnIndices)) {
-        dependsOnIndices = task.dependsOnIndices.filter((i: unknown) => typeof i === 'number' && i >= 0 && i < index);
+        // Keep forward and self references visible so malformed cycles cannot
+        // be repaired into an accidental dependency-free root.
+        dependsOnIndices = task.dependsOnIndices.filter((i: unknown) => (
+          typeof i === 'number'
+          && Number.isInteger(i)
+          && i >= 0
+          && i < rawPlan.tasks.length
+        ));
       } else if (index > 0 && (!task?.dependsOn || task.dependsOn.length === 0)) {
         dependsOnIndices = [index - 1];
       }
@@ -198,6 +240,7 @@ export function validateAndRepairPlan(rawPlan: any, userRequest: string): Struct
         priority,
         requiredCapabilities,
         dependsOnIndices,
+        targetDescriptor: role === 'builder' ? parseBuilderTargetDescriptor(task?.targetDescriptor) : undefined,
       };
     });
   }
@@ -233,8 +276,15 @@ export class Orchestrator {
   private inMemoryTasks: Map<string, TaskSelect> = new Map();
   private inMemoryMissions: Map<string, MissionSelect> = new Map();
   private handledRuntimeTerminalSessions = new Set<string>();
+  private reconciledRejectedTaskFailures = new Set<string>();
   private unsubscribeEvents?: Unsubscribe;
   private applyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
+
+  /** Seed retry state recovered from durable task-attempt history. */
+  protected seedTaskRetryCount(taskId: string, retryCount: number): void {
+    const current = this.taskRetries.get(taskId) ?? 0;
+    this.taskRetries.set(taskId, Math.max(current, retryCount));
+  }
 
   constructor(
     config: OrchestratorConfig,
@@ -281,6 +331,14 @@ export class Orchestrator {
     this.workspaceManager = wm;
   }
 
+  /**
+   * V2 overrides this hook to fence durable task transitions against a
+   * cancelled or superseded run. Legacy orchestration has no additional fence.
+   */
+  protected async assertTaskCompletionCurrent(_event: TaskCompleted): Promise<void> {
+    // Intentionally empty for the legacy orchestrator.
+  }
+
   private subscribeToEvents(): void {
     if (!this.eventBus) return;
 
@@ -319,6 +377,8 @@ export class Orchestrator {
     title: string;
     assignedRole?: string | null;
     agentInstanceId?: string;
+    agentProfileId?: string | null;
+    targetDescriptor?: BuilderTargetDescriptor;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
     this.emitEvent({
@@ -329,6 +389,8 @@ export class Orchestrator {
       title: params.title,
       assignedRole: params.assignedRole ?? null,
       agentInstanceId: params.agentInstanceId,
+      agentProfileId: params.agentProfileId || undefined,
+      targetDescriptor: params.targetDescriptor,
       timestamp: new Date().toISOString(),
     });
   }
@@ -338,6 +400,7 @@ export class Orchestrator {
     taskId: string;
     agentInstanceId?: string;
     role: string;
+    agentProfileId?: string | null;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
     this.emitEvent({
@@ -347,6 +410,7 @@ export class Orchestrator {
       taskId: params.taskId,
       agentInstanceId: params.agentInstanceId ?? '',
       role: params.role,
+      agentProfileId: params.agentProfileId || undefined,
       timestamp: new Date().toISOString(),
     });
   }
@@ -467,6 +531,166 @@ export class Orchestrator {
     return planId ? tasks.filter((task) => task.planId === planId) : tasks;
   }
 
+  private dependencyFreeRoots(tasks: TaskSelect[]): TaskSelect[] {
+    return tasks.filter((task) => (
+      (task.status === 'planned' || task.status === 'ready')
+      && (!task.dependsOn || (task.dependsOn as string[]).length === 0)
+    ));
+  }
+
+  private async capacityAllowedTasks(missionId: string, candidates: TaskSelect[]): Promise<TaskSelect[]> {
+    if (!this.workspaceManager || candidates.length === 0) return candidates;
+    const allTasks = await this.workspaceManager.listTasks(missionId);
+    const policy = typeof this.workspaceManager.resolveMissionWorkerPoolPolicy === 'function'
+      ? await this.workspaceManager.resolveMissionWorkerPoolPolicy(missionId)
+      : undefined;
+    const candidateIds = new Set(candidates.map((task) => task.id));
+    const allocation = allocateWorkerBatch({
+      delegations: candidates.flatMap((task) => task.assignedRole && task.assignedRole !== 'orchestrator' ? [{
+        id: task.id, role: task.assignedRole, objective: task.description,
+        requiredCapabilities: task.requiredCapabilities || [], dependsOnDelegationIds: [],
+      }] : []),
+      runningWorkers: allTasks.filter((task) => !candidateIds.has(task.id) && ['claimed', 'running', 'review'].includes(String(task.status)) && task.assignedRole)
+        .map((task) => ({ role: task.assignedRole!, delegationId: task.id })),
+      policy,
+    });
+    const allowed = new Set(allocation.dispatchable.map((item) => item.id));
+    return candidates.filter((task) => allowed.has(task.id));
+  }
+
+  private async failBlockedPlan(missionId: string, planId: string | null, tasks: TaskSelect[]): Promise<void> {
+    const now = new Date().toISOString();
+    const blockers = tasks.map((task) => {
+      const dependencies = (task.dependsOn as string[]) || [];
+      return `${task.id} waits for ${dependencies.length > 0 ? dependencies.join(', ') : 'no-runnable-transition'}`;
+    }).join('; ');
+    const reason = `Plan ${planId || 'unknown'} has no active or dispatchable tasks and no dependency-free root tasks. Dependency graph is blocked: ${blockers}.`;
+
+    if (this.workspaceManager) {
+      await this.workspaceManager.updateMission(missionId, { status: 'failed', completedAt: now });
+    }
+    const cachedMission = this.inMemoryMissions.get(missionId);
+    if (cachedMission) {
+      this.inMemoryMissions.set(missionId, {
+        ...cachedMission,
+        status: 'failed',
+        completedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    console.warn(`[Orchestrator] Mission ${missionId} plan ${planId || 'unknown'} failed: no dependency-free roots; no tasks dispatched.`);
+    this.emitMissionFailed({ missionId, reason, failedTaskId: tasks[0]?.id ?? null });
+  }
+
+  private async failRejectedTaskMission(missionId: string, taskId: string, error: string): Promise<void> {
+    const mission = this.workspaceManager
+      ? await this.workspaceManager.getMission(missionId)
+      : this.inMemoryMissions.get(missionId);
+    if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status))) return;
+
+    const now = new Date().toISOString();
+    if (this.workspaceManager) {
+      await this.workspaceManager.updateMission(missionId, { status: 'failed', completedAt: now });
+    }
+
+    const cachedTask = this.inMemoryTasks.get(taskId);
+    if (cachedTask && cachedTask.status !== 'rejected') {
+      this.inMemoryTasks.set(taskId, { ...cachedTask, status: 'rejected', updatedAt: now });
+    }
+    const cachedMission = this.inMemoryMissions.get(missionId);
+    if (cachedMission) {
+      this.inMemoryMissions.set(missionId, {
+        ...cachedMission,
+        status: 'failed',
+        completedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    this.emitMissionFailed({
+      missionId,
+      reason: `Task ${taskId} was rejected by the runtime and failed before execution could continue: ${error}`,
+      failedTaskId: taskId,
+    });
+  }
+
+  /**
+   * Persist a diagnostic terminal/non-progressing state before surfacing a
+   * preflight or scheduler error. Runtime event subscribers are intentionally
+   * best-effort, so an exception must not leave a mission looking runnable.
+   */
+  protected async transitionMissionDiagnostic(params: {
+    missionId: string;
+    reason: string;
+    status?: 'failed';
+    taskId?: string | null;
+  }): Promise<void> {
+    const status = params.status || 'failed';
+    const now = new Date().toISOString();
+    let mission: MissionSelect | null = null;
+    try {
+      mission = this.workspaceManager
+        ? await this.workspaceManager.getMission(params.missionId)
+        : this.inMemoryMissions.get(params.missionId) || null;
+    } catch (error) {
+      console.error('[Orchestrator] Failed to read mission while recording a diagnostic transition:', error);
+    }
+
+    // A nested error handler (for example assignTask inside reconciliation)
+    // may observe the same already-persisted state. Do not emit duplicate
+    // failure events in that case.
+    if (mission && (TERMINAL_MISSION_STATUSES.has(String(mission.status)) || mission.status === status)) return;
+
+    if (params.taskId) {
+      try {
+        const task = this.workspaceManager
+          ? await this.workspaceManager.getTask(params.taskId)
+          : this.inMemoryTasks.get(params.taskId) || null;
+        if (task && !TERMINAL_TASK_STATUSES.has(String(task.status)) && task.status !== 'blocked') {
+          if (this.workspaceManager) {
+            await this.workspaceManager.updateTask(params.taskId, { status: 'blocked', completedAt: null });
+          }
+          this.inMemoryTasks.set(params.taskId, {
+            ...task,
+            status: 'blocked',
+            completedAt: null,
+            updatedAt: now,
+          });
+        }
+      } catch (error) {
+        console.error('[Orchestrator] Failed to persist the task diagnostic state:', error);
+      }
+    }
+
+    try {
+      if (this.workspaceManager) {
+        await this.workspaceManager.updateMission(params.missionId, {
+          status,
+          completedAt: status === 'failed' ? now : null,
+        });
+      }
+    } catch (error) {
+      console.error('[Orchestrator] Failed to persist the mission diagnostic state:', error);
+    }
+
+    const cachedMission = this.inMemoryMissions.get(params.missionId);
+    if (cachedMission) {
+      this.inMemoryMissions.set(params.missionId, {
+        ...cachedMission,
+        status,
+        completedAt: status === 'failed' ? now : null,
+        updatedAt: now,
+      });
+    }
+
+    this.emitMissionFailed({
+      missionId: params.missionId,
+      reason: params.reason,
+      failedTaskId: params.taskId,
+    });
+  }
+
   /**
    * Generate structured plan and repair if invalid.
    */
@@ -490,6 +714,27 @@ export class Orchestrator {
    * mission is started again after a terminal turn, a new planId is created and
    * all execution decisions are scoped to that plan instead of reusing old tasks.
    */
+  protected async resolveTaskProfileIds(
+    missionId: string,
+    roles: AgentRole[],
+    requested: Partial<Record<AgentRole, string>> = {},
+  ): Promise<Partial<Record<AgentRole, string>>> {
+    const resolved: Partial<Record<AgentRole, string>> = {};
+    for (const role of new Set(roles)) {
+      const resolver = this.workspaceManager?.resolveAgentProfileForMission;
+      if (typeof resolver !== 'function') {
+        if (requested[role]) throw new Error('Named agent profiles require durable profile resolution.');
+        continue;
+      }
+      const result = await this.workspaceManager!.resolveAgentProfileForMission({ missionId, role, profileId: requested[role] });
+      if (result.profile.role !== role || (requested[role] && result.profile.id !== requested[role])) {
+        throw new Error(`Agent profile selection does not match fixed role '${role}'.`);
+      }
+      if (result.profile.id !== role) resolved[role] = result.profile.id;
+    }
+    return resolved;
+  }
+
   async startMission(
     missionId: string,
     request: string,
@@ -498,7 +743,10 @@ export class Orchestrator {
       reasoningLevel?: string;
       targetRole?: string;
       command?: string;
+      /** Trusted, pre-validated named profile selection keyed by fixed role. */
+      agentProfileIds?: Partial<Record<AgentRole, string>>;
       rawModelPlanOutput?: string;
+      researchContextPlanId?: string;
     }
   ): Promise<{
     missionId: string;
@@ -631,13 +879,30 @@ export class Orchestrator {
     }
 
     const createdTasks: TaskSelect[] = [];
+    // Resolve all roles before inserting any task, so invalid defaults cannot
+    // leave a partially materialized graph or launch a different specialist.
+    const agentProfileIds = await this.resolveTaskProfileIds(missionId, structuredPlan.tasks.map((task) => task.role), options?.agentProfileIds);
     const taskIndexToIds: Map<number, string[]> = new Map();
+
+    // Allocate every task ID before resolving dependencies so forward edges
+    // remain attached to their eventual task records.
+    for (let i = 0; i < structuredPlan.tasks.length; i++) {
+      const taskSpec = structuredPlan.tasks[i];
+      const isCandidate = currentExecutionMode === 'candidate'
+        && taskSpec.role === 'builder'
+        && taskSpec.targetDescriptor?.kind !== 'new_sibling_project';
+      const tasksToCreateCount = isCandidate ? 2 : 1;
+      taskIndexToIds.set(i, Array.from({ length: tasksToCreateCount }, () => crypto.randomUUID()));
+    }
 
     // Build tasks (and candidate worktrees if candidate mode)
     for (let i = 0; i < structuredPlan.tasks.length; i++) {
       const taskSpec = structuredPlan.tasks[i];
-      const isCandidate = currentExecutionMode === 'candidate' && taskSpec.role === 'builder';
+      const isCandidate = currentExecutionMode === 'candidate'
+        && taskSpec.role === 'builder'
+        && taskSpec.targetDescriptor?.kind !== 'new_sibling_project';
       const tasksToCreateCount = isCandidate ? 2 : 1;
+      const taskIdsForIndex = taskIndexToIds.get(i) ?? [];
 
       // Resolve dependency task IDs from indices
       const dependsOnTaskIds: string[] = [];
@@ -647,10 +912,8 @@ export class Orchestrator {
         dependsOnTaskIds.push(...parentIds);
       }
 
-      const currentTaskIdsForIndex: string[] = [];
-
       for (let j = 0; j < tasksToCreateCount; j++) {
-        const taskId = crypto.randomUUID();
+        const taskId = taskIdsForIndex[j];
         const candidateSuffix = isCandidate ? (j === 0 ? ' (Candidate A)' : ' (Candidate B)') : '';
         const title = taskSpec.title + candidateSuffix;
         const worktreeId = isCandidate ? (j === 0 ? `candidate-a-${taskId}` : `candidate-b-${taskId}`) : null;
@@ -667,9 +930,11 @@ export class Orchestrator {
             status: 'planned',
             priority: taskSpec.priority,
             assignedRole: taskSpec.role,
+            agentProfileId: agentProfileIds[taskSpec.role],
             requiredCapabilities: taskSpec.requiredCapabilities,
             dependsOn: dependsOnTaskIds,
             worktreeId,
+            targetDescriptor: taskSpec.targetDescriptor,
           });
         } else {
           taskRecord = {
@@ -685,6 +950,8 @@ export class Orchestrator {
             requiredCapabilities: taskSpec.requiredCapabilities,
             dependsOn: dependsOnTaskIds,
             worktreeId,
+            targetDescriptor: taskSpec.targetDescriptor ?? null,
+            agentProfileId: agentProfileIds[taskSpec.role] || null,
             createdAt: now,
             updatedAt: now,
             completedAt: null,
@@ -693,10 +960,7 @@ export class Orchestrator {
 
         this.inMemoryTasks.set(taskId, taskRecord);
         createdTasks.push(taskRecord);
-        currentTaskIdsForIndex.push(taskId);
       }
-
-      taskIndexToIds.set(i, currentTaskIdsForIndex);
     }
 
     // STATE: Planning -> Ready (Plan Generated)
@@ -723,10 +987,23 @@ export class Orchestrator {
         missionId,
         planId,
         previousPlanId,
-        reason: 'New user turn received in the existing conversation. A fresh execution plan was created without mixing prior-turn tasks.',
+        reason: options?.researchContextPlanId
+          ? `Same-conversation follow-up created a new plan and reused completed research from prior plan ${options.researchContextPlanId}; completed plans were not mutated.`
+          : 'Same-conversation follow-up created a fresh execution plan without mixing or mutating prior-turn tasks.',
         changedTaskIds: createdTasks.map((task) => task.id),
         timestamp: new Date().toISOString(),
       });
+    }
+
+    const firstTasks = this.dependencyFreeRoots(createdTasks);
+    if (createdTasks.length > 0 && firstTasks.length === 0) {
+      await this.failBlockedPlan(missionId, planId, createdTasks);
+      return {
+        missionId,
+        planId,
+        tasks: createdTasks,
+        structuredPlan,
+      };
     }
 
     // 4. Policy Engine check for Plan Approval
@@ -734,7 +1011,11 @@ export class Orchestrator {
     const planDecision = currentAutomationPolicy
       ? resolveAutomationAction(currentAutomationPolicy.profile, 'plan', currentAutomationPolicy.overrides)
       : null;
-    if (planDecision === 'deny') throw new Error('Mission policy denies plan execution.');
+    if (planDecision === 'deny') {
+      const reason = 'Mission policy denies plan execution.';
+      await this.transitionMissionDiagnostic({ missionId, status: 'failed', reason });
+      throw new Error(reason);
+    }
     const autoApproved = planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
       'plan', `Approve execution plan with ${createdTasks.length} tasks for: ${request}`);
 
@@ -781,14 +1062,34 @@ export class Orchestrator {
       });
     }
 
-    // Start first ready task(s)
-    if (createdTasks.length > 0) {
-      const firstTasks = createdTasks.filter(
-        (t) => !t.dependsOn || (t.dependsOn as string[]).length === 0
-      );
-      const startTasks = firstTasks.length > 0 ? firstTasks : [createdTasks[0]];
-      for (const taskToStart of startTasks) {
-        await this.assignTask(taskToStart.id, taskToStart.assignedRole ?? 'researcher');
+    // Start first ready task(s); a plan without roots was failed before Running.
+    // Target preflight and capacity resolution are part of dispatch. Any
+    // exception is persisted before it can be swallowed by an event subscriber.
+    if (firstTasks.length > 0) {
+      try {
+        const dispatchableFirstTasks = await this.capacityAllowedTasks(missionId, firstTasks);
+        console.info(`[Orchestrator] Mission ${missionId} plan ${planId} dispatching root task(s): ${dispatchableFirstTasks.map((task) => task.id).join(', ')}`);
+        for (const taskToStart of dispatchableFirstTasks) {
+          try {
+            await this.assignTask(taskToStart.id, taskToStart.assignedRole ?? 'researcher');
+          } catch (error) {
+            await this.transitionMissionDiagnostic({
+              missionId,
+              taskId: taskToStart.id,
+              status: 'failed',
+              reason: `Initial task dispatch failed before execution for task ${taskToStart.id}: ${error instanceof Error ? error.message : String(error)}`,
+            });
+            throw error;
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        await this.transitionMissionDiagnostic({
+          missionId,
+          status: 'failed',
+          reason: `Mission dispatch failed before execution: ${reason}`,
+        });
+        throw error;
       }
     }
 
@@ -814,6 +1115,19 @@ export class Orchestrator {
     }
 
     const roleToAssign = agentRole ?? task?.assignedRole ?? 'builder';
+    if (this.workspaceManager && task && roleToAssign === 'builder') {
+      try {
+        await this.workspaceManager.preflightTaskTarget?.(taskId);
+      } catch (error) {
+        await this.transitionMissionDiagnostic({
+          missionId: task.missionId,
+          taskId,
+          status: 'failed',
+          reason: `Builder target preflight failed before execution for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        throw error;
+      }
+    }
     const agentInstanceId = crypto.randomUUID();
 
     if (this.workspaceManager && task) {
@@ -843,6 +1157,7 @@ export class Orchestrator {
       taskId,
       role: roleToAssign,
       agentInstanceId,
+      agentProfileId: task?.agentProfileId,
     });
 
     this.emitEvent({
@@ -851,6 +1166,7 @@ export class Orchestrator {
       missionId,
       agentInstanceId,
       role: roleToAssign,
+      agentProfileId: task?.agentProfileId || undefined,
       displayName: `${displayRole} Agent`,
       spawnReason: `Orchestrator scheduled task: ${title}`,
       taskId,
@@ -864,6 +1180,8 @@ export class Orchestrator {
       title,
       assignedRole: roleToAssign,
       agentInstanceId,
+      agentProfileId: task?.agentProfileId,
+      targetDescriptor: task?.targetDescriptor ?? undefined,
     });
 
     if (task) return task;
@@ -879,9 +1197,11 @@ export class Orchestrator {
       priority: 'medium',
       assignedAgentId: agentInstanceId,
       assignedRole: roleToAssign,
+      agentProfileId: null,
       requiredCapabilities: [],
       dependsOn: [],
       worktreeId: null,
+      targetDescriptor: null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,
@@ -899,11 +1219,34 @@ export class Orchestrator {
     const task = this.workspaceManager
       ? await this.workspaceManager.getTask(event.taskId)
       : this.inMemoryTasks.get(event.taskId);
+    // A higher-level reconciler may persist the current completion before
+    // delegating this event; only that matching in-flight handoff may proceed.
+    // ISO timestamps have millisecond precision, so equal values are possible.
+    const isCurrentCompletionFence = task?.status === 'done'
+      && event.type === 'task_completed'
+      && Boolean(event.agentInstanceId)
+      && task.assignedAgentId === event.agentInstanceId
+      && ((task.completedAt !== null && task.completedAt >= event.timestamp)
+        || task.updatedAt >= event.timestamp);
     const agentInstanceId = event.agentInstanceId;
-    if (!agentInstanceId) return false;
+    if (agentInstanceId && this.handledRuntimeTerminalSessions.has(agentInstanceId)) return true;
+    if (agentInstanceId && task?.assignedAgentId && task.assignedAgentId !== agentInstanceId) return true;
 
-    if (this.handledRuntimeTerminalSessions.has(agentInstanceId)) return true;
-    if (task?.assignedAgentId && task.assignedAgentId !== agentInstanceId) return true;
+    if (task?.status === 'rejected' && event.type === 'task_failed') {
+      const failureKey = `${event.missionId}:${event.taskId}`;
+      if (this.reconciledRejectedTaskFailures.has(failureKey)) return true;
+      this.reconciledRejectedTaskFailures.add(failureKey);
+      try {
+        await this.failRejectedTaskMission(event.missionId, event.taskId, event.error);
+      } catch (error) {
+        this.reconciledRejectedTaskFailures.delete(failureKey);
+        throw error;
+      }
+      return true;
+    }
+
+    if (task && TERMINAL_TASK_STATUSES.has(String(task.status)) && !isCurrentCompletionFence) return true;
+    if (!agentInstanceId) return false;
 
     // Fence this runtime attempt before the state transition awaits. Runtime
     // adapters may report both an explicit turn failure and a non-zero process
@@ -919,6 +1262,8 @@ export class Orchestrator {
    */
   async handleTaskCompleted(event: TaskCompleted): Promise<void> {
     if (await this.shouldIgnoreRuntimeTerminalEvent(event)) return;
+
+    await this.assertTaskCompletionCurrent(event);
 
     const { taskId, missionId } = event;
     const now = new Date().toISOString();
@@ -958,6 +1303,7 @@ export class Orchestrator {
     }
 
     if (allTasks.length === 0) {
+      await this.assertTaskCompletionCurrent(event);
       this.emitMissionCompleted({
         missionId,
         summary: `Task ${taskId} completed successfully`,
@@ -973,6 +1319,7 @@ export class Orchestrator {
 
     // 3. All execution tasks are finished. Review and apply are separate, auditable stages.
     if (terminalTasksCount === allTasks.length) {
+      await this.assertTaskCompletionCurrent(event);
       const mission = this.workspaceManager
         ? await this.workspaceManager.getMission(missionId)
         : this.inMemoryMissions.get(missionId);
@@ -983,6 +1330,7 @@ export class Orchestrator {
       const qaTasks = allTasks.filter((task) => task.assignedRole === 'qa');
       const qaDone = qaTasks.length === 0 || qaTasks.every((task) => task.status === 'done');
 
+      await this.assertTaskCompletionCurrent(event);
       if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'reviewing' });
       const cachedMission = this.inMemoryMissions.get(missionId);
       if (cachedMission) this.inMemoryMissions.set(missionId, { ...cachedMission, status: 'reviewing', updatedAt: now });
@@ -1036,10 +1384,16 @@ export class Orchestrator {
         return;
       }
 
+      // Newer orchestrators own durable apply and post-apply verification.
+      // Keep policy/quality checks above shared, but never bypass that owner.
+      if (await this.applyAutomaticallyApprovedPlan(event)) return;
+
       if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'applying' });
       const builderTasks = allTasks.filter((task) => task.assignedRole === 'builder' && task.status === 'done');
       for (const builderTask of builderTasks) {
+        await this.assertTaskCompletionCurrent(event);
         const result = await this.applyTaskChanges(builderTask.id);
+        await this.assertTaskCompletionCurrent(event);
         if (!result.success) {
           if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'blocked' });
           this.emitMissionFailed({
@@ -1061,7 +1415,9 @@ export class Orchestrator {
       }
 
       if (this.workspaceManager) {
+        await this.assertTaskCompletionCurrent(event);
         await this.workspaceManager.updateMission(missionId, { status: 'verifying' });
+        await this.assertTaskCompletionCurrent(event);
         await this.workspaceManager.updateMission(missionId, { status: 'completed', completedAt: new Date().toISOString() });
       }
       this.emitMissionCompleted({
@@ -1087,6 +1443,12 @@ export class Orchestrator {
       ? await this.workspaceManager.getMission(missionId)
       : this.inMemoryMissions.get(missionId);
     if (currentMission && TERMINAL_MISSION_STATUSES.has(String(currentMission.status))) return;
+    const pendingTasks = allTasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
+    const hasActiveTasks = allTasks.some((task) => ACTIVE_TASK_STATUSES.has(String(task.status)));
+    if (nextTasks.length === 0 && pendingTasks.length > 0 && !hasActiveTasks) {
+      await this.failBlockedPlan(missionId, activePlanId, pendingTasks);
+      return;
+    }
     const candidateBuilders = allTasks.filter((task) => task.assignedRole === 'builder' && task.title.includes('(Candidate'));
     const candidateResolved = candidateBuilders.length > 1 && candidateBuilders.some((task) => task.status === 'superseded');
     if (currentMission?.executionMode === 'candidate' && candidateBuilders.length > 1 && !candidateResolved && nextTasks.some((task) => task.assignedRole === 'qa')) {
@@ -1099,7 +1461,7 @@ export class Orchestrator {
       return;
     }
 
-    for (const task of nextTasks) {
+    for (const task of await this.capacityAllowedTasks(missionId, nextTasks)) {
       if (this.workspaceManager) {
         await this.workspaceManager.updateTask(task.id, { status: 'ready' });
       }
@@ -1128,7 +1490,13 @@ export class Orchestrator {
 
       console.warn(`[Orchestrator] Task ${taskId} failed (${error}). Retrying (${newCount}/${this.maxTaskRetries})...`);
 
-      await this.assignTask(taskId);
+      // The failed attempt no longer occupies a worker slot. Leave the task
+      // ready if another worker currently owns capacity, rather than keeping
+      // the dead attempt running and blocking its own retry indefinitely.
+      const retryTask = this.workspaceManager
+        ? await this.workspaceManager.updateTask(taskId, { status: 'ready', assignedAgentId: null })
+        : null;
+      if (!retryTask || (await this.capacityAllowedTasks(missionId, [retryTask])).length > 0) await this.assignTask(taskId);
       return;
     }
 
@@ -1192,26 +1560,6 @@ export class Orchestrator {
 
     this.taskAttempts.set(taskId, currentAttempts);
 
-    // Save TaskAttempt record if DB is available
-    if (this.db) {
-      try {
-        const newAttempt: TaskAttemptInsert = {
-          id: crypto.randomUUID(),
-          taskId,
-          missionId,
-          agentInstanceId: task?.assignedAgentId ?? 'builder-session',
-          attemptNumber: currentAttempts,
-          status: 'running',
-          worktreePath: task?.worktreeId ?? null,
-          startedAt: now,
-          error: reason,
-        };
-        await this.db.insert(taskAttemptsTable).values(newAttempt);
-      } catch (err) {
-        console.warn('[Orchestrator] Failed to insert taskAttempt record:', err);
-      }
-    }
-
     const updatedDescription = (task?.description ?? '') + `\n\n[Revision Attempt ${currentAttempts}]: ${reason}`;
 
     if (this.workspaceManager) {
@@ -1240,11 +1588,25 @@ export class Orchestrator {
     await this.assignTask(taskId, task?.assignedRole ?? 'builder');
   }
 
+  protected applyOperationForTask(
+    missionId: string,
+    planId: string | null | undefined,
+    taskId: string,
+    options?: ApplyTaskChangesContext,
+  ): ApplyTaskChangesContext {
+    return applyOperationForTask(missionId, planId, taskId, options);
+  }
+
   async handleApprovalDecision(
     missionId: string,
     approvalType: string,
     approved: boolean,
-    options?: { selectedCandidateId?: string; reason?: string },
+    options?: {
+      selectedCandidateId?: string;
+      reason?: string;
+      operationId?: string;
+      idempotencyKey?: string;
+    },
   ): Promise<void> {
     if (!this.workspaceManager) {
       throw new Error('Approval decisions require a WorkspaceManager.');
@@ -1268,13 +1630,16 @@ export class Orchestrator {
 
     if (approvalType === 'plan') {
       const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission?.planId);
+      const pending = tasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
+      const roots = this.dependencyFreeRoots(pending);
+      if (pending.length > 0 && roots.length === 0) {
+        await this.failBlockedPlan(missionId, mission?.planId || tasks[0]?.planId || null, pending);
+        return;
+      }
       await this.workspaceManager.updateMission(missionId, { status: 'running' });
-      const ready = tasks.filter((task) => {
-        if (task.status !== 'planned' && task.status !== 'ready') return false;
-        const dependencies = (task.dependsOn as string[]) || [];
-        return dependencies.length === 0;
-      });
-      for (const task of ready) {
+      const dispatchableRoots = await this.capacityAllowedTasks(missionId, roots);
+      console.info(`[Orchestrator] Mission ${missionId} plan ${mission?.planId || tasks[0]?.planId || 'unknown'} dispatching root task(s): ${dispatchableRoots.map((task) => task.id).join(', ') || 'none'}`);
+      for (const task of dispatchableRoots) {
         await this.assignTask(task.id, task.assignedRole ?? undefined);
       }
       return;
@@ -1297,7 +1662,8 @@ export class Orchestrator {
 
       await this.workspaceManager.updateMission(missionId, { status: 'applying' });
       for (const task of tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
-        const result = await this.applyTaskChanges(task.id);
+        const operation = this.applyOperationForTask(missionId, mission?.planId, task.id, options);
+        const result = await this.applyTaskChanges(task.id, operation);
         if (!result.success) {
           await this.workspaceManager.updateMission(missionId, { status: 'blocked' });
           throw new Error(result.output || `Applying task ${task.id} failed.`);
@@ -1326,6 +1692,10 @@ export class Orchestrator {
     }
 
     throw new Error(`Approval type '${approvalType}' does not have a resumable action.`);
+  }
+
+  protected async applyAutomaticallyApprovedPlan(_event: TaskCompleted): Promise<boolean> {
+    return false;
   }
 
   async selectCandidate(missionId: string, selectedTaskId: string, reason: string): Promise<void> {
@@ -1366,7 +1736,7 @@ export class Orchestrator {
         return dependency?.status === 'done' || dependency?.status === 'superseded';
       });
     });
-    for (const task of nextTasks) await this.assignTask(task.id, task.assignedRole ?? undefined);
+    for (const task of await this.capacityAllowedTasks(missionId, nextTasks)) await this.assignTask(task.id, task.assignedRole ?? undefined);
   }
 
   async retryTask(taskId: string): Promise<TaskSelect> {
@@ -1386,6 +1756,9 @@ export class Orchestrator {
     }
     this.taskRetries.set(taskId, 0);
     this.taskAttempts.set(taskId, 1);
+    if (missionId && task && (await this.capacityAllowedTasks(missionId, [task])).length === 0) {
+      throw new Error(`Mission '${missionId}' has no available worker capacity for task '${taskId}'.`);
+    }
     return await this.assignTask(taskId);
   }
 
@@ -1432,7 +1805,7 @@ export class Orchestrator {
       const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(mission.id), mission.planId);
 
       const activeTasks = tasks.filter((t) => t.status === 'running' || t.status === 'revision_requested');
-      for (const task of activeTasks) {
+      for (const task of await this.capacityAllowedTasks(mission.id, activeTasks)) {
         console.log(`[Orchestrator] Resuming active task: ${task.id}`);
         await this.assignTask(task.id, task.assignedRole ?? undefined);
       }

@@ -45,11 +45,15 @@ fn main_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
 }
 
 fn git_output(workspace_path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace_path)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.args(args).current_dir(workspace_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

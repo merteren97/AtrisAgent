@@ -23,6 +23,7 @@ async function runPolicyTests() {
   assert(!engine.isPathAllowed('/workspace/.env'), 'Blocks access to .env sensitive file');
   assert(engine.isPathAllowed('src/components/button.tsx'), 'Allows clean relative path');
   assert(!engine.isPathAllowed('/other/dir/file.txt', '/workspace/root'), 'Blocks path outside workspace boundary');
+  assert(!engine.isPathAllowed('/workspace/root-secrets/file.txt', '/workspace/root'), 'Blocks sibling paths that only share a string prefix with the workspace');
 
   // Test 2: Command Denylist Filtering
   const cmdCheck1 = engine.validateCommand('rm -rf /');

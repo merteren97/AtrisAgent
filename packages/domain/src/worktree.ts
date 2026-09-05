@@ -5,6 +5,12 @@ export interface Worktree {
   branchName: string;
   path: string;
   status: 'active' | 'merged' | 'abandoned';
+  isolationKind?: 'workspace-git' | 'nested-git' | 'mirror' | 'new-sibling';
+  canonicalContainer?: string | null;
+  targetName?: string | null;
+  targetPath?: string | null;
+  appliedOperationKey?: string | null;
+  targetDescriptor?: import('./task').BuilderTargetDescriptor | null;
   createdAt: string;
 }
 

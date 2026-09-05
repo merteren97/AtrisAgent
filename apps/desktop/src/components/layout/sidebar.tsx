@@ -13,6 +13,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   KeyRound,
+  UsersRound,
   History,
   BarChart2,
   Brain,
@@ -31,9 +32,10 @@ import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
+import { ConversationDeleteDialog } from '../history/ConversationDeleteDialog';
 import { useWorkspaceStore } from '../../stores/workspace-store';
 import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
@@ -42,6 +44,7 @@ import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
 import { ThemeToggle } from '../theme-toggle';
 import { useAuthSession } from '@/lib/auth-session';
+import { needsMissionAttention } from '@/lib/mission-display';
 
 interface SidebarItemProps {
   icon: ReactNode;
@@ -56,6 +59,7 @@ function SidebarItem({ icon, label, badge, isActive, onClick, collapsed }: Sideb
   const content = (
     <button
       onClick={onClick}
+      aria-label={collapsed ? label : undefined}
       className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${isActive ? 'bg-sidebar-accent text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
     >
       {icon}
@@ -74,6 +78,8 @@ function SidebarItem({ icon, label, badge, isActive, onClick, collapsed }: Sideb
 }
 
 function missionStateIcon(mission: Mission) {
+  if (mission.deletionState?.status === 'pending') return <Loader2 className="h-3 w-3 animate-spin text-amber-400" />;
+  if (mission.deletionState?.status === 'retryable') return <AlertCircle className="h-3 w-3 text-destructive" />;
   if (['running', 'planning', 'applying', 'verifying', 'revising'].includes(mission.status)) {
     return <Loader2 className="h-3 w-3 animate-spin text-primary" />;
   }
@@ -82,6 +88,18 @@ function missionStateIcon(mission: Mission) {
   if (mission.status === 'cancelled') return <Ban className="h-3 w-3 text-muted-foreground" />;
   if (['failed', 'blocked'].includes(mission.status)) return <AlertCircle className="h-3 w-3 text-destructive" />;
   return <Circle className="h-2.5 w-2.5 text-muted-foreground" />;
+}
+
+export function conversationDeleteActionLabel(mission: Pick<Mission, 'deletionState'>): string {
+  if (mission.deletionState?.status === 'pending') return 'Check deletion status…';
+  if (mission.deletionState?.status === 'retryable') return 'Retry conversation deletion…';
+  return 'Delete conversation…';
+}
+
+export function conversationDeleteStatusLabel(mission: Pick<Mission, 'deletionState'>): string | null {
+  if (mission.deletionState?.status === 'pending') return 'Deleting…';
+  if (mission.deletionState?.status === 'retryable') return 'Delete failed · retry';
+  return null;
 }
 
 function agentRoleIcon(role: string) {
@@ -110,10 +128,6 @@ function agentTitle(agent: AgentInstance): string {
   if (agent.specialty) return agent.specialty;
   if (agent.role.toLowerCase() === 'qa') return 'QA Agent';
   return `${agent.role.charAt(0).toUpperCase()}${agent.role.slice(1)}`;
-}
-
-function canDeleteConversation(mission: Mission): boolean {
-  return ['completed', 'failed', 'cancelled'].includes(mission.status);
 }
 
 function SidebarAgentTree({
@@ -165,10 +179,9 @@ export function Sidebar() {
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
-  const [deletingMissionId, setDeletingMissionId] = useState<string | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
-  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission } = useWorkspaceStore();
-  const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput, deleteMission } = useMissionStore();
+  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
+  const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput } = useMissionStore();
   const agents = useAgentStore((state) => state.agents);
   const selectedAgentId = useAgentStore((state) => state.selectedAgentId);
   const setSelectedAgent = useAgentStore((state) => state.setSelectedAgent);
@@ -228,7 +241,7 @@ export function Sidebar() {
     () => activeMissionAgents.filter((agent) => !agent.parentAgentId || !activeAgentIds.has(agent.parentAgentId)),
     [activeAgentIds, activeMissionAgents],
   );
-  const attentionCount = missions.filter((mission) => ['waiting_for_approval', 'reviewing', 'blocked', 'failed'].includes(mission.status)).length;
+  const attentionCount = missions.filter((mission) => mission.workspaceId === activeWorkspaceId && needsMissionAttention(mission.status)).length;
 
   const handleDrag = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -275,14 +288,7 @@ export function Sidebar() {
     openInspector('agents');
   };
 
-  const handleDeleteConversation = async () => {
-    const mission = pendingDeleteMission;
-    if (!mission || !canDeleteConversation(mission)) return;
-    setDeletingMissionId(mission.id);
-    const deleted = await deleteMission(mission.id);
-    setDeletingMissionId(null);
-    if (!deleted) return;
-    setPendingDeleteMission(null);
+  const handleConversationDeleted = (mission: Mission) => {
     if (mission.id === activeMissionId) {
       setComposerInput('');
       setActiveView('chat');
@@ -290,10 +296,15 @@ export function Sidebar() {
     }
   };
 
+  const dialogMission = pendingDeleteMission
+    ? missions.find((mission) => mission.id === pendingDeleteMission.id) || pendingDeleteMission
+    : null;
+
   const currentWidth = sidebarCollapsed ? 48 : sidebarWidth;
 
   return (
     <aside
+      aria-label="Project navigation"
       className="relative flex flex-col select-none border-r border-sidebar-border bg-sidebar transition-[width] duration-300 ease-in-out"
       style={{ width: currentWidth, minWidth: currentWidth }}
     >
@@ -312,7 +323,7 @@ export function Sidebar() {
         </div>
         <div className={`flex items-center gap-1 ${sidebarCollapsed ? 'flex-col' : ''}`}>
           {!sidebarCollapsed && <ThemeToggle compact />}
-          <Button variant="ghost" size="icon" className="h-7 w-7 text-sidebar-muted hover:text-sidebar-foreground" onClick={toggleSidebar}>
+          <Button variant="ghost" size="icon" aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} className="h-7 w-7 text-sidebar-muted hover:text-sidebar-foreground" onClick={toggleSidebar}>
             {sidebarCollapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}
           </Button>
         </div>
@@ -320,6 +331,8 @@ export function Sidebar() {
 
       <div className="px-2 py-2">
         <button
+          type="button"
+          aria-label="Search workspaces and missions"
           onClick={() => setCommandPaletteOpen(true)}
           className={`flex w-full items-center rounded-md border border-sidebar-border/70 bg-sidebar-accent py-1.5 text-xs text-sidebar-muted transition-colors hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-2.5'}`}
         >
@@ -349,7 +362,7 @@ export function Sidebar() {
         {!sidebarCollapsed && <p className="px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-sidebar-muted">Workspaces</p>}
         <Tooltip delayDuration={0}>
           <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">
+            <Button variant="ghost" size="icon" aria-label="Open project" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">
               <Plus className="h-3.5 w-3.5" />
             </Button>
           </TooltipTrigger>
@@ -358,7 +371,20 @@ export function Sidebar() {
       </div>
 
       <ScrollArea className="flex-1 px-2">
-        {workspaces.length === 0 && !sidebarCollapsed && (
+        {workspaceError && (
+          <div role="alert" className="mt-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[10px] text-destructive">
+            <p>{workspaceError}</p>
+            <Button type="button" variant="outline" size="sm" className="mt-2 h-6 text-[10px]" onClick={() => void fetchWorkspaces()} disabled={workspacesLoading}>
+              Retry
+            </Button>
+          </div>
+        )}
+        {workspacesLoading && workspaces.length === 0 && !sidebarCollapsed && (
+          <div role="status" className="mt-2 flex items-center gap-2 rounded-lg border border-sidebar-border px-3 py-3 text-[10px] text-sidebar-muted">
+            <Loader2 className="h-3 w-3 animate-spin" /> Loading projects…
+          </div>
+        )}
+        {workspaces.length === 0 && !sidebarCollapsed && !workspacesLoading && !workspaceError && (
           <button type="button" onClick={() => setIsWorkspaceDialogOpen(true)} className="mt-2 w-full rounded-lg border border-dashed border-sidebar-border px-3 py-4 text-center text-[11px] text-sidebar-muted hover:border-primary/40 hover:text-sidebar-foreground">
             Open your first project
           </button>
@@ -366,7 +392,7 @@ export function Sidebar() {
 
         {workspaces.map((workspace) => {
           const isActiveWorkspace = workspace.id === activeWorkspaceId;
-          const workspaceMissions = isActiveWorkspace ? missions : [];
+          const workspaceMissions = isActiveWorkspace ? missions.filter((mission) => mission.workspaceId === workspace.id) : [];
           return (
             <div key={workspace.id} className="mb-2">
               <div
@@ -376,6 +402,7 @@ export function Sidebar() {
                 <button
                   type="button"
                   onClick={() => handleWorkspaceSelect(workspace.id)}
+                  aria-label={sidebarCollapsed ? workspace.name : undefined}
                   className={`flex min-w-0 flex-1 items-center ${sidebarCollapsed ? 'justify-center py-1.5' : 'gap-1.5 py-1.5 pl-1.5'}`}
                 >
                   {!sidebarCollapsed && <ChevronRight className={`h-3 w-3 shrink-0 text-sidebar-muted transition-transform ${isActiveWorkspace ? 'rotate-90' : ''}`} />}
@@ -423,48 +450,75 @@ export function Sidebar() {
                     const isActiveMission = mission.id === activeMissionId;
                     const missionAgents = isActiveMission ? activeMissionAgents : [];
                     const missionCancelled = mission.status === 'cancelled';
-                    const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
-                    const deletable = canDeleteConversation(mission);
-                    return (
-                      <div key={mission.id} className="group/conversation mb-0.5">
-                        <div className={`flex items-center rounded-md transition-colors ${isActiveMission ? 'bg-primary/[0.07] text-sidebar-foreground' : 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
+                     const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;
+                     const deletionStatusLabel = conversationDeleteStatusLabel(mission);
+                     const deletionActionLabel = conversationDeleteActionLabel(mission);
+                     const deletionPending = mission.deletionState?.status === 'pending';
+                     return (
+                       <div key={mission.id} className="group/conversation mb-0.5">
+                         <ContextMenu>
+                           <ContextMenuTrigger asChild>
+                             <div
+                               className={`flex items-center rounded-md transition-colors ${isActiveMission ? 'bg-primary/[0.07] text-sidebar-foreground' : 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}
+                               aria-busy={deletionPending || undefined}
+                             >
                           <button
                             type="button"
                             onClick={() => handleMissionSelect(mission.id)}
-                            className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-[11px]"
-                            title={`${mission.title} · ${mission.status}`}
+                             disabled={deletionPending}
+                             className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-[11px] disabled:cursor-wait disabled:opacity-80"
+                             title={`${mission.title} · ${deletionStatusLabel || mission.status}`}
                           >
                             <span className="flex h-4 w-4 shrink-0 items-center justify-center">{missionStateIcon(mission)}</span>
                             <span className="min-w-0 flex-1 truncate text-left">{mission.title}</span>
-                            {isActiveMission && missionAgents.length > 0 && (
-                              <span className="shrink-0 text-[9px] text-sidebar-muted">
-                                {runningAgents > 0 ? `${runningAgents} active` : `${missionAgents.length} agents`}
-                              </span>
-                            )}
+                             {deletionStatusLabel ? (
+                               <span className={`shrink-0 text-[9px] ${mission.deletionState?.status === 'retryable' ? 'text-destructive' : 'text-amber-400'}`}>
+                                 {deletionStatusLabel}
+                               </span>
+                             ) : isActiveMission && missionAgents.length > 0 ? (
+                               <span className="shrink-0 text-[9px] text-sidebar-muted">
+                                 {runningAgents > 0 ? `${runningAgents} active` : `${missionAgents.length} agents`}
+                               </span>
+                             ) : null}
                           </button>
 
                           <DropdownMenu>
                             <DropdownMenuTrigger asChild>
                               <button
                                 type="button"
-                                className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-0 transition-opacity hover:bg-sidebar hover:text-sidebar-foreground focus:opacity-100 focus:outline-none group-hover/conversation:opacity-100 data-[state=open]:opacity-100"
+                                 className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-70 transition-all hover:bg-sidebar hover:text-sidebar-foreground hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground data-[state=open]:opacity-100 group-hover/conversation:opacity-100"
                                 aria-label={`Conversation actions for ${mission.title}`}
+                                title="Conversation actions"
                               >
                                 <MoreHorizontal className="h-3.5 w-3.5" />
                               </button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent side="right" align="start" className="w-52">
                               <DropdownMenuItem
-                                variant={deletable ? 'destructive' : 'default'}
-                                disabled={!deletable}
-                                onSelect={() => deletable && setPendingDeleteMission(mission)}
+                                variant="destructive"
+                                onSelect={() => {
+                                  setPendingDeleteMission(mission);
+                                }}
+                               >
+                                 <Trash2 className="h-3.5 w-3.5" />
+                                 {deletionActionLabel}
+                              </DropdownMenuItem>
+                           </DropdownMenuContent>
+                         </DropdownMenu>
+                              </div>
+                            </ContextMenuTrigger>
+                            <ContextMenuContent className="w-52">
+                              <ContextMenuItem
+                                variant="destructive"
+                                onSelect={() => {
+                                  setPendingDeleteMission(mission);
+                                }}
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
-                                {deletable ? 'Delete conversation' : 'Stop before deleting'}
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
+                                {deletionActionLabel}
+                              </ContextMenuItem>
+                            </ContextMenuContent>
+                          </ContextMenu>
 
                         {isActiveMission && rootAgents.length > 0 && (
                           <div className="ml-2 mt-0.5 border-l border-sidebar-border/50 pl-1">
@@ -493,6 +547,7 @@ export function Sidebar() {
 
       <Separator className="bg-sidebar-border" />
       <div className="space-y-0.5 px-2 py-2">
+        <SidebarItem collapsed={sidebarCollapsed} icon={<UsersRound className="h-3.5 w-3.5 text-violet-400" />} label="Agents" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
         <SidebarItem collapsed={sidebarCollapsed} icon={<KeyRound className="h-3.5 w-3.5 text-amber-500" />} label="Accounts" isActive={activeView === 'accounts'} onClick={() => setActiveView('accounts')} />
         <SidebarItem collapsed={sidebarCollapsed} icon={<Settings className="h-3.5 w-3.5 text-muted-foreground" />} label="Settings" isActive={activeView === 'settings'} onClick={() => setActiveView('settings')} />
       </div>
@@ -555,35 +610,7 @@ export function Sidebar() {
 
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
-
-      <Dialog open={Boolean(pendingDeleteMission)} onOpenChange={(open) => !open && !deletingMissionId && setPendingDeleteMission(null)}>
-        <DialogContent className="sm:max-w-[440px]">
-          <DialogHeader>
-            <div className="mb-1 flex h-9 w-9 items-center justify-center rounded-lg border border-destructive/25 bg-destructive/10 text-destructive">
-              <Trash2 className="h-4 w-4" />
-            </div>
-            <DialogTitle>Delete conversation?</DialogTitle>
-            <DialogDescription className="leading-relaxed">
-              This permanently removes the mission timeline, tasks, agent history, events, artifacts, and managed task worktrees for this conversation. Changes that were already applied to your project files are not reverted.
-            </DialogDescription>
-          </DialogHeader>
-
-          {pendingDeleteMission && (
-            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5">
-              <div className="truncate text-xs font-medium text-foreground">{pendingDeleteMission.title}</div>
-              <div className="mt-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{pendingDeleteMission.status}</div>
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingDeleteMission(null)} disabled={Boolean(deletingMissionId)}>Cancel</Button>
-            <Button variant="destructive" onClick={() => void handleDeleteConversation()} disabled={!pendingDeleteMission || Boolean(deletingMissionId)}>
-              {deletingMissionId ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Trash2 className="mr-2 h-3.5 w-3.5" />}
-              Delete conversation
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConversationDeleteDialog mission={dialogMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />
     </aside>
   );
 }

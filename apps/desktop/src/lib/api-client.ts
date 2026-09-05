@@ -4,6 +4,8 @@ import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 const configuredBase = import.meta.env?.VITE_ATRIS_API_URL as string | undefined;
 let apiOrigin = normalizeApiOrigin(configuredBase);
 let runtimeTransportToken: string | null = null;
+const API_REQUEST_TIMEOUT_MS = 30_000;
+const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
 
 export interface ApiRuntimeConfig {
   origin: string;
@@ -42,23 +44,65 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiRequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Request timed out after ${timeoutMs}ms.`);
+    this.name = 'ApiRequestTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export function isApiRequestTimeout(error: unknown): error is ApiRequestTimeoutError {
+  return error instanceof ApiRequestTimeoutError
+    || (error instanceof Error && error.name === 'ApiRequestTimeoutError')
+    || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'API_REQUEST_TIMEOUT');
+}
+
 export interface ApiRequestInit extends RequestInit {
   /** Auth endpoints can opt out when there is a stale token in memory. */
   skipAuth?: boolean;
   /** Logout handles cleanup itself and should not race the session-expired callback. */
   suppressUnauthorized?: boolean;
+  /** Override the desktop request deadline, or set to 0 to disable it. */
+  timeoutMs?: number;
 }
 
-export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {}): Promise<T> {
-  const { skipAuth = false, suppressUnauthorized = false, ...requestInit } = init;
+async function fetchWithDeadline(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  if (timeoutMs <= 0) return fetch(input, init);
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const abort = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) abort();
+  else init.signal?.addEventListener('abort', abort, { once: true });
+  const timer = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) throw new ApiRequestTimeoutError(timeoutMs);
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timer);
+    init.signal?.removeEventListener('abort', abort);
+  }
+}
+
+export async function apiRequestWithHeaders<T>(pathname: string, init: ApiRequestInit = {}): Promise<{ data: T; headers: Headers; status: number }> {
+  const { skipAuth = false, suppressUnauthorized = false, timeoutMs = API_REQUEST_TIMEOUT_MS, ...requestInit } = init;
   const headers = runtimeHeaders(requestInit.headers);
   if (requestInit.body && !(requestInit.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = getAuthToken();
   if (!skipAuth && token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
-  const response = await fetch(`${getApiBaseUrl()}${pathname.startsWith('/') ? pathname : `/${pathname}`}`, {
+  const response = await fetchWithDeadline(`${getApiBaseUrl()}${pathname.startsWith('/') ? pathname : `/${pathname}`}`, {
     ...requestInit,
     headers,
-  });
+  }, timeoutMs);
   const contentType = response.headers.get('content-type') || '';
   const payload = contentType.includes('application/json')
     ? await response.json().catch(() => null)
@@ -70,13 +114,17 @@ export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {})
       : `Request failed with ${response.status}`;
     throw new ApiError(message, response.status, payload);
   }
-  return payload as T;
+  return { data: payload as T, headers: response.headers, status: response.status };
+}
+
+export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {}): Promise<T> {
+  return (await apiRequestWithHeaders<T>(pathname, init)).data;
 }
 
 export async function checkApiHealth(): Promise<{ status: string; version?: string; connectedAccounts?: number }> {
   // Health is intentionally public: it reports local process availability,
   // not AtrisHub identity or Premium entitlement.
-  const response = await fetch(`${getApiOrigin()}/health`, { headers: runtimeHeaders() });
+  const response = await fetchWithDeadline(`${getApiOrigin()}/health`, { headers: runtimeHeaders() }, HEALTH_REQUEST_TIMEOUT_MS);
   if (!response.ok) throw new ApiError(`Local service returned ${response.status}`, response.status);
   return response.json();
 }

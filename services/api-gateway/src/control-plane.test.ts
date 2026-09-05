@@ -42,6 +42,10 @@ async function runTests() {
   ]);
 
   const workspaceManager: any = {
+    async reserveAgentCapacity() {
+      // Production performs an atomic SQLite reservation. This isolated control-plane
+      // fixture exercises identity/tool routing after that ownership boundary.
+    },
     async getMission(id: string) {
       return id === missionId ? { id, title: 'Control plane test', status: 'running', executionMode: 'balanced' } : null;
     },

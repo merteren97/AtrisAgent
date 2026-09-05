@@ -16,6 +16,7 @@ const RUNTIME_EVENT_TYPES = new Set([
   'agent_spawned', 'agent_started', 'agent_progressed', 'agent_waiting', 'agent_resumed',
   'agent_completed', 'agent_error', 'agent_thought', 'agent_tool_call', 'text_delta',
   'tool_call_started', 'tool_call_completed', 'task_completed', 'task_failed', 'file_changed',
+  'runtime_telemetry',
 ]);
 
 export function DeveloperConsole() {
@@ -43,16 +44,16 @@ export function DeveloperConsole() {
         <div className="flex items-center gap-2">
           <Terminal className="w-3.5 h-3.5 text-primary" />
           <span className="text-xs font-semibold">Developer Mode Console & Diagnostics</span>
-          <Badge variant="outline" className="text-[10px] px-1.5 py-0 font-mono">{timeline.length} raw events</Badge>
+          <Badge variant="outline" className="text-[10px] px-1.5 py-0 font-mono">{timeline.length} observed events</Badge>
         </div>
-        <Button variant="ghost" size="icon" className="h-5 w-5 cursor-pointer" onClick={toggleDevMode}>
+        <Button variant="ghost" size="icon" className="h-5 w-5 cursor-pointer" onClick={toggleDevMode} aria-label="Close developer console">
           <X className="w-3 h-3" />
         </Button>
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col overflow-hidden">
         <TabsList className="h-7 px-2 justify-start bg-transparent border-b border-border rounded-none gap-1">
-          <TabsTrigger value="events" className="text-[11px] h-6 px-2.5 cursor-pointer"><Activity className="w-3 h-3 mr-1 text-primary" />Raw Events ({timeline.length})</TabsTrigger>
+          <TabsTrigger value="events" className="text-[11px] h-6 px-2.5 cursor-pointer"><Activity className="w-3 h-3 mr-1 text-primary" />Events ({timeline.length})</TabsTrigger>
           <TabsTrigger value="process" className="text-[11px] h-6 px-2.5 cursor-pointer"><Terminal className="w-3 h-3 mr-1 text-blue-400" />Runtime Stream ({runtimeEvents.length})</TabsTrigger>
           <TabsTrigger value="mcp" className="text-[11px] h-6 px-2.5 cursor-pointer"><Network className="w-3 h-3 mr-1 text-indigo-400" />MCP Calls ({mcpEvents.length})</TabsTrigger>
           <TabsTrigger value="environment" className="text-[11px] h-6 px-2.5 cursor-pointer"><Settings2 className="w-3 h-3 mr-1 text-emerald-400" />Environment & Diagnostics</TabsTrigger>
@@ -60,7 +61,7 @@ export function DeveloperConsole() {
 
         <TabsContent value="events" className="flex-1 overflow-hidden flex flex-col m-0 p-0">
           <div className="px-2 py-1 border-b border-border bg-muted/10">
-            <Input placeholder="Filter raw event log stream..." value={filter} onChange={e => setFilter(e.target.value)}
+            <Input placeholder="Filter observed mission events..." value={filter} onChange={e => setFilter(e.target.value)}
               className="h-6 text-xs bg-transparent border-none focus-visible:ring-0 px-1 font-mono" />
           </div>
           <ScrollArea className="flex-1" ref={scrollRef}>
@@ -78,7 +79,7 @@ export function DeveloperConsole() {
                   {event.agentRole && <Badge variant="secondary" className="text-[8px] py-0 h-3 px-1">{event.agentRole}</Badge>}
                 </div>
               ))}
-              {filteredEvents.length === 0 && <div className="text-muted-foreground text-center py-6 text-xs font-mono">No raw events emitted yet</div>}
+              {filteredEvents.length === 0 && <div className="text-muted-foreground text-center py-6 text-xs font-mono">No matching mission events observed yet</div>}
             </div>
           </ScrollArea>
         </TabsContent>
@@ -144,7 +145,7 @@ export function DeveloperConsole() {
                     <span className="text-muted-foreground">Local API Gateway:</span>
                     <span className={cn('font-semibold flex items-center gap-1', serviceOnline ? 'text-emerald-500' : 'text-rose-400')}><CheckCircle2 className="w-3 h-3" /> {serviceOnline ? getApiOrigin() : `Offline · ${getApiOrigin()}`}</span>
                   </div>
-                  <div className="flex justify-between border-b border-border/40 pb-1"><span className="text-muted-foreground">SQLite Storage:</span><span className="text-foreground font-semibold">%APPDATA%/AtrisAgent/atris.db</span></div>
+                  <div className="flex justify-between border-b border-border/40 pb-1"><span className="text-muted-foreground">SQLite Storage:</span><span className="text-foreground font-semibold">Managed by local API</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">Security Policy:</span><span className="text-indigo-400 font-semibold flex items-center gap-1"><ShieldCheck className="w-3 h-3" /> Path Traversal Active</span></div>
                 </div>
               </Card>

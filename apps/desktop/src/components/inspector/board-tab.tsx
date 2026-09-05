@@ -115,6 +115,12 @@ export function BoardTab() {
                           {task.assignedRole ? <Badge variant="outline" className="h-4 px-1 py-0 text-[10px] font-normal">{task.assignedRole}</Badge> : <span className="text-[10px] text-muted-foreground">Unassigned</span>}
                           <span className="text-[10px] capitalize text-muted-foreground">{task.status.replaceAll('_', ' ')}</span>
                         </div>
+                        <div className="text-[9px] text-muted-foreground">
+                          <span className="font-medium text-foreground/80">Attempt route:</span>{' '}
+                          {task.effectiveRoute
+                            ? [task.effectiveRoute.adapterId, task.effectiveRoute.runtimeModelId || task.effectiveRoute.modelCatalogId].filter(Boolean).join(' / ') || 'Persisted route'
+                            : 'Not exposed by API'}
+                        </div>
                       </Card>
                     ))}
                   </div>

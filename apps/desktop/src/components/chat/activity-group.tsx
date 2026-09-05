@@ -1,5 +1,5 @@
 import { useId, useMemo, useState } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, CircleDotDashed, CircleHelp, TerminalSquare, XCircle } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, CircleDotDashed, CircleHelp, TerminalSquare, TriangleAlert, XCircle } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -36,7 +36,7 @@ const DETAIL_KEYS = [
   'error',
 ];
 
-type ActivityStatus = 'running' | 'success' | 'failure' | 'unknown';
+export type ActivityStatus = 'running' | 'success' | 'failure' | 'warning' | 'unknown';
 
 const RUNNING_EVENTS = new Set([
   'agent_started',
@@ -54,10 +54,11 @@ const SUCCESS_EVENTS = new Set([
 ]);
 
 const FAILURE_EVENTS = new Set([
-  'agent_error',
   'mission_failed',
   'task_failed',
 ]);
+
+const DIAGNOSTIC_EVENTS = new Set(['agent_error']);
 
 function readableEventType(value?: string): string {
   return (value || 'activity').replace(/_/g, ' ');
@@ -73,7 +74,7 @@ function metadataString(metadata: Record<string, unknown> | undefined, key: stri
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function statusForItem(item: TimelineItem): ActivityStatus {
+export function statusForItem(item: TimelineItem): ActivityStatus {
   const eventType = item.eventType || '';
   const success = item.metadata?.success;
   const passed = item.metadata?.passed;
@@ -82,11 +83,12 @@ function statusForItem(item: TimelineItem): ActivityStatus {
   if (success === false || passed === false || approved === false || FAILURE_EVENTS.has(eventType)) return 'failure';
   if (success === true || passed === true || approved === true) return 'success';
   if (SUCCESS_EVENTS.has(eventType) && eventType !== 'tool_call_completed' && eventType !== 'check_completed') return 'success';
+  if (DIAGNOSTIC_EVENTS.has(eventType)) return 'warning';
   if (RUNNING_EVENTS.has(eventType)) return 'running';
   return 'unknown';
 }
 
-function groupStatus(items: TimelineItem[]): ActivityStatus {
+export function groupStatus(items: TimelineItem[]): ActivityStatus {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const status = statusForItem(items[index]);
     if (status !== 'unknown') return status;
@@ -98,6 +100,7 @@ const STATUS_CONFIG: Record<ActivityStatus, { label: string; variant: 'warning' 
   running: { label: 'Running', variant: 'warning' },
   success: { label: 'Complete', variant: 'success' },
   failure: { label: 'Failed', variant: 'destructive' },
+  warning: { label: 'Diagnostic', variant: 'warning' },
   unknown: { label: 'Recorded', variant: 'secondary' },
 };
 
@@ -105,6 +108,7 @@ function ActivityStatusIcon({ status }: { status: ActivityStatus }) {
   if (status === 'success') return <CheckCircle2 className="h-3.5 w-3.5 text-success" />;
   if (status === 'failure') return <XCircle className="h-3.5 w-3.5 text-destructive" />;
   if (status === 'running') return <CircleDotDashed className="h-3.5 w-3.5 text-primary" />;
+  if (status === 'warning') return <TriangleAlert className="h-3.5 w-3.5 text-warning" />;
   return <CircleHelp className="h-3.5 w-3.5 text-muted-foreground" />;
 }
 

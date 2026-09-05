@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { Clock3, Send, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
-import { parseAgentDirective } from '@/lib/agent-directive';
+import { AgentProfileSelector } from './agent-profile-selector';
+import { buildComposerRouteOptions, parseAgentDirective } from '@/lib/agent-directive';
 import { useAccountStore } from '@/stores/account-store';
 import { useMissionStore, type StartMissionOptions, type TurnDelivery } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
@@ -11,7 +12,7 @@ import { ChatComposer as StandardChatComposer } from './chat-composer-base';
 
 function QueuedTurnComposer() {
   const [message, setMessage] = useState('');
-  const [delivery, setDelivery] = useState<TurnDelivery>('steer');
+  const [delivery, setDelivery] = useState<TurnDelivery>('queue');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const sendMissionCommand = useMissionStore((state) => state.sendMissionCommand);
@@ -19,7 +20,7 @@ function QueuedTurnComposer() {
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const discoveredModels = useAccountStore((state) => state.discoveredModels);
   const serviceOnline = useAccountStore((state) => state.serviceOnline);
-  const { selectedModel, reasoningLevel, trustMode, teamTemplate, automationSettings, setActiveView } = useSettingsStore();
+  const { selectedModel, reasoningLevel, trustMode, teamTemplate, agentProfileIds, automationSettings, setActiveView } = useSettingsStore();
 
   const selectedModelObject = useMemo(
     () => discoveredModels.find((model) => model.catalogId === selectedModel),
@@ -33,6 +34,16 @@ function QueuedTurnComposer() {
     () => discoveredModels.find((model) => model.catalogId === directive.modelCatalogId),
     [discoveredModels, directive.modelCatalogId],
   );
+  const directiveReasoningSupported = !directive.reasoningLevel
+    || !directiveModel
+    || directiveModel.supportedReasoning.length === 0
+    || directiveModel.supportedReasoning.includes(directive.reasoningLevel as never);
+  const routeResolution = useMemo(() => buildComposerRouteOptions(directive, {
+    selectedModel: selectedModelObject?.available ? selectedModel : undefined,
+    selectedReasoning: reasoningLevel,
+    directiveModelDefaultReasoning: directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0],
+    directiveReasoningSupported,
+  }), [directive, directiveModel, directiveReasoningSupported, reasoningLevel, selectedModel, selectedModelObject]);
   const queuedCount = useMemo(
     () => activeMissionId ? queuedTurns.filter((turn) => turn.missionId === activeMissionId).length : 0,
     [activeMissionId, queuedTurns],
@@ -46,34 +57,18 @@ function QueuedTurnComposer() {
 
   const submit = () => {
     const prompt = message.trim();
-    if (!prompt || !activeMissionId || !activeWorkspaceId) return;
+    if (!prompt || !activeMissionId || !activeWorkspaceId || routeResolution.error) return;
     if (!serviceOnline) {
       setActiveView('accounts');
       return;
     }
 
-    const targetRole = directive.targetRole || 'Orchestrator';
-    const scopedSelectedModel = selectedModel || undefined;
-    const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
-    const routeScope: StartMissionOptions['routeScope'] = directive.modelCatalogId
-      ? 'role'
-      : scopedSelectedModel
-        ? 'mission'
-        : undefined;
-    const resolvedReasoning = directive.reasoningLevel
-      || (directive.modelCatalogId
-        ? directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0]
-        : scopedSelectedModel ? reasoningLevel : undefined);
     const options: StartMissionOptions = {
-      model: resolvedModel,
-      reasoningLevel: resolvedReasoning,
       teamTemplate,
+      agentProfileIds,
       trustMode,
-      targetRole: directive.targetRole,
-      routeRole: targetRole,
-      routeScope,
-      command: directive.command,
       automationSettings,
+      ...routeResolution.options,
     };
 
     void sendMissionCommand(activeMissionId, prompt, delivery, options);
@@ -94,7 +89,7 @@ function QueuedTurnComposer() {
           <div className="flex min-w-0 items-center gap-2">
             <Clock3 className="h-3.5 w-3.5 shrink-0 text-primary" />
             <span className="font-medium text-foreground">Current turn is still running</span>
-            <span className="truncate text-muted-foreground">Steer at the next safe boundary, queue a follow-up, or stop and replan.</span>
+            <span className="truncate text-muted-foreground">Queue starts a new turn in this conversation. Steer only guides the active turn at its next safe boundary.</span>
           </div>
           {queuedCount > 0 ? <span className="shrink-0 rounded-full border border-border bg-background px-2 py-0.5 text-[9px] text-muted-foreground">{queuedCount} queued</span> : null}
         </div>
@@ -114,11 +109,13 @@ function QueuedTurnComposer() {
           <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
             <div className="flex min-w-0 items-center gap-1.5 text-[9px] text-muted-foreground">
               {selectedModelObject ? <RuntimeBrandIcon runtimeId={selectedModelObject.runtimeType} className="h-3 w-3 shrink-0" /> : <Sparkles className="h-3 w-3 shrink-0 text-primary" />}
-              <span className="truncate">Next turn model: {selectedModelObject?.name || 'Auto routing'}</span>
+              <span className="truncate">{directive.teamWideModel ? `All mission agents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Next Orchestrator model: ${selectedModelObject?.name || 'Auto routing'}`}</span>
               {reasoningLevel && reasoningLevel !== 'none' && selectedModelObject?.supportedReasoning.length ? <span className="shrink-0">· {reasoningLevel}</span> : null}
+              {routeResolution.error ? <span className="shrink-0 text-amber-400">· {routeResolution.error}</span> : null}
             </div>
-            <div className="flex items-center gap-1">
-              <div className="flex rounded-md border border-border/70 bg-background/70 p-0.5" aria-label="Message delivery">
+              <div className="flex items-center gap-1">
+                <AgentProfileSelector />
+                <div className="flex rounded-md border border-border/70 bg-background/70 p-0.5" aria-label="Message delivery">
                 {(['steer', 'queue', 'stop_and_replan'] as TurnDelivery[]).map((mode) => <button key={mode} type="button" onClick={() => setDelivery(mode)} aria-pressed={delivery === mode}
                   className={delivery === mode ? 'rounded px-2 py-1 text-[9px] font-medium text-foreground bg-accent' : 'rounded px-2 py-1 text-[9px] text-muted-foreground hover:text-foreground'}>
                   {mode === 'stop_and_replan' ? 'Replan' : mode[0].toUpperCase() + mode.slice(1)}
@@ -127,7 +124,7 @@ function QueuedTurnComposer() {
               <Button
               size="icon"
               className="h-8 w-8 rounded-lg"
-              disabled={!message.trim() || !serviceOnline || !activeWorkspaceId}
+              disabled={!message.trim() || !serviceOnline || !activeWorkspaceId || Boolean(routeResolution.error)}
               onClick={submit}
               aria-label={`Send with ${delivery} delivery`}
             >
@@ -138,7 +135,7 @@ function QueuedTurnComposer() {
         </div>
 
         <div className="mt-1.5 flex items-center justify-between px-1 text-[9px] text-muted-foreground/70">
-          <span>Enter to send · Shift+Enter for a new line · Steer never mutates an already-running worker</span>
+          <span>Enter to send · Shift+Enter for a new line · Queue is the safe default; Steer does not start implementation</span>
           {message.length > 0 ? <span>~{Math.ceil(message.length / 4)} tokens</span> : null}
         </div>
       </div>

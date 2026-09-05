@@ -6,7 +6,7 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "test": "npx tsx src/policy.test.ts",
+    "test": "npx tsx src/policy.test.ts && npx tsx src/action-broker.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

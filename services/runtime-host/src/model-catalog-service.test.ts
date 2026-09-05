@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { ModelCatalogService } from './model-catalog-service';
 
-function model(profileId: string, id = 'model-old'): any {
+function model(profileId: string, id = 'model-old', source: 'discovered' | 'documented' = 'discovered'): any {
   return {
     catalogId: `claude_code:${profileId}:${id}`,
     runtimeId: 'claude_code',
@@ -15,7 +15,7 @@ function model(profileId: string, id = 'model-old'): any {
     supportedReasoning: ['medium'],
     inputModalities: ['text'],
     availability: 'available',
-    source: 'discovered',
+    source,
   };
 }
 
@@ -79,7 +79,7 @@ async function runTests() {
         configureProfile() {},
         async discoverModels() {
           if (failDiscovery) throw new Error('runtime temporarily unavailable');
-          return [model(profile.id, 'model-known-good')];
+          return [model(profile.id, 'model-known-good'), model(profile.id, 'documented-alias', 'documented')];
         },
       };
       const service = new ModelCatalogService(undefined, dir);
@@ -88,10 +88,15 @@ async function runTests() {
       failDiscovery = true;
       const degraded = await service.discoverLiveModels([profile]);
       assert(degraded.some((item) => item.runtimeModelId === 'model-known-good'), 'failed refresh keeps the last known model route instead of deleting it');
+      const stale = degraded.find((item) => item.runtimeModelId === 'model-known-good');
+      const documented = degraded.find((item) => item.runtimeModelId === 'documented-alias');
+      assert(stale?.source === 'cached' && stale.availability === 'unknown', 'failed refresh marks the in-memory live route as cached and unverified');
+      assert(documented?.source === 'documented' && documented.availability === 'unknown', 'failed refresh preserves documented model provenance while removing live availability');
 
       const reloaded = new ModelCatalogService(undefined, dir);
       const cached = reloaded.getModelsForProfile(profile.id)[0];
       assert(cached?.source === 'cached' && cached?.availability === 'unknown', 'failed refresh cache reload is explicitly marked non-live');
+      assert(reloaded.getModelsForProfile(profile.id).some((item) => item.runtimeModelId === 'documented-alias' && item.source === 'documented'), 'documented provenance survives a cache reload');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

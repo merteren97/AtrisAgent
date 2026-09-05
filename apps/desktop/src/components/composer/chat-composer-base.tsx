@@ -23,13 +23,14 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
 import { TeamTemplateSelector } from './team-template-selector';
+import { AgentProfileSelector } from './agent-profile-selector';
 import { TrustModeSelector } from './trust-mode-selector';
 import { useMissionStore } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { cn } from '@/lib/utils';
-import { AGENT_ROLES, parseAgentDirective } from '@/lib/agent-directive';
+import { AGENT_ROLES, buildComposerRouteOptions, parseAgentDirective } from '@/lib/agent-directive';
 
 const ROLES = AGENT_ROLES;
 const COMMANDS = [
@@ -38,7 +39,7 @@ const COMMANDS = [
   { id: 'review', label: 'Request a focused review' },
   { id: 'summarize', label: 'Summarize current mission state' },
 ] as const;
-const TERMINAL_CONVERSATION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_CONVERSATION_STATUSES = new Set(['completed', 'failed', 'cancelled', 'blocked']);
 
 function titleCase(value: string): string {
   return value === 'xhigh' ? 'Extra High' : value.charAt(0).toUpperCase() + value.slice(1);
@@ -65,10 +66,14 @@ export function ChatComposer() {
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
   const missions = useMissionStore((state) => state.missions);
   const loading = useMissionStore((state) => state.loading);
+  const pendingMissionStart = useMissionStore((state) => state.pendingMissionStart);
   const composerInput = useMissionStore((state) => state.composerInput);
   const setComposerInput = useMissionStore((state) => state.setComposerInput);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const discoveredModels = useAccountStore((state) => state.discoveredModels);
+  const modelCatalogLoading = useAccountStore((state) => state.modelCatalogLoading);
+  const modelCatalogReady = useAccountStore((state) => state.modelCatalogReady);
+  const modelCatalogError = useAccountStore((state) => state.modelCatalogError);
   const serviceOnline = useAccountStore((state) => state.serviceOnline);
   const refreshModels = useAccountStore((state) => state.refreshModels);
 
@@ -78,6 +83,7 @@ export function ChatComposer() {
     trustMode,
     automationSettings,
     teamTemplate,
+    agentProfileIds,
     setSelectedRole,
     setSelectedModel,
     setReasoningLevel,
@@ -94,6 +100,7 @@ export function ChatComposer() {
     activeMission && TERMINAL_CONVERSATION_STATUSES.has(activeMission.status),
   );
   const activeConversationBusy = Boolean(activeMission && !activeConversationCanContinue);
+  const missionStartPending = Boolean(pendingMissionStart);
 
   const selectedModelObject = useMemo(
     () => discoveredModels.find((model) => model.catalogId === selectedModel),
@@ -114,12 +121,19 @@ export function ChatComposer() {
     || !directiveModel
     || directiveModel.supportedReasoning.length === 0
     || directiveModel.supportedReasoning.includes(directive.reasoningLevel as never);
+  const routeResolution = useMemo(() => buildComposerRouteOptions(directive, {
+    selectedModel: selectedModelObject?.available ? selectedModel : undefined,
+    selectedReasoning: reasoningLevel,
+    directiveModelDefaultReasoning: directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0],
+    directiveReasoningSupported,
+  }), [directive, directiveModel, directiveReasoningSupported, reasoningLevel, selectedModel, selectedModelObject]);
 
   useEffect(() => {
     if (!selectedModel) return;
+    if (!modelCatalogReady || modelCatalogLoading) return;
     if (selectedModelObject?.available && modelSupportsRole(selectedModelObject, 'Orchestrator')) return;
     setSelectedModel('');
-  }, [selectedModel, selectedModelObject, setSelectedModel]);
+  }, [modelCatalogLoading, modelCatalogReady, selectedModel, selectedModelObject, setSelectedModel]);
 
   useEffect(() => {
     if (!selectedModelObject) return;
@@ -147,6 +161,7 @@ export function ChatComposer() {
   const matchingModels = useMemo(() => {
     const search = modelSearch.trim().toLowerCase();
     return discoveredModels.filter((model) => {
+      if (!model.available) return false;
       if (!modelSupportsRole(model, 'Orchestrator')) return false;
       if (modelRuntimeFilter !== 'all' && model.runtimeType !== modelRuntimeFilter) return false;
       return !search || [model.name, model.routeLabel, model.accountName, model.provider, model.runtimeModelId]
@@ -165,34 +180,18 @@ export function ChatComposer() {
 
   const submit = async () => {
     const prompt = message.trim();
-    if (!prompt || loading || activeConversationBusy || !directiveModelRoleCompatible || !activeWorkspaceId) return;
+    if (!prompt || loading || missionStartPending || activeConversationBusy || !directiveModelRoleCompatible || routeResolution.error || !activeWorkspaceId) return;
     if (!serviceOnline) {
       setActiveView('accounts');
       return;
     }
 
-    const targetRole = directive.targetRole || 'Orchestrator';
-    const explicitDirectiveModel = Boolean(directive.modelCatalogId);
-    const scopedSelectedModel = selectedModel || undefined;
-    const resolvedModel = directive.modelCatalogId || scopedSelectedModel;
-    const routeScope: 'role' | 'mission' | undefined = explicitDirectiveModel ? 'role' : scopedSelectedModel ? 'mission' : undefined;
-    const resolvedReasoning = directive.reasoningLevel && directiveReasoningSupported
-      ? directive.reasoningLevel
-      : directive.modelCatalogId
-        ? directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0]
-        : scopedSelectedModel
-          ? reasoningLevel
-          : undefined;
     const options = {
-      model: resolvedModel,
-      reasoningLevel: resolvedReasoning,
       teamTemplate,
+      agentProfileIds,
       trustMode,
-      targetRole: directive.targetRole,
-      routeRole: targetRole,
-      routeScope,
-      command: directive.command,
       automationSettings,
+      ...routeResolution.options,
     };
 
     setMessage('');
@@ -280,6 +279,8 @@ export function ChatComposer() {
   const routeLabel = selectedModelObject?.name || 'Auto';
   const composerPlaceholder = !activeWorkspaceId
     ? 'Open a project before starting a mission…'
+    : missionStartPending
+      ? 'A previous mission start is still being reconciled. Select a mission before retrying…'
     : activeConversationBusy
       ? 'This mission is still running. Finish or stop it before sending the next turn…'
       : activeConversationCanContinue
@@ -289,15 +290,16 @@ export function ChatComposer() {
   return (
     <div className="border-t border-border bg-background">
       <div className="mx-auto max-w-4xl px-4 py-3">
-        {directive.dynamicAgent && (
+        {(directive.dynamicAgent || directive.teamWideModel) && (
           <div className={cn(
             'mb-2 flex items-center gap-2 rounded-lg border px-3 py-1.5 text-[10px]',
-            directiveReasoningSupported && directiveModelRoleCompatible ? 'border-primary/25 bg-primary/[0.04]' : 'border-amber-500/40 bg-amber-500/[0.04]',
+            directiveReasoningSupported && directiveModelRoleCompatible && !routeResolution.error ? 'border-primary/25 bg-primary/[0.04]' : 'border-amber-500/40 bg-amber-500/[0.04]',
           )}>
             <Sparkles className="h-3 w-3 shrink-0 text-primary" />
-            <span className="font-medium">Delegate to {directive.targetRole || 'specialist'}</span>
-            <span className="truncate text-muted-foreground">{directive.modelName || 'role policy'}{directive.reasoningLevel ? ` · ${titleCase(directive.reasoningLevel)}` : ''}</span>
+            <span className="font-medium">{directive.teamWideModel ? `All mission agents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Delegate to ${directive.targetRole || 'specialist'}`}</span>
+            {!directive.teamWideModel && <span className="truncate text-muted-foreground">{directive.modelName || 'role policy'}{directive.reasoningLevel ? ` · ${titleCase(directive.reasoningLevel)}` : ''}</span>}
             {!directiveModelRoleCompatible && <span className="ml-auto text-amber-400">Incompatible model</span>}
+            {routeResolution.error && <span className="ml-auto text-amber-400">{routeResolution.error}</span>}
           </div>
         )}
 
@@ -336,7 +338,8 @@ export function ChatComposer() {
             onKeyDown={handleKeyDown}
             rows={1}
             placeholder={composerPlaceholder}
-            disabled={loading || !activeWorkspaceId}
+            aria-label="Mission message"
+            disabled={loading || missionStartPending || !activeWorkspaceId}
             className="block max-h-[170px] min-h-[42px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/75 disabled:cursor-not-allowed disabled:opacity-60"
           />
 
@@ -344,7 +347,7 @@ export function ChatComposer() {
             <div className="flex items-center gap-0.5">
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Attach context" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading || missionStartPending}>
                     <Paperclip className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -352,7 +355,7 @@ export function ChatComposer() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading || missionStartPending}>
                     <AtSign className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -360,7 +363,7 @@ export function ChatComposer() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading}>
+                  <Button variant="ghost" size="icon" aria-label="Mission commands" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading || missionStartPending}>
                     <Terminal className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
@@ -383,11 +386,11 @@ export function ChatComposer() {
                   <div className="flex items-center justify-between border-b border-border bg-muted/20 px-3 py-2.5">
                     <div>
                       <div className="flex items-center gap-1.5 text-xs font-semibold"><Settings2 className="h-3.5 w-3.5 text-primary" />Run settings</div>
-                      <p className="mt-0.5 text-[9px] text-muted-foreground">Normal missions are orchestrated automatically. Override only when needed.</p>
+                      <p className="mt-0.5 text-[9px] text-muted-foreground">{directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : 'This picker overrides Orchestrator only. Child roles keep their role policies.'}</p>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" onClick={(event) => { event.preventDefault(); void refreshModels(); }}>
-                        <RefreshCw className="h-3 w-3" />Refresh routes
+                      <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" disabled={modelCatalogLoading} onClick={(event) => { event.preventDefault(); void refreshModels().catch(() => undefined); }}>
+                        <RefreshCw className={cn('h-3 w-3', modelCatalogLoading && 'animate-spin')} />{modelCatalogLoading ? 'Discovering…' : 'Refresh routes'}
                       </Button>
                       <Badge variant="outline" className="text-[9px]">{trustMode}</Badge>
                     </div>
@@ -412,7 +415,7 @@ export function ChatComposer() {
                       {RUNTIME_BRANDS.map((runtime) => (
                         <Tooltip key={runtime.id}>
                           <TooltipTrigger asChild>
-                            <button type="button" onClick={(event) => { event.preventDefault(); setModelRuntimeFilter(runtime.id); }} className={cn('flex h-7 w-7 items-center justify-center rounded-md border', modelRuntimeFilter === runtime.id ? 'border-primary bg-primary/10' : 'border-border text-muted-foreground')}>
+                            <button type="button" aria-label={`Filter ${runtime.label} routes`} aria-pressed={modelRuntimeFilter === runtime.id} onClick={(event) => { event.preventDefault(); setModelRuntimeFilter(runtime.id); }} className={cn('flex h-7 w-7 items-center justify-center rounded-md border', modelRuntimeFilter === runtime.id ? 'border-primary bg-primary/10' : 'border-border text-muted-foreground')}>
                               <RuntimeBrandIcon runtimeId={runtime.id} className="h-3.5 w-3.5" />
                             </button>
                           </TooltipTrigger>
@@ -421,15 +424,22 @@ export function ChatComposer() {
                       ))}
                       <div className="relative ml-auto w-[190px]">
                         <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
-                        <input value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="Search routes…" className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[10px] outline-none focus:border-primary" />
+                        <input aria-label="Search connected routes" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="Search routes…" className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[10px] outline-none focus:border-primary" />
                       </div>
                     </div>
                   </div>
 
                   <div className="max-h-[240px] overflow-y-auto p-2">
                     {!matchingModels.length && (
-                      <div className="flex items-center gap-2 rounded-lg border border-dashed border-border p-4 text-[10px] text-muted-foreground">
-                        <AlertCircle className="h-4 w-4" />No compatible connected routes. <button type="button" className="ml-auto text-primary hover:underline" onClick={() => setActiveView('accounts')}>Accounts</button>
+                      <div className="flex items-start gap-2 rounded-lg border border-dashed border-border p-4 text-[10px] text-muted-foreground">
+                        {modelCatalogLoading ? <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" /> : <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+                        {modelCatalogLoading ? (
+                          <span>Discovering connected model routes…</span>
+                        ) : modelCatalogError ? (
+                          <><span className="min-w-0 flex-1">Model discovery failed. Check the connected runtime and retry.</span><button type="button" className="shrink-0 text-primary hover:underline" onClick={() => { void refreshModels().catch(() => undefined); }}>Retry</button></>
+                        ) : (
+                          <><span className="min-w-0 flex-1">No compatible connected routes.</span><button type="button" className="shrink-0 text-primary hover:underline" onClick={() => setActiveView('accounts')}>Accounts</button></>
+                        )}
                       </div>
                     )}
                     {recommendedModels.length > 0 && <div className="mb-1 px-2 text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Recommended</div>}
@@ -441,7 +451,7 @@ export function ChatComposer() {
                   <div className="space-y-2 border-t border-border bg-muted/15 p-3" onClick={(event) => event.stopPropagation()}>
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Team & autonomy</span>
-                      <div className="flex items-center gap-1"><TeamTemplateSelector /><TrustModeSelector /></div>
+                      <div className="flex flex-wrap items-center justify-end gap-1"><TeamTemplateSelector /><AgentProfileSelector /><TrustModeSelector /></div>
                     </div>
                     {selectedModelObject && (
                       <div className="flex items-center justify-between gap-2">
@@ -455,7 +465,7 @@ export function ChatComposer() {
                         </div>
                       </div>
                     )}
-                     <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {selectedModelObject ? `Mission model: ${selectedModelObject.name} · all compatible agents` : 'Auto routing uses role policies.'}</div>
+                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child role directives preserved` : 'Auto routing uses role policies.'}</div>
                   </div>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -463,7 +473,7 @@ export function ChatComposer() {
               <Button
                 size="icon"
                 className="h-8 w-8 rounded-lg"
-                disabled={!message.trim() || loading || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible}
+                disabled={!message.trim() || loading || missionStartPending || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible || Boolean(routeResolution.error)}
                 onClick={() => void submit()}
                 aria-label={activeConversationCanContinue ? 'Continue conversation' : 'Send mission'}
               >
@@ -474,7 +484,7 @@ export function ChatComposer() {
         </div>
 
         <div className="mt-1.5 flex items-center justify-between px-1 text-[9px] text-muted-foreground/70">
-          <span>{activeConversationBusy ? 'Mission is running · stop or finish it before the next turn' : activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
+          <span>{missionStartPending ? 'Mission start is being reconciled · select a mission before retrying' : activeConversationBusy ? 'Mission is running · stop or finish it before the next turn' : activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
           {message.length > 0 && <span>~{Math.ceil(message.length / 4)} tokens</span>}
         </div>
       </div>

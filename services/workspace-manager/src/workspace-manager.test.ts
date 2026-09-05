@@ -2,8 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execFileSync } from 'child_process';
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from '@atris-agent-code/database';
+import type { AtrisDatabase } from '@atris-agent-code/database';
 import { WorktreeManager } from './worktree-manager';
 import { CheckpointManager, isSafeCheckpointId, isValidGitCommitSha } from './checkpoint-manager';
+import { WorkspaceManager } from './workspace-manager';
 
 async function runTests() {
   console.log('--- Starting WorkspaceManager & Worktree & Checkpoint Tests ---');
@@ -38,6 +43,233 @@ async function runTests() {
 
     const worktreeManager = new WorktreeManager();
     const checkpointManager = new CheckpointManager();
+    const durableAttemptApi = WorkspaceManager.prototype;
+    assert(
+      typeof durableAttemptApi.claimTaskAttempt === 'function'
+        && typeof durableAttemptApi.markTaskAttemptRunning === 'function'
+        && typeof durableAttemptApi.heartbeatTaskAttempt === 'function'
+        && typeof durableAttemptApi.finishTaskAttempt === 'function'
+        && typeof durableAttemptApi.expireStaleTaskAttempts === 'function'
+        && typeof durableAttemptApi.expireOrphanedTaskAttempts === 'function',
+      'WorkspaceManager exposes the durable task-attempt lifecycle API',
+    );
+
+    const sqlite = new Database(':memory:');
+    sqlite.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, git_initialized INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT, last_team_template_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', team_template_id TEXT NOT NULL DEFAULT '', plan_id TEXT, execution_mode TEXT NOT NULL DEFAULT 'balanced', automation_policy TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, agent_profile_id TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, target_descriptor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, agent_profile_id TEXT, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, route_adapter_id TEXT, route_provider TEXT, route_account_profile_id TEXT, route_model_catalog_id TEXT, route_runtime_model_id TEXT, route_reasoning_level TEXT, route_source TEXT, route_selection_mode TEXT, provider_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
+      CREATE UNIQUE INDEX idx_task_attempts_task_number ON task_attempts(task_id, attempt_number);
+      CREATE TABLE team_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', max_parallel_agents INTEGER, worker_pools TEXT, is_default INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+      CREATE TABLE team_roles (id TEXT PRIMARY KEY, template_id TEXT NOT NULL REFERENCES team_templates(id), role TEXT NOT NULL, model_profile_id TEXT, account_profile_id TEXT, default_capabilities TEXT NOT NULL, access_level TEXT NOT NULL);
+      CREATE TABLE agent_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, instructions TEXT NOT NULL DEFAULT '', capabilities TEXT NOT NULL DEFAULT '[]', specialty TEXT, description TEXT, route_policy TEXT, allowed_route_policy TEXT, is_default INTEGER NOT NULL DEFAULT 0, archived_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE UNIQUE INDEX idx_agent_profiles_role_default ON agent_profiles(role) WHERE is_default = 1 AND archived_at IS NULL;
+      CREATE TABLE agent_profile_bindings (id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, role TEXT NOT NULL, profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE RESTRICT, override TEXT, is_default INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE UNIQUE INDEX idx_agent_profile_bindings_scope_role_profile ON agent_profile_bindings(scope_type, scope_id, role, profile_id);
+      CREATE UNIQUE INDEX idx_agent_profile_bindings_scope_role_default ON agent_profile_bindings(scope_type, scope_id, role) WHERE is_default = 1;
+      CREATE TRIGGER trg_agent_profile_bindings_profile_role BEFORE INSERT ON agent_profile_bindings WHEN (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) IS NULL OR (SELECT role FROM agent_profiles WHERE id = NEW.profile_id) <> NEW.role BEGIN SELECT RAISE(ABORT, 'Agent profile binding role must match profile role'); END;
+      CREATE TABLE execution_policies (id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, role TEXT NOT NULL, model_catalog_id TEXT, account_profile_id TEXT, reasoning_level TEXT, fallback_catalog_ids TEXT NOT NULL, selection_mode TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE conversation_turns (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, content TEXT NOT NULL, delivery TEXT NOT NULL, options TEXT, status TEXT NOT NULL DEFAULT 'queued', idempotency_key TEXT, request_hash TEXT, command_id TEXT, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT);
+      CREATE TABLE agent_instances (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, role TEXT NOT NULL, profile_id TEXT, agent_profile_id TEXT, model_profile_id TEXT DEFAULT '', account_profile_id TEXT DEFAULT '', runtime_adapter_id TEXT DEFAULT '', session_id TEXT, status TEXT DEFAULT 'idle', task_id TEXT, parent_agent_id TEXT, display_name TEXT, specialty TEXT, spawn_reason TEXT, status_message TEXT, progress INTEGER, workspace_mode TEXT, started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL);
+    `);
+    const attemptManager = new WorkspaceManager(drizzle(sqlite, { schema }) as unknown as AtrisDatabase);
+
+    const globalBuilder = await attemptManager.createAgentProfile({
+      id: 'profile-global-builder',
+      name: 'Global Builder',
+      role: 'builder',
+      instructions: 'Build safely',
+      capabilities: ['implementation'],
+      allowedRoutePolicy: { allowedCatalogIds: ['catalog-safe', 'catalog-safe-2'] },
+      isDefault: true,
+    });
+    const teamBuilder = await attemptManager.createAgentProfile({
+      id: 'profile-team-builder',
+      name: 'Team Builder',
+      role: 'builder',
+      instructions: 'Build for this team',
+      capabilities: ['implementation', 'testing'],
+    });
+    const workspaceBuilder = await attemptManager.createAgentProfile({
+      id: 'profile-workspace-builder',
+      name: 'Workspace Builder',
+      role: 'builder',
+      instructions: 'Build in this workspace',
+      capabilities: ['implementation', 'refactor'],
+    });
+    assert(globalBuilder.isDefault && globalBuilder.role === 'builder', 'global Agent Profile catalog records preserve fixed roles and defaults');
+    assert((await attemptManager.listAgentProfiles()).length === 3, 'active Agent Profile catalog records are listable');
+    await attemptManager.bindAgentProfile({
+      id: 'binding-team-builder', scopeType: 'team_template', scopeId: 'profile-team-template',
+      profileId: teamBuilder.id, isDefault: true,
+    });
+    const workspaceBinding = await attemptManager.bindAgentProfile({
+      id: 'binding-workspace-builder', scopeType: 'workspace', scopeId: 'attempt-workspace',
+      profileId: workspaceBuilder.id, isDefault: true,
+      override: { allowedRoutePolicy: { allowedCatalogIds: ['catalog-safe'] } },
+    });
+    assert(workspaceBinding.isDefault && workspaceBinding.role === 'builder', 'workspace/team Agent Profile bindings persist fixed role and default state');
+    const profileWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
+    const attemptMission = await attemptManager.createMission({ id: 'attempt-mission', workspaceId: profileWorkspace.id, title: 'Parallel research', teamTemplateId: 'profile-team-template' });
+    const workspaceResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' });
+    assert(workspaceResolution.source === 'workspace' && workspaceResolution.profile.id === workspaceBuilder.id
+      && workspaceResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.join(',') === 'catalog-safe',
+      'workspace binding wins resolution precedence and cannot broaden profile route allowlists');
+    const explicitResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder', profileId: globalBuilder.id });
+    assert(explicitResolution.source === 'explicit' && explicitResolution.profile.id === globalBuilder.id
+      && explicitResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.length === 2, 'explicit named profiles bypass lower-scope bindings without losing their identity');
+    await attemptManager.archiveAgentProfile(workspaceBuilder.id);
+    let archivedWorkspaceRejected = false;
+    try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' }); } catch { archivedWorkspaceRejected = true; }
+    assert(archivedWorkspaceRejected, 'archived workspace defaults fail closed instead of falling through');
+    await attemptManager.archiveAgentProfile(teamBuilder.id);
+    await attemptManager.unbindAgentProfile('binding-workspace-builder');
+    let archivedTeamRejected = false;
+    try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' }); } catch { archivedTeamRejected = true; }
+    assert(archivedTeamRejected, 'archived team defaults fail closed instead of falling through');
+    await attemptManager.archiveAgentProfile(globalBuilder.id);
+    await attemptManager.unbindAgentProfile('binding-team-builder');
+    let archivedGlobalRejected = false;
+    try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder', profileId: globalBuilder.id }); } catch { archivedGlobalRejected = true; }
+    assert(archivedGlobalRejected, 'archived explicit profiles fail closed');
+    assert((await attemptManager.listAgentProfiles()).length === 0 && (await attemptManager.listAgentProfiles({ includeArchived: true })).length === 3,
+      'Agent Profile archive is soft and hidden from active catalog reads');
+    let roleMutationRejected = false;
+    try { await attemptManager.updateAgentProfile(globalBuilder.id, { role: 'reviewer' }); } catch { roleMutationRejected = true; }
+    assert(roleMutationRejected, 'Agent Profile roles are immutable');
+    let wrongRoleRejected = false;
+    try { await attemptManager.bindAgentProfile({ scopeType: 'workspace', scopeId: 'attempt-workspace', profileId: globalBuilder.id, role: 'reviewer' }); } catch { wrongRoleRejected = true; }
+    assert(wrongRoleRejected, 'bindings reject wrong-role assignments');
+    sqlite.prepare('DELETE FROM agent_profile_bindings').run();
+    sqlite.prepare('DELETE FROM agent_profiles').run();
+    const attemptWorkspace = profileWorkspace;
+    const targetScopeMission = await attemptManager.createMission({
+      id: 'target-scope-mission',
+      workspaceId: attemptWorkspace.id,
+      title: 'Plan-scoped Builder target ownership',
+    });
+    await attemptManager.createTask({
+      id: 'previous-plan-builder',
+      missionId: targetScopeMission.id,
+      planId: 'previous-plan',
+      title: 'Create AtrisTask (previous plan)',
+      assignedRole: 'builder',
+      status: 'done',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+    });
+    const followUpBuilder = await attemptManager.createTask({
+      id: 'follow-up-builder',
+      missionId: targetScopeMission.id,
+      planId: 'follow-up-plan',
+      title: 'Create AtrisTask (follow-up plan)',
+      assignedRole: 'builder',
+      status: 'planned',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+    });
+    let crossPlanRejected = false;
+    try { await attemptManager.preflightTaskTarget(followUpBuilder.id); } catch { crossPlanRejected = true; }
+    assert(!crossPlanRejected, 'a completed Builder from a previous conversation plan does not block a new plan target');
+    await attemptManager.createTask({
+      id: 'a-same-plan-owner',
+      missionId: targetScopeMission.id,
+      planId: 'same-plan',
+      title: 'Same-plan target owner',
+      assignedRole: 'builder',
+      status: 'done',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'SamePlanTarget' },
+    });
+    const samePlanDuplicate = await attemptManager.createTask({
+      id: 'b-same-plan-duplicate',
+      missionId: targetScopeMission.id,
+      planId: 'same-plan',
+      title: 'Same-plan target duplicate',
+      assignedRole: 'builder',
+      status: 'planned',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'SamePlanTarget' },
+    });
+    let samePlanRejected = false;
+    try { await attemptManager.preflightTaskTarget(samePlanDuplicate.id); } catch { samePlanRejected = true; }
+    assert(samePlanRejected, 'duplicate Builder targets remain rejected within the same execution plan');
+
+    const attemptTasks = await Promise.all([0, 1, 2].map((index) => attemptManager.createTask({
+      id: `attempt-task-${index}`,
+      missionId: attemptMission.id,
+      title: `Research ${index}`,
+      assignedRole: 'researcher',
+      agentProfileId: index === 0 ? 'research-specialist' : undefined,
+    })));
+    const claimedAttempts = await Promise.all(attemptTasks.map((task, index) => attemptManager.claimTaskAttempt({
+      taskId: task.id,
+      missionId: attemptMission.id,
+      agentInstanceId: `researcher-${index}`,
+      agentProfileId: index === 0 ? 'research-specialist' : undefined,
+      leaseExpiresAt: '2026-08-30T01:05:00.000Z',
+      now: '2026-08-30T01:00:00.000Z',
+      route: { adapterId: 'codex', provider: 'openai', accountProfileId: 'profile-explicit', modelCatalogId: 'catalog-explicit', runtimeModelId: 'gpt-5', reasoningLevel: 'high', source: 'explicit', selectionMode: 'fixed', agentProfileId: index === 0 ? 'research-specialist' : undefined },
+    })));
+    assert(claimedAttempts.length === 3 && claimedAttempts.every((attempt) => attempt.attemptNumber === 1), 'parallel task attempts are claimed through a synchronous SQLite transaction');
+    assert(claimedAttempts[0].agentProfileId === 'research-specialist'
+      && attemptTasks[0].agentProfileId === 'research-specialist', 'agent profile identity is persisted on the task and its attempt snapshot');
+    const retryAttempt = await attemptManager.claimTaskAttempt({
+      taskId: attemptTasks[0].id,
+      missionId: attemptMission.id,
+      agentInstanceId: 'researcher-retry',
+      leaseExpiresAt: '2026-08-30T01:10:00.000Z',
+      now: '2026-08-30T01:05:00.000Z',
+      route: { adapterId: 'claude_code', provider: 'anthropic', accountProfileId: 'profile-workspace', modelCatalogId: 'catalog-workspace', runtimeModelId: 'claude-sonnet', reasoningLevel: 'medium', source: 'workspace', selectionMode: 'prefer' },
+    });
+    assert(retryAttempt.attemptNumber === 2, 'task attempt numbering remains atomic across retries');
+    assert(claimedAttempts[0].routeSource === 'explicit' && claimedAttempts[0].routeRuntimeModelId === 'gpt-5', 'explicit chat route is persisted on the claimed attempt');
+    assert(retryAttempt.routeSource === 'workspace' && retryAttempt.routeAdapterId === 'claude_code', 'a retry receives a distinct policy snapshot in a new attempt');
+    const routedTasks = await attemptManager.listTasks(attemptMission.id);
+    assert(routedTasks[0].effectiveRoute?.adapterId === 'claude_code' && routedTasks[0].effectiveRoute?.runtimeModelId === 'claude-sonnet'
+      && !('providerSessionId' in (routedTasks[0].effectiveRoute || {})), 'task read model exposes only the latest effective route snapshot without session secrets');
+    sqlite.prepare("INSERT INTO team_templates (id, name, max_parallel_agents, worker_pools, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run('limited-team', 'Limited', 99, JSON.stringify([{ role: 'researcher', minInstances: -4, maxInstances: 2, maxParallel: 1 }]), new Date().toISOString());
+    await attemptManager.updateMission(attemptMission.id, { teamTemplateId: 'limited-team' });
+    const effectivePool = await attemptManager.resolveMissionWorkerPoolPolicy(attemptMission.id);
+    assert(effectivePool.maxParallelAgents === 32 && effectivePool.pools.find((pool) => pool.role === 'researcher')?.maxParallel === 1,
+      'template global and role overrides are resolved with invalid values capped');
+    const fallbackPool = await attemptManager.resolveMissionWorkerPoolPolicy('missing-mission');
+    assert(fallbackPool.maxParallelAgents === 4, 'missing and legacy templates use the safe Core worker-pool default');
+    sqlite.prepare('UPDATE team_templates SET max_parallel_agents = 2 WHERE id = ?').run('limited-team');
+    const reserve = (id: string, role: 'researcher' | 'builder' = 'researcher') => attemptManager.reserveAgentCapacity({
+      id, missionId: attemptMission.id, role, displayName: id, spawnReason: 'capacity test', workspaceMode: 'read_only', createdAt: new Date().toISOString(),
+    });
+    const concurrentReservations = await Promise.allSettled([reserve('pool-researcher-1'), reserve('pool-researcher-2')]);
+    assert(concurrentReservations.filter((result) => result.status === 'fulfilled').length === 1,
+      'concurrent dynamic spawns atomically enforce the effective role cap');
+    await reserve('pool-builder-1', 'builder');
+    let globalCapBlocked = false;
+    try { await reserve('pool-builder-2', 'builder'); } catch (error: any) { globalCapBlocked = String(error.message).includes('parallel-agent limit reached (2)'); }
+    assert(globalCapBlocked, 'dynamic children and existing durable workers share the mission-global cap');
+    const restartedManager = new WorkspaceManager(drizzle(sqlite, { schema }) as unknown as AtrisDatabase);
+    let restartBlocked = false;
+    try { await restartedManager.reserveAgentCapacity({ id: 'restart-reader', missionId: attemptMission.id, role: 'builder', displayName: 'Restart', spawnReason: 'restart test', workspaceMode: 'isolated_worktree', createdAt: new Date().toISOString() }); }
+    catch (error: any) { restartBlocked = String(error.message).includes('parallel-agent limit reached (2)'); }
+    assert(restartBlocked, 'capacity read model survives WorkspaceManager restart');
+    sqlite.prepare("UPDATE agent_instances SET status = 'completed', completed_at = ? WHERE id = 'pool-researcher-1'").run(new Date().toISOString());
+    await restartedManager.reserveAgentCapacity({ id: 'released-slot', missionId: attemptMission.id, role: 'researcher', displayName: 'Released slot', spawnReason: 'terminal release test', workspaceMode: 'read_only', createdAt: new Date().toISOString() });
+    assert((sqlite.prepare("SELECT COUNT(*) AS count FROM agent_instances WHERE mission_id = ? AND status IN ('idle', 'running', 'waiting')").get(attemptMission.id) as { count: number }).count === 2,
+      'terminal agents release durable global and role capacity');
+    await attemptManager.markTaskAttemptRunning(retryAttempt.id, 'runtime-session', '2026-08-30T01:05:01.000Z', '2026-08-30T01:10:01.000Z', 'provider-session');
+    const persistedAttempts = await attemptManager.listTaskAttempts(attemptTasks[0].id);
+    assert(persistedAttempts[0].routeAdapterId === 'codex' && persistedAttempts[1].providerSessionId === 'provider-session', 'attempt reads retain stable route snapshots and attach the provider session at start');
+    sqlite.prepare('INSERT INTO conversation_turns (id, mission_id, content, delivery, options, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('supervisor-turn', attemptMission.id, 'Continue', 'queue', JSON.stringify({ clientOption: true }), 'completed', '2026-08-30T01:20:00.000Z');
+    await attemptManager.saveSupervisorSessionMetadata('supervisor-turn', {
+      providerSessionId: 'opencode-provider-session', resumeCapability: 'restart',
+      route: { adapterId: 'opencode', provider: 'opencode', accountProfileId: 'profile-explicit', modelCatalogId: 'catalog-explicit', runtimeModelId: 'provider/model', reasoningLevel: 'high', source: 'explicit', selectionMode: 'fixed' },
+      updatedAt: '2026-08-30T01:20:01.000Z',
+    });
+    const supervisorMetadata = await attemptManager.getLatestSupervisorSessionMetadata(attemptMission.id);
+    const persistedTurn = sqlite.prepare('SELECT options FROM conversation_turns WHERE id = ?').get('supervisor-turn') as { options: string };
+    const persistedOptions = JSON.parse(persistedTurn.options);
+    assert(supervisorMetadata?.providerSessionId === 'opencode-provider-session' && supervisorMetadata.route.modelCatalogId === 'catalog-explicit', 'supervisor provider session capability and explicit route survive manager restart reads');
+    assert(persistedOptions.clientOption === true && !JSON.stringify(persistedOptions).includes('password'), 'supervisor metadata preserves existing turn options and contains no server credentials');
+    sqlite.close();
 
     assert(isValidGitCommitSha('0123456789abcdef0123456789abcdef01234567'), '40-character Git commit SHA is accepted');
     assert(!isValidGitCommitSha('0123456789abcdef0123456789abcdef0123456'), 'Short Git commit ref is rejected');
@@ -319,6 +551,82 @@ async function runTests() {
     }
     assert(ambiguousError.includes('multiple Git projects'), 'Multiple child repositories fail safely when the task does not identify a project');
 
+    const eightRepoContainer = path.join(tmpDir, 'eight-repo-container');
+    fs.mkdirSync(eightRepoContainer, { recursive: true });
+    for (let index = 1; index <= 8; index += 1) {
+      const repo = path.join(eightRepoContainer, `Sibling${index}`);
+      fs.mkdirSync(repo);
+      runGit(repo, ['init', '--quiet']);
+      fs.writeFileSync(path.join(repo, 'untouched.txt'), `sibling-${index}`);
+    }
+    const newTarget = await worktreeManager.resolveBuilderTarget(
+      eightRepoContainer,
+      { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+      'Create AtrisTask',
+    );
+    assert(newTarget.kind === 'new-sibling' && newTarget.targetName === 'AtrisTask', 'Absent AtrisTask resolves as a new sibling without selecting one of eight repositories');
+    const newStaging = path.join(eightRepoContainer, '.atris-worktrees', 'mission-new', 'task-new');
+    await worktreeManager.createEmptyManagedStaging(newStaging, newTarget.canonicalContainer!);
+    assert((await fs.promises.readdir(newStaging)).join(',') === '.atris-baseline', 'New sibling Builder staging starts with only an empty baseline');
+    assert(Array.from({ length: 8 }, (_, index) => fs.readFileSync(path.join(eightRepoContainer, `Sibling${index + 1}`, 'untouched.txt'), 'utf8')).every((value, index) => value === `sibling-${index + 1}`), 'New sibling staging does not copy or modify existing repositories');
+
+    for (const unsafeName of ['.', '..', '../escape', 'nested/project', 'nested\\project', 'C:\\escape', '\\\\server\\share', 'name:stream', 'NUL', 'con.txt', 'trail.', 'trail ', '\0bad']) {
+      let rejected = false;
+      try { await worktreeManager.validateNewSiblingTarget(eightRepoContainer, unsafeName); } catch { rejected = true; }
+      assert(rejected, `Unsafe new sibling target is rejected: ${JSON.stringify(unsafeName)}`);
+    }
+    fs.mkdirSync(path.join(eightRepoContainer, 'Collision'));
+    let collisionRejected = false;
+    try { await worktreeManager.validateNewSiblingTarget(eightRepoContainer, 'collision'); } catch { collisionRejected = true; }
+    assert(collisionRejected, 'New sibling target rejects case-insensitive collisions with existing entries');
+
+    fs.writeFileSync(path.join(newStaging, 'package.json'), JSON.stringify({ name: 'atris-task' }));
+    fs.mkdirSync(path.join(newStaging, 'src'));
+    fs.writeFileSync(path.join(newStaging, 'src', 'index.ts'), 'export const ready = true;\n');
+    const newSiblingChanges = await worktreeManager.getChangedFiles(newStaging);
+    assert(newSiblingChanges.length === 2 && newSiblingChanges.every((file) => file.status === 'added'), 'Every new sibling project file is reported as added');
+    const newSiblingDiff = await worktreeManager.getDiff(newStaging);
+    assert(newSiblingDiff.includes('+++ b/package.json') && newSiblingDiff.includes('+++ b/src/index.ts'), 'New sibling diff includes every added project file');
+    assert(!newSiblingChanges.some((file) => file.path.includes('.atris-')) && !newSiblingDiff.includes('.atris-baseline'), 'New sibling review data excludes Atris metadata');
+    const firstSiblingApply = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'operation-new');
+    assert(firstSiblingApply.success && fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', 'package.json')), 'New sibling apply safely publishes staged content into AtrisTask');
+    assert(fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', '.atris-operation.json')), 'Atomic apply moves its durable ownership marker with the project');
+    const recoveredRetry = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'operation-new');
+    assert(recoveredRetry.success && recoveredRetry.output.includes('Recovered'), 'Retry reconciles a matching marker after rename and before database ownership');
+    const foreignRetry = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'other-operation');
+    assert(!foreignRetry.success && foreignRetry.output.includes('not owned'), 'Atomic apply never overwrites an existing foreign destination');
+    await worktreeManager.finalizeNewSiblingApply(newTarget.canonicalContainer!, 'AtrisTask', 'operation-new');
+    assert(!fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', '.atris-operation.json')) && !fs.existsSync(path.join(eightRepoContainer, 'AtrisTask', '.atris-baseline')), 'Applied project contains no Atris baseline or operation marker after ownership is durable');
+    const ownedRetry = await worktreeManager.applyNewSibling(newStaging, newTarget.canonicalContainer!, 'AtrisTask', 'operation-new', 'operation-new');
+    assert(ownedRetry.success && ownedRetry.output.includes('already applied'), 'Persisted Atris ownership remains idempotent after marker cleanup');
+
+    const nonGitContainer = path.join(tmpDir, 'non-git-child-container');
+    const nonGitChild = path.join(nonGitContainer, 'PlainProject');
+    const nestedChildRepo = path.join(nonGitChild, 'vendor', 'NestedRepo');
+    fs.mkdirSync(nestedChildRepo, { recursive: true });
+    fs.writeFileSync(path.join(nonGitChild, 'root.txt'), 'before\n');
+    fs.writeFileSync(path.join(nonGitContainer, 'untouched.txt'), 'container\n');
+    runGit(nestedChildRepo, ['init', '--quiet']);
+    fs.writeFileSync(path.join(nestedChildRepo, 'nested.txt'), 'nested\n');
+    commitAll(nestedChildRepo, 'Nested baseline');
+    const explicitNonGit = await worktreeManager.resolveBuilderTarget(
+      nonGitContainer,
+      { kind: 'existing_project', projectName: 'PlainProject' },
+    );
+    assert(explicitNonGit.kind === 'mirror' && path.resolve(explicitNonGit.targetPath!) === path.resolve(nonGitChild), 'Explicit non-Git child persists its canonical apply target');
+    const nonGitWorktree = await worktreeManager.createWorktree(
+      explicitNonGit.path,
+      'atris/non-git-child',
+      undefined,
+      'HEAD',
+      '',
+      explicitNonGit,
+    );
+    fs.writeFileSync(path.join(nonGitWorktree, 'root.txt'), 'after\n');
+    const nonGitMerge = await worktreeManager.merge(nonGitWorktree, undefined, explicitNonGit.targetPath);
+    assert(nonGitMerge.success && fs.readFileSync(path.join(nonGitChild, 'root.txt'), 'utf8') === 'after\n', 'Explicit non-Git child applies back to the selected child');
+    assert(fs.readFileSync(path.join(nonGitContainer, 'untouched.txt'), 'utf8') === 'container\n', 'Explicit non-Git child apply leaves the parent container untouched');
+
     const nestedTaskWorktree = await worktreeManager.createWorktree(
       projectContainer,
       'atris/mission-parent/task-builder',
@@ -337,6 +645,53 @@ async function runTests() {
     assert(nestedMerge.success, 'Nested Builder result merges back to the owning project');
     assert(fs.readFileSync(path.join(atrisTracker, 'tracker.ts'), 'utf8').includes('fixed'), 'AtrisTracker receives the Builder change');
     assert(fs.readFileSync(path.join(siblingProject, 'sibling.ts'), 'utf8').includes('untouched'), 'Sibling project remains untouched by Builder apply');
+
+    // An interrupted request must be safe to retry after the owning Git merge
+    // committed but before the approval outbox was finalized.
+    const operationRepo = path.join(tmpDir, 'operation-repo');
+    fs.mkdirSync(operationRepo, { recursive: true });
+    runGit(operationRepo, ['init', '--quiet']);
+    fs.writeFileSync(path.join(operationRepo, 'operation.ts'), 'export const applied = false;\n');
+    commitAll(operationRepo, 'Operation baseline');
+    const operationWorktree = await worktreeManager.createWorktree(
+      operationRepo,
+      'atris/mission-operation/task-merge',
+    );
+    fs.writeFileSync(path.join(operationWorktree, 'operation.ts'), 'export const applied = true;\n');
+    const operationKey = 'approval:operation-retry:1:task:merge';
+    const firstOperationMerge = await worktreeManager.merge(
+      operationWorktree,
+      undefined,
+      operationRepo,
+      { idempotencyKey: operationKey },
+    );
+    const firstOperationHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: operationRepo,
+      windowsHide: true,
+      encoding: 'utf-8',
+    }).trim();
+    assert(firstOperationMerge.success, 'Operation-aware Git merge succeeds');
+    assert(execFileSync('git', ['log', '-1', '--format=%B'], {
+      cwd: operationRepo,
+      windowsHide: true,
+      encoding: 'utf-8',
+    }).includes(`AtrisAgent-Operation: ${operationKey}`), 'Git merge commit records the operation idempotency marker');
+
+    await worktreeManager.removeWorktree(operationWorktree, true, operationRepo);
+    const secondOperationMerge = await worktreeManager.merge(
+      operationWorktree,
+      undefined,
+      operationRepo,
+      { idempotencyKey: operationKey },
+    );
+    const secondOperationHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: operationRepo,
+      windowsHide: true,
+      encoding: 'utf-8',
+    }).trim();
+    assert(secondOperationMerge.success && secondOperationMerge.output.includes('already applied'), 'Retry detects an already-applied Git operation');
+    assert(firstOperationHead === secondOperationHead, 'Idempotent merge retry does not create a second merge commit');
+    assert(!fs.existsSync(operationWorktree), 'Operation-aware worktree is cleaned up successfully');
 
     await worktreeManager.removeWorktree(nestedTaskWorktree, true, projectContainer);
     assert(!fs.existsSync(nestedTaskWorktree), 'Nested linked worktree is cleaned up from its owning repository');

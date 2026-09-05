@@ -53,6 +53,14 @@ function statusLabel(status: EffectiveTaskStatus) {
   }
 }
 
+function targetLabel(task: { targetDescriptor?: { kind: string; projectName?: string } | null }): string | null {
+  const target = task.targetDescriptor;
+  if (!target) return null;
+  if (target.kind === 'new_sibling_project') return `New project: ${target.projectName}`;
+  if (target.kind === 'existing_project') return `Project: ${target.projectName}`;
+  return 'Workspace root';
+}
+
 export function PlanTab() {
   const { activeMissionId, missions, activeTasks } = useMissionStore();
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
@@ -197,12 +205,21 @@ export function PlanTab() {
                         </p>
                       )}
                       {task.assignedRole && (
-                        <div className="flex min-w-0 items-center gap-1.5 pl-5">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5 pl-5">
                           <span className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
                             {task.assignedRole}
                           </span>
+                          {targetLabel(task) && (
+                            <span className="max-w-full truncate rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                              {targetLabel(task)}
+                            </span>
+                          )}
                           {displayStatus === 'preparing' && (
-                            <span className="text-[10px] text-muted-foreground">Preparing route and isolated execution context…</span>
+                            <span className="text-[10px] text-muted-foreground">
+                              {task.targetDescriptor?.kind === 'new_sibling_project'
+                                ? `Creating ${task.targetDescriptor.projectName} in isolated staging...`
+                                : 'Preparing route and isolated execution context...'}
+                            </span>
                           )}
                         </div>
                       )}
@@ -251,6 +268,11 @@ export function PlanTab() {
                             {task.assignedRole && (
                               <span className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
                                 {task.assignedRole}
+                              </span>
+                            )}
+                            {targetLabel(task) && (
+                              <span className="max-w-full truncate rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                                {targetLabel(task)}
                               </span>
                             )}
                           </div>

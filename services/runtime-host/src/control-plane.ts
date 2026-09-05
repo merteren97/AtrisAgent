@@ -46,6 +46,53 @@ export interface PreparedControlPlaneSession {
 
 let bridgeConfig: RuntimeControlPlaneBridgeConfig | undefined;
 
+const TEMP_DIRECTORY_RETRY_LIMIT = 8;
+const TEMP_DIRECTORY_RETRY_DELAY_MS = 50;
+
+type RemoveDirectory = (directory: string) => void;
+
+function isRetryableRemoveError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EBUSY' || code === 'EPERM' || code === 'ENOTEMPTY' || code === 'EMFILE' || code === 'ENFILE';
+}
+
+/**
+ * Windows can keep a CLI working directory or MCP config open briefly after
+ * the child process emits `close`. Cleanup must not turn that normal teardown
+ * race into an uncaught exception that takes down the gateway.
+ */
+export function removeTemporaryDirectory(
+  directory: string,
+  removeDirectory: RemoveDirectory = (target) => {
+    fs.rmSync(target, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: TEMP_DIRECTORY_RETRY_DELAY_MS,
+    });
+  },
+): void {
+  let retries = 0;
+  const attempt = () => {
+    try {
+      removeDirectory(directory);
+      return;
+    } catch (error) {
+      if (!isRetryableRemoveError(error) || retries >= TEMP_DIRECTORY_RETRY_LIMIT) {
+        console.warn(`[RuntimeHost] Temporary directory cleanup deferred or abandoned for ${directory}: ${String(error)}`);
+        return;
+      }
+      const delay = Math.min(1000, TEMP_DIRECTORY_RETRY_DELAY_MS * 2 ** retries);
+      retries += 1;
+      setTimeout(attempt, delay);
+    }
+  };
+
+  // The first attempt is synchronous so callers that clean up before spawning
+  // observe the usual semantics; only a Windows lock is deferred.
+  attempt();
+}
+
 export function configureRuntimeControlPlaneBridge(config?: RuntimeControlPlaneBridgeConfig): void {
   bridgeConfig = config;
 }
@@ -125,9 +172,14 @@ export function createClaudeMcpConfig(session?: PreparedControlPlaneSession): { 
       },
     },
   }, null, 2), 'utf8');
+  let cleaned = false;
   return {
     path: configPath,
-    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      removeTemporaryDirectory(dir);
+    },
   };
 }
 
@@ -172,7 +224,7 @@ export function createAntigravityMcpOverlay(
   if (!session) return undefined;
   const root = path.join(os.tmpdir(), 'AtrisAgent', 'antigravity-control-plane', agentInstanceId);
   const agentsDir = path.join(root, '.agents');
-  fs.rmSync(root, { recursive: true, force: true });
+  removeTemporaryDirectory(root);
   fs.mkdirSync(agentsDir, { recursive: true });
   fs.writeFileSync(path.join(agentsDir, 'mcp_config.json'), JSON.stringify({
     mcpServers: {
@@ -182,9 +234,14 @@ export function createAntigravityMcpOverlay(
       },
     },
   }, null, 2), 'utf8');
+  let cleaned = false;
   return {
     cwd: root,
     extraArgs: ['--add-dir', workspacePath],
-    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      removeTemporaryDirectory(root);
+    },
   };
 }

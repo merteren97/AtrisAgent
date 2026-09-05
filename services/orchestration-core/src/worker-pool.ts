@@ -3,6 +3,7 @@ import type {
   OrchestratorDelegation,
   WorkerPoolPolicy,
 } from '@atris-agent-code/domain';
+import { DEFAULT_WORKER_POOL_POLICY } from '@atris-agent-code/domain';
 
 export interface WorkerPoolTemplatePolicy {
   maxParallelAgents: number;
@@ -22,43 +23,7 @@ export interface WorkerAllocationBatch {
   }>;
 }
 
-export const DEFAULT_CORE_WORKER_POOL: WorkerPoolTemplatePolicy = {
-  maxParallelAgents: 4,
-  pools: [
-    {
-      role: 'researcher',
-      minInstances: 0,
-      maxInstances: 3,
-      maxParallel: 3,
-      preferParallel: true,
-      splitCapabilities: ['research', 'documentation', 'web-research', 'codebase-analysis'],
-    },
-    {
-      role: 'builder',
-      minInstances: 0,
-      maxInstances: 2,
-      maxParallel: 2,
-      preferParallel: true,
-      splitCapabilities: ['workspace-write', 'implementation', 'refactor'],
-    },
-    {
-      role: 'reviewer',
-      minInstances: 0,
-      maxInstances: 2,
-      maxParallel: 2,
-      preferParallel: true,
-      splitCapabilities: ['code-review', 'security-review', 'architecture-review'],
-    },
-    {
-      role: 'qa',
-      minInstances: 0,
-      maxInstances: 2,
-      maxParallel: 2,
-      preferParallel: true,
-      splitCapabilities: ['testing', 'build', 'lint', 'validation'],
-    },
-  ],
-};
+export const DEFAULT_CORE_WORKER_POOL: WorkerPoolTemplatePolicy = DEFAULT_WORKER_POOL_POLICY;
 
 function countByRole(workers: RunningWorkerSnapshot[]): Map<string, number> {
   const counts = new Map<string, number>();

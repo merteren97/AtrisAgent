@@ -58,13 +58,15 @@ interface PendingWorkspaceRemoval {
 export function ProjectsView() {
   const { workspaces, activeWorkspaceId, setActiveWorkspace, removeWorkspace, fetchWorkspaces } = useWorkspaceStore();
   const { missions, fetchMissions } = useMissionStore();
-  const { loadWorkspaceMemory, fetchProjects: fetchMemoryProjects, deleteProjectMemory, mutating: memoryMutating } = useMemoryStore();
+  const { loadWorkspaceMemory, fetchProjects: fetchMemoryProjects, mutating: memoryMutating } = useMemoryStore();
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedWsId, setSelectedWsId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [pendingRemoval, setPendingRemoval] = useState<PendingWorkspaceRemoval | null>(null);
   const [removing, setRemoving] = useState(false);
   const [loadingRemovalInfo, setLoadingRemovalInfo] = useState<string | null>(null);
+  const [removeMemory, setRemoveMemory] = useState(false);
+  const [removalError, setRemovalError] = useState<string | null>(null);
 
   useEffect(() => {
     void fetchWorkspaces();
@@ -84,11 +86,24 @@ export function ProjectsView() {
 
   const requestRemoval = async (workspace: Workspace) => {
     setLoadingRemovalInfo(workspace.id);
-    const workspaceMissions = missions.filter((mission) => mission.workspaceId === workspace.id);
-    const activeMissionCount = workspaceMissions.filter((mission) => ACTIVE_MISSION_STATUSES.has(mission.status)).length;
-    const memory = await loadWorkspaceMemory(workspace.id);
-    setLoadingRemovalInfo(null);
-    setPendingRemoval({ workspace, memory, missionCount: workspaceMissions.length, activeMissionCount });
+    setRemovalError(null);
+    setRemoveMemory(false);
+    try {
+      await fetchMissions(workspace.id);
+      const missionState = useMissionStore.getState();
+      if (missionState.error) throw new Error(`Could not verify workspace conversations: ${missionState.error}`);
+      const authoritativeMissions = missionState.missions;
+      const workspaceMissions = authoritativeMissions.filter((mission) => mission.workspaceId === workspace.id);
+      const activeMissionCount = workspaceMissions.filter((mission) => ACTIVE_MISSION_STATUSES.has(mission.status)).length;
+      const memory = await loadWorkspaceMemory(workspace.id);
+      const memoryError = useMemoryStore.getState().error;
+      if (memoryError) throw new Error(`Could not inspect workspace memory: ${memoryError}`);
+      setPendingRemoval({ workspace, memory, missionCount: workspaceMissions.length, activeMissionCount });
+    } catch (cause: any) {
+      flash(`${cause?.message || 'Could not prepare workspace deletion.'} Check the local service, then retry.`);
+    } finally {
+      setLoadingRemovalInfo(null);
+    }
   };
 
   const finishWorkspaceStateRemoval = (workspaceId: string) => {
@@ -96,44 +111,34 @@ export function ProjectsView() {
     setPendingRemoval(null);
   };
 
-  const removeAndKeepMemory = async () => {
+  const confirmWorkspaceRemoval = async () => {
     const pending = pendingRemoval;
-    if (!pending || pending.activeMissionCount > 0) return;
+    if (!pending) return;
     setRemoving(true);
-    const removed = await removeWorkspace(pending.workspace.id);
-    if (removed) {
+    setRemovalError(null);
+    try {
+      await fetchMissions(pending.workspace.id);
+      const missionState = useMissionStore.getState();
+      if (missionState.error) throw new Error(`Could not verify workspace conversations: ${missionState.error}`);
+      const latestActiveCount = missionState.missions.filter((mission) => (
+        mission.workspaceId === pending.workspace.id && ACTIVE_MISSION_STATUSES.has(mission.status)
+      )).length;
+      if (latestActiveCount > 0) {
+        throw new Error(`Stop the ${latestActiveCount} active conversation${latestActiveCount === 1 ? '' : 's'} before deleting this workspace.`);
+      }
+
+      await removeWorkspace(pending.workspace.id, removeMemory);
       await fetchMissions();
       await fetchMemoryProjects();
       finishWorkspaceStateRemoval(pending.workspace.id);
-      flash(pending.memory
-        ? `Workspace "${pending.workspace.name}" removed. Project memory was retained as a detached backup.`
-        : `Workspace "${pending.workspace.name}" removed.`);
-    }
-    setRemoving(false);
-  };
-
-  const removeAndDeleteMemory = async () => {
-    const pending = pendingRemoval;
-    if (!pending || pending.activeMissionCount > 0) return;
-    const otherActiveAttachments = pending.memory?.activeWorkspaceIds.filter((id) => id !== pending.workspace.id).length || 0;
-    if (otherActiveAttachments > 0) return;
-
-    setRemoving(true);
-    const projectId = pending.memory?.project.id || null;
-    const removed = await removeWorkspace(pending.workspace.id);
-    if (!removed) {
+      flash(removeMemory
+        ? `Workspace "${pending.workspace.name}" and its workspace-attributable memory were deleted. Project files and shared memory were retained.`
+        : `Workspace "${pending.workspace.name}" removed. Project files and memory were retained.`);
+    } catch (cause: any) {
+      setRemovalError(cause?.message || 'Workspace deletion failed.');
+    } finally {
       setRemoving(false);
-      return;
     }
-
-    await fetchMissions();
-    let memoryDeleted = true;
-    if (projectId) memoryDeleted = await deleteProjectMemory(projectId);
-    finishWorkspaceStateRemoval(pending.workspace.id);
-    setRemoving(false);
-    flash(memoryDeleted
-      ? `Workspace "${pending.workspace.name}" and its retained project memory were deleted.`
-      : `Workspace "${pending.workspace.name}" was removed, but memory deletion failed safely. The memory remains as a backup.`);
   };
 
   const handleSetActive = (id: string, name: string) => {
@@ -154,7 +159,7 @@ export function ProjectsView() {
         </div>
         <div className="flex items-center gap-3">
           {feedback ? (
-            <span className="flex max-w-[520px] items-center gap-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-400">
+            <span role="status" aria-live="polite" className="flex max-w-[520px] items-center gap-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-400">
               <Check className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{feedback}</span>
             </span>
           ) : null}
@@ -195,6 +200,15 @@ export function ProjectsView() {
                       isActive && 'bg-primary/[0.03]',
                     )}
                     onClick={() => setSelectedWsId(workspace.id)}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter' && event.key !== ' ') return;
+                      event.preventDefault();
+                      setSelectedWsId(workspace.id);
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={isSelected}
+                    aria-label={`Select workspace ${workspace.name}`}
                   >
                     {isActive ? <div className="absolute left-0 right-0 top-0 h-1 bg-primary" /> : null}
                     <div className="mb-3 flex items-start justify-between">
@@ -324,6 +338,8 @@ export function ProjectsView() {
                 </div>
               ) : null}
 
+              {removalError ? <div role="alert" className="rounded-lg border border-destructive/25 bg-destructive/10 p-3 text-xs text-destructive">{removalError}</div> : null}
+
               {pendingRemoval.memory ? (
                 <div className="rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
                   <div className="flex items-center gap-2 text-xs font-semibold text-violet-200"><Brain className="h-4 w-4" />Project memory detected</div>
@@ -333,40 +349,31 @@ export function ProjectsView() {
                     <div className="rounded-md bg-background/60 p-2"><div className="font-semibold">{pendingRemoval.memory.evidenceCount}</div><div className="text-[9px] uppercase text-muted-foreground">Evidence</div></div>
                   </div>
                   {(pendingRemoval.memory.activeWorkspaceIds.filter((id) => id !== pendingRemoval.workspace.id).length > 0) ? (
-                    <p className="mt-2 text-[10px] leading-relaxed text-amber-300">Permanent memory deletion is disabled because another workspace is attached to the same project identity.</p>
+                    <p className="mt-2 text-[10px] leading-relaxed text-amber-300">Memory shared with another workspace will be preserved; only provenance attributable to this workspace will be removed.</p>
                   ) : null}
                 </div>
               ) : (
                 <div className="rounded-lg border border-border bg-muted/20 p-3 text-[11px] text-muted-foreground">No accumulated project-memory snapshot was found for this workspace yet.</div>
               )}
+              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border bg-muted/20 p-3 text-xs">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 accent-primary"
+                  checked={removeMemory}
+                  onChange={(event) => setRemoveMemory(event.target.checked)}
+                  disabled={!pendingRemoval.memory || removing}
+                />
+                <span><strong>Also remove workspace-associated memory</strong><span className="mt-1 block text-[11px] leading-relaxed text-muted-foreground">Project files and already-applied code are always retained. Leave unchecked to keep memory as a detached backup.</span></span>
+              </label>
             </div>
           ) : null}
 
           <DialogFooter className="sm:justify-between">
             <Button variant="outline" onClick={() => setPendingRemoval(null)} disabled={removing || memoryMutating}>Cancel</Button>
-            <div className="flex flex-wrap justify-end gap-2">
-              <Button
-                variant="outline"
-                onClick={() => void removeAndKeepMemory()}
-                disabled={!pendingRemoval || pendingRemoval.activeMissionCount > 0 || removing}
-                className="border-violet-500/30 text-violet-200 hover:bg-violet-500/10"
-              >
-                {removing ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Brain className="mr-2 h-3.5 w-3.5" />}
-                Remove & keep memory
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={() => void removeAndDeleteMemory()}
-                disabled={
-                  !pendingRemoval
-                  || pendingRemoval.activeMissionCount > 0
-                  || removing
-                  || Boolean(pendingRemoval.memory?.activeWorkspaceIds.some((id) => id !== pendingRemoval.workspace.id))
-                }
-              >
-                <Trash2 className="mr-2 h-3.5 w-3.5" />Remove & delete memory
-              </Button>
-            </div>
+            <Button variant="destructive" onClick={() => void confirmWorkspaceRemoval()} disabled={!pendingRemoval || removing}>
+              {removing ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Trash2 className="mr-2 h-3.5 w-3.5" />}
+              Delete workspace
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

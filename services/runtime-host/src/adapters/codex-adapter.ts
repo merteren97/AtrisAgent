@@ -19,7 +19,7 @@ import type {
   AuthPollResult,
   CanonicalReasoning,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
+import { BaseRuntimeAdapter, isReadOnlyAgentRole, type SpawnAgentOptions } from './base-adapter';
 import {
   appendControlPlaneInstructions,
   codexControlPlaneArgs,
@@ -97,7 +97,9 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       modelSelection: /--model\b/.test(execHelp) || /-m,?\s+--model/.test(execHelp),
       reasoningControl: /reasoning/.test(help) || /reasoning/.test(execHelp),
       toolCallEvents: /--json\b/.test(execHelp),
-      interactiveApproval: /approval/.test(help),
+      // Codex exec approvals must be configured before launch; this adapter
+      // cannot answer an in-flight approval request.
+      interactiveApproval: false,
       usageInfo: false,
       cancellation: true,
       worktreeAwareness: true,
@@ -356,12 +358,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     const model = options.model || '';
     const controlPlane = prepareControlPlaneSession(options, sessionId);
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, cwd);
-    const readOnly = ['orchestrator', 'reviewer', 'researcher'].includes(String(options.role || '').toLowerCase());
-    const args = ['exec', '--json', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '--skip-git-repo-check'];
-    args.push(...codexControlPlaneArgs(controlPlane));
-    if (model) args.push('--model', model);
-    if (options.reasoningLevel) args.push('-c', `model_reasoning_effort="${options.reasoningLevel}"`);
-    args.push(prompt);
+    const args = buildCodexExecArgs(options, prompt, codexControlPlaneArgs(controlPlane));
 
     const session: AgentSession = {
       id: sessionId,
@@ -483,8 +480,10 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (event.type === 'turn.completed') {
+      this.recordProviderUsage(sessionId, event);
       this.emitCompleted(sessionId, 'Codex turn completed');
     } else if (event.type === 'turn.failed' || event.type === 'error') {
+      this.recordProviderUsage(sessionId, event);
       this.emitFailure(sessionId, event.error?.message || event.message || 'Codex turn failed');
     }
   }
@@ -527,6 +526,28 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     this.terminalSessions.add(sessionId);
     this.emitEvent({ id: crypto.randomUUID(), type: 'task_failed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, error: redactSecrets(error), exitCode, timestamp: new Date().toISOString() });
   }
+}
+
+export function buildCodexExecArgs(
+  options: Pick<SpawnAgentOptions, 'accessMode' | 'model' | 'reasoningLevel' | 'role'>,
+  prompt: string,
+  controlPlaneArgs: string[] = [],
+): string[] {
+  const accessMode = options.accessMode || (isReadOnlyAgentRole(options.role) ? 'read-only' : 'workspace-write');
+  const args = [
+    'exec',
+    '--json',
+    '--sandbox',
+    accessMode,
+    '-c',
+    'approval_policy="never"',
+    '--skip-git-repo-check',
+    ...controlPlaneArgs,
+  ];
+  if (options.model) args.push('--model', options.model);
+  if (options.reasoningLevel) args.push('-c', `model_reasoning_effort="${options.reasoningLevel}"`);
+  args.push(prompt);
+  return args;
 }
 
 function identifierValue(...values: unknown[]): string | undefined {

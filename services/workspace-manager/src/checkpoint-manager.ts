@@ -283,6 +283,15 @@ export class CheckpointManager {
     throw new Error(`Checkpoint snapshot for "${checkpointId}" is unavailable and no valid Git rollback target could be restored.`);
   }
 
+  /** Idempotently remove AtrisAgent-owned checkpoint snapshots, never project files. */
+  removeWorkspaceCheckpoints(workspacePath: string): void {
+    if (!fs.existsSync(workspacePath)) return;
+    const workspaceRoot = canonicalDirectory(workspacePath, 'Workspace');
+    const managedRoot = checkpointRoot(workspaceRoot, false);
+    if (!fs.existsSync(managedRoot)) return;
+    fs.rmSync(managedRoot, { recursive: true, force: true });
+  }
+
   async listCheckpoints(
     workspacePath: string,
     options?: ListCheckpointOptions,

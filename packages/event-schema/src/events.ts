@@ -69,6 +69,13 @@ export interface TaskCreated extends BaseEvent {
   assignedRole: string | null;
   agentInstanceId?: string;
   parentAgentId?: string | null;
+  /** Named profile identity; assignedRole remains the fixed security boundary. */
+  profileId?: string;
+  /** Canonical named profile identity; profileId is a compatibility alias. */
+  agentProfileId?: string;
+  /** Optional inline profile metadata for trusted producers. */
+  profile?: Record<string, unknown>;
+  agentProfile?: Record<string, unknown>;
   displayName?: string;
   specialty?: string;
   spawnReason?: string;
@@ -78,6 +85,10 @@ export interface TaskCreated extends BaseEvent {
   reasoningLevel?: string;
   fallbackCatalogIds?: string[];
   routeSelectionMode?: 'auto' | 'prefer' | 'fixed';
+  targetDescriptor?:
+    | { kind: 'workspace_root' }
+    | { kind: 'existing_project'; projectName: string }
+    | { kind: 'new_sibling_project'; projectName: string };
 }
 
 export interface TaskAssigned extends BaseEvent {
@@ -85,6 +96,7 @@ export interface TaskAssigned extends BaseEvent {
   taskId: string;
   agentInstanceId: string;
   role: string;
+  agentProfileId?: string;
 }
 
 export interface TaskClaimed extends BaseEvent {
@@ -92,6 +104,7 @@ export interface TaskClaimed extends BaseEvent {
   taskId: string;
   agentInstanceId: string;
   worktreePath?: string | null;
+  agentProfileId?: string;
 }
 
 export interface TaskSplit extends BaseEvent {
@@ -114,6 +127,8 @@ export interface AgentStarted extends BaseEvent {
   role: string;
   model: string;
   parentAgentId?: string | null;
+  profileId?: string;
+  agentProfileId?: string;
   displayName?: string;
   specialty?: string;
   spawnReason?: string;
@@ -126,6 +141,8 @@ export interface AgentSpawned extends BaseEvent {
   agentInstanceId: string;
   parentAgentId?: string | null;
   role: string;
+  profileId?: string;
+  agentProfileId?: string;
   displayName: string;
   specialty?: string;
   spawnReason: string;
@@ -192,6 +209,7 @@ export interface AgentCompleted extends BaseEvent {
   type: 'agent_completed';
   agentInstanceId: string;
   summary?: string;
+  agentProfileId?: string;
 }
 
 export interface AgentCancelled extends BaseEvent {
@@ -199,6 +217,7 @@ export interface AgentCancelled extends BaseEvent {
   agentInstanceId: string;
   taskId?: string | null;
   reason?: string;
+  agentProfileId?: string;
 }
 
 export interface TextDelta extends BaseEvent {
@@ -243,6 +262,72 @@ export interface ApprovalRequested extends BaseEvent {
   approvalId: string;
   approvalType: string;
   description: string;
+  taskId?: string;
+  agentInstanceId?: string;
+  toolName?: string;
+  path?: string;
+  command?: string;
+  args?: Record<string, unknown>;
+}
+
+export interface ProcessStarted extends BaseEvent {
+  type: 'process_started';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  model?: string;
+  phase: 'decision' | 'synthesis' | 'task' | 'turn';
+  parentProcessId?: string;
+  taskId?: string;
+}
+
+export interface ProcessOutputDelta extends BaseEvent {
+  type: 'process_output_delta';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  content: string;
+  taskId?: string;
+}
+
+export interface ProcessToolStarted extends BaseEvent {
+  type: 'process_tool_started';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  toolName: string;
+  toolCallId?: string;
+  taskId?: string;
+}
+
+export interface ProcessToolCompleted extends BaseEvent {
+  type: 'process_tool_completed';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  toolName: string;
+  toolCallId?: string;
+  success: boolean;
+  result?: string;
+  taskId?: string;
+}
+
+export interface ProcessCompleted extends BaseEvent {
+  type: 'process_completed';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  summary?: string;
+  taskId?: string;
+}
+
+export interface ProcessFailed extends BaseEvent {
+  type: 'process_failed';
+  processId: string;
+  runtimeSessionId: string;
+  role: string;
+  error: string;
+  taskId?: string;
 }
 
 export interface ApprovalResponded extends BaseEvent {
@@ -250,6 +335,12 @@ export interface ApprovalResponded extends BaseEvent {
   approvalId: string;
   approved: boolean;
   decidedBy: string;
+}
+
+export interface ApprovalReconciled extends BaseEvent {
+  type: 'approval_reconciled';
+  approvalId: string;
+  outcome: 'applied' | 'not_applied';
 }
 
 export interface CheckCompleted extends BaseEvent {
@@ -333,6 +424,7 @@ export interface TaskCompleted extends BaseEvent {
   taskId: string;
   result?: string;
   agentInstanceId?: string;
+  agentProfileId?: string;
 }
 
 export interface TaskFailed extends BaseEvent {
@@ -341,6 +433,7 @@ export interface TaskFailed extends BaseEvent {
   error: string;
   exitCode?: number | null;
   agentInstanceId?: string;
+  agentProfileId?: string;
 }
 
 export interface AgentThought extends BaseEvent {
@@ -366,6 +459,31 @@ export interface AgentError extends BaseEvent {
   taskId: string;
   error: string;
   agentInstanceId?: string;
+  agentProfileId?: string;
+}
+
+export interface RuntimeTelemetry extends BaseEvent {
+  type: 'runtime_telemetry';
+  taskId: string;
+  agentInstanceId: string;
+  adapterId: string;
+  accountProfileId?: string;
+  profileId?: string;
+  agentProfileId?: string;
+  profileName?: string;
+  profileSource?: string;
+  attemptId?: string;
+  outcome: 'completed' | 'failed';
+  usageAvailable: boolean;
+  usageSource: 'provider_reported' | 'unavailable';
+  inputTokens: number;
+  outputTokens: number;
+  cost: number | null;
+  currency: string | null;
+  queueWaitMs: number;
+  durationMs: number;
+  retryCount: number;
+  workerUtilization: number;
 }
 
 export type AgentEvent =
@@ -398,12 +516,20 @@ export type AgentEvent =
   | AgentThought
   | AgentToolCall
   | AgentError
+  | RuntimeTelemetry
   | TextDelta
+  | ProcessStarted
+  | ProcessOutputDelta
+  | ProcessToolStarted
+  | ProcessToolCompleted
+  | ProcessCompleted
+  | ProcessFailed
   | ToolCallStarted
   | ToolCallCompleted
   | FileChanged
   | ApprovalRequested
   | ApprovalResponded
+  | ApprovalReconciled
   | CheckCompleted
   | ReviewCompleted
   | VerificationStarted

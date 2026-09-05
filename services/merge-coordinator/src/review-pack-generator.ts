@@ -12,6 +12,34 @@ export interface GenerateReviewPackOptions {
   artifacts?: string[];
 }
 
+/** Count only the current file section, including deleted/new Git files. */
+function countFileChanges(diff: string): Map<string, { additions: number; deletions: number }> {
+  const counts = new Map<string, { additions: number; deletions: number }>();
+  const lines = diff.split('\n');
+  let current: { additions: number; deletions: number } | undefined;
+  const decodePath = (header: string) => {
+    const value = header.split('\t')[0];
+    try { return value.startsWith('"') ? JSON.parse(value) as string : value; }
+    catch { return value; }
+  };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.startsWith('diff --git ')) { current = undefined; continue; }
+    if (line.startsWith('--- ') && lines[index + 1]?.startsWith('+++ ')) {
+      const oldPath = decodePath(line.slice(4));
+      const newPath = decodePath(lines[++index].slice(4));
+      const filePath = (newPath === '/dev/null' ? oldPath : newPath).replace(/^[ab]\//, '');
+      current = counts.get(filePath) || { additions: 0, deletions: 0 };
+      counts.set(filePath, current);
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith('+')) current.additions++;
+    else if (line.startsWith('-')) current.deletions++;
+  }
+  return counts;
+}
+
 export class ReviewPackGenerator {
   constructor(private workspaceManager: WorkspaceManager) {}
 
@@ -32,21 +60,10 @@ export class ReviewPackGenerator {
     const rawChangedFiles = await worktreeManager.getChangedFiles(worktreePath);
     const unifiedDiff = await worktreeManager.getDiff(worktreePath);
 
+    const counts = countFileChanges(unifiedDiff);
     // Calculate additions and deletions per changed file
     const changedFiles: ChangedFile[] = rawChangedFiles.map((f) => {
-      let additions = 0;
-      let deletions = 0;
-
-      // Extract addition/deletion line counts from diff if available
-      const fileHeader = `+++ b/${f.path}`;
-      if (unifiedDiff.includes(fileHeader)) {
-        const fileDiffSection = unifiedDiff.split(`--- a/${f.path}`)[1] || '';
-        const lines = fileDiffSection.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('+') && !line.startsWith('+++')) additions++;
-          if (line.startsWith('-') && !line.startsWith('---')) deletions++;
-        }
-      }
+      const { additions = 0, deletions = 0 } = counts.get(f.path) || {};
 
       return {
         path: f.path,

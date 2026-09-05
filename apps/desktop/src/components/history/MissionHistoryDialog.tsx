@@ -4,8 +4,9 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { useMissionStore, type MissionStatus } from '@/stores/mission-store';
+import { useMissionStore, type Mission, type MissionStatus } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { ConversationDeleteDialog } from './ConversationDeleteDialog';
 import {
   AlertCircle,
   ArrowUpRight,
@@ -21,6 +22,7 @@ import {
   Sparkles,
   X,
   XCircle,
+  Trash2,
 } from 'lucide-react';
 
 interface MissionHistoryDialogProps {
@@ -93,6 +95,7 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<HistoryFilter>('all');
   const [selectedMissionId, setSelectedMissionId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Mission | null>(null);
 
   useEffect(() => {
     if (open) setSelectedMissionId(activeMissionId);
@@ -278,15 +281,10 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
                         </div>
                       </div>
                     </div>
-                    <Button
-                      size="sm"
-                      variant={activeMissionId === selectedMission.id ? 'outline' : 'default'}
-                      className="shrink-0 gap-1.5"
-                      onClick={() => handleOpenMission(selectedMission.id)}
-                    >
-                      <ArrowUpRight className="h-3.5 w-3.5" />
-                      {activeMissionId === selectedMission.id ? 'Open conversation' : 'Open mission'}
-                    </Button>
+                    <div className="flex shrink-0 gap-2">
+                      <Button size="sm" variant="outline" className="gap-1.5 text-destructive hover:text-destructive" onClick={() => setPendingDelete(selectedMission)}><Trash2 className="h-3.5 w-3.5" />Delete…</Button>
+                      <Button size="sm" variant={activeMissionId === selectedMission.id ? 'outline' : 'default'} className="gap-1.5" onClick={() => handleOpenMission(selectedMission.id)}><ArrowUpRight className="h-3.5 w-3.5" />{activeMissionId === selectedMission.id ? 'Open conversation' : 'Open mission'}</Button>
+                    </div>
                   </div>
 
                   <div className="mt-6 grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -340,6 +338,11 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
             )}
           </section>
         </div>
+        <ConversationDeleteDialog
+          mission={pendingDelete}
+          onOpenChange={(nextOpen) => !nextOpen && setPendingDelete(null)}
+          onDeleted={(deleted) => setSelectedMissionId((selected) => selected === deleted.id ? null : selected)}
+        />
       </DialogContent>
     </Dialog>
   );

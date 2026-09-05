@@ -235,7 +235,7 @@ export function AgentsTab() {
               </div>
 
               {!missionCancelled && selectedAgent.progress !== undefined && (selectedAgent.status === 'running' || selectedAgent.progress > 0) && (
-                <div className="mt-3 h-1 overflow-hidden rounded-full bg-muted">
+                <div role="progressbar" aria-label={`${titleForAgent(selectedAgent)} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.max(0, Math.min(100, selectedAgent.progress))} className="mt-3 h-1 overflow-hidden rounded-full bg-muted">
                   <div className="h-full rounded-full bg-primary" style={{ width: `${Math.max(0, Math.min(100, selectedAgent.progress))}%` }} />
                 </div>
               )}
@@ -245,6 +245,17 @@ export function AgentsTab() {
                   <div className="min-w-0">
                     <div className="text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Current work</div>
                     <div className="mt-0.5 break-words text-[10px] font-medium leading-relaxed text-foreground">{selectedTask.title}</div>
+                  </div>
+                )}
+                {selectedTask && (
+                  <div className="min-w-0">
+                    <div className="text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Effective attempt route</div>
+                    {selectedTask.effectiveRoute ? (
+                      <div className="mt-0.5 break-words font-mono text-[9px] leading-relaxed text-foreground">
+                        {[selectedTask.effectiveRoute.adapterId, selectedTask.effectiveRoute.provider, selectedTask.effectiveRoute.runtimeModelId || selectedTask.effectiveRoute.modelCatalogId].filter(Boolean).join(' / ')}
+                        {selectedTask.effectiveRoute.reasoningLevel ? ` · ${selectedTask.effectiveRoute.reasoningLevel}` : ''}
+                      </div>
+                    ) : <p className="mt-0.5 text-[9px] leading-relaxed text-muted-foreground">Not exposed by the current mission-state API.</p>}
                   </div>
                 )}
                 {selectedAgent.spawnReason && (

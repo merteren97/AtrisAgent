@@ -11,7 +11,7 @@ export { OpenCodeAdapter } from './adapters/opencode-adapter';
 export { AccountProfileManager } from './account-profile-manager';
 export { ModelCatalogService } from './model-catalog-service';
 export { Scheduler } from './scheduler';
-export { getAtrisDataDir, resolveAtrisDataDir } from './runtime-utils';
+export { getAtrisDataDir, resolveAtrisDataDir, runCommand } from './runtime-utils';
 export {
   ATRIS_MCP_SERVER_NAME,
   ATRIS_MCP_ALLOWED_TOOLS,

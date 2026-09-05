@@ -16,6 +16,7 @@ function profile(id: string, runtimeType: AccountProfile['runtimeType']): Accoun
     updatedAt: now,
     allowedRoles: ['builder'],
     schedulerAuto: true,
+    capabilitySnapshot: { worktreeAwareness: true },
   };
 }
 
@@ -134,6 +135,13 @@ function run(): void {
     preferredAccountProfileId: claude.id,
   }), profiles, models);
   assert(fixedAccount.profile?.id === claude.id, 'Fixed account-only policy cannot escape to another account');
+
+  const capable = { ...codex, capabilitySnapshot: { worktreeAwareness: true } };
+  const incapable = { ...claude, capabilitySnapshot: { worktreeAwareness: false } };
+  const capabilityRoute = scheduler.resolveRoute(request({ capabilities: ['workspace-write'] }), [capable, incapable], [codexModel, claudeModel]);
+  assert(capabilityRoute.profile?.id === capable.id, 'Scheduler excludes runtimes that do not advertise a required runtime capability');
+  assert(scheduler.canFulfill(request({ capabilities: ['implementation'] })), 'Scheduler canFulfill accepts semantic task capabilities when an adapter is registered');
+  assert(!new Scheduler({ availableAdapters: [] }).canFulfill(request()), 'Scheduler canFulfill rejects requests when no adapter is registered');
 
   let rejected = false;
   try {

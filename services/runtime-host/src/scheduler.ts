@@ -7,6 +7,7 @@ import type {
   CanonicalReasoning,
   RouteSelectionMode,
 } from '@atris-agent-code/domain';
+import { missingRuntimeCapabilities, normalizeRuntimeCapability } from '@atris-agent-code/policy-engine';
 
 export interface SchedulerConfig {
   availableAdapters: string[];
@@ -49,6 +50,9 @@ export class Scheduler {
       if (selectionMode === 'auto' && profile.schedulerAuto === false) continue;
       const allowed = (profile.allowedRoles || []).map((role) => role.toLowerCase());
       if (allowed.length && !allowed.includes(roleName)) continue;
+      const runtimeRequirements = this.runtimeRequirements(request);
+      const missingCapabilities = missingRuntimeCapabilities(runtimeRequirements, profile.capabilitySnapshot);
+      if (missingCapabilities.length > 0) continue;
 
       const accountMatches = !request.preferredAccountProfileId || request.preferredAccountProfileId === profile.id;
 
@@ -107,9 +111,8 @@ export class Scheduler {
         if (model.isDefault) { score += 5; reasons.push('runtime default'); }
         if (profile.schedulerAuto !== false) score += 10;
 
-        const required = request.capabilities || [];
-        const capabilityText = JSON.stringify(profile.capabilitySnapshot || {}).toLowerCase();
-        const matched = required.filter((capability) => capabilityText.includes(capability.toLowerCase())).length;
+        const required = this.runtimeRequirements(request);
+        const matched = required.filter((capability) => profile.capabilitySnapshot?.[capability] === true).length;
         score += matched * 3;
         if (matched) reasons.push(`${matched}/${required.length} requested capabilities matched`);
         if (request.role === 'orchestrator') score += model.supportedReasoning.includes('high') ? 15 : 0;
@@ -153,7 +156,20 @@ export class Scheduler {
   }
 
   canFulfill(request: WorkerRequest): boolean {
-    try { return Boolean(this.resolveAdapter(request)); } catch { return false; }
+    try {
+      // Capability snapshots are available during route resolution, not on this
+      // legacy adapter-presence probe. Do not reject semantic task capabilities
+      // or claim a runtime capability is missing without a selected profile.
+      return Boolean(this.resolveAdapter(request));
+    } catch { return false; }
+  }
+
+  private runtimeRequirements(request: WorkerRequest): string[] {
+    const requirements = request.capabilities
+      .map(normalizeRuntimeCapability)
+      .filter((capability): capability is string => Boolean(capability));
+    if (request.requiresWorktree) requirements.push('worktreeAwareness');
+    return [...new Set(requirements)];
   }
 
   private bestReasoning(levels: CanonicalReasoning[], role: AgentRole): CanonicalReasoning | undefined {

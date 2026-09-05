@@ -3,7 +3,8 @@ import type { Orchestrator } from '@atris-agent-code/orchestration-core';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { AgentMessage, AgentRole, AgentSpawnRequest, AgentStatus, AgentWorkspaceMode } from '@atris-agent-code/domain';
-import { approvals, artifacts, type AtrisDatabase } from '@atris-agent-code/database';
+import { agentInstances, agentMessages, approvals, artifacts, type AtrisDatabase } from '@atris-agent-code/database';
+import { eq } from 'drizzle-orm';
 import { ResourceLeaseManager } from './resource-lease-manager';
 
 export interface CoordinationOptions {
@@ -18,6 +19,10 @@ interface RuntimeAgentState {
   id: string;
   missionId: string;
   role: AgentRole | string;
+  /** Canonical named profile identity. */
+  agentProfileId?: string;
+  /** @deprecated Use agentProfileId. Kept for older MCP clients and rows. */
+  profileId?: string;
   displayName: string;
   specialty?: string;
   parentAgentId?: string | null;
@@ -60,7 +65,151 @@ export class CoordinationMCP {
     this.eventBus = options.eventBus;
     this.db = options.db;
     this.workspacePath = options.workspacePath || process.cwd();
+    this.hydrateDurableState();
     this.eventBus?.on('*', (event) => this.syncAgentEvent(event));
+  }
+
+  private hydrateDurableState(): void {
+    if (!this.db) return;
+    try {
+      let rows: Array<Record<string, any>>;
+      try {
+        rows = (this.db.select().from(agentInstances) as any).all() as Array<Record<string, any>>;
+      } catch {
+        // A standalone MCP database may be on the profile_id compatibility
+        // column before the canonical agent_profile_id migration runs.
+        rows = (this.db.select({
+          id: agentInstances.id,
+          missionId: agentInstances.missionId,
+          role: agentInstances.role,
+          profileId: agentInstances.profileId,
+          modelProfileId: agentInstances.modelProfileId,
+          status: agentInstances.status,
+          taskId: agentInstances.taskId,
+          parentAgentId: agentInstances.parentAgentId,
+          displayName: agentInstances.displayName,
+          specialty: agentInstances.specialty,
+          spawnReason: agentInstances.spawnReason,
+          statusMessage: agentInstances.statusMessage,
+          progress: agentInstances.progress,
+          workspaceMode: agentInstances.workspaceMode,
+          startedAt: agentInstances.startedAt,
+          completedAt: agentInstances.completedAt,
+          createdAt: agentInstances.createdAt,
+        }).from(agentInstances) as any).all() as Array<Record<string, any>>;
+      }
+      for (const row of rows) {
+        this.agentRegistry.set(row.id, {
+          id: row.id,
+          missionId: row.missionId,
+          role: row.role,
+          agentProfileId: row.agentProfileId || row.profileId || undefined,
+          profileId: row.agentProfileId || row.profileId || undefined,
+          displayName: row.displayName || this.defaultAgentName(row.role),
+          specialty: row.specialty || undefined,
+          parentAgentId: row.parentAgentId || null,
+          taskId: row.taskId || null,
+          model: row.modelProfileId || undefined,
+          status: row.status || 'idle',
+          statusMessage: row.statusMessage || undefined,
+          progress: row.progress ?? undefined,
+          workspaceMode: row.workspaceMode || undefined,
+          spawnReason: row.spawnReason || undefined,
+          createdAt: row.createdAt,
+          startedAt: row.startedAt || null,
+          completedAt: row.completedAt || null,
+        });
+      }
+      const messages = (this.db.select().from(agentMessages) as any).all() as Array<Record<string, any>>;
+      for (const row of messages) {
+        const message: AgentMessage = {
+          id: row.id,
+          missionId: row.missionId,
+          fromAgentId: row.fromAgentId,
+          toAgentId: row.toAgentId,
+          content: row.content,
+          createdAt: row.createdAt,
+          readAt: row.readAt || null,
+          kind: row.kind || 'message',
+          replyToMessageId: row.replyToMessageId || null,
+        };
+        const mailbox = this.mailboxes.get(message.toAgentId) || [];
+        mailbox.push(message);
+        this.mailboxes.set(message.toAgentId, mailbox);
+      }
+    } catch (error) {
+      // Optional coordination tables may not exist for an older standalone
+      // MCP database; migrations will hydrate them on the next startup.
+      console.warn('[CoordinationMCP] Durable agent state could not be hydrated:', error);
+    }
+  }
+
+  private saveAgentState(agent: RuntimeAgentState): void {
+    const agentProfileId = agent.agentProfileId || agent.profileId || undefined;
+    const normalizedAgent = { ...agent, agentProfileId, profileId: agentProfileId };
+    this.agentRegistry.set(agent.id, normalizedAgent);
+    if (!this.db) return;
+    const values = {
+      id: agent.id,
+      missionId: agent.missionId,
+      role: agent.role as any,
+      // profile_id is the physical compatibility column used by existing
+      // coordination databases; the in-memory/API contract is canonical.
+      profileId: agentProfileId || null,
+      agentProfileId: agentProfileId || null,
+      modelProfileId: agent.model || '',
+      accountProfileId: '',
+      runtimeAdapterId: '',
+      sessionId: null,
+      status: agent.status,
+      taskId: agent.taskId || null,
+      parentAgentId: agent.parentAgentId || null,
+      displayName: agent.displayName,
+      specialty: agent.specialty || null,
+      spawnReason: agent.spawnReason || null,
+      statusMessage: agent.statusMessage || null,
+      progress: agent.progress ?? null,
+      workspaceMode: agent.workspaceMode || null,
+      startedAt: agent.startedAt || null,
+      completedAt: agent.completedAt || null,
+      createdAt: agent.createdAt,
+    };
+    const updates = {
+      target: agentInstances.id,
+      set: {
+        missionId: agent.missionId,
+        role: agent.role as any,
+        profileId: agentProfileId || null,
+        agentProfileId: agentProfileId || null,
+        modelProfileId: agent.model || '',
+        status: agent.status,
+        taskId: agent.taskId || null,
+        parentAgentId: agent.parentAgentId || null,
+        displayName: agent.displayName,
+        specialty: agent.specialty || null,
+        spawnReason: agent.spawnReason || null,
+        statusMessage: agent.statusMessage || null,
+        progress: agent.progress ?? null,
+        workspaceMode: agent.workspaceMode || null,
+        startedAt: agent.startedAt || null,
+        completedAt: agent.completedAt || null,
+      },
+    };
+    try {
+      (this.db.insert(agentInstances).values(values).onConflictDoUpdate(updates) as any).run();
+    } catch (error) {
+      // Standalone/older coordination stores may have profile_id but not the
+      // canonical column yet. Preserve the durable compatibility path until
+      // the next database migration instead of dropping the agent state.
+      const { agentProfileId: _canonicalInsert, ...legacyValues } = values;
+      const { set, ...legacyUpdates } = updates;
+      const { agentProfileId: _canonicalSet, ...legacySet } = set;
+      (this.db.insert(agentInstances).values(legacyValues).onConflictDoUpdate({
+        ...legacyUpdates,
+        set: legacySet,
+      }) as any).run();
+      void error;
+    }
   }
 
   private syncAgentEvent(event: AgentEvent): void {
@@ -69,15 +218,17 @@ export class CoordinationMCP {
       : undefined;
 
     if (event.type === 'agent_spawned') {
-      this.agentRegistry.set(event.agentInstanceId, {
+      this.saveAgentState({
         id: event.agentInstanceId,
         missionId: event.missionId,
         role: event.role,
+        agentProfileId: event.agentProfileId || event.profileId,
+        profileId: event.agentProfileId || event.profileId,
         displayName: event.displayName,
         specialty: event.specialty,
         parentAgentId: event.parentAgentId,
         taskId: event.taskId,
-        model: event.model,
+        model: event.model === 'scheduler-selected' ? existing?.model || event.model : event.model || existing?.model,
         status: 'idle',
         workspaceMode: event.workspaceMode,
         spawnReason: event.spawnReason,
@@ -87,10 +238,12 @@ export class CoordinationMCP {
     }
 
     if (event.type === 'agent_started') {
-      this.agentRegistry.set(event.agentInstanceId, {
+      this.saveAgentState({
         id: event.agentInstanceId,
         missionId: event.missionId,
         role: event.role,
+        agentProfileId: event.agentProfileId || event.profileId || existing?.agentProfileId || existing?.profileId,
+        profileId: event.agentProfileId || event.profileId || existing?.agentProfileId || existing?.profileId,
         displayName: event.displayName || existing?.displayName || this.defaultAgentName(event.role),
         specialty: event.specialty || existing?.specialty,
         parentAgentId: event.parentAgentId ?? existing?.parentAgentId,
@@ -105,22 +258,33 @@ export class CoordinationMCP {
       return;
     }
 
+    if (existing && (event.type === 'task_created' || event.type === 'task_assigned' || event.type === 'task_claimed')
+      && 'agentProfileId' in event && event.agentProfileId) {
+      this.saveAgentState({
+        ...existing,
+        agentProfileId: event.agentProfileId,
+        profileId: event.agentProfileId,
+        taskId: 'taskId' in event ? event.taskId : existing.taskId,
+      });
+      return;
+    }
+
     if (!existing) return;
     if (event.type === 'agent_progressed') {
-      this.agentRegistry.set(existing.id, {
+      this.saveAgentState({
         ...existing,
         status: 'running',
         statusMessage: event.progress,
         progress: event.percentage ?? existing.progress,
       });
     } else if (event.type === 'agent_waiting') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'waiting', statusMessage: event.reason });
+      this.saveAgentState({ ...existing, status: 'waiting', statusMessage: event.reason });
     } else if (event.type === 'agent_resumed') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'running', statusMessage: event.reason });
+      this.saveAgentState({ ...existing, status: 'running', statusMessage: event.reason });
     } else if (event.type === 'agent_completed') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'completed', statusMessage: event.summary, progress: 100, completedAt: event.timestamp });
+      this.saveAgentState({ ...existing, status: 'completed', statusMessage: event.summary, progress: 100, completedAt: event.timestamp });
     } else if (event.type === 'agent_error' || event.type === 'task_failed') {
-      this.agentRegistry.set(existing.id, { ...existing, status: 'failed', statusMessage: event.error, completedAt: event.timestamp });
+      this.saveAgentState({ ...existing, status: 'failed', statusMessage: event.error, completedAt: event.timestamp });
     }
   }
 
@@ -164,27 +328,39 @@ export class CoordinationMCP {
       }
     }
 
-    const activeCount = [...this.agentRegistry.values()].filter((agent) =>
-      agent.missionId === request.missionId && ['idle', 'running', 'waiting'].includes(agent.status)).length;
-    if (activeCount >= DEFAULT_MAX_PARALLEL) {
-      throw new Error(`Mission parallel-agent limit reached (${DEFAULT_MAX_PARALLEL}). Wait for an active agent to complete before spawning another.`);
-    }
-
     const agentInstanceId = crypto.randomUUID();
     const role = request.role;
+    const agentProfileId = String(request.agentProfileId || request.profileId || '').trim() || undefined;
     const displayName = request.displayName?.trim() || request.specialty?.trim() || this.defaultAgentName(role);
     const workspaceMode: AgentWorkspaceMode = request.workspaceMode
       || (role === 'builder' ? 'isolated_worktree' : role === 'orchestrator' ? 'shared' : 'read_only');
+    const timestamp = new Date().toISOString();
+
+    await this.workspaceManager.reserveAgentCapacity({
+      id: agentInstanceId,
+      missionId: request.missionId,
+      role,
+      modelProfileId: request.modelCatalogId || request.modelProfileId,
+      agentProfileId,
+      parentAgentId: request.parentAgentId || null,
+      displayName,
+      specialty: request.specialty,
+      spawnReason: request.spawnReason.trim(),
+      workspaceMode,
+      createdAt: timestamp,
+    });
 
     let task;
     if (request.taskId) {
       task = await this.requireTask(request.taskId);
       if (task.missionId !== request.missionId) throw new Error('Cannot assign a sub-agent to a task from another mission.');
-      task = await this.workspaceManager.updateTask(task.id, {
+      const taskUpdates: Parameters<WorkspaceManager['updateTask']>[1] = {
         assignedAgentId: agentInstanceId,
         assignedRole: role,
         status: 'planned',
-      });
+      };
+      if (agentProfileId !== undefined) taskUpdates.agentProfileId = agentProfileId;
+      task = await this.workspaceManager.updateTask(task.id, taskUpdates);
     } else {
       task = await this.workspaceManager.createTask({
         missionId: request.missionId,
@@ -194,16 +370,18 @@ export class CoordinationMCP {
         priority: request.priority || 'medium',
         assignedAgentId: agentInstanceId,
         assignedRole: role,
+        agentProfileId,
         requiredCapabilities: request.capabilities || [],
         dependsOn: [],
       });
     }
 
-    const timestamp = new Date().toISOString();
-    this.agentRegistry.set(agentInstanceId, {
+    this.saveAgentState({
       id: agentInstanceId,
       missionId: request.missionId,
       role,
+      agentProfileId,
+      profileId: agentProfileId,
       displayName,
       specialty: request.specialty,
       parentAgentId: request.parentAgentId || null,
@@ -222,6 +400,8 @@ export class CoordinationMCP {
       agentInstanceId,
       parentAgentId: request.parentAgentId || null,
       role,
+      agentProfileId,
+      profileId: agentProfileId,
       displayName,
       specialty: request.specialty,
       spawnReason: request.spawnReason.trim(),
@@ -237,6 +417,7 @@ export class CoordinationMCP {
       taskId: task.id,
       agentInstanceId,
       role,
+      agentProfileId,
       timestamp,
     });
     this.eventBus?.emit({
@@ -248,6 +429,8 @@ export class CoordinationMCP {
       assignedRole: role,
       agentInstanceId,
       parentAgentId: request.parentAgentId || null,
+      agentProfileId,
+      profileId: agentProfileId,
       displayName,
       specialty: request.specialty,
       spawnReason: request.spawnReason.trim(),
@@ -290,6 +473,19 @@ export class CoordinationMCP {
       createdAt: new Date().toISOString(),
       readAt: null,
     };
+    if (this.db) {
+      await this.db.insert(agentMessages).values({
+        id: message.id,
+        missionId: message.missionId,
+        fromAgentId: message.fromAgentId,
+        toAgentId: message.toAgentId,
+        content: message.content,
+        createdAt: message.createdAt,
+        readAt: null,
+        kind: message.kind || 'message',
+        replyToMessageId: message.replyToMessageId || null,
+      });
+    }
     const mailbox = this.mailboxes.get(input.toAgentId) || [];
     mailbox.push(message);
     this.mailboxes.set(input.toAgentId, mailbox);
@@ -314,6 +510,11 @@ export class CoordinationMCP {
     if (!markRead || selected.length === 0) return selected;
     const readIds = new Set(selected.map((message) => message.id));
     const readAt = new Date().toISOString();
+    if (this.db) {
+      for (const message of selected) {
+        (this.db.update(agentMessages).set({ readAt }).where(eq(agentMessages.id, message.id)) as any).run();
+      }
+    }
     this.mailboxes.set(agentId, mailbox.map((message) => readIds.has(message.id) ? { ...message, readAt } : message));
     for (const message of selected) {
       this.eventBus?.emit({
@@ -398,7 +599,8 @@ export class CoordinationMCP {
     await this.workspaceManager!.updateTask(taskId, {
       status: 'running', assignedAgentId: agentId, assignedRole: (role as any) || task.assignedRole || 'builder',
     });
-    this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_claimed', missionId: task.missionId, taskId, agentInstanceId: agentId, worktreePath: null, timestamp: new Date().toISOString() });
+    const taskProfileId = (task as any).agentProfileId || (task as any).profileId || undefined;
+    this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_claimed', missionId: task.missionId, taskId, agentInstanceId: agentId, agentProfileId: taskProfileId, worktreePath: null, timestamp: new Date().toISOString() });
     return { success: true, taskId };
   }
 
@@ -413,11 +615,10 @@ export class CoordinationMCP {
 
   async submitResult(taskId: string, resultSummary: string, _reviewPack?: unknown, _artifactsList?: string[], status: 'done' | 'failed' = 'done'): Promise<void> {
     const task = await this.requireTask(taskId);
-    await this.workspaceManager!.updateTask(taskId, { status: status === 'done' ? 'done' : 'rejected' });
     if (status === 'done') {
-      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_completed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, result: resultSummary, timestamp: new Date().toISOString() });
+      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_completed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, agentProfileId: (task as any).agentProfileId || (task as any).profileId || undefined, result: resultSummary, timestamp: new Date().toISOString() });
     } else {
-      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_failed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, error: resultSummary, timestamp: new Date().toISOString() });
+      this.eventBus?.emit({ id: crypto.randomUUID(), type: 'task_failed', missionId: task.missionId, taskId, agentInstanceId: task.assignedAgentId || undefined, agentProfileId: (task as any).agentProfileId || (task as any).profileId || undefined, error: resultSummary, timestamp: new Date().toISOString() });
     }
   }
 

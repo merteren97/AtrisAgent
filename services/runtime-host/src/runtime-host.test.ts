@@ -11,6 +11,8 @@ import { AntigravityAdapter } from './adapters/antigravity-adapter';
 import { ModelCatalogService } from './model-catalog-service';
 import { AccountProfileManager } from './account-profile-manager';
 import { runtimeProfileEnv } from './runtime-utils';
+import { isReadOnlyAgentRole } from './adapters/base-adapter';
+import { RuntimeHost } from './runtime-host';
 
 async function runTests() {
   console.log('--- Starting RuntimeHost & Adapters Tests ---');
@@ -58,6 +60,13 @@ async function runTests() {
       const capabilities = await adapter.probeCapabilities();
       assert(validCapabilitySnapshot(capabilities), `${adapter.name} returns a complete boolean capability snapshot when unavailable`);
     }
+  }
+
+  // Read-only roles must remain read-only across every CLI adapter.
+  {
+    assert(isReadOnlyAgentRole('qa'), 'QA is classified as a read-only runtime role');
+    assert(isReadOnlyAgentRole('reviewer'), 'Reviewer is classified as a read-only runtime role');
+    assert(!isReadOnlyAgentRole('builder'), 'Builder retains write-capable runtime mode');
   }
 
   // 2. Runtime profile isolation is defined by public environment helpers, not adapter-private methods.
@@ -183,7 +192,7 @@ async function runTests() {
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu-read-file-1', name: 'ReadFile', input: { path: 'package.json' } }] } }),
       JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu-read-file-1', content: '{ "name": "app" }', is_error: false }] } }),
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Analyzed package.json successfully.' }] } }),
-      JSON.stringify({ type: 'result', is_error: true, result: 'Token quota warning' }),
+      JSON.stringify({ type: 'result', is_error: true, result: 'Token quota warning', usage: { input_tokens: 120, output_tokens: 30 }, total_cost_usd: 0.04 }),
     ];
     for (const line of claudeLines) (claudeAdapter as any).handleStreamLine('test-session-1', line);
     const claudeTypes = emittedEvents.map((e) => e.type);
@@ -196,6 +205,8 @@ async function runTests() {
     const claudeCompleted = emittedEvents.find((event) => event.type === 'tool_call_completed') as any;
     assert(claudeStarted?.toolCallId === 'toolu-read-file-1' && claudeStarted.toolName === 'ReadFile', 'Claude preserves tool_use id without replacing the visible tool name');
     assert(claudeCompleted?.toolCallId === 'toolu-read-file-1' && claudeCompleted.toolName === 'ReadFile', 'Claude matches tool_result by tool_use_id and keeps the start tool name');
+    const claudeUsage = await claudeAdapter.getUsage('test-session-1');
+    assert(claudeUsage?.inputTokens === 120 && claudeUsage.outputTokens === 30 && claudeUsage.totalCost === 0.04 && claudeUsage.currency === 'USD', 'Claude preserves provider-reported tokens and cost from the terminal result');
 
     emittedEvents.length = 0;
     const codexAdapter = new CodexAdapter(eventBus);
@@ -214,9 +225,11 @@ async function runTests() {
     assert(codexCommandEvents[0]?.runId === 'codex-run-1' && codexCommandEvents[0]?.attemptId === 'codex-attempt-1', 'Codex preserves run and attempt ids when provided');
     assert(codexMcpEvents[0]?.toolCallId === 'mcp-1' && codexMcpEvents[1]?.toolCallId === 'mcp-1', 'Codex preserves MCP item id across start and completion');
     assert(codexCommandEvents[2]?.toolCallId && codexCommandEvents[3]?.toolCallId && codexCommandEvents[2].toolCallId !== codexCommandEvents[3].toolCallId, 'Codex fallback ids are deterministic event keys and do not fabricate a cross-event match');
-    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.completed' }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 80, output_tokens: 20 } }));
     (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.failed', error: { message: 'late duplicate' } }));
     assert(emittedEvents.filter((event) => event.type === 'task_completed').length === 1, 'CodexAdapter emits one terminal event when completed and failed signals race');
+    const codexUsage = await codexAdapter.getUsage('test-codex-session');
+    assert(codexUsage?.inputTokens === 80 && codexUsage.outputTokens === 20 && codexUsage.totalCost === null, 'Codex records official token usage without fabricating cost');
 
     emittedEvents.length = 0;
     const openCodeAdapter = new OpenCodeAdapter(eventBus);
@@ -242,6 +255,12 @@ async function runTests() {
     });
     const openCodeToolEvents = emittedEvents.filter((event) => event.type === 'tool_call_started' || event.type === 'tool_call_completed') as any[];
     assert(openCodeToolEvents[0]?.toolCallId === 'part-tool-1' && openCodeToolEvents[1]?.toolCallId === 'part-tool-1', 'OpenCode preserves part id across tool start and completion');
+    (openCodeAdapter as any).handleServerEvent('test-opencode-session', {
+      type: 'message.updated',
+      properties: { sessionID: 'opencode-runtime-session', info: { tokens: { input: 44, output: 11 }, cost: 0.02 } },
+    });
+    const openCodeUsage = await openCodeAdapter.getUsage('test-opencode-session');
+    assert(openCodeUsage?.inputTokens === 44 && openCodeUsage.outputTokens === 11 && openCodeUsage.totalCost === 0.02, 'OpenCode records provider-reported message usage');
 
     emittedEvents.length = 0;
     (codexAdapter as any).sessionContext.set('cancelled-codex-session', { missionId: 'm-1', taskId: 't-cancelled-codex' });
@@ -316,10 +335,13 @@ async function runTests() {
       success: true,
       status: 'SUCCESS',
       response: 'Research complete',
+      usage: { input_tokens: 60, output_tokens: 15 },
     }));
     const successPendingOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-3');
     assert(successStdinEnded, 'AntigravityAdapter starts native shutdown after a successful terminal result');
     assert(successPendingOutcome?.kind === 'completed', 'AntigravityAdapter records a successful terminal result for close-phase handoff');
+    const antigravityUsage = await antigravityAdapter.getUsage('test-session-3');
+    assert(antigravityUsage?.inputTokens === 60 && antigravityUsage.outputTokens === 15 && antigravityUsage.totalCost === null, 'Antigravity records reported token usage without inventing cost');
     assert(!emittedEvents.some((event) => event.type === 'task_completed'), 'AntigravityAdapter still waits for native cleanup before publishing task_completed');
     (antigravityAdapter as any).activeProcesses.delete('test-session-3');
 
@@ -410,7 +432,640 @@ async function runTests() {
     assert(!(antigravityAdapter as any).softTerminalTimers.has('test-session-6'), 'A subsequent Antigravity step cancels the soft completion candidate');
     assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-6'), 'Follow-on tool activity cannot be prematurely completed by an earlier DONE response');
     (antigravityAdapter as any).activeProcesses.delete('test-session-6');
+
+    const unknownAfterDoneContext = { missionId: 'm-6', taskId: 'research-unknown-after-done' };
+    let unknownStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-7', unknownAfterDoneContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-7', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { unknownStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-7', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final answer before an unknown event',
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-7'), 'Unknown-event regression starts with a pending DONE soft candidate');
+    (antigravityAdapter as any).handleStreamLine('test-session-7', JSON.stringify({ type: 'checkpoint' }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-7'), 'An unknown Antigravity event re-arms the bounded DONE fallback');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-7'), 'An unknown Antigravity event does not complete the task immediately');
+    const unknownCandidateResult = (antigravityAdapter as any).softTerminalResultsBySession.get('test-session-7');
+    assert(unknownCandidateResult === 'Final answer before an unknown event', 'Unknown-event fallback retains the original DONE result');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-7', unknownCandidateResult);
+    const unknownOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-7');
+    assert(unknownOutcome?.kind === 'completed' && unknownOutcome.result === 'Final answer before an unknown event', 'Unknown-event fallback eventually completes with the retained result');
+    assert(unknownStdinEnded, 'Unknown-event fallback starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-7');
+
+    const malformedAfterDoneContext = { missionId: 'm-6', taskId: 'research-malformed-after-done' };
+    let malformedStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-8', malformedAfterDoneContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-8', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { malformedStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-8', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final answer before a malformed event',
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-8'), 'Malformed-event regression starts with a pending DONE soft candidate');
+    (antigravityAdapter as any).handleStreamLine('test-session-8', 'not-json');
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-8'), 'A malformed Antigravity event re-arms the bounded DONE fallback');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-8'), 'A malformed Antigravity event does not complete the task immediately');
+    const malformedCandidateResult = (antigravityAdapter as any).softTerminalResultsBySession.get('test-session-8');
+    assert(malformedCandidateResult === 'Final answer before a malformed event', 'Malformed-event fallback retains the original DONE result');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-8', malformedCandidateResult);
+    const malformedOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-8');
+    assert(malformedOutcome?.kind === 'completed' && malformedOutcome.result === 'Final answer before a malformed event', 'Malformed-event fallback eventually completes with the retained result');
+    assert(malformedStdinEnded, 'Malformed-event fallback starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-8');
+
+    const malformedResultContext = { missionId: 'm-6', taskId: 'research-malformed-result' };
+    let malformedResultStdinEnded = false;
+    (antigravityAdapter as any).sessionContext.set('test-session-9', malformedResultContext);
+    (antigravityAdapter as any).activeProcesses.set('test-session-9', {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        end() { malformedResultStdinEnded = true; this.writableEnded = true; },
+      },
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine('test-session-9', JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Final answer before a malformed result',
+    }));
+    (antigravityAdapter as any).handleStreamLine('test-session-9', JSON.stringify({
+      type: 'result',
+      result: { response: 'Result without authoritative success' },
+    }));
+    assert((antigravityAdapter as any).softTerminalTimers.has('test-session-9'), 'A malformed result re-arms the bounded DONE fallback');
+    assert(!(antigravityAdapter as any).pendingTerminalBySession.has('test-session-9'), 'A malformed result does not complete the task immediately');
+    const malformedResultCandidate = (antigravityAdapter as any).softTerminalResultsBySession.get('test-session-9');
+    (antigravityAdapter as any).promoteSoftTerminalCandidate('test-session-9', malformedResultCandidate);
+    const malformedResultOutcome = (antigravityAdapter as any).pendingTerminalBySession.get('test-session-9');
+    assert(malformedResultOutcome?.kind === 'completed' && malformedResultOutcome.result === 'Final answer before a malformed result', 'Malformed result fallback eventually preserves the DONE result');
+    assert(malformedResultStdinEnded, 'Malformed result fallback starts deterministic Antigravity process shutdown');
+    (antigravityAdapter as any).activeProcesses.delete('test-session-9');
+
+    const cancelCleanupSession = 'cancel-cleanup-session';
+    let cancelCleanupKilled = false;
+    (antigravityAdapter as any).sessionContext.set(cancelCleanupSession, { missionId: 'm-7', taskId: 'cancel-cleanup' });
+    (antigravityAdapter as any).activeProcesses.set(cancelCleanupSession, {
+      killed: false,
+      kill() { cancelCleanupKilled = true; this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine(cancelCleanupSession, JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Cancelled candidate',
+    }));
+    (antigravityAdapter as any).scheduleTerminalRelease(cancelCleanupSession);
+    (antigravityAdapter as any).terminalSessions.add(cancelCleanupSession);
+    (antigravityAdapter as any).publishedTerminalSessions.add(cancelCleanupSession);
+    (antigravityAdapter as any).pendingTerminalBySession.set(cancelCleanupSession, { kind: 'completed', result: 'late' });
+    (antigravityAdapter as any).stdoutBuffers.set(cancelCleanupSession, 'stdout');
+    (antigravityAdapter as any).stderrBuffers.set(cancelCleanupSession, 'stderr');
+    await antigravityAdapter.cancel(cancelCleanupSession);
+    assert(cancelCleanupKilled, 'Antigravity cancel terminates the native process');
+    assert(!(antigravityAdapter as any).activeProcesses.has(cancelCleanupSession), 'Antigravity cancel removes the native process reference');
+    assert(!(antigravityAdapter as any).sessionContext.has(cancelCleanupSession), 'Antigravity cancel removes session context');
+    assert(!(antigravityAdapter as any).softTerminalTimers.has(cancelCleanupSession) && !(antigravityAdapter as any).softTerminalResultsBySession.has(cancelCleanupSession), 'Antigravity cancel clears soft-terminal timers and results');
+    assert(!(antigravityAdapter as any).terminalReleaseTimers.has(cancelCleanupSession) && !(antigravityAdapter as any).pendingTerminalBySession.has(cancelCleanupSession), 'Antigravity cancel clears terminal release and pending outcome state');
+
+    const shutdownCleanupSession = 'shutdown-cleanup-session';
+    let shutdownCleanupKilled = false;
+    (antigravityAdapter as any).sessionContext.set(shutdownCleanupSession, { missionId: 'm-7', taskId: 'shutdown-cleanup' });
+    (antigravityAdapter as any).activeProcesses.set(shutdownCleanupSession, {
+      killed: false,
+      kill() { shutdownCleanupKilled = true; this.killed = true; return true; },
+    });
+    (antigravityAdapter as any).handleStreamLine(shutdownCleanupSession, JSON.stringify({
+      type: 'step_update',
+      step_type: 'agent_response',
+      state: 'DONE',
+      text: 'Shutdown candidate',
+    }));
+    (antigravityAdapter as any).scheduleTerminalRelease(shutdownCleanupSession);
+    await antigravityAdapter.shutdown();
+    assert(shutdownCleanupKilled, 'Antigravity shutdown terminates active native processes');
+    assert(
+      (antigravityAdapter as any).activeProcesses.size === 0
+        && (antigravityAdapter as any).activeSessions.size === 0
+        && (antigravityAdapter as any).sessionContext.size === 0
+        && (antigravityAdapter as any).terminalSessions.size === 0
+        && (antigravityAdapter as any).publishedTerminalSessions.size === 0
+        && (antigravityAdapter as any).pendingTerminalBySession.size === 0
+        && (antigravityAdapter as any).lastOutputBySession.size === 0
+        && (antigravityAdapter as any).softTerminalTimers.size === 0
+        && (antigravityAdapter as any).softTerminalResultsBySession.size === 0
+        && (antigravityAdapter as any).terminalReleaseTimers.size === 0
+        && (antigravityAdapter as any).stdoutBuffers.size === 0
+        && (antigravityAdapter as any).stderrBuffers.size === 0,
+      'Antigravity shutdown clears session maps and timers',
+    );
   }
+
+  // Persisted leases, not the in-memory session map, fence timeout delivery.
+  {
+    const eventBus = new LocalEventBus();
+    const failures: AgentEvent[] = [];
+    eventBus.on('task_failed', (event) => { failures.push(event); });
+    const staleAttempt = {
+      id: 'attempt-stale', taskId: 'task-stale', missionId: 'mission-stale',
+      agentInstanceId: 'agent-stale', runtimeSessionId: 'session-stale',
+      error: 'Runtime session lease expired before completion was confirmed',
+    };
+    let expiryCalls = 0;
+    const manager: any = {
+      async finishTaskAttempt() { return true; },
+      async expireStaleTaskAttempts() {
+        expiryCalls += 1;
+        return expiryCalls === 1 ? [staleAttempt] : [];
+      },
+    };
+    const host = new RuntimeHost(eventBus, { workspaceManager: manager, sessionTimeout: 100, watchdogInterval: 0 });
+    const first = await host.runSessionWatchdog(new Date('2026-01-01T00:00:00.000Z'));
+    const second = await host.runSessionWatchdog(new Date('2026-01-01T00:00:01.000Z'));
+    assert(first === 1 && second === 0, 'watchdog expires a persisted stale attempt exactly once');
+    assert(failures.length === 1 && (failures[0] as any).taskId === 'task-stale', 'watchdog emits one correlated terminal task failure');
+    await host.stopAll();
+  }
+
+  // Quiet server sessions are renewed from a positive protocol probe, not process existence alone.
+  {
+    let heartbeatCalls = 0;
+    let probeCalls = 0;
+    const manager: any = {
+      async heartbeatTaskAttempt() { heartbeatCalls += 1; return true; },
+      async expireStaleTaskAttempts() { return []; },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, sessionTimeout: 100, sessionIdleGrace: 100, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'quiet', setEventBus() {}, isSessionAlive: () => true,
+      async probeSessionResponsiveness() { probeCalls += 1; return true; },
+      shutdown: async () => undefined,
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('quiet-session', {
+      adapterId: 'quiet', session: { id: 'quiet-session' }, attemptId: 'quiet-attempt', queuedAt: 0, startedAt: 0, retryCount: 1,
+      lastProtocolResponseAt: 0, probeFailures: 0,
+    });
+    await host.runSessionWatchdog(new Date(101));
+    assert(probeCalls === 1 && heartbeatCalls === 1, 'watchdog renews a quiet session only after a positive responsiveness probe');
+    (host as any).activeSessions.clear();
+    await host.stopAll();
+  }
+
+  // A late terminal event from an expired attempt cannot finish its replacement.
+  {
+    const eventBus = new LocalEventBus();
+    let finishCalls = 0;
+    const manager: any = {
+      async finishTaskAttempt() { finishCalls += 1; return true; },
+      async expireStaleTaskAttempts() { return []; },
+    };
+    const host = new RuntimeHost(eventBus, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'correlated', setEventBus() {}, isSessionAlive: () => true,
+      async cancel() {}, async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('replacement-session', {
+      adapterId: 'correlated',
+      session: { id: 'replacement-session', agentInstanceId: 'agent-same', runtimeSessionId: 'replacement-run' },
+      missionId: 'mission-correlation', taskId: 'task-correlation', attemptId: 'attempt-new',
+      queuedAt: 0, startedAt: 0, retryCount: 2, lastProtocolResponseAt: Date.now(), probeFailures: 0,
+    });
+    eventBus.emit({
+      id: 'late-old', type: 'task_failed', missionId: 'mission-correlation', taskId: 'task-correlation',
+      agentInstanceId: 'agent-same', attemptId: 'attempt-old', error: 'old process', timestamp: new Date().toISOString(),
+    } as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert(finishCalls === 0 && (host as any).activeSessions.has('replacement-session'), 'late terminal event with an old attempt id is ignored');
+    eventBus.emit({
+      id: 'matching-new', type: 'task_failed', missionId: 'mission-correlation', taskId: 'task-correlation',
+      agentInstanceId: 'agent-same', attemptId: 'attempt-new', error: 'new process', timestamp: new Date().toISOString(),
+    } as any);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert(finishCalls === 1 && !(host as any).activeSessions.has('replacement-session'), 'matching attempt id finishes the active session');
+    await host.stopAll();
+  }
+
+  // Persisted expiry must not cancel a replacement process that reuses a runtime id.
+  {
+    let cancelCalls = 0;
+    let expiryCalls = 0;
+    const manager: any = {
+      async finishTaskAttempt() { return true; },
+      async expireStaleTaskAttempts() {
+        expiryCalls += 1;
+        return expiryCalls === 1 ? [{ id: 'attempt-old', missionId: 'mission-reuse', taskId: 'task-reuse', agentInstanceId: 'agent-reuse', runtimeSessionId: 'reused-runtime', error: 'expired' }] : [];
+      },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'reuse', setEventBus() {}, isSessionAlive: () => false,
+      async cancel() { cancelCalls += 1; }, async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('reused-runtime', {
+      adapterId: 'reuse',
+      session: { id: 'reused-runtime', agentInstanceId: 'agent-reuse', runtimeSessionId: 'reused-runtime' },
+      missionId: 'mission-reuse', taskId: 'task-reuse', attemptId: 'attempt-new',
+      queuedAt: 0, startedAt: 0, retryCount: 2, lastProtocolResponseAt: Date.now(), probeFailures: 0,
+    });
+    await host.runSessionWatchdog(new Date('2026-01-01T00:00:00.000Z'));
+    assert(cancelCalls === 0 && (host as any).activeSessions.has('reused-runtime'), 'stale lease expiry does not cancel a replacement attempt');
+    await host.stopAll();
+  }
+
+  // A live but unresponsive process is never renewed and is cancelled after bounded failures.
+  {
+    let heartbeatCalls = 0;
+    let cancelCalls = 0;
+    let expiredCalls = 0;
+    const manager: any = {
+      async heartbeatTaskAttempt() { heartbeatCalls += 1; return true; },
+      async finishTaskAttempt(_id: string, status: string) { if (status === 'expired') expiredCalls += 1; return true; },
+      async expireStaleTaskAttempts() { return []; },
+    };
+    const host = new RuntimeHost(undefined, {
+      workspaceManager: manager, sessionTimeout: 100, sessionIdleGrace: 100, maxProbeFailures: 2, watchdogInterval: 0,
+    });
+    const adapter: any = {
+      id: 'stuck', setEventBus() {}, isSessionAlive: () => true,
+      async probeSessionResponsiveness() { return false; },
+      async cancel() { cancelCalls += 1; }, async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).activeSessions.set('stuck-session', {
+      adapterId: 'stuck', session: { id: 'stuck-session' }, attemptId: 'stuck-attempt', queuedAt: 0, startedAt: 0, retryCount: 1,
+      lastProtocolResponseAt: 0, probeFailures: 0,
+    });
+    await host.runSessionWatchdog(new Date(101));
+    assert(heartbeatCalls === 0 && cancelCalls === 0, 'a failed probe does not renew a live process lease');
+    await host.runSessionWatchdog(new Date(102));
+    assert(cancelCalls === 1 && expiredCalls === 1 && !(host as any).activeSessions.has('stuck-session'), 'repeated probe failure expires and cancels the session once');
+    await host.stopAll();
+  }
+
+  // OpenCode probes inherit the local request deadline even when fetch never settles itself.
+  {
+    const adapter = new OpenCodeAdapter();
+    const child: any = { exitCode: null, killed: false };
+    (adapter as any).activeSessions.set('probe-timeout', { id: 'probe-timeout' });
+    (adapter as any).sessionContext.set('probe-timeout', { serverKey: 'server', runtimeSessionId: 'runtime' });
+    (adapter as any).servers.set('server', { url: 'http://127.0.0.1:1', username: 'u', password: 'p', process: child });
+    const originalFetch = globalThis.fetch;
+    const startedAt = Date.now();
+    try {
+      globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      })) as typeof fetch;
+      const responsive = await adapter.probeSessionResponsiveness('probe-timeout');
+      assert(!responsive && Date.now() - startedAt < 1_500, 'OpenCode probe timeout resolves false within its request deadline');
+    } finally {
+      globalThis.fetch = originalFetch;
+      (adapter as any).activeSessions.clear();
+      (adapter as any).sessionContext.clear();
+      (adapter as any).servers.clear();
+    }
+  }
+
+  {
+    const manager: any = {
+      async expireOrphanedTaskAttempts(completedAt: string) {
+        return completedAt === '2026-01-02T00:00:00.000Z'
+          ? [{ id: 'orphan', runtimeSessionId: 'lost-session' }]
+          : [];
+      },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    assert(await host.reconcileStartup(new Date('2026-01-02T00:00:00.000Z')) === 1, 'startup reconciliation deterministically expires persisted orphan attempts');
+    await host.stopAll();
+  }
+
+  // Effective routes cross the WorkspaceManager boundary before provider execution.
+  {
+    const cases = [
+      {
+        name: 'explicit chat route',
+        eventRoute: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'high', routeSelectionMode: 'fixed' },
+        expectedSource: 'explicit', expectedMode: 'fixed', policy: undefined,
+      },
+      {
+        name: 'workspace role policy route', eventRoute: {}, expectedSource: 'workspace', expectedMode: 'prefer',
+        policy: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'medium', fallbackCatalogIds: [], selectionMode: 'prefer', source: 'workspace' },
+      },
+      {
+        name: 'scheduler fallback route', eventRoute: {}, expectedSource: 'scheduler', expectedMode: 'auto', policy: undefined,
+      },
+    ];
+    for (const testCase of cases) {
+      let claimedRoute: any;
+      let spawned = false;
+      const manager: any = {
+        async getTask() { return { missionId: 'mission-route', assignedRole: 'researcher', description: 'Research route durability', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
+        async getMission() { return { workspaceId: 'workspace-route', automationPolicy: null }; },
+        async getWorkspace() { return { path: process.cwd() }; },
+        async listTasks() { return []; },
+        async resolveRoleExecutionPolicy() { return testCase.policy; },
+        async claimTaskAttempt(input: any) {
+          claimedRoute = input.route;
+          assert(!spawned, `${testCase.name} snapshot is claimed before provider execution`);
+          return { id: `attempt-${testCase.expectedSource}`, attemptNumber: 1 };
+        },
+        async markTaskAttemptRunning() { return true; },
+        async updateTask() {},
+        async expireOrphanedTaskAttempts() { return []; },
+      };
+      const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+      const adapter: any = {
+        id: 'codex', runtimeType: 'codex', name: 'Codex test', setEventBus() {}, configureProfile() {},
+        async probeCapabilities() { return {}; },
+        async spawnAgent(options: any) { spawned = true; return { id: `provider-${testCase.expectedSource}`, agentInstanceId: options.sessionId }; },
+        async shutdown() {}, async cancel() {},
+      };
+      host.registerAdapter(adapter);
+      (host as any).profileManager.getProfiles = async () => [{
+        id: 'profile-primary', provider: 'openai', runtimeType: 'codex', profileName: 'Primary', authStatus: 'connected',
+        configDir: '', supportedModels: ['gpt-test'], usageScope: null, createdAt: '', updatedAt: '', allowedRoles: ['researcher'], schedulerAuto: true,
+      }];
+      (host as any).catalogService.getCachedCatalog = () => [{
+        catalogId: 'catalog-primary', runtimeId: 'codex', accountProfileId: 'profile-primary', providerId: 'openai', runtimeModelId: 'gpt-test',
+        displayName: 'GPT Test', supportedRoles: ['researcher'], supportedReasoning: ['medium', 'high'], inputModalities: ['text'], availability: 'available', source: 'discovered',
+      }];
+      await host.handleTaskCreated({
+        id: `event-${testCase.expectedSource}`, type: 'task_created', missionId: 'mission-route', taskId: `task-${testCase.expectedSource}`,
+        agentInstanceId: `agent-${testCase.expectedSource}`, assignedRole: 'researcher', title: testCase.name,
+        timestamp: '2026-08-30T01:00:00.000Z', ...testCase.eventRoute,
+      } as any);
+      assert(
+        claimedRoute?.source === testCase.expectedSource
+          && claimedRoute?.selectionMode === testCase.expectedMode
+          && claimedRoute?.adapterId === 'codex'
+          && claimedRoute?.accountProfileId === 'profile-primary'
+          && claimedRoute?.modelCatalogId === 'catalog-primary'
+          && claimedRoute?.runtimeModelId === 'gpt-test',
+        `${testCase.name} persists the effective adapter, account, catalog/runtime model, source, and selection mode`,
+      );
+      (host as any).activeSessions.clear();
+      await host.stopAll();
+    }
+  }
+
+  // An explicit persisted profile id must resolve to a known profile. Human
+  // readable task metadata must not silently manufacture a new profile.
+  {
+    let claimCalls = 0;
+    let spawnCalls = 0;
+    const manager: any = {
+      async getTask() {
+        return {
+          missionId: 'mission-profile-guard', assignedRole: 'researcher', agentProfileId: 'missing-profile',
+          description: 'Profile guard', priority: 'medium', requiredCapabilities: [], assignedAgentId: null,
+        };
+      },
+      async getMission() { return { workspaceId: 'workspace-profile-guard', automationPolicy: null }; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+      async claimTaskAttempt() { claimCalls += 1; return { id: 'attempt-profile-guard', attemptNumber: 1 }; },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'codex', runtimeType: 'codex', name: 'Profile guard test', setEventBus() {}, configureProfile() {},
+      async spawnAgent() { spawnCalls += 1; return { id: 'never-started' }; },
+      async shutdown() {}, async cancel() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-guard', provider: 'openai', runtimeType: 'codex', profileName: 'Guard', authStatus: 'connected',
+      allowedRoles: ['researcher'], schedulerAuto: true,
+    }];
+    let errorMessage = '';
+    try {
+      await host.handleTaskCreated({
+        id: 'event-profile-guard', type: 'task_created', missionId: 'mission-profile-guard', taskId: 'task-profile-guard',
+        agentInstanceId: 'agent-profile-guard', assignedRole: 'researcher', title: 'Friendly metadata',
+        displayName: 'Friendly metadata', instructions: 'This must not become an implicit profile.',
+        agentProfileId: 'researcher', profile: { id: 'researcher', role: 'researcher', name: 'Event override', capabilities: [], instructions: '' },
+        timestamp: new Date().toISOString(),
+      } as any);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    assert(errorMessage.includes("Agent profile 'missing-profile'") && errorMessage.includes('not found'), 'unknown persisted agent profile id fails closed before route selection');
+    assert(claimCalls === 0 && spawnCalls === 0, 'unknown persisted agent profile cannot claim a task or spawn a provider process');
+    await host.stopAll();
+  }
+
+  // A stale cached route must be refreshed and then rejected before any task
+  // claim or provider spawn if the runtime still cannot verify it live.
+  {
+    let discoveryCalls = 0;
+    let spawned = false;
+    const manager: any = {
+      async getTask() { return { missionId: 'mission-stale-route', assignedRole: 'researcher', description: 'Use a verified route', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
+      async getMission() { return { workspaceId: 'workspace-stale-route', automationPolicy: null }; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'codex', runtimeType: 'codex', name: 'Codex stale-route test', setEventBus() {}, configureProfile() {},
+      async probeCapabilities() { return {}; },
+      async spawnAgent() { spawned = true; return { id: 'never-spawned' }; },
+      async shutdown() {}, async cancel() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-stale-route', provider: 'openai', runtimeType: 'codex', profileName: 'Stale route profile', authStatus: 'connected',
+      allowedRoles: ['researcher'], schedulerAuto: true, capabilitySnapshot: {},
+    }];
+    const staleModel = {
+      catalogId: 'catalog-stale-route', runtimeId: 'codex', accountProfileId: 'profile-stale-route', providerId: 'openai',
+      runtimeModelId: 'gpt-stale', displayName: 'GPT stale', supportedRoles: ['researcher'], supportedReasoning: ['medium'],
+      inputModalities: ['text'], availability: 'unknown', source: 'cached',
+    };
+    (host as any).catalogService.getCachedCatalog = () => [staleModel];
+    (host as any).catalogService.discoverLiveModels = async () => { discoveryCalls += 1; return [staleModel]; };
+    let errorMessage = '';
+    try {
+      await host.handleTaskCreated({
+        id: 'event-stale-route', type: 'task_created', missionId: 'mission-stale-route', taskId: 'task-stale-route',
+        agentInstanceId: 'agent-stale-route', assignedRole: 'researcher', title: 'Stale route', timestamp: new Date().toISOString(),
+      } as any);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    assert(discoveryCalls === 1 && errorMessage.includes('not verified by a live runtime catalog'), 'RuntimeHost refreshes and rejects a stale route before task execution');
+    assert(!spawned, 'RuntimeHost never spawns a provider process for an unverified cached route');
+    await host.stopAll();
+  }
+
+  // Persisted task identity and role are authoritative for execution access.
+  {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-runtime-access-'));
+    try {
+      async function executeAccessCase(options: {
+        name: string;
+        eventRole: 'builder' | 'researcher';
+        persistedRole: 'builder' | 'researcher';
+        worktreePath: string;
+      }) {
+        let spawnOptions: any;
+        let spawnCalls = 0;
+        let worktreeCalls = 0;
+        let claimCalls = 0;
+        const task = {
+          id: `task-${options.name}`,
+          missionId: 'mission-access',
+          assignedRole: options.persistedRole,
+          description: 'Verify authoritative runtime access',
+          priority: 'medium',
+          requiredCapabilities: [],
+          assignedAgentId: null,
+          worktreeId: null,
+          dependsOn: [],
+          title: options.name,
+        };
+        const manager: any = {
+          async getTask() { return task; },
+          async getMission() { return { workspaceId: 'workspace-access', automationPolicy: null }; },
+          async getWorkspace() { return { path: options.persistedRole === 'researcher' ? path.join(tempRoot, 'missing-read-only-root') : tempRoot }; },
+          async listTasks() { return [task]; },
+          async resolveRoleExecutionPolicy() { return undefined; },
+          async createWorktreeForTask() { worktreeCalls += 1; return options.worktreePath; },
+          async claimTaskAttempt() { claimCalls += 1; return { id: `attempt-${options.name}`, attemptNumber: 1 }; },
+          async markTaskAttemptRunning() { return true; },
+          async updateTask() {},
+        };
+        const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+        const adapter: any = {
+          id: 'codex', runtimeType: 'codex', name: 'Codex access test', setEventBus() {}, configureProfile() {},
+          async probeCapabilities() { return { worktreeAwareness: true }; },
+          async spawnAgent(input: any) {
+            spawnCalls += 1;
+            spawnOptions = input;
+            return { id: `session-${options.name}`, agentInstanceId: input.sessionId };
+          },
+          async shutdown() {}, async cancel() {},
+        };
+        host.registerAdapter(adapter);
+        (host as any).profileManager.getProfiles = async () => [{
+          id: `profile-${options.name}`, provider: 'openai', runtimeType: 'codex', profileName: 'Access profile', authStatus: 'connected',
+          configDir: '', supportedModels: ['gpt-access'], usageScope: null, createdAt: '', updatedAt: '',
+          allowedRoles: [options.persistedRole], schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true },
+        }];
+        (host as any).catalogService.getCachedCatalog = () => [{
+          catalogId: `catalog-${options.name}`, runtimeId: 'codex', accountProfileId: `profile-${options.name}`, providerId: 'openai', runtimeModelId: 'gpt-access',
+          displayName: 'GPT Access', supportedRoles: [options.persistedRole], supportedReasoning: ['medium'], inputModalities: ['text'], availability: 'available', source: 'discovered',
+        }];
+        let error: Error | undefined;
+        try {
+          await host.handleTaskCreated({
+            id: `event-${options.name}`, type: 'task_created', missionId: 'mission-access', taskId: task.id,
+            agentInstanceId: `agent-${options.name}`, assignedRole: options.eventRole, title: options.name,
+            timestamp: '2026-08-30T02:00:00.000Z',
+          } as any);
+        } catch (caught) {
+          error = caught instanceof Error ? caught : new Error(String(caught));
+        }
+        (host as any).activeSessions.clear();
+        await host.stopAll();
+        return { error, spawnOptions, spawnCalls, worktreeCalls, claimCalls };
+      }
+
+      const builderWorktree = path.join(tempRoot, 'builder-worktree');
+      fs.mkdirSync(builderWorktree);
+      const builder = await executeAccessCase({
+        name: 'persisted-builder', eventRole: 'researcher', persistedRole: 'builder', worktreePath: builderWorktree,
+      });
+      assert(!builder.error, 'persisted Builder launches despite a conflicting researcher event role');
+      assert(
+        builder.spawnOptions?.role === 'builder'
+          && builder.spawnOptions?.accessMode === 'workspace-write'
+          && builder.spawnOptions?.isolated === true
+          && builder.spawnOptions?.worktreePath === builderWorktree
+          && builder.worktreeCalls === 1,
+        'persisted Builder role controls the isolated worktree and write-capable provider route',
+      );
+      assert(fs.readdirSync(builderWorktree).length === 0, 'Builder writeability preflight removes its contained Atris probe file');
+
+      const researcher = await executeAccessCase({
+        name: 'persisted-researcher', eventRole: 'builder', persistedRole: 'researcher', worktreePath: path.join(tempRoot, 'unused-worktree'),
+      });
+      assert(!researcher.error && researcher.spawnOptions?.role === 'researcher' && researcher.spawnOptions?.accessMode === 'read-only' && researcher.spawnOptions?.isolated === false, 'persisted read-only role stays read-only despite a conflicting Builder event role');
+      assert(researcher.worktreeCalls === 0, 'read-only execution does not create or write-probe a Builder worktree');
+
+      const unwritable = await executeAccessCase({
+        name: 'unwritable-builder', eventRole: 'builder', persistedRole: 'builder', worktreePath: path.join(tempRoot, 'missing-parent', 'worktree'),
+      });
+      assert(Boolean(unwritable.error?.message.includes('Builder worktree is not writable')), 'unwritable Builder worktree fails the writeability preflight');
+      assert(unwritable.spawnCalls === 0 && unwritable.claimCalls === 0, 'Builder writeability failure occurs before task claim and provider spawn');
+
+      const resumedPath = path.join(tempRoot, 'resumed-worktree');
+      const foreignPath = path.join(tempRoot, 'foreign-worktree');
+      fs.mkdirSync(resumedPath);
+      fs.mkdirSync(foreignPath);
+      const ownershipHost = new RuntimeHost(undefined, { workspaceManager: {
+        async getTask() { return { id: 'task-owned', missionId: 'mission-access', worktreeId: resumedPath }; },
+        async getMission() { return { workspaceId: 'workspace-access' }; },
+        async getWorkspace() { return { path: tempRoot }; },
+        async getWorktreeForTask() { return { taskId: 'task-owned', missionId: 'mission-access', path: foreignPath }; },
+      } as any, watchdogInterval: 0 });
+      let ownershipError = '';
+      try {
+        await (ownershipHost as any).resolveTaskExecutionContext({ taskId: 'task-owned', missionId: 'mission-access' }, 'builder');
+      } catch (error) {
+        ownershipError = error instanceof Error ? error.message : String(error);
+      }
+      assert(ownershipError.includes('worktree ownership is invalid'), 'resumed Builder rejects a persisted path that is not owned by its task record');
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  }
+
+  const siblingStagingPath = path.join(os.tmpdir(), 'atris-runtime-target', '.atris-worktrees', 'mission-new', 'task-new');
+  let dispatchedTarget: unknown;
+  const targetAwareManager = {
+    getTask: async () => ({
+      id: 'task-new', missionId: 'mission-new', worktreeId: null,
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+    }),
+    getMission: async () => ({ id: 'mission-new', workspaceId: 'workspace-container' }),
+    getWorkspace: async () => ({ id: 'workspace-container', path: path.dirname(path.dirname(siblingStagingPath)) }),
+    createWorktreeForTask: async () => {
+      dispatchedTarget = (await targetAwareManager.getTask()).targetDescriptor;
+      return siblingStagingPath;
+    },
+  } as any;
+  const targetAwareHost = new RuntimeHost(undefined, { workspaceManager: targetAwareManager, watchdogInterval: 0 });
+  const targetExecution = await (targetAwareHost as any).resolveTaskExecutionContext({ taskId: 'task-new', missionId: 'mission-new' }, 'builder');
+  assert((dispatchedTarget as any)?.kind === 'new_sibling_project' && (dispatchedTarget as any)?.projectName === 'AtrisTask', 'RuntimeHost dispatch preserves the persisted structured new sibling target');
+  assert(targetExecution.cwd === siblingStagingPath && targetExecution.worktreePath === siblingStagingPath, 'RuntimeHost runs the Builder in the managed new sibling staging directory');
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) process.exit(1);

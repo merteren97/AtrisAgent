@@ -8,6 +8,12 @@ export interface SupervisorTurnRuntimeRequest {
   reasoningLevel?: string;
   fallbackCatalogIds?: string[];
   selectionMode?: 'auto' | 'prefer' | 'fixed';
+  /** Optional named profile identity; core role remains orchestrator. */
+  agentProfileId?: string;
+  /** Compatibility alias for callers that use profileId for named profiles. */
+  profileId?: string;
+  agentProfile?: Record<string, unknown>;
+  profile?: Record<string, unknown>;
 }
 
 export type SupervisorTurnRunner = (request: SupervisorTurnRuntimeRequest) => Promise<string>;

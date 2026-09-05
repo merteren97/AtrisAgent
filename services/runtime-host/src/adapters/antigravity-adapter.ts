@@ -43,6 +43,7 @@ import {
   runCommand,
   spawnHidden,
   spawnHiddenChecked,
+  terminateProcessTree,
 } from '../runtime-utils';
 
 interface PendingAuth {
@@ -63,6 +64,12 @@ type PendingTerminalOutcome =
   | { kind: 'completed'; result: string }
   | { kind: 'failed'; error: string; exitCode?: number | null };
 
+interface AntigravityCliOptions {
+  supportsSandbox: boolean;
+  supportsMode: boolean;
+  supportsPrintTimeout: boolean;
+}
+
 const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'];
 const MAX_STDERR_CHARS = 8_000;
 const TERMINAL_EXIT_GRACE_MS = 750;
@@ -70,9 +77,69 @@ const TERMINAL_FORCE_KILL_MS = 3_000;
 const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
 const FINAL_RESPONSE_QUIET_GRACE_MS = 2_500;
 const TERMINAL_RELEASE_GRACE_MS = TERMINAL_EXIT_GRACE_MS + TERMINAL_FORCE_KILL_MS + 500;
+const ANTIGRAVITY_AUTH_PROBE_MARKER = 'ATRIS_AUTH_OK';
+const AGY_VERSION_TIMEOUT_MS = 8_000;
+const AGY_AUTH_PROBE_TIMEOUT_MS = 75_000;
+const AGY_MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
+const AGY_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024;
+const MAX_COMMAND_DIAGNOSTIC_CHARS = 1_500;
+
+function commandDiagnostic(error: unknown, fallback: string): string {
+  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const parts = [
+    typeof record.message === 'string' ? record.message : undefined,
+    typeof record.stderr === 'string' ? record.stderr : undefined,
+    typeof record.stdout === 'string' ? record.stdout : undefined,
+    typeof error === 'string' ? error : undefined,
+  ].filter(Boolean).join('\n').trim();
+  return redactSecrets(parts || fallback).slice(-MAX_COMMAND_DIAGNOSTIC_CHARS);
+}
+
+export function resolveAntigravityExecutionMode(accessMode?: SpawnAgentOptions['accessMode']): 'accept-edits' | 'plan' {
+  return accessMode === 'workspace-write' ? 'accept-edits' : 'plan';
+}
+
+function classifyAntigravityAuthStatus(output: string): AccountProfileStatus {
+  const authBooleans: boolean[] = [];
+  const authStatuses: string[] = [];
+  const visit = (value: unknown, depth = 0): void => {
+    if (!value || depth > 5) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      const normalizedKey = key.toLowerCase().replace(/[^a-z]/g, '');
+      if (['authenticated', 'connected', 'loggedin', 'signedin'].includes(normalizedKey) && typeof nested === 'boolean') {
+        authBooleans.push(nested);
+      }
+      if (['status', 'authstatus', 'authenticationstatus', 'connectionstatus', 'sessionstatus'].includes(normalizedKey) && typeof nested === 'string') {
+        authStatuses.push(nested.toLowerCase());
+      }
+      visit(nested, depth + 1);
+    }
+  };
+  for (const line of [output, ...output.split(/\r?\n/)]) {
+    try { visit(JSON.parse(line)); } catch { /* Status commands may return plain text. */ }
+  }
+
+  const text = output.toLowerCase();
+  const structuredNegative = authBooleans.includes(false)
+    || authStatuses.some((status) => /^(?:false|disconnected|expired|invalid|revoked|unauthenticated|unauthorized|logged[_ -]?out|signed[_ -]?out|login[_ -]?required)$/.test(status));
+  const explicitNegative = /\b(?:authenticated|connected|logged[_ -]?in|signed[_ -]?in)\s*[=:]\s*false\b|not\s+(?:authenticated|connected|logged\s+in|signed\s+in)|unauthenticated|unauthorized|disconnected|logged\s+out|signed\s+out|(?:login|sign\s+in|authentication)\s+required|credential[^\r\n]*missing|(?:session|token|credential|authentication)\s+(?:(?:is|has|was)\s+)?(?:expired|invalid|revoked|no\s+longer\s+valid)|(?:expired|invalid|revoked)\s+(?:session|token|credential)/.test(text);
+  if (structuredNegative || explicitNegative) {
+    return 'login_required';
+  }
+  const structuredPositive = authBooleans.includes(true)
+    || authStatuses.some((status) => /^(?:true|connected|authenticated|valid|active|logged[_ -]?in|signed[_ -]?in)$/.test(status));
+  if (structuredPositive || /^(?:\s*(?:authenticated|connected|logged\s+in|signed\s+in)\s*[.!]?\s*)$/i.test(output)) return 'connected';
+  return 'error';
+}
 
 // Last-resort fallback only. `agy models` is authoritative when the installed CLI exposes it.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
+  { slug: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
@@ -94,36 +161,76 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private pendingTerminalBySession = new Map<string, PendingTerminalOutcome>();
   private lastOutputBySession = new Map<string, string>();
   private softTerminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private softTerminalResultsBySession = new Map<string, string>();
   private terminalReleaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private liveModelFamilies: AntigravityCliModelFamily[] = [];
+  private cliOptions: AntigravityCliOptions = {
+    supportsSandbox: false,
+    supportsMode: false,
+    supportsPrintTimeout: false,
+  };
   private lastVerification?: { status: AccountProfileStatus; checkedAt: number; activeModel?: string; message?: string };
 
-  constructor(eventBus?: LocalEventBus) {
+  constructor(
+    eventBus?: LocalEventBus,
+    private readonly passiveAuthCommands: {
+      getHelpText: typeof getHelpText;
+      runCommand: typeof runCommand;
+    } = { getHelpText, runCommand },
+  ) {
     super(eventBus);
+  }
+
+  override async cancel(sessionId: string): Promise<void> {
+    await super.cancel(sessionId);
+    this.cleanupSessionState(sessionId);
+  }
+
+  override async shutdown(): Promise<void> {
+    await super.shutdown();
+    this.cleanupAllSessionState();
   }
 
   async discoverInstallation(): Promise<InstallationStatus> {
     const executable = await findExecutable('agy');
     if (!executable) return { installed: false, error: 'Antigravity CLI (`agy`) was not found in PATH.' };
     try {
-      const version = (await runCommand(executable, ['--version'], { timeoutMs: 8_000 })).stdout.trim();
+      const version = (await runCommand(executable, ['--version'], {
+        timeoutMs: AGY_VERSION_TIMEOUT_MS,
+        maxOutputBytes: 4_096,
+      })).stdout.trim();
       return { installed: true, path: executable, version: version || undefined };
     } catch (error: any) {
-      return { installed: true, path: executable, error: error?.message || 'Could not read Antigravity version.' };
+      return {
+        installed: true,
+        path: executable,
+        error: `Antigravity version probe failed: ${commandDiagnostic(error, 'Could not read Antigravity version.')}`,
+      };
     }
   }
 
   async probeCapabilities(): Promise<CapabilitySnapshot> {
     const install = await this.discoverInstallation();
     if (!install.installed) return this.emptyCapabilities();
-    const help = (await getHelpText(install.path || 'agy')).toLowerCase();
+    let help = '';
+    try {
+      help = (await this.passiveAuthCommands.getHelpText(install.path || 'agy')).slice(-AGY_PROBE_OUTPUT_LIMIT_BYTES).toLowerCase();
+    } catch (error) {
+      console.warn(`[AntigravityAdapter] Capability probe failed: ${commandDiagnostic(error, 'could not read CLI help.')}`);
+    }
+    this.cliOptions = {
+      supportsSandbox: /(?:^|\s)--sandbox(?:\s|=|,|$)/.test(help),
+      supportsMode: /(?:^|\s)--mode(?:\s|=|,|$)/.test(help),
+      supportsPrintTimeout: /(?:^|\s)--print-timeout(?:\s|=|,|$)/.test(help),
+    };
     return {
       structuredEventStreaming: /stream-json/.test(help) && /--print|-p\b/.test(help),
       sessionResume: /--continue|-c\b|--conversation/.test(help),
       modelSelection: /--model\b/.test(help),
       reasoningControl: /--effort\b/.test(help),
       toolCallEvents: /stream-json/.test(help),
-      interactiveApproval: /permissions|sandbox/.test(help),
+      // Antigravity exposes sandbox flags but no in-process approval callback.
+      interactiveApproval: false,
       usageInfo: /usage|quota/.test(help),
       cancellation: true,
       worktreeAwareness: true,
@@ -190,7 +297,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         status,
         message: verification?.activeModel
           ? `Antigravity is connected. Active model detected: ${verification.activeModel}.`
-          : 'Antigravity is connected and print mode is reachable.',
+          : 'Antigravity authentication is connected.',
       };
     }
     if (status === 'rate_limited') {
@@ -210,8 +317,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
 
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) return 'not_installed';
-    const capabilities = await this.probeCapabilities();
-    if (!capabilities.structuredEventStreaming) {
+    const help = await this.passiveAuthCommands.getHelpText(install.path);
+    if (!/--print(?:\s|,)|(?:^|\s)-p(?:\s|,)/i.test(help) || !/--output-format/i.test(help)) {
       this.lastVerification = {
         status: 'error',
         checkedAt: Date.now(),
@@ -219,37 +326,95 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       };
       return 'error';
     }
+    const supportsSandbox = /(?:^|\s)--sandbox(?:\s|=|,|$)/i.test(help);
+    if (!supportsSandbox) {
+      this.lastVerification = {
+        status: 'error',
+        checkedAt: Date.now(),
+        message: 'Antigravity structured authentication probe requires the CLI sandbox option. Update the installed CLI before connecting it.',
+      };
+      return 'error';
+    }
 
     try {
-      const result = await runCommand(install.path, [
+      const probeArgs = [
         '--print',
         'Reply with exactly ATRIS_AUTH_OK. Do not use tools and do not modify files.',
         '--output-format',
         'json',
         '--sandbox',
-      ], { timeoutMs: 75_000, cwd: os.homedir() });
-      const activeModel = this.extractModelId(result.stdout);
-      this.lastVerification = { status: 'connected', checkedAt: Date.now(), activeModel };
-      return 'connected';
+      ];
+      // `--print-timeout` is optional across CLI versions. Only pass it when
+      // the installed help text advertises the flag; runCommand still bounds
+      // the probe if an older CLI uses its own default timeout.
+      if (/(?:^|\s)--print-timeout(?:\s|=|,|$)/i.test(help)) probeArgs.push('--print-timeout', `${AGY_AUTH_PROBE_TIMEOUT_MS / 1000}s`);
+      const result = await this.passiveAuthCommands.runCommand(install.path, probeArgs, {
+        timeoutMs: AGY_AUTH_PROBE_TIMEOUT_MS,
+        cwd: os.homedir(),
+        maxOutputBytes: AGY_PROBE_OUTPUT_LIMIT_BYTES,
+      });
+      const raw = `${result.stdout}\n${result.stderr}`;
+      const commandFailed = result.exitCode !== 0;
+      const classified = classifyAntigravityAuthStatus(raw);
+      const text = raw.toLowerCase();
+      const finalStatus: AccountProfileStatus = commandFailed
+        ? /rate.?limit|quota|resource exhausted|too many requests/.test(text)
+          ? 'rate_limited'
+          : classified === 'login_required' ? 'login_required' : 'error'
+        : /rate.?limit|quota|resource exhausted|too many requests/.test(text)
+          ? 'rate_limited'
+          : classified === 'login_required'
+            ? 'login_required'
+            : result.stdout.includes(ANTIGRAVITY_AUTH_PROBE_MARKER) ? 'connected' : 'error';
+      this.lastVerification = {
+        status: finalStatus,
+        checkedAt: Date.now(),
+        activeModel: finalStatus === 'connected' ? this.extractModelId(result.stdout) : undefined,
+        message: finalStatus === 'error'
+          ? 'Antigravity returned an unrecognized authentication status. Use the visible sign-in terminal to verify setup.'
+          : undefined,
+      };
+      return finalStatus;
     } catch (error: any) {
       const raw = `${error?.stdout || ''}\n${error?.stderr || ''}\n${error?.message || ''}`;
-      const text = raw.toLowerCase();
       const message = redactSecrets(raw).trim().slice(-1_500);
-      const needsOnboarding = /first.?launch|onboarding|workspace trust|trust this|select.*theme|rendering mode/.test(text);
+      const classified = classifyAntigravityAuthStatus(raw);
+      const text = raw.toLowerCase();
       const status: AccountProfileStatus = /rate.?limit|quota|resource exhausted|too many requests/.test(text)
         ? 'rate_limited'
-        : /auth|login|sign.?in|credential|keyring|unauthorized|forbidden|account/.test(text)
-          ? 'login_required'
-          : 'error';
+        : classified === 'login_required' ? 'login_required' : 'error';
       this.lastVerification = {
         status,
         checkedAt: Date.now(),
-        message: needsOnboarding
-          ? 'Antigravity still requires first-launch setup or workspace trust. Finish the prompts in the opened Antigravity terminal, then check the connection again.'
-          : message,
+        message: status === 'login_required'
+          ? 'Antigravity requires interactive setup. Start sign-in and finish setup in the visible terminal, then check the connection again.'
+          : message || 'Antigravity authentication status could not be determined from the CLI probe.',
       };
       return status;
     }
+  }
+
+  private extractModelId(stdout: string): string | undefined {
+    const candidates: unknown[] = [];
+    for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
+      try { candidates.push(JSON.parse(line)); } catch { /* Text output is allowed. */ }
+    }
+    const visit = (value: unknown, depth = 0): string | undefined => {
+      if (!value || depth > 5) return undefined;
+      if (Array.isArray(value)) {
+        for (const item of value) { const found = visit(item, depth + 1); if (found) return found; }
+        return undefined;
+      }
+      if (typeof value !== 'object') return undefined;
+      const record = value as Record<string, unknown>;
+      for (const key of ['model_id', 'modelId', 'model', 'reasoning_model']) {
+        if (typeof record[key] === 'string' && record[key]) return record[key] as string;
+      }
+      for (const nested of Object.values(record)) { const found = visit(nested, depth + 1); if (found) return found; }
+      return undefined;
+    };
+    for (const candidate of candidates) { const found = visit(candidate); if (found) return found; }
+    return undefined;
   }
 
   async logout(): Promise<void> {
@@ -259,19 +424,28 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     await new Promise((resolve) => setTimeout(resolve, 800));
     child.stdin?.write('/logout\n');
     await new Promise((resolve) => setTimeout(resolve, 1_200));
-    child.kill('SIGTERM');
+    await terminateProcessTree(child);
     this.lastVerification = undefined;
     this.liveModelFamilies = [];
   }
 
   private async discoverLiveModelFamilies(executable: string): Promise<AntigravityCliModelFamily[]> {
+    // Never reuse a prior live snapshot after a failed or empty refresh.
+    this.liveModelFamilies = [];
     try {
-      const result = await runCommand(executable, ['models'], { timeoutMs: 12_000, cwd: os.homedir() });
+      const result = await this.passiveAuthCommands.runCommand(executable, ['models'], {
+        timeoutMs: AGY_MODEL_DISCOVERY_TIMEOUT_MS,
+        cwd: os.homedir(),
+        maxOutputBytes: AGY_PROBE_OUTPUT_LIMIT_BYTES,
+      });
       const families = parseAntigravityModelsOutput(result.stdout);
-      if (families.length) this.liveModelFamilies = families;
+      this.liveModelFamilies = families;
+      if (!families.length) {
+        console.warn('[AntigravityAdapter] Live `agy models` returned no parseable model routes.');
+      }
       return families;
     } catch (error) {
-      console.warn('[AntigravityAdapter] Live `agy models` discovery failed; using fallback catalog.', error);
+      console.warn(`[AntigravityAdapter] Live \`agy models\` discovery failed; using fallback catalog: ${commandDiagnostic(error, 'model discovery failed.')}`);
       return [];
     }
   }
@@ -338,20 +512,20 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     }
 
     const models: ModelDescriptor[] = [];
-    const activeRouteId = activeModel || 'antigravity-active-route';
+    const activeRouteId = 'antigravity-active-route';
     models.push({
       catalogId: `${this.id}:${profileId}:${activeRouteId}`,
       runtimeId: this.runtimeType,
       accountProfileId: profileId,
       providerId: activeModel ? this.providerFor(activeModel) : 'google',
-      runtimeModelId: activeRouteId,
+      runtimeModelId: 'antigravity-active-route',
       displayName: activeModel ? this.displayName(activeModel) : 'Antigravity Active Model',
       description: 'The sticky model currently selected inside Antigravity. Live model discovery was unavailable.',
       supportedRoles: ALL_ROLES,
       supportedReasoning: capabilities.reasoningControl ? ['low', 'medium', 'high'] : [],
       inputModalities: ['text', 'image'],
-      availability: 'available',
-      source: 'discovered',
+      availability: 'unknown',
+      source: 'cached',
       routeLabel: 'Antigravity CLI · active route',
       isDefault: true,
       warning: 'Live `agy models` discovery failed. Refresh routes after confirming the CLI is reachable.',
@@ -380,29 +554,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       });
     }
     return models;
-  }
-
-  private extractModelId(stdout: string): string | undefined {
-    const candidates: unknown[] = [];
-    for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
-      try { candidates.push(JSON.parse(line)); } catch { /* Text output is allowed. */ }
-    }
-    const visit = (value: unknown, depth = 0): string | undefined => {
-      if (!value || depth > 5) return undefined;
-      if (Array.isArray(value)) {
-        for (const item of value) { const found = visit(item, depth + 1); if (found) return found; }
-        return undefined;
-      }
-      if (typeof value !== 'object') return undefined;
-      const record = value as Record<string, unknown>;
-      for (const key of ['model_id', 'modelId', 'model', 'reasoning_model']) {
-        if (typeof record[key] === 'string' && record[key]) return record[key] as string;
-      }
-      for (const nested of Object.values(record)) { const found = visit(nested, depth + 1); if (found) return found; }
-      return undefined;
-    };
-    for (const candidate of candidates) { const found = visit(candidate); if (found) return found; }
-    return undefined;
   }
 
   private normalizeModelId(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, ''); }
@@ -452,17 +603,35 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private async resolveRequestedModelRoute(executable: string, model: string, reasoning?: string): Promise<string> {
     if (model === 'antigravity-active-route') return model;
     let families = this.liveModelFamilies;
-    if (!families.length || !families.some((family) => family.id === model || Object.values(family.routes).includes(model))) {
-      const discovered = await this.discoverLiveModelFamilies(executable);
-      if (discovered.length) families = discovered;
+    const normalizedModel = this.normalizeModelId(model);
+    const hasRequestedRoute = families.some((family) =>
+      this.normalizeModelId(family.id) === normalizedModel
+      || Object.values(family.routes).some((route) => this.normalizeModelId(route) === normalizedModel),
+    );
+    if (!hasRequestedRoute) {
+      families = await this.discoverLiveModelFamilies(executable);
     }
-    return resolveAntigravityModelRoute(families, model, reasoning);
+    if (!families.length) {
+      throw new Error(`Antigravity model route '${model}' could not be verified because the live model catalog is unavailable. Refresh the catalog or choose the active route.`);
+    }
+    const resolved = resolveAntigravityModelRoute(families, model, reasoning);
+    const resolvedFamily = families.some((family) =>
+      this.normalizeModelId(family.id) === this.normalizeModelId(model)
+      || Object.values(family.routes).some((route) => this.normalizeModelId(route) === this.normalizeModelId(model)),
+    );
+    if (!resolvedFamily) {
+      throw new Error(`Antigravity model route '${model}' is not present in the live model catalog.`);
+    }
+    return resolved;
   }
 
   async spawnAgent(options: SpawnAgentOptions): Promise<AgentSession> {
     const capabilities = await this.probeCapabilities();
     if (!capabilities.structuredEventStreaming) {
       throw new Error('Antigravity 1.1.8 or newer with print-mode `stream-json` is required for background agents.');
+    }
+    if (!this.cliOptions.supportsSandbox || !this.cliOptions.supportsMode) {
+      throw new Error('Antigravity background agents require CLI support for `--sandbox` and `--mode`; update the installed CLI before starting a run.');
     }
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) throw new Error(install.error || 'Antigravity CLI was not found.');
@@ -483,9 +652,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       '--output-format',
       'stream-json',
       '--sandbox',
-      '--print-timeout',
-      printTimeout,
+      '--mode',
+      resolveAntigravityExecutionMode(options.accessMode),
     ];
+    if (this.cliOptions.supportsPrintTimeout) args.push('--print-timeout', printTimeout);
     if (overlay) args.push(...overlay.extraArgs);
     if (modelRoute && modelRoute !== 'antigravity-active-route' && capabilities.modelSelection) args.push('--model', modelRoute);
     const routeEncodesReasoning = Boolean(modelRoute && /-(?:minimal|low|medium|high|xhigh|max)$/i.test(modelRoute));
@@ -606,10 +776,16 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const context = this.sessionContext.get(sessionId);
     if (!context || this.isSessionCancelled(sessionId) || !line.trim()) return;
     const parsed = parseAntigravityStreamLine(line);
+    const softTerminalResult = this.softTerminalResultsBySession.get(sessionId);
+    this.clearSoftTerminalCandidate(sessionId);
     const timestamp = new Date().toISOString();
 
-    if (parsed.kind === 'malformed') return;
+    if (parsed.kind === 'malformed') {
+      if (softTerminalResult !== undefined) this.scheduleSoftTerminalCandidate(sessionId, softTerminalResult);
+      return;
+    }
     if (parsed.kind === 'unknown') {
+      if (softTerminalResult !== undefined) this.scheduleSoftTerminalCandidate(sessionId, softTerminalResult);
       this.emitEvent({
         id: crypto.randomUUID(),
         type: 'agent_progressed',
@@ -622,7 +798,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'init') {
-      this.clearSoftTerminalCandidate(sessionId);
       const session = this.activeSessions.get(sessionId);
       if (session && parsed.conversationId) session.runtimeSessionId = parsed.conversationId;
       this.emitEvent({
@@ -637,7 +812,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'step') {
-      this.clearSoftTerminalCandidate(sessionId);
       const stepType = parsed.stepType.toLowerCase();
       const isFinalResponseCandidate = /(?:^|[_-])(?:agent|final)[_-]?response(?:$|[_-])/.test(stepType)
         && /^(?:done|completed|success|succeeded)$/i.test(parsed.state || '');
@@ -659,7 +833,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (parsed.kind === 'result') {
-      this.clearSoftTerminalCandidate(sessionId);
+      this.recordProviderUsage(sessionId, parsed.raw);
       if (this.terminalSessions.has(sessionId)) return;
       if (!parsed.success) {
         this.recordTerminalOutcome(sessionId, {
@@ -683,6 +857,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const timer = this.softTerminalTimers.get(sessionId);
     if (timer) clearTimeout(timer);
     this.softTerminalTimers.delete(sessionId);
+    this.softTerminalResultsBySession.delete(sessionId);
   }
 
   private clearTerminalRelease(sessionId: string): void {
@@ -691,8 +866,40 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.terminalReleaseTimers.delete(sessionId);
   }
 
+  private cleanupSessionState(sessionId: string): void {
+    this.clearSoftTerminalCandidate(sessionId);
+    this.clearTerminalRelease(sessionId);
+    this.activeProcesses.delete(sessionId);
+    this.activeSessions.delete(sessionId);
+    this.sessionContext.delete(sessionId);
+    this.terminalSessions.delete(sessionId);
+    this.publishedTerminalSessions.delete(sessionId);
+    this.pendingTerminalBySession.delete(sessionId);
+    this.lastOutputBySession.delete(sessionId);
+    this.stdoutBuffers.delete(sessionId);
+    this.stderrBuffers.delete(sessionId);
+    revokeControlPlaneAgent(sessionId);
+  }
+
+  private cleanupAllSessionState(): void {
+    for (const timer of this.softTerminalTimers.values()) clearTimeout(timer);
+    for (const timer of this.terminalReleaseTimers.values()) clearTimeout(timer);
+    for (const sessionId of this.sessionContext.keys()) revokeControlPlaneAgent(sessionId);
+    this.sessionContext.clear();
+    this.terminalSessions.clear();
+    this.publishedTerminalSessions.clear();
+    this.pendingTerminalBySession.clear();
+    this.lastOutputBySession.clear();
+    this.softTerminalTimers.clear();
+    this.softTerminalResultsBySession.clear();
+    this.terminalReleaseTimers.clear();
+    this.stdoutBuffers.clear();
+    this.stderrBuffers.clear();
+  }
+
   private scheduleSoftTerminalCandidate(sessionId: string, result: string): void {
     this.clearSoftTerminalCandidate(sessionId);
+    this.softTerminalResultsBySession.set(sessionId, result);
     const timer = setTimeout(() => {
       this.promoteSoftTerminalCandidate(sessionId, result);
     }, FINAL_RESPONSE_QUIET_GRACE_MS);
@@ -773,12 +980,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const terminate = setTimeout(() => {
       const active = this.activeProcesses.get(sessionId);
       if (!active || active.exitCode !== null || active.signalCode !== null) return;
-      active.kill('SIGTERM');
+      void terminateProcessTree(active);
 
       const forceKill = setTimeout(() => {
         const stillActive = this.activeProcesses.get(sessionId);
         if (!stillActive || stillActive.exitCode !== null || stillActive.signalCode !== null) return;
-        stillActive.kill('SIGKILL');
+        void terminateProcessTree(stillActive, true);
       }, TERMINAL_FORCE_KILL_MS);
       forceKill.unref?.();
     }, TERMINAL_EXIT_GRACE_MS);

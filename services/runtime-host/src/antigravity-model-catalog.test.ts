@@ -1,15 +1,15 @@
 import { parseAntigravityModelsOutput, resolveAntigravityModelRoute } from './antigravity-model-catalog';
 
 const OUTPUT = `
+gemini-3.8-flash-high      Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium    Gemini 3.8 Flash (Medium)
+gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
 gemini-3.7-flash-high      Gemini 3.7 Flash (High)
 gemini-3.7-flash-medium    Gemini 3.7 Flash (Medium)
 gemini-3.7-flash-low       Gemini 3.7 Flash (Low)
 gemini-3.6-flash-high      Gemini 3.6 Flash (High)
 gemini-3.6-flash-medium    Gemini 3.6 Flash (Medium)
 gemini-3.6-flash-low       Gemini 3.6 Flash (Low)
-gemini-3.5-flash-high      Gemini 3.5 Flash (High)
-gemini-3.5-flash-medium    Gemini 3.5 Flash (Medium)
-gemini-3.5-flash-low       Gemini 3.5 Flash (Low)
 gemini-3.1-pro-high        Gemini 3.1 Pro (High)
 gemini-3.1-pro-low         Gemini 3.1 Pro (Low)
 claude-sonnet-4-6          Claude Sonnet 4.6 (Thinking)
@@ -23,12 +23,16 @@ function assert(condition: boolean, message: string): void {
 }
 
 const families = parseAntigravityModelsOutput(OUTPUT);
+const gemini38 = families.find((family) => family.id === 'gemini-3.8-flash');
 const gemini37 = families.find((family) => family.id === 'gemini-3.7-flash');
 const gemini36 = families.find((family) => family.id === 'gemini-3.6-flash');
 const claude = families.find((family) => family.id === 'claude-sonnet-4-6');
 const gpt = families.find((family) => family.id === 'gpt-oss-120b');
 
 assert(families.length === 7, 'Antigravity 1.1.12 routes collapse into seven user-facing model families');
+assert(Boolean(gemini38), 'Gemini 3.8 Flash is discovered from the current AGY table catalog');
+assert(JSON.stringify(gemini38?.efforts) === JSON.stringify(['low', 'medium', 'high']), 'Gemini 3.8 exposes low, medium, and high reasoning routes');
+assert(resolveAntigravityModelRoute(families, 'gemini-3.8-flash', 'high') === 'gemini-3.8-flash-high', 'Gemini 3.8 family + reasoning resolves to the exact CLI route');
 assert(Boolean(gemini37), 'Gemini 3.7 Flash is discovered from the live CLI catalog');
 assert(Boolean(gemini36), 'Gemini 3.6 Flash is discovered from the live CLI catalog');
 assert(gemini37?.displayName === 'Gemini 3.7 Flash', 'reasoning suffix is removed from the display name');

@@ -180,7 +180,7 @@ export class PolicyEngine {
   validatePath(targetPath: string, workspacePath?: string): { allowed: boolean; reason?: string } {
     if (!targetPath) return { allowed: true };
 
-    const normalized = targetPath.replace(/\\/g, '/');
+    const normalized = targetPath.trim().replace(/\\/g, '/');
 
     // Path traversal check
     if (normalized.includes('../') || normalized.includes('/..') || normalized === '..') {
@@ -198,12 +198,54 @@ export class PolicyEngine {
 
     // Workspace boundary check
     if (workspacePath) {
-      const normWorkspace = workspacePath.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
-      const normTarget = normalized.toLowerCase();
+      const normalizeComparable = (value: string): string => {
+        const normalizedValue = path.posix.normalize(value.replace(/\\/g, '/'));
+        return normalizedValue.length > 1 && normalizedValue.endsWith('/')
+          ? normalizedValue.slice(0, -1).toLowerCase()
+          : normalizedValue.toLowerCase();
+      };
+      const normWorkspace = normalizeComparable(workspacePath);
+      const normTarget = normalizeComparable(normalized);
 
       const isAbsolute = normTarget.startsWith('/') || /^[a-z]:\//i.test(normTarget);
-      if (isAbsolute && !normTarget.startsWith(normWorkspace)) {
+      const targetWithinWorkspace = isAbsolute
+        ? normTarget === normWorkspace || normTarget.startsWith(`${normWorkspace}/`)
+        : normalizeComparable(`${normWorkspace}/${normTarget}`) === normWorkspace
+          || normalizeComparable(`${normWorkspace}/${normTarget}`).startsWith(`${normWorkspace}/`);
+      if (!targetWithinWorkspace) {
         return { allowed: false, reason: `Path outside workspace boundary blocked: ${targetPath}` };
+      }
+
+      // Lexical checks do not protect a new path below an existing symlink.
+      // Resolve the nearest existing parent when both paths are on disk.
+      try {
+        if (fs.existsSync(workspacePath)) {
+          const realPathWithExistingParent = (value: string): string | undefined => {
+            let cursor = path.resolve(value);
+            const missing: string[] = [];
+            while (!fs.existsSync(cursor)) {
+              const parent = path.dirname(cursor);
+              if (parent === cursor) return undefined;
+              missing.unshift(path.basename(cursor));
+              cursor = parent;
+            }
+            let resolved = fs.realpathSync.native(cursor);
+            for (const segment of missing) resolved = path.join(resolved, segment);
+            return resolved;
+          };
+          const physicalRoot = realPathWithExistingParent(workspacePath);
+          const physicalTarget = realPathWithExistingParent(
+            isAbsolute ? normalized : path.join(workspacePath, normalized),
+          );
+          if (!physicalRoot || !physicalTarget) return { allowed: true };
+          const root = normalizeComparable(physicalRoot);
+          const target = normalizeComparable(physicalTarget);
+          if (target !== root && !target.startsWith(`${root}/`)) {
+            return { allowed: false, reason: `Path escapes workspace through a symlink: ${targetPath}` };
+          }
+        }
+      } catch {
+        // A not-yet-created file is covered by the lexical boundary check.
       }
     }
 
@@ -375,3 +417,5 @@ export class PolicyEngine {
   }
 }
 
+import fs from 'node:fs';
+import path from 'node:path';

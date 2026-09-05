@@ -1,12 +1,17 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import type { ChildProcess } from 'child_process';
 import {
   assertRuntimeLaunchPreconditions,
   normalizeExecutablePath,
+  prepareInteractiveTerminalLaunch,
+  prepareBackgroundSpawnOptions,
   prepareRuntimeCommand,
   runCommand,
   spawnHiddenChecked,
+  terminateProcessTree,
+  waitForHttp,
 } from './runtime-utils';
 
 async function runTests() {
@@ -25,6 +30,45 @@ async function runTests() {
   }
 
   const decodeBase64 = (value: string | undefined) => Buffer.from(value || '', 'base64').toString('utf8');
+
+  const windowsBackgroundOptions = prepareBackgroundSpawnOptions({
+    shell: true,
+    windowsHide: false,
+    detached: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }, 'win32');
+  assert(windowsBackgroundOptions.shell === false, 'forces background runtime launches to bypass the shell');
+  assert(windowsBackgroundOptions.windowsHide === true, 'forces background runtime launches to hide Windows consoles');
+  assert(windowsBackgroundOptions.detached === false, 'keeps Windows background children attached for reliable tree cancellation');
+  assert(
+    JSON.stringify(windowsBackgroundOptions.stdio) === JSON.stringify(['pipe', 'pipe', 'pipe']),
+    'preserves background runtime streaming and stdin/stdout configuration',
+  );
+  assert(
+    prepareBackgroundSpawnOptions({ detached: false }, 'linux').detached === true,
+    'preserves detached process-group behavior on non-Windows platforms',
+  );
+
+  const escalationSignals: Array<NodeJS.Signals | number | undefined> = [];
+  let confirmedSignal: NodeJS.Signals | null = null;
+  const signaledChild = {
+    exitCode: null,
+    get signalCode() { return confirmedSignal; },
+    killed: true,
+    pid: undefined,
+    kill(signal?: NodeJS.Signals | number) {
+      escalationSignals.push(signal);
+      confirmedSignal = typeof signal === 'string' ? signal : null;
+      return true;
+    },
+  } as unknown as ChildProcess;
+  await terminateProcessTree(signaledChild, true);
+  assert(
+    escalationSignals.length === 1 && escalationSignals[0] === 'SIGKILL',
+    'force-escalates after a prior signal set killed=true without confirming process exit',
+  );
+  await terminateProcessTree(signaledChild, true);
+  assert(escalationSignals.length === 1, 'keeps repeated termination safe after signal exit is confirmed');
 
   const quotedOpenCode = '"C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd"';
   assert(
@@ -59,9 +103,35 @@ async function runTests() {
     'does not trust caller-controlled ComSpec or SystemRoot values as shell executables',
   );
 
+  const interactiveCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-interactive-terminal-'));
+  try {
+    const interactive = prepareInteractiveTerminalLaunch(
+      process.execPath,
+      ['--print', 'sign-in & continue', '--output-format', 'json'],
+      { cwd: interactiveCwd, title: 'Antigravity CLI Sign-In' },
+      'win32',
+      { Path: 'C:\\Windows\\System32' },
+    );
+    assert(interactive.command === 'powershell.exe', 'uses PowerShell as the visible Windows terminal host');
+    assert(interactive.args.includes('-NoExit'), 'keeps the sign-in terminal open after the CLI exits');
+    assert(!interactive.args.includes('-NonInteractive'), 'keeps the sign-in host interactive for browser/terminal setup');
+    assert(interactive.args.includes('-WindowStyle') && interactive.args.includes('Normal'), 'requests a normal visible PowerShell window explicitly');
+    assert(!interactive.args.includes('Hidden') && !interactive.args.includes('hidden'), 'does not hide the sign-in terminal window');
+    assert(
+      JSON.stringify(JSON.parse(decodeBase64(interactive.env.ATRIS_TERMINAL_ARGS_B64)))
+        === JSON.stringify(['--print', 'sign-in & continue', '--output-format', 'json']),
+      'passes interactive CLI arguments without PowerShell-only flags or shell interpolation',
+    );
+    assert(decodeBase64(interactive.env.ATRIS_TERMINAL_CWD_B64) === interactiveCwd, 'passes the interactive working directory as opaque data');
+    assert(decodeBase64(interactive.env.ATRIS_TERMINAL_TITLE_B64) === 'Antigravity CLI Sign-In', 'passes the interactive window title as opaque data');
+  } finally {
+    fs.rmSync(interactiveCwd, { recursive: true, force: true });
+  }
+
   const resolutionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-path-resolution-'));
   try {
     fs.writeFileSync(path.join(resolutionRoot, 'atris-cli.cmd'), '@echo off\r\n', 'utf8');
+    fs.writeFileSync(path.join(resolutionRoot, 'atris-cli.ps1'), 'Write-Output ignored\r\n', 'utf8');
     const resolvedBareCommand = prepareRuntimeCommand(
       'atris-cli',
       ['--version'],
@@ -71,10 +141,24 @@ async function runTests() {
     assert(resolvedBareCommand.command === 'powershell.exe', 'resolves a bare Windows CLI name before entering the static bridge');
     assert(
       decodeBase64(resolvedBareCommand.env?.ATRIS_RUNTIME_COMMAND_B64).endsWith('atris-cli.cmd'),
-      'keeps the resolved PATH shim as an opaque bridge value',
+      'prefers the native cmd shim when a PowerShell shim would collapse argv',
     );
   } finally {
     fs.rmSync(resolutionRoot, { recursive: true, force: true });
+  }
+
+  const originalFetch = globalThis.fetch;
+  const startedAt = Date.now();
+  try {
+    globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    })) as typeof fetch;
+    await waitForHttp('http://127.0.0.1:1/health', {}, 40);
+    assert(false, 'bounds an individual hung startup health request');
+  } catch {
+    assert(Date.now() - startedAt < 1_500, 'bounds an individual hung startup health request');
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 
   const hostileArguments = [
@@ -186,6 +270,36 @@ async function runTests() {
       );
       assert(!fs.existsSync(path.join(root, 'injected.txt')), 'does not allow a prompt argument to create a redirected file');
       assert(!result.stdout.includes('\nATRIS_INJECTED'), 'does not execute an injected command separator payload');
+
+      const genericWrapper = path.join(root, 'generic wrapper.cmd');
+      const powershellPrinter = path.join(root, 'print-args.ps1');
+      fs.writeFileSync(powershellPrinter, 'ConvertTo-Json -InputObject ([string[]]$args) -Compress', 'utf8');
+      fs.writeFileSync(genericWrapper, '@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -File "%~dp0print-args.ps1" %*\r\n', 'utf8');
+      const genericArguments = ['hello world', '--mode', 'safe'];
+      const genericResult = await runCommand(`"${genericWrapper}"`, genericArguments, { cwd: root, timeoutMs: 5_000 });
+      const genericReceived = JSON.parse(genericResult.stdout.trim()) as string[];
+      assert(
+        JSON.stringify(genericReceived) === JSON.stringify(genericArguments),
+        'forwards arguments to a non-Node .cmd wrapper without relying on NODE_OPTIONS',
+      );
+
+      const cancellationMarker = path.join(root, 'descendant-survived.txt');
+      const cancellationWorker = path.join(root, 'cancellation-worker.cjs');
+      const cancellationWrapper = path.join(root, 'cancellation-wrapper.cmd');
+      fs.writeFileSync(
+        cancellationWorker,
+        `const fs = require('node:fs'); setTimeout(() => fs.writeFileSync(${JSON.stringify(cancellationMarker)}, 'alive'), 800); setInterval(() => {}, 1000);`,
+        'utf8',
+      );
+      fs.writeFileSync(cancellationWrapper, '@echo off\r\nnode "%~dp0cancellation-worker.cjs"\r\n', 'utf8');
+      try {
+        await runCommand(cancellationWrapper, [], { cwd: root, timeoutMs: 100 });
+        assert(false, 'times out a Windows wrapper command');
+      } catch (error: any) {
+        assert(String(error?.message || error).includes('timed out'), 'times out a Windows wrapper command');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      assert(!fs.existsSync(cancellationMarker), 'kills Windows wrapper descendants when a background command times out');
     } catch (error: any) {
       console.error('[FAIL] securely executes a quoted .cmd path containing spaces through the static bridge');
       console.error(error?.message || error);

@@ -9,11 +9,24 @@ import { and, eq } from 'drizzle-orm';
 import * as schema from '@atris-agent-code/database';
 import type { AtrisDatabase } from '@atris-agent-code/database';
 import { migrateDatabase } from '@atris-agent-code/database';
-import { LocalEventBus } from '@atris-agent-code/event-bus';
+import { BoundedEventQueue, LocalEventBus } from '@atris-agent-code/event-bus';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
-import { Orchestrator } from '@atris-agent-code/orchestration-core';
+import { hasExplicitImplementationIntent, Orchestrator } from '@atris-agent-code/orchestration-core';
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { MergeCoordinator } from '@atris-agent-code/merge-coordinator';
+import { ActionBroker } from '@atris-agent-code/policy-engine';
+import {
+  AGENT_ROLES,
+  isAgentRole,
+  normalizeAgentProfile,
+  resolveWorkerPoolPolicy,
+} from '@atris-agent-code/domain';
+import type {
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileRoutePolicy,
+  AgentRole,
+} from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AtrisAuthService, extractBearerHeader, installAuthRoutes } from './auth';
 import {
@@ -30,6 +43,14 @@ import {
   createRuntimeShutdownCoordinator,
   installRuntimeShutdownRoute,
 } from './runtime-lifecycle';
+import { cursorFromQuery, encodeEventCursor, replayPages } from './event-cursor';
+import { decodeMissionCommandCursor, encodeMissionCommandCursor } from './command-cursor';
+import { persistRuntimeTelemetry } from './runtime-telemetry-store';
+import { ApprovalOutbox, type ApprovalDecision } from './approval-outbox';
+import { verifyAppliedMission } from './post-apply-verification';
+import { ApplyVerificationOperationStore, executeApplyVerificationOperation } from './apply-verification-operation';
+import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-sibling';
+import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 
 import path from 'path';
 import fs from 'fs';
@@ -108,6 +129,8 @@ sqlite.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    max_parallel_agents INTEGER,
+    worker_pools TEXT,
     is_default INTEGER DEFAULT 0,
     created_at TEXT NOT NULL
   );
@@ -147,8 +170,33 @@ sqlite.exec(`
     description TEXT NOT NULL DEFAULT '',
     status TEXT DEFAULT 'pending',
     decided_by TEXT,
+    requested_decision TEXT,
+    claimed_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    execution_error TEXT,
     created_at TEXT NOT NULL,
     decided_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS approval_operations (
+    approval_id TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS mission_completions (
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT,
+    tasks_completed INTEGER NOT NULL,
+    total_tasks INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (mission_id, plan_id)
   );
 
   CREATE TABLE IF NOT EXISTS mission_events (
@@ -270,6 +318,8 @@ sqlite.exec(`
 migrateDatabase(sqlite as any);
 
 const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
+const deletionStore = new DeletionOperationStore(sqlite);
+const approvalOutbox = new ApprovalOutbox(sqlite);
 
 // Seed default team template
 try {
@@ -314,13 +364,25 @@ try {
 const eventBus = new LocalEventBus();
 const workspaceManager = new WorkspaceManager(db, eventBus);
 const mergeCoordinator = new MergeCoordinator(workspaceManager);
+const applyVerificationStore = new ApplyVerificationOperationStore(sqlite);
+const actionBroker = new ActionBroker();
 const orchestrator = new Orchestrator(
   {
     workspacePath: process.cwd(),
-    applyTaskChanges: async (taskId) => {
-      const result = await mergeCoordinator.applyWorktree(taskId);
+    applyTaskChanges: async (taskId, operation) => {
+      const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
       return { success: result.success, output: result.output, checkpointId: result.checkpointId };
     },
+    postApplyVerification: (context) => verifyAppliedMission(context, workspaceManager),
+    executeApplyVerificationOperation: (context) => executeApplyVerificationOperation(
+      applyVerificationStore,
+      context,
+      async (taskId, operation) => {
+        const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
+        return { success: result.success, output: result.output };
+      },
+      (operation) => verifyAppliedMission(operation, workspaceManager),
+    ),
   },
   eventBus,
   db,
@@ -368,6 +430,13 @@ eventBus.on('*', (event: AgentEvent) => {
       console.warn('[API Gateway] Failed to persist approval request:', error);
     }
   }
+  if (event.type === 'runtime_telemetry') {
+    try {
+      persistRuntimeTelemetry(sqlite, event);
+    } catch (error) {
+      console.warn('[API Gateway] Failed to persist runtime telemetry:', error);
+    }
+  }
   try {
     const persisted = sqlite.transaction(() => {
       const duplicate = sqlite.prepare('SELECT payload FROM mission_events WHERE id = ?').get(event.id) as { payload: string } | undefined;
@@ -399,6 +468,9 @@ const allowedOrigins = new Set([
   'https://tauri.localhost',
 ]);
 app.use(cors({
+  // Mission event history is cursor-paged at 500 rows. Browsers only expose
+  // these response headers to the desktop client when CORS opts in explicitly.
+  exposedHeaders: ['X-Next-Cursor', 'X-Has-More'],
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) callback(null, true);
     else callback(new Error(`Origin ${origin} is not allowed by the local AtrisAgent service.`));
@@ -452,6 +524,299 @@ function normalizeFallbackCatalogIds(value: unknown, primaryCatalogId?: string):
   ));
 }
 
+type AgentProfileIdMap = Partial<Record<AgentRole, string>>;
+type GatewayError = Error & { statusCode?: number; code?: string };
+type AgentProfileRecord = AgentProfile & {
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  archivedAt?: string | null;
+};
+type AgentProfileBinding = {
+  scopeType?: string;
+  scopeId?: string;
+  role?: AgentRole;
+  profileId?: string;
+  isDefault?: boolean;
+  override?: AgentProfilePatch | null;
+};
+
+const PROFILE_ROUTE_POLICY_KEYS = [
+  'selectionMode',
+  'modelCatalogId',
+  'accountProfileId',
+  'reasoningLevel',
+  'fallbackCatalogIds',
+  'allowedCatalogIds',
+  'allowedModelCatalogIds',
+  'allowedAccountProfileIds',
+  'allowedRuntimeTypes',
+] as const;
+const PROFILE_SELECTION_MODES = new Set(['auto', 'prefer', 'fixed']);
+const PROFILE_REASONING_LEVELS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const PROFILE_RUNTIME_TYPES = new Set(['codex', 'claude_code', 'antigravity', 'opencode']);
+const PROFILE_SCOPE_TYPES = new Set(['global', 'workspace', 'team_template']);
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function profileClientError(message: string, code = 'INVALID_AGENT_PROFILE'): GatewayError {
+  const error = new Error(message) as GatewayError;
+  error.statusCode = 400;
+  error.code = code;
+  return error;
+}
+
+function profileStoreError(message: string): GatewayError {
+  const error = new Error(message) as GatewayError;
+  error.statusCode = 503;
+  error.code = 'PROFILE_STORE_UNAVAILABLE';
+  return error;
+}
+
+function profileErrorStatus(error: unknown): number | undefined {
+  const status = Number((error as GatewayError | undefined)?.statusCode);
+  return Number.isInteger(status) && status >= 400 && status <= 599 ? status : undefined;
+}
+
+function profileField(record: Record<string, any>, camel: string, snake: string): unknown {
+  return record[camel] !== undefined ? record[camel] : record[snake];
+}
+
+function cleanProfileString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function safeProfileRoutePolicy(value: unknown): AgentProfileRoutePolicy | undefined {
+  if (!isRecord(value)) return undefined;
+  const policy: AgentProfileRoutePolicy = {};
+  const selectionMode = cleanProfileString(value.selectionMode);
+  if (selectionMode && PROFILE_SELECTION_MODES.has(selectionMode)) policy.selectionMode = selectionMode as AgentProfileRoutePolicy['selectionMode'];
+  for (const key of ['modelCatalogId', 'accountProfileId'] as const) {
+    const item = cleanProfileString(value[key]);
+    if (item) policy[key] = item;
+  }
+  const reasoningLevel = cleanProfileString(value.reasoningLevel);
+  if (reasoningLevel && PROFILE_REASONING_LEVELS.has(reasoningLevel)) policy.reasoningLevel = reasoningLevel as AgentProfileRoutePolicy['reasoningLevel'];
+  for (const key of ['fallbackCatalogIds', 'allowedCatalogIds', 'allowedModelCatalogIds', 'allowedAccountProfileIds'] as const) {
+    if (!Array.isArray(value[key])) continue;
+    policy[key] = Array.from(new Set(value[key]
+      .filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+      .map((item: string) => item.trim()))) as never;
+  }
+  if (Array.isArray(value.allowedRuntimeTypes)) {
+    policy.allowedRuntimeTypes = Array.from(new Set(value.allowedRuntimeTypes
+      .filter((item: unknown): item is string => typeof item === 'string' && PROFILE_RUNTIME_TYPES.has(item)))) as never;
+  }
+  return Object.keys(policy).length > 0 ? policy : undefined;
+}
+
+function safeAgentProfile(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const nested = isRecord(value.profile) ? value.profile : {};
+  const source = { ...nested, ...value };
+  const id = cleanProfileString(profileField(source, 'id', 'profile_id'));
+  const roleValue = cleanProfileString(profileField(source, 'role', 'agent_role'))?.toLowerCase();
+  if (!id || !roleValue || !isAgentRole(roleValue)) return null;
+  const output: Record<string, unknown> = {
+    id,
+    name: cleanProfileString(source.name) || cleanProfileString(source.displayName) || `${roleValue} Agent`,
+    role: roleValue,
+    instructions: typeof source.instructions === 'string' ? source.instructions : '',
+    capabilities: Array.isArray(source.capabilities)
+      ? Array.from(new Set(source.capabilities.filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim())).map((item: string) => item.trim())))
+      : [],
+  };
+  for (const key of ['specialty', 'description'] as const) {
+    const item = cleanProfileString(source[key]);
+    if (item) output[key] = item;
+  }
+  const routePolicy = safeProfileRoutePolicy(source.routePolicy);
+  const allowedRoutePolicy = safeProfileRoutePolicy(source.allowedRoutePolicy);
+  if (routePolicy) output.routePolicy = routePolicy;
+  if (allowedRoutePolicy) output.allowedRoutePolicy = allowedRoutePolicy;
+  for (const key of ['createdAt', 'updatedAt', 'archivedAt'] as const) {
+    const item = profileField(source, key, key.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`));
+    if (item !== undefined) output[key] = item ?? null;
+  }
+  return output;
+}
+
+function safeProfileOverride(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  const output: Record<string, unknown> = {};
+  for (const key of ['name', 'instructions', 'specialty', 'description'] as const) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && typeof value[key] === 'string') output[key] = value[key].trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'capabilities') && Array.isArray(value.capabilities)) {
+    output.capabilities = Array.from(new Set(value.capabilities
+      .filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+      .map((item: string) => item.trim())));
+  }
+  const routePolicy = safeProfileRoutePolicy(value.routePolicy);
+  const allowedRoutePolicy = safeProfileRoutePolicy(value.allowedRoutePolicy);
+  if (routePolicy) output.routePolicy = routePolicy;
+  if (allowedRoutePolicy) output.allowedRoutePolicy = allowedRoutePolicy;
+  return Object.keys(output).length > 0 ? output : undefined;
+}
+
+function safeProfileBinding(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const scopeType = cleanProfileString(profileField(value, 'scopeType', 'scope_type'))?.toLowerCase();
+  const scopeId = cleanProfileString(profileField(value, 'scopeId', 'scope_id'));
+  const roleValue = cleanProfileString(profileField(value, 'role', 'agent_role'))?.toLowerCase();
+  const profileId = cleanProfileString(profileField(value, 'profileId', 'profile_id'));
+  if (!scopeType || !PROFILE_SCOPE_TYPES.has(scopeType) || !scopeId || !roleValue || !isAgentRole(roleValue) || !profileId) return null;
+  const output: Record<string, unknown> = { scopeType, scopeId, role: roleValue, profileId };
+  const isDefault = value.isDefault ?? value.is_default;
+  if (typeof isDefault === 'boolean' || isDefault === 0 || isDefault === 1) output.isDefault = Boolean(isDefault);
+  const override = safeProfileOverride(value.override ?? value.profileOverride ?? value.profile_override);
+  if (override) output.override = override;
+  return output;
+}
+
+function normalizeAgentProfileIds(value: unknown): AgentProfileIdMap | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw profileClientError('agentProfileIds must be an object keyed by fixed agent roles.');
+  const result: AgentProfileIdMap = {};
+  const seen = new Set<AgentRole>();
+  for (const [rawRole, rawId] of Object.entries(value)) {
+    const role = rawRole.toLowerCase();
+    if (!isAgentRole(role)) throw profileClientError(`Unknown agent profile role '${rawRole}'.`);
+    const canonicalRole = role as AgentRole;
+    if (seen.has(canonicalRole)) throw profileClientError(`Duplicate agent profile role '${rawRole}'.`);
+    if (typeof rawId !== 'string' || !rawId.trim()) throw profileClientError(`Agent profile ID for role '${canonicalRole}' must be a non-empty string.`);
+    seen.add(canonicalRole);
+    result[canonicalRole] = rawId.trim();
+  }
+  return result;
+}
+
+function normalizeProfileRoutePolicyInput(value: unknown, key: string): AgentProfileRoutePolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw profileClientError(`${key} must be an object.`);
+  const policy = safeProfileRoutePolicy(value);
+  for (const field of PROFILE_ROUTE_POLICY_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(value, field) || value[field] === undefined) continue;
+    if (['selectionMode', 'modelCatalogId', 'accountProfileId', 'reasoningLevel'].includes(field)
+      && typeof value[field] !== 'string') throw profileClientError(`${key}.${field} must be a string.`);
+    if (['fallbackCatalogIds', 'allowedCatalogIds', 'allowedModelCatalogIds', 'allowedAccountProfileIds', 'allowedRuntimeTypes'].includes(field)
+      && (!Array.isArray(value[field]) || value[field].some((item: unknown) => typeof item !== 'string' || !item.trim()))) {
+      throw profileClientError(`${key}.${field} must be an array of non-empty strings.`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'selectionMode')
+    && (typeof value.selectionMode !== 'string' || !PROFILE_SELECTION_MODES.has(value.selectionMode.trim()))) {
+    throw profileClientError(`${key}.selectionMode is invalid.`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'reasoningLevel')
+    && (typeof value.reasoningLevel !== 'string' || !PROFILE_REASONING_LEVELS.has(value.reasoningLevel.trim().toLowerCase()))) {
+    throw profileClientError(`${key}.reasoningLevel is invalid.`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'allowedRuntimeTypes')
+    && Array.isArray(value.allowedRuntimeTypes)
+    && value.allowedRuntimeTypes.some((item: unknown) => typeof item !== 'string' || !PROFILE_RUNTIME_TYPES.has(item))) {
+    throw profileClientError(`${key}.allowedRuntimeTypes contains an unknown runtime.`);
+  }
+  return policy;
+}
+
+function normalizeAgentProfileInput(value: unknown, fallbackRole?: AgentRole, id?: string): AgentProfile {
+  if (!isRecord(value)) throw profileClientError('Agent profile must be a JSON object.');
+  const rawRole = value.role ?? fallbackRole;
+  if (!isAgentRole(rawRole)) throw profileClientError('Agent profile role must be one of the fixed core roles.');
+  const role = String(rawRole).toLowerCase() as AgentRole;
+  const profileId = id || cleanProfileString(value.id) || cleanProfileString(value.profileId) || crypto.randomUUID();
+  if (value.id !== undefined && (typeof value.id !== 'string' || !value.id.trim())) throw profileClientError('Agent profile id must be a non-empty string.');
+  if (value.profileId !== undefined && (typeof value.profileId !== 'string' || !value.profileId.trim())) throw profileClientError('Agent profile id must be a non-empty string.');
+  if (value.name !== undefined && (typeof value.name !== 'string' || !value.name.trim())) throw profileClientError('Agent profile name must be a non-empty string.');
+  normalizeProfileRoutePolicyInput(value.routePolicy, 'routePolicy');
+  normalizeProfileRoutePolicyInput(value.allowedRoutePolicy, 'allowedRoutePolicy');
+  try {
+    return normalizeAgentProfile({ ...value, id: profileId, role }, role);
+  } catch (error) {
+    throw profileClientError(error instanceof Error ? error.message : 'Agent profile is invalid.');
+  }
+}
+
+function normalizeAgentProfilePatch(value: unknown, current: AgentProfile): AgentProfilePatch {
+  if (!isRecord(value)) throw profileClientError('Agent profile patch must be a JSON object.');
+  if (Object.prototype.hasOwnProperty.call(value, 'role')) {
+    if (!isAgentRole(value.role) || String(value.role).toLowerCase() !== current.role) {
+      throw profileClientError(`Agent profile role is immutable and must remain '${current.role}'.`, 'PROFILE_ROLE_IMMUTABLE');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'id') || Object.prototype.hasOwnProperty.call(value, 'profileId')) {
+    const requestedId = value.id ?? value.profileId;
+    if (typeof requestedId !== 'string' || requestedId.trim() !== current.id) {
+      throw profileClientError('Agent profile id is immutable.', 'PROFILE_ID_IMMUTABLE');
+    }
+  }
+  const merged = normalizeAgentProfile({ ...current, ...value, id: current.id, role: current.role }, current.role);
+  const patch: AgentProfilePatch = {};
+  for (const key of ['name', 'instructions', 'capabilities', 'specialty', 'description', 'routePolicy', 'allowedRoutePolicy'] as const) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) patch[key] = merged[key] as never;
+  }
+  return patch;
+}
+
+async function listStoredAgentProfiles(includeArchived = false): Promise<unknown[]> {
+  const result = await workspaceManager.listAgentProfiles({ includeArchived });
+  return result;
+}
+
+async function getStoredAgentProfile(id: string, includeArchived = false): Promise<unknown | null> {
+  return await workspaceManager.getAgentProfile(id, { includeArchived }) ?? null;
+}
+
+async function callStoredProfileMutation(name: 'createAgentProfile' | 'updateAgentProfile' | 'archiveAgentProfile', ...args: any[]): Promise<unknown> {
+  if (name === 'createAgentProfile') return workspaceManager.createAgentProfile(args[0]);
+  if (name === 'updateAgentProfile') return workspaceManager.updateAgentProfile(args[0], args[1]);
+  return workspaceManager.archiveAgentProfile(args[0]);
+}
+
+async function listStoredAgentProfileBindings(scopeType: string, scopeId: string): Promise<unknown[]> {
+  return workspaceManager.listAgentProfileBindings({ scopeType: scopeType as any, scopeId });
+}
+
+async function listStoredAgentProfileBindingsIfAvailable(scopeType: string, scopeId: string): Promise<unknown[]> {
+  return listStoredAgentProfileBindings(scopeType, scopeId);
+}
+
+async function bindStoredAgentProfile(input: Record<string, unknown>): Promise<unknown> {
+  return workspaceManager.bindAgentProfile(input as any);
+}
+
+async function unbindStoredAgentProfile(scopeType: string, scopeId: string, role: AgentRole): Promise<unknown> {
+  return workspaceManager.unbindAgentProfile(scopeType as any, scopeId, role);
+}
+
+async function resolveStoredAgentProfileForMission(missionId: string, role: AgentRole, profileId?: string): Promise<unknown> {
+  return workspaceManager.resolveAgentProfileForMission(missionId, role, undefined, profileId as string);
+}
+
+async function validateAgentProfileIds(
+  profileIds: AgentProfileIdMap | undefined,
+  missionId?: string,
+): Promise<AgentProfileIdMap | undefined> {
+  if (profileIds === undefined) return undefined;
+  for (const role of AGENT_ROLES) {
+    const id = profileIds[role];
+    if (!id) continue;
+    const stored = missionId
+      ? await resolveStoredAgentProfileForMission(missionId, role, id)
+      : await getStoredAgentProfile(id);
+    const profileValue = isRecord(stored) && isRecord(stored.profile) ? stored.profile : stored;
+    const safe = safeAgentProfile(profileValue);
+    if (!safe) throw profileClientError(`Agent profile '${id}' was not found for fixed role '${role}'.`, 'AGENT_PROFILE_NOT_FOUND');
+    if (String(safe.role) !== role) throw profileClientError(`Agent profile '${id}' is assigned to fixed role '${safe.role}', not '${role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+    if (safe.archivedAt) throw profileClientError(`Agent profile '${id}' is archived and cannot be selected.`, 'AGENT_PROFILE_ARCHIVED');
+    const resolvedId = String(safe.id);
+    if (resolvedId !== id) throw profileClientError(`Agent profile '${id}' could not be resolved for fixed role '${role}'.`, 'AGENT_PROFILE_NOT_FOUND');
+  }
+  return profileIds;
+}
+
 const ACTIVE_MISSION_STATUSES = new Set([
   'planning',
   'ready',
@@ -463,7 +828,96 @@ const ACTIVE_MISSION_STATUSES = new Set([
   'revising',
 ]);
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+// A newly accepted mission is kept in `planning` until its durable command is
+// claimed and the orchestrator has materialized the first turn. Keeping this
+// status drainable lets the existing command lifecycle do the actual work
+// without making the HTTP request wait for provider startup.
+const DRAINABLE_MISSION_STATUSES = new Set(['draft', 'ready', 'planning', 'blocked', ...TERMINAL_MISSION_STATUSES]);
 const missionDrains = new Map<string, Promise<void>>();
+const missionTurnOperations = new Map<string, Set<Promise<void>>>();
+const missionStartIdempotencyOperations = new Map<string, Promise<Record<string, unknown>>>();
+
+type MissionStartStage = 'durability' | 'routing' | 'orchestration';
+
+function formatMissionStartError(stage: MissionStartStage, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `Mission start failed during ${stage}: ${message}`;
+}
+
+function missionStartIdempotencyKey(value: unknown): string | undefined {
+  const raw = String(value || '').trim();
+  return raw ? `mission-start:${raw}` : undefined;
+}
+
+function normalizeMissionStartOptions(body: Record<string, any>, automationPolicy?: unknown): Record<string, any> {
+  const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId.trim()
+    ? body.modelCatalogId.trim()
+    : typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
+  const agentProfileIds = normalizeAgentProfileIds(body.agentProfileIds);
+  return {
+    modelCatalogId,
+    accountProfileId: typeof body.accountProfileId === 'string' && body.accountProfileId.trim() ? body.accountProfileId.trim() : undefined,
+    reasoningLevel: typeof body.reasoningLevel === 'string' && body.reasoningLevel.trim() ? body.reasoningLevel.trim().toLowerCase() : undefined,
+    fallbackCatalogIds: normalizeFallbackCatalogIds(body.fallbackCatalogIds, modelCatalogId),
+    routeSelectionMode: body.routeSelectionMode,
+    routeRole: body.routeRole,
+    routeScope: body.routeScope,
+    targetRole: body.targetRole,
+    command: body.command,
+    teamTemplate: body.teamTemplate,
+    executionMode: body.executionMode,
+    agentProfileIds,
+    automationPolicy,
+    clientMessageId: body.clientMessageId,
+  };
+}
+
+function missionStartRequestHash(missionId: string, content: string, options: Record<string, any>): string {
+  const { clientMessageId: _clientMessageId, idempotencyKey: _idempotencyKey, ...requestOptions } = options;
+  return turnRequestHash(missionId, content, 'start', requestOptions);
+}
+
+function missionStartRequestMatches(existing: any, content: string, options: Record<string, any>): boolean {
+  if (!existing) return false;
+  if (existing.content !== content) return false;
+  if (!existing.request_hash) return true;
+  return existing.request_hash === missionStartRequestHash(existing.mission_id, content, options);
+}
+
+function queuedMissionStartDto(mission: any, turn: any, command: any, duplicate = false): Record<string, unknown> {
+  return {
+    accepted: true,
+    duplicate,
+    missionId: mission.id,
+    turnId: turn.id,
+    commandId: command.id,
+    planId: mission.planId || null,
+    tasks: [],
+    status: mission.status,
+    turn: turnDto(turn, command),
+  };
+}
+
+function trackMissionTurn<T>(missionId: string, operation: () => Promise<T>): Promise<T> {
+  const operationPromise = Promise.resolve().then(operation);
+  const tracked = operationPromise.then(() => undefined, () => undefined).finally(() => {
+    const operations = missionTurnOperations.get(missionId);
+    operations?.delete(tracked);
+    if (operations && operations.size === 0) missionTurnOperations.delete(missionId);
+  });
+  const operations = missionTurnOperations.get(missionId) || new Set<Promise<void>>();
+  operations.add(tracked);
+  missionTurnOperations.set(missionId, operations);
+  return operationPromise;
+}
+
+async function waitForMissionTurns(missionId: string): Promise<void> {
+  while (true) {
+    const operations = missionTurnOperations.get(missionId);
+    if (!operations || operations.size === 0) return;
+    await Promise.all([...operations]);
+  }
+}
 
 function stableJson(value: unknown): string {
   const canonicalize = (item: unknown): unknown => {
@@ -520,34 +974,59 @@ function emitTurnEvent(event: AgentEvent): void {
   eventBus.emit(event);
 }
 
+function activeRunIsResearchOnly(missionId: string): boolean {
+  const rows = sqlite.prepare(`SELECT r.status, r.plan_id, t.assigned_role AS role
+    FROM mission_runs r
+    LEFT JOIN tasks t ON t.mission_id = r.mission_id AND t.plan_id = r.plan_id
+    WHERE r.mission_id = ? AND r.status IN ('starting', 'running', 'stopping')`).all(missionId) as Array<{ status: string; plan_id: string | null; role: string | null }>;
+  if (rows.length === 0) return false;
+  if (rows.some((row) => row.status === 'starting' || row.plan_id === null)) return true;
+  return rows.every((row) => row.role === 'researcher');
+}
+
 async function startDurableTurn(command: any, turn: any): Promise<void> {
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
-  sqlite.transaction(() => {
-    sqlite.prepare("UPDATE conversation_turns SET status = 'starting', started_at = ? WHERE id = ?").run(now, turn.id);
-    sqlite.prepare("INSERT INTO mission_runs (id, mission_id, turn_id, command_id, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'starting', ?, ?)")
-      .run(runId, command.mission_id, turn.id, command.id, now, now);
-    sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, command.mission_id);
-  })();
-  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
-    content: turn.content, delivery: turn.delivery, timestamp: now });
+  let stage: MissionStartStage = 'durability';
   try {
+    sqlite.transaction(() => {
+      const commandState = sqlite.prepare('SELECT status FROM mission_commands WHERE id = ?').get(command.id) as { status: string } | undefined;
+      if (commandState?.status !== 'processing') throw new Error('The queued command is no longer claimable.');
+      const transitioned = sqlite.prepare("UPDATE conversation_turns SET status = 'starting', started_at = ? WHERE id = ? AND status IN ('queued', 'pending_priority')")
+        .run(now, turn.id) as { changes: number };
+      if (transitioned.changes !== 1) throw new Error('The queued turn was cancelled before execution started.');
+      sqlite.prepare("INSERT INTO mission_runs (id, mission_id, turn_id, command_id, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'starting', ?, ?)")
+        .run(runId, command.mission_id, turn.id, command.id, now, now);
+      sqlite.prepare("UPDATE missions SET active_run_id = ?, status = CASE WHEN status = 'cancelled' THEN status ELSE 'planning' END, completed_at = CASE WHEN status = 'cancelled' THEN completed_at ELSE NULL END, updated_at = ? WHERE id = ?")
+        .run(runId, now, command.mission_id);
+    })();
     const options = turn.options ? JSON.parse(turn.options) : {};
-    configureMissionRouting(command.mission_id, options);
+    stage = 'routing';
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId: command.mission_id, turnId: turn.id,
+      content: turn.content, clientMessageId: options.clientMessageId, timestamp: now });
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId: command.mission_id, turnId: turn.id, runId,
+      content: turn.content, delivery: turn.delivery, timestamp: now });
+    await configureMissionRouting(command.mission_id, options);
+    stage = 'orchestration';
     const result = await orchestrator.startMission(command.mission_id, turn.content, { ...options, turnId: turn.id, runId });
     sqlite.transaction(() => {
-      sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ?").run(new Date().toISOString(), command.id);
+      const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, command.mission_id) as { status: string } | undefined;
+      const mission = sqlite.prepare('SELECT active_run_id FROM missions WHERE id = ?').get(command.mission_id) as { active_run_id: string | null } | undefined;
+      if (run?.status !== 'starting' || mission?.active_run_id !== runId) return;
+      sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ? AND status = 'processing'").run(new Date().toISOString(), command.id);
       sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turn.id);
       sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
         .run(result.planId || null, new Date().toISOString(), runId);
     })();
   } catch (error: any) {
     const failedAt = new Date().toISOString();
+    const failure = formatMissionStartError(stage, error);
     sqlite.transaction(() => {
-      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), command.id);
-      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turn.id);
-      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(failedAt, error?.message || String(error), runId);
-      sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(command.mission_id, runId);
+      sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ? WHERE id = ? AND status = 'processing'").run(failedAt, failure, command.id);
+      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turn.id);
+      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')").run(failedAt, failure, runId);
+      sqlite.prepare("UPDATE missions SET active_run_id = NULL, status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'failed' END, completed_at = CASE WHEN status IN ('completed', 'cancelled') THEN completed_at ELSE ? END, updated_at = ? WHERE id = ? AND active_run_id = ?")
+        .run(failedAt, failedAt, command.mission_id, runId);
     })();
     throw error;
   }
@@ -559,7 +1038,7 @@ function drainMissionCommands(missionId: string): Promise<void> {
   const drain = (async () => {
     while (true) {
       const mission = await workspaceManager.getMission(missionId);
-      if (!mission || !TERMINAL_MISSION_STATUSES.has(String(mission.status))) return;
+      if (!mission || !DRAINABLE_MISSION_STATUSES.has(String(mission.status))) return;
       const claimed = sqlite.transaction(() => {
       const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
       if (activeRun) return null;
@@ -578,7 +1057,7 @@ function drainMissionCommands(missionId: string): Promise<void> {
           .run(new Date().toISOString(), command.id);
         continue;
       }
-      await startDurableTurn(command, turn);
+      await trackMissionTurn(missionId, () => startDurableTurn(command, turn));
       const active = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
       if (active) return;
     }
@@ -592,29 +1071,166 @@ async function startMissionWithDurability(missionId: string, content: string, op
   const now = new Date().toISOString();
   const turnId = crypto.randomUUID();
   const runId = crypto.randomUUID();
-  sqlite.transaction(() => {
-    sqlite.prepare(`INSERT INTO conversation_turns
-      (id, mission_id, content, delivery, options, status, created_at, started_at)
-      VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
-    sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
-      VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
-    sqlite.prepare('UPDATE missions SET active_run_id = ? WHERE id = ?').run(runId, missionId);
-  })();
-  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
-    content, delivery: 'queue', timestamp: now });
+  let stage: MissionStartStage = 'durability';
   try {
+    sqlite.transaction(() => {
+      const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
+      if (activeRun) {
+        const error = new Error('The current conversation turn is still running. Queue a follow-up instead.');
+        Object.assign(error, { code: 'TURN_ALREADY_RUNNING' });
+        throw error;
+      }
+      sqlite.prepare(`INSERT INTO conversation_turns
+        (id, mission_id, content, delivery, options, status, created_at, started_at)
+        VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
+      sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
+        VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
+      sqlite.prepare("UPDATE missions SET active_run_id = ?, status = CASE WHEN status = 'cancelled' THEN status ELSE 'planning' END, completed_at = CASE WHEN status = 'cancelled' THEN completed_at ELSE NULL END, updated_at = ? WHERE id = ?")
+        .run(runId, now, missionId);
+    })();
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
+      clientMessageId: options.clientMessageId, content, timestamp: now });
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
+      content, delivery: 'queue', timestamp: now });
+    stage = 'orchestration';
     const result = await orchestrator.startMission(missionId, content, { ...options, turnId, runId });
-    sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turnId);
-    sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
-      .run(result.planId || null, new Date().toISOString(), runId);
+    sqlite.transaction(() => {
+      const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, missionId) as { status: string } | undefined;
+      const mission = sqlite.prepare('SELECT active_run_id FROM missions WHERE id = ?').get(missionId) as { active_run_id: string | null } | undefined;
+      if (run?.status !== 'starting' || mission?.active_run_id !== runId) return;
+      sqlite.prepare("UPDATE conversation_turns SET status = 'running' WHERE id = ? AND status = 'starting'").run(turnId);
+      sqlite.prepare("UPDATE mission_runs SET status = 'running', plan_id = ?, heartbeat_at = ? WHERE id = ? AND status = 'starting'")
+        .run(result.planId || null, new Date().toISOString(), runId);
+    })();
     return result;
   } catch (error: any) {
     const failedAt = new Date().toISOString();
-    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ?").run(failedAt, turnId);
-    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?")
-      .run(failedAt, error?.message || String(error), runId);
-    sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(missionId, runId);
+    const failure = formatMissionStartError(stage, error);
+    sqlite.transaction(() => {
+      sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')").run(failedAt, turnId);
+      sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')")
+        .run(failedAt, failure, runId);
+      sqlite.prepare("UPDATE missions SET active_run_id = NULL, status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'failed' END, completed_at = CASE WHEN status IN ('completed', 'cancelled') THEN completed_at ELSE ? END, updated_at = ? WHERE id = ? AND active_run_id = ?")
+        .run(failedAt, failedAt, missionId, runId);
+    })();
     throw error;
+  }
+}
+
+async function createQueuedMissionStart(params: {
+  workspaceId: string;
+  promptText: string;
+  automationPolicy: import('@atris-agent-code/domain').MissionAutomationPolicy;
+  teamTemplate: string;
+  options: Record<string, any>;
+  idempotencyKey?: string;
+}): Promise<Record<string, unknown>> {
+  const perform = async (): Promise<Record<string, unknown>> => {
+    const existing = params.idempotencyKey
+      ? sqlite.prepare('SELECT * FROM conversation_turns WHERE idempotency_key = ?').get(params.idempotencyKey) as any
+      : null;
+    if (existing) {
+      if (!missionStartRequestMatches(existing, params.promptText, params.options)) {
+        const error = new Error('Idempotency key was already used for a different mission start request.');
+        Object.assign(error, { code: 'IDEMPOTENCY_KEY_REUSED' });
+        throw error;
+      }
+      const existingMission = await workspaceManager.getMission(existing.mission_id);
+      if (!existingMission) {
+        const error = new Error('The idempotent mission start points to a missing mission.');
+        Object.assign(error, { code: 'IDEMPOTENCY_RECORD_INVALID' });
+        throw error;
+      }
+      setImmediate(() => void drainMissionCommands(existing.mission_id));
+      return queuedMissionStartDto(existingMission, existing, { id: existing.command_id || null }, true);
+    }
+
+    const missionId = crypto.randomUUID();
+    const turnId = crypto.randomUUID();
+    const commandId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const requestHash = missionStartRequestHash(missionId, params.promptText, params.options);
+    await workspaceManager.createMission({
+      id: missionId,
+      workspaceId: params.workspaceId,
+      title: params.promptText,
+      description: params.promptText,
+      status: 'planning',
+      executionMode: params.options.executionMode || 'balanced',
+      automationPolicy: params.automationPolicy,
+      teamTemplateId: params.teamTemplate || 'default-core-dev-team',
+    });
+    try {
+      sqlite.transaction(() => {
+        if (params.idempotencyKey) {
+          const raced = sqlite.prepare('SELECT mission_id FROM conversation_turns WHERE idempotency_key = ?').get(params.idempotencyKey);
+          if (raced) {
+            const error = new Error('Idempotency key was already used for a different mission start request.');
+            Object.assign(error, { code: 'IDEMPOTENCY_RECORD_RACED' });
+            throw error;
+          }
+        }
+        sqlite.prepare(`INSERT INTO conversation_turns
+          (id, mission_id, content, delivery, options, status, idempotency_key, request_hash, command_id, created_at)
+          VALUES (?, ?, ?, 'queue', ?, 'queued', ?, ?, ?, ?)`).run(
+          turnId,
+          missionId,
+          params.promptText,
+          JSON.stringify(params.options),
+          params.idempotencyKey || null,
+          requestHash,
+          commandId,
+          now,
+        );
+        sqlite.prepare(`INSERT INTO mission_commands
+          (id, mission_id, turn_id, type, status, priority, request_hash, created_at)
+          VALUES (?, ?, ?, 'start', 'pending', 0, ?, ?)`).run(commandId, missionId, turnId, requestHash, now);
+      })();
+    } catch (error: any) {
+      if (error?.code === 'IDEMPOTENCY_RECORD_RACED' && params.idempotencyKey) {
+        const raced = sqlite.prepare('SELECT * FROM conversation_turns WHERE idempotency_key = ?').get(params.idempotencyKey) as any;
+        if (raced && missionStartRequestMatches(raced, params.promptText, params.options)) {
+          sqlite.prepare('DELETE FROM missions WHERE id = ? AND active_run_id IS NULL').run(missionId);
+          const racedMission = await workspaceManager.getMission(raced.mission_id);
+          if (racedMission) {
+            setImmediate(() => void drainMissionCommands(raced.mission_id));
+            return queuedMissionStartDto(racedMission, raced, { id: raced.command_id || null }, true);
+          }
+        }
+        sqlite.prepare('DELETE FROM missions WHERE id = ? AND active_run_id IS NULL').run(missionId);
+        const conflict = new Error('Idempotency key was already used for a different mission start request.');
+        Object.assign(conflict, { code: 'IDEMPOTENCY_KEY_REUSED' });
+        throw conflict;
+      }
+      const failedAt = new Date().toISOString();
+      sqlite.prepare("UPDATE missions SET status = 'failed', completed_at = ?, updated_at = ? WHERE id = ? AND status NOT IN ('completed', 'cancelled')")
+        .run(failedAt, failedAt, missionId);
+      throw error;
+    }
+
+    const turn = sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId) as any;
+    const command = sqlite.prepare('SELECT * FROM mission_commands WHERE id = ?').get(commandId) as any;
+    const mission = await workspaceManager.getMission(missionId);
+    if (!turn || !command || !mission) throw new Error('Mission start was accepted but its durable records could not be reloaded.');
+    emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content: params.promptText,
+      delivery: 'queue', priorityPending: false, clientMessageId: params.options.clientMessageId || undefined, timestamp: now });
+    setImmediate(() => void drainMissionCommands(missionId));
+    return queuedMissionStartDto(mission, turn, command);
+  };
+
+  if (!params.idempotencyKey) return perform();
+  const previous = missionStartIdempotencyOperations.get(params.idempotencyKey);
+  if (previous) await previous.catch(() => undefined);
+  const existingAfterWait = missionStartIdempotencyOperations.get(params.idempotencyKey);
+  if (existingAfterWait) await existingAfterWait.catch(() => undefined);
+  const operation = perform();
+  missionStartIdempotencyOperations.set(params.idempotencyKey, operation);
+  try {
+    return await operation;
+  } finally {
+    if (missionStartIdempotencyOperations.get(params.idempotencyKey) === operation) {
+      missionStartIdempotencyOperations.delete(params.idempotencyKey);
+    }
   }
 }
 
@@ -622,30 +1238,31 @@ eventBus.on('*', (event) => {
   if (event.type !== 'mission_completed' && event.type !== 'mission_failed') return;
   if (!event.runId) return;
   const completedAt = event.timestamp;
-  sqlite.transaction(() => {
-    const run = sqlite.prepare("SELECT turn_id FROM mission_runs WHERE id = ? AND mission_id = ? AND status IN ('starting', 'running', 'stopping')")
-      .get(event.runId, event.missionId) as { turn_id: string | null } | undefined;
-    if (!run) return;
+  const shouldDrain = sqlite.transaction(() => {
+    const run = sqlite.prepare("SELECT turn_id, command_id FROM mission_runs WHERE id = ? AND mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+      .get(event.runId, event.missionId) as { turn_id: string | null; command_id: string | null } | undefined;
+    if (!run) return false;
+    const terminalStatus = event.type === 'mission_completed' ? 'completed' : 'failed';
+    if (run.command_id) sqlite.prepare('UPDATE mission_commands SET status = ?, processed_at = ? WHERE id = ? AND status = \'processing\'')
+      .run(terminalStatus, completedAt, run.command_id);
     sqlite.prepare("UPDATE mission_runs SET status = ?, completed_at = ? WHERE id = ?")
-      .run(event.type === 'mission_completed' ? 'completed' : 'failed', completedAt, event.runId);
+      .run(terminalStatus, completedAt, event.runId);
     if (run.turn_id) sqlite.prepare('UPDATE conversation_turns SET status = ?, completed_at = ? WHERE id = ?')
-      .run(event.type === 'mission_completed' ? 'completed' : 'failed', completedAt, run.turn_id);
+      .run(terminalStatus, completedAt, run.turn_id);
     sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ? AND active_run_id = ?').run(event.missionId, event.runId);
+    return true;
   })();
-  setImmediate(() => void drainMissionCommands(event.missionId));
+  if (shouldDrain) setImmediate(() => void drainMissionCommands(event.missionId));
 });
 
 async function cleanupMissionResources(missionId: string): Promise<void> {
   await runtimeHost.stopMission(missionId).catch(() => undefined);
-  const missionTasks = await workspaceManager.listTasks(missionId);
-  for (const task of missionTasks) {
-    if (task.worktreeId) await workspaceManager.removeWorktreeForTask(task.id);
-  }
+  await (workspaceManager as WorkspaceManager & { removeMissionWorktrees(missionId: string): Promise<void> }).removeMissionWorktrees(missionId);
   await workspaceManager.deleteRoleExecutionPolicies('mission', missionId);
   runtimeHost.clearMissionRoutingPreference(missionId, false);
 }
 
-function configureMissionRouting(missionId: string, body: Record<string, any>): void {
+export async function configureMissionRouting(missionId: string, body: Record<string, any>): Promise<void> {
   const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId ? body.modelCatalogId : undefined;
   const accountProfileId = typeof body.accountProfileId === 'string' && body.accountProfileId ? body.accountProfileId : undefined;
   const targetRole = typeof body.targetRole === 'string' ? body.targetRole.toLowerCase() : undefined;
@@ -664,7 +1281,7 @@ function configureMissionRouting(missionId: string, body: Record<string, any>): 
   const fallbackCatalogIds = normalizeFallbackCatalogIds(body.fallbackCatalogIds, modelCatalogId);
 
   if (!modelCatalogId && !accountProfileId && !body.reasoningLevel && fallbackCatalogIds.length === 0) return;
-  runtimeHost.setMissionRoutingPreference(missionId, {
+  const preference = {
     modelCatalogId,
     accountProfileId,
     reasoningLevel: typeof body.reasoningLevel === 'string' ? body.reasoningLevel.toLowerCase() as any : undefined,
@@ -672,7 +1289,21 @@ function configureMissionRouting(missionId: string, body: Record<string, any>): 
     selectionMode: selectionMode as any,
     scopeRole: routeScope as any,
     targetRole: targetRole as any,
-  });
+  };
+  const roles = routeScope === 'mission'
+    ? ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'] as const
+    : ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'].includes(String(routeScope))
+      ? [routeScope as 'orchestrator' | 'builder' | 'reviewer' | 'researcher' | 'qa']
+      : [];
+  await Promise.all(roles.map((role) => workspaceManager.upsertRoleExecutionPolicy('mission', missionId, {
+    role,
+    modelCatalogId: preference.modelCatalogId,
+    accountProfileId: preference.accountProfileId,
+    reasoningLevel: preference.reasoningLevel,
+    fallbackCatalogIds: preference.fallbackCatalogIds,
+    selectionMode: preference.selectionMode,
+  }, 'mission')));
+  runtimeHost.setMissionRoutingPreference(missionId, preference);
 }
 
 // 4. REST API Routes
@@ -720,23 +1351,18 @@ app.get('/api/workspaces/:id', async (req: Request, res: Response) => {
 app.delete('/api/workspaces/:id', async (req: Request, res: Response) => {
   try {
     const workspaceId = routeParam(req.params.id);
+    const existingOperation = deletionStore.get('workspace', workspaceId);
+    if (existingOperation) return void sendDeletionOutcome(res, await executeDeletion(existingOperation));
     const workspace = await workspaceManager.getWorkspace(workspaceId);
     if (!workspace) return void res.status(404).json({ error: 'Workspace not found' });
+    const removeMemory = req.body?.removeMemory === true;
 
     const workspaceMissions = await workspaceManager.listMissions(workspaceId);
-    const activeMissions = workspaceMissions.filter((mission) => ACTIVE_MISSION_STATUSES.has(String(mission.status)));
-    if (activeMissions.length > 0) {
-      return void res.status(409).json({
-        error: `Stop or finish ${activeMissions.length === 1 ? 'the active conversation' : 'all active conversations'} before deleting this workspace.`,
-      });
-    }
-
-    // Remove runtime-owned resources before the workspace cascade removes the
-    // mission rows that are needed to locate them.
-    for (const mission of workspaceMissions) await cleanupMissionResources(mission.id);
-    await workspaceManager.deleteRoleExecutionPolicies('workspace', workspaceId);
-    db.delete((schema as any).workspaces).where(eq((schema as any).workspaces.id, workspaceId)).run();
-    res.json({ success: true });
+    const operation = deletionStore.begin('workspace', workspaceId, removeMemory, [
+      `workspace-path:${workspace.path}`,
+      ...workspaceMissions.map((mission) => `mission:${mission.id}`),
+    ]);
+    sendDeletionOutcome(res, await executeDeletion(operation));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to remove workspace' });
   }
@@ -746,6 +1372,7 @@ app.post('/api/missions', async (req: Request, res: Response) => {
   try {
     const { workspaceId, title, description, teamTemplateId, executionMode } = req.body;
     if (!workspaceId || !title) return void res.status(400).json({ error: 'workspaceId and title are required' });
+    if (isDeletionFenced('workspace', workspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
     const mission = await workspaceManager.createMission({ workspaceId, title, description, teamTemplateId, executionMode });
     res.status(201).json(mission);
   } catch (error: any) {
@@ -758,12 +1385,70 @@ app.get('/api/missions', async (req: Request, res: Response) => {
   catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to list missions' }); }
 });
 
+app.get('/api/mission-commands', (req: Request, res: Response) => {
+  try {
+    const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId.trim() : '';
+    if (!workspaceId) return void res.status(400).json({ error: 'workspaceId is required' });
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isInteger(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 50;
+    const cursorValue = typeof req.query.cursor === 'string' ? req.query.cursor : '';
+    const cursor = cursorValue ? decodeMissionCommandCursor(cursorValue) : null;
+    if (cursorValue && !cursor) return void res.status(400).json({ error: 'cursor is invalid' });
+    const cursorClause = cursor
+      ? ` AND (command.priority < ? OR (command.priority = ? AND (command.created_at > ?
+          OR (command.created_at = ? AND command.id > ?))))`
+      : '';
+    const queryParams: Array<string | number> = [workspaceId];
+    if (cursor) queryParams.push(cursor.priority, cursor.priority, cursor.createdAt, cursor.createdAt, cursor.commandId);
+    queryParams.push(limit + 1);
+    const rows = sqlite.prepare(`SELECT command.id, command.mission_id, command.type, command.status, command.priority,
+        command.created_at, command.claimed_at, command.attempt_count, turn.content, turn.delivery, mission.title AS mission_title
+      FROM mission_commands command
+      JOIN conversation_turns turn ON turn.id = command.turn_id
+      JOIN missions mission ON mission.id = command.mission_id
+      WHERE mission.workspace_id = ? AND command.status IN ('pending', 'processing')
+      ${cursorClause}
+      ORDER BY command.priority DESC, command.created_at, command.id LIMIT ?`).all(...queryParams) as any[];
+    const hasNext = rows.length > limit;
+    const pageRows = hasNext ? rows.slice(0, limit) : rows;
+    const last = pageRows[pageRows.length - 1];
+    const nextCursor = hasNext && last
+      ? encodeMissionCommandCursor({ priority: Number(last.priority), createdAt: last.created_at, commandId: last.id })
+      : null;
+    if (nextCursor) res.setHeader('X-Next-Cursor', nextCursor);
+    res.json({
+      items: pageRows.map((row) => ({
+        id: row.id,
+        missionId: row.mission_id,
+        missionTitle: row.mission_title,
+        type: row.type,
+        delivery: row.delivery,
+        status: row.status,
+        priority: row.priority,
+        claimedAt: row.claimed_at,
+        attemptCount: row.attempt_count,
+        preview: String(row.content || '').slice(0, 240),
+        createdAt: row.created_at,
+      })),
+      nextCursor,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to list queued mission commands' });
+  }
+});
+
 app.get('/api/missions/:id', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
     const state = await orchestrator.getMissionState(missionId);
     if (!state.mission) return void res.status(404).json({ error: 'Mission not found' });
-    res.json(state);
+    res.json({
+      ...state,
+      mission: {
+        ...state.mission,
+        recovery: missionRecoveryFor(missionId, state.mission.status, state.tasks),
+      },
+    });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to get mission state' });
   }
@@ -772,17 +1457,13 @@ app.get('/api/missions/:id', async (req: Request, res: Response) => {
 app.delete('/api/missions/:id', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
+    const existingOperation = deletionStore.get('mission', missionId);
+    if (existingOperation) return void sendDeletionOutcome(res, await executeDeletion(existingOperation));
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Conversation not found' });
 
-    const deletableStatuses = new Set(['completed', 'failed', 'cancelled']);
-    if (!deletableStatuses.has(String(mission.status))) {
-      return void res.status(409).json({ error: 'Stop or finish this conversation before deleting it.' });
-    }
-
-    await cleanupMissionResources(missionId);
-    db.delete((schema as any).missions).where(eq((schema as any).missions.id, missionId)).run();
-    res.json({ success: true });
+    const operation = deletionStore.begin('mission', missionId, false, [`mission:${missionId}`, `workspace:${mission.workspaceId}`]);
+    sendDeletionOutcome(res, await executeDeletion(operation));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to delete conversation' });
   }
@@ -791,25 +1472,44 @@ app.delete('/api/missions/:id', async (req: Request, res: Response) => {
 app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
+    if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
-    const delivery = String(req.body?.delivery || '');
+    let delivery = String(req.body?.delivery || '');
     if (!content || !['steer', 'queue', 'stop_and_replan'].includes(delivery)) {
       return void res.status(400).json({ error: "content and delivery ('steer', 'queue', or 'stop_and_replan') are required" });
     }
+    const requestedDelivery = delivery;
     const idempotencyKey = typeof req.header('Idempotency-Key') === 'string' ? req.header('Idempotency-Key')!.trim() : '';
     const active = ACTIVE_MISSION_STATUSES.has(String(mission.status));
     const turnId = crypto.randomUUID();
     const commandId = crypto.randomUUID();
     const now = new Date().toISOString();
     const requestedOptions = req.body?.options && typeof req.body.options === 'object' ? req.body.options : {};
+    const agentProfileIds = normalizeAgentProfileIds(requestedOptions.agentProfileIds);
     const turnOptions = {
       ...requestedOptions,
       modelCatalogId: requestedOptions.modelCatalogId || requestedOptions.model || undefined,
+      agentProfileIds,
     };
     delete turnOptions.model;
-    const requestHash = turnRequestHash(missionId, content, delivery, turnOptions);
+    await validateAgentProfileIds(agentProfileIds, missionId);
+    const queuedImplementationFollowUp = active && delivery === 'steer' && activeRunIsResearchOnly(missionId)
+      && hasExplicitImplementationIntent({
+        userMessage: content,
+        explicitCommand: turnOptions.command,
+        explicitTargetRole: turnOptions.targetRole,
+      });
+    const queuedRoutingFollowUp = active && delivery === 'steer' && Boolean(
+      turnOptions.modelCatalogId
+      || turnOptions.accountProfileId
+      || turnOptions.reasoningLevel
+      || turnOptions.fallbackCatalogIds?.length
+      || turnOptions.routeScope,
+    );
+    if (queuedImplementationFollowUp || queuedRoutingFollowUp) delivery = 'queue';
+    const requestHash = turnRequestHash(missionId, content, requestedDelivery, turnOptions);
     if (idempotencyKey) {
       const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?')
         .get(missionId, idempotencyKey) as any;
@@ -831,8 +1531,6 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         (id, mission_id, turn_id, type, status, priority, request_hash, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`)
         .run(commandId, missionId, turnId, delivery, priorityPending ? 100 : delivery === 'stop_and_replan' ? 200 : 0, requestHash, now);
     })();
-    emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId, clientMessageId: idempotencyKey || undefined,
-      content, timestamp: now });
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content,
       delivery: delivery as any, priorityPending, clientMessageId: idempotencyKey || undefined, timestamp: now });
     if (priorityPending) {
@@ -841,6 +1539,8 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       if (!activeRun) throw new Error('Active run metadata is unavailable for steering.');
       sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
         .run(now, commandId);
+      emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
+        clientMessageId: idempotencyKey || undefined, content, timestamp: now });
       try {
         const applied = await orchestrator.steerActiveTurn({ missionId, targetTurnId: activeRun.turn_id, content });
         const appliedAt = new Date().toISOString();
@@ -859,8 +1559,24 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       }
     }
     if (delivery === 'stop_and_replan') {
+      const activeRuns = sqlite.prepare("SELECT id, turn_id, command_id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')")
+        .all(missionId) as Array<{ id: string; turn_id: string | null; command_id: string | null }>;
+      const activeTurnIds = new Set<string>(activeRuns.map((run) => run.turn_id).filter((id): id is string => Boolean(id)));
       const activeTurns = sqlite.prepare("SELECT id FROM conversation_turns WHERE mission_id = ? AND status IN ('starting', 'running')")
         .all(missionId) as Array<{ id: string }>;
+      for (const turn of activeTurns) activeTurnIds.add(turn.id);
+      const activeCommandIds = new Set<string>(activeRuns.map((run) => run.command_id).filter((id): id is string => Boolean(id)));
+      if (activeTurnIds.size > 0) {
+        const placeholders = [...activeTurnIds].map(() => '?').join(', ');
+        const commands = sqlite.prepare(`SELECT id FROM mission_commands WHERE mission_id = ? AND turn_id IN (${placeholders}) AND status IN ('pending', 'processing')`)
+          .all(missionId, ...activeTurnIds) as Array<{ id: string }>;
+        for (const command of commands) activeCommandIds.add(command.id);
+      }
+      const cancelRun = (orchestrator as any).cancelRun;
+      if (typeof cancelRun === 'function') {
+        for (const run of activeRuns) cancelRun.call(orchestrator, missionId, run.id);
+        if (activeRuns.length === 0) cancelRun.call(orchestrator, missionId);
+      }
       try {
         await runtimeHost.stopMission(missionId);
       } catch (error: any) {
@@ -871,24 +1587,35 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         })();
         throw error;
       }
-      await workspaceManager.cancelMissionTasks(missionId);
-      await workspaceManager.updateMission(missionId, { status: 'cancelled' });
       const cancelledAt = new Date().toISOString();
+      await workspaceManager.updateMission(missionId, { status: 'cancelled', completedAt: cancelledAt });
+      await workspaceManager.cancelMissionTasks(missionId);
       sqlite.transaction(() => {
-        sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')")
-          .run(cancelledAt, missionId);
-        sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running')")
-          .run(cancelledAt, missionId);
+        for (const run of activeRuns) sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('starting', 'running', 'stopping')")
+          .run(cancelledAt, run.id);
+        for (const turnIdToCancel of activeTurnIds) sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('starting', 'running')")
+          .run(cancelledAt, turnIdToCancel);
+        for (const activeCommandId of activeCommandIds) sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE id = ? AND status IN ('pending', 'processing')")
+          .run(cancelledAt, activeCommandId);
         sqlite.prepare('UPDATE missions SET active_run_id = NULL WHERE id = ?').run(missionId);
       })();
+      await waitForMissionTurns(missionId);
+      await runtimeHost.stopMission(missionId);
+      await workspaceManager.cancelMissionTasks(missionId);
       for (const activeTurn of activeTurns) emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_cancelled',
         missionId, turnId: activeTurn.id, reason: 'Stopped for replanning', timestamp: cancelledAt });
+      await workspaceManager.updateMission(missionId, { status: 'ready', completedAt: null });
       void drainMissionCommands(missionId);
     } else if (!active) {
       void drainMissionCommands(missionId);
     }
-    res.status(202).json(turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }));
+    res.status(202).json({
+      ...turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }),
+      ...(queuedImplementationFollowUp || queuedRoutingFollowUp ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
+    });
   } catch (error: any) {
+    const profileStatus = profileErrorStatus(error);
+    if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: error?.message || 'Invalid agent profile selection.' });
     if (String(error?.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
       const missionId = routeParam(req.params.id);
       const key = String(req.header('Idempotency-Key') || '').trim();
@@ -913,17 +1640,20 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
 app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
+    if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const existingMission = await workspaceManager.getMission(missionId);
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
-    configureMissionRouting(missionId, req.body || {});
-    res.json(await startMissionWithDurability(missionId, userRequest, {
-      modelCatalogId: req.body?.modelCatalogId,
-      reasoningLevel: req.body?.reasoningLevel,
-      targetRole: req.body?.targetRole,
-      command: req.body?.command,
-    }));
+    const startOptions = normalizeMissionStartOptions(req.body || {});
+    await validateAgentProfileIds(startOptions.agentProfileIds, missionId);
+    await configureMissionRouting(missionId, req.body || {});
+    res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, startOptions)));
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
+    const profileStatus = profileErrorStatus(error);
+    if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: message });
+    if (error?.code === 'TURN_ALREADY_RUNNING') {
+      return void res.status(409).json({ code: 'TURN_ALREADY_RUNNING', error: message });
+    }
     res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
   }
 });
@@ -934,22 +1664,14 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       request,
       title,
       workspaceId,
-      modelCatalogId,
-      accountProfileId,
-      reasoningLevel,
-      fallbackCatalogIds,
-      routeSelectionMode,
-      routeRole,
       teamTemplate,
       trustMode,
       executionMode,
-      targetRole,
-      command,
       automationSettings,
       automationOverrides,
       trustProfile,
       executionStrategy,
-    } = req.body;
+    } = req.body || {};
     const automationPolicy = normalizeAutomationPolicy({ trustMode, executionMode, automationSettings, automationOverrides, trustProfile, executionStrategy });
     const promptText = request || title;
     if (!promptText) return void res.status(400).json({ error: 'title or request is required' });
@@ -960,46 +1682,35 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       targetWorkspaceId = existingWorkspaces[0]?.id;
       if (!targetWorkspaceId) return void res.status(400).json({ error: 'Create or select a workspace before starting a mission.' });
     }
+    if (isDeletionFenced('workspace', targetWorkspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
 
-    const missionId = crypto.randomUUID();
-    await workspaceManager.createMission({
-      id: missionId,
+    const startOptions: Record<string, any> = {
+      ...normalizeMissionStartOptions(req.body || {}, automationPolicy),
+      // Keep workspace scope in the idempotency fingerprint without relying on
+      // the generated mission id, which would make retries impossible to match.
       workspaceId: targetWorkspaceId,
-      title: promptText,
-      description: promptText,
-      status: 'running',
-      executionMode: executionMode || 'balanced',
+    };
+    await validateAgentProfileIds(startOptions.agentProfileIds, undefined);
+    const idempotencyKey = missionStartIdempotencyKey(req.header('Idempotency-Key') || req.body?.clientMessageId);
+    const result = await createQueuedMissionStart({
+      workspaceId: targetWorkspaceId,
+      promptText,
       automationPolicy,
-      teamTemplateId: teamTemplate || 'default-core-dev-team',
+      teamTemplate: teamTemplate || 'default-core-dev-team',
+      options: {
+        ...startOptions,
+      },
+      idempotencyKey,
     });
-
-    configureMissionRouting(missionId, {
-      modelCatalogId,
-      accountProfileId,
-      reasoningLevel,
-      fallbackCatalogIds,
-      routeSelectionMode,
-      routeRole,
-      routeScope: req.body?.routeScope,
-      targetRole,
-    });
-
-    const result = await startMissionWithDurability(missionId, promptText, {
-      modelCatalogId,
-      reasoningLevel,
-      targetRole,
-      command,
-      automationPolicy,
-    });
-    res.status(201).json({
-      missionId: result.missionId,
-      planId: result.planId,
-      tasks: result.tasks,
-      status: (await workspaceManager.getMission(result.missionId))?.status || 'running',
-    });
+    res.status(result.duplicate ? 200 : 202).json(result);
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
-    res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
+    const profileStatus = profileErrorStatus(error);
+    if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: message });
+    const status = /^Invalid automation override:/.test(message)
+      || error?.code === 'IDEMPOTENCY_KEY_REUSED'
+      || error?.code === 'IDEMPOTENCY_RECORD_INVALID' ? 400 : 500;
+    res.status(status).json({ code: error?.code, error: message });
   }
 });
 
@@ -1031,11 +1742,22 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
     if (!task) return void res.status(404).json({ error: 'Task not found' });
     const mission = await workspaceManager.getMission(task.missionId);
     const policy = mission?.automationPolicy as any;
-    const workspaceApply = policy?.overrides?.workspaceApply || (policy?.profile === 'auto' ? 'auto' : policy?.profile === 'review' ? 'review' : 'ask');
-    if (workspaceApply !== 'auto') {
+    const profile = policy?.profile === 'auto' || policy?.profile === 'review' || policy?.profile === 'ask'
+      ? policy.profile
+      : 'ask';
+    const decision = actionBroker.authorize({
+      action: 'workspaceApply',
+      profile,
+      overrides: policy?.overrides,
+      boundary: 'workspace',
+    });
+    if (!decision.allowed || decision.requiresApproval) {
       return void res.status(409).json({ code: 'APPROVAL_REQUIRED', error: 'Workspace apply must continue through the mission approval flow.' });
     }
-    const result = await mergeCoordinator.applyWorktree(taskId);
+    const result = await mergeCoordinator.applyWorktree(taskId, undefined, {
+      operationId: `direct-task-merge:${task.missionId}:${taskId}`,
+      idempotencyKey: `direct-task-merge:${task.missionId}:${taskId}`,
+    });
     if (!result.success) return void res.status(400).json({ error: result.output });
     res.json(result);
   } catch (error: any) {
@@ -1128,6 +1850,202 @@ app.get('/api/models', async (req, res) => {
   }
 });
 
+function normalizeProfileBindingInput(
+  value: unknown,
+  defaults: { scopeType?: string; scopeId?: string; role?: string } = {},
+): Record<string, unknown> {
+  if (!isRecord(value)) throw profileClientError('Agent profile binding must be a JSON object.');
+  const scopeType = String(defaults.scopeType ?? value.scopeType ?? value.scope_type ?? '').trim().toLowerCase();
+  const scopeId = String(defaults.scopeId ?? value.scopeId ?? value.scope_id ?? '').trim();
+  const rawRole = String(defaults.role ?? value.role ?? value.agentRole ?? '').trim().toLowerCase();
+  const profileId = String(value.profileId ?? value.profile_id ?? value.agentProfileId ?? '').trim();
+  if (!PROFILE_SCOPE_TYPES.has(scopeType)) throw profileClientError('Binding scopeType must be global, workspace, or team_template.');
+  if (!scopeId) throw profileClientError('Binding scopeId is required.');
+  if (!isAgentRole(rawRole)) throw profileClientError('Binding role must be one of the fixed core roles.');
+  if (!profileId) throw profileClientError('Binding profileId is required.');
+  const rawOverride = value.override ?? value.profileOverride ?? value.profile_override;
+  if (rawOverride !== undefined && !isRecord(rawOverride)) throw profileClientError('Binding override must be an object.');
+  if (isRecord(rawOverride) && rawOverride.role !== undefined
+    && (!isAgentRole(rawOverride.role) || String(rawOverride.role).toLowerCase() !== rawRole)) {
+    throw profileClientError(`Binding override role must remain '${rawRole}'.`, 'PROFILE_ROLE_IMMUTABLE');
+  }
+  return {
+    scopeType,
+    scopeId,
+    role: rawRole,
+    profileId,
+    isDefault: value.isDefault === true,
+    ...(safeProfileOverride(rawOverride) ? { override: safeProfileOverride(rawOverride) } : {}),
+  };
+}
+
+async function validateProfileForRole(profileId: string, role: AgentRole): Promise<Record<string, unknown>> {
+  const stored = await getStoredAgentProfile(profileId);
+  const safe = safeAgentProfile(stored);
+  if (!safe) throw profileClientError(`Agent profile '${profileId}' was not found.`, 'AGENT_PROFILE_NOT_FOUND');
+  if (safe.role !== role) throw profileClientError(`Agent profile '${profileId}' is assigned to fixed role '${safe.role}', not '${role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+  if (safe.archivedAt) throw profileClientError(`Agent profile '${profileId}' is archived and cannot be selected.`, 'AGENT_PROFILE_ARCHIVED');
+  return safe;
+}
+
+async function validateProfileBindingScope(scopeType: string, scopeId: string): Promise<void> {
+  if (scopeType === 'workspace') {
+    if (!await workspaceManager.getWorkspace(scopeId)) throw profileClientError('Workspace not found.', 'BINDING_SCOPE_NOT_FOUND');
+    return;
+  }
+  if (scopeType === 'team_template') {
+    if (!db.select().from((schema as any).teamTemplates).where(eq((schema as any).teamTemplates.id, scopeId)).get()) {
+      throw profileClientError('Team template not found.', 'BINDING_SCOPE_NOT_FOUND');
+    }
+  }
+}
+
+async function sendAgentProfileList(res: Response, includeArchived = false): Promise<void> {
+  const rows = await listStoredAgentProfiles(includeArchived);
+  res.json(rows.map(safeAgentProfile).filter((profile): profile is Record<string, unknown> => Boolean(profile)));
+}
+
+async function sendAgentProfileBindings(res: Response, scopeType: string, scopeId: string): Promise<void> {
+  const rows = await listStoredAgentProfileBindings(scopeType, scopeId);
+  res.json(rows.map(safeProfileBinding).filter((binding): binding is Record<string, unknown> => Boolean(binding)));
+}
+
+async function createOrUpdateAgentProfileBinding(res: Response, value: unknown, defaults: { scopeType?: string; scopeId?: string; role?: string } = {}): Promise<void> {
+  const binding = normalizeProfileBindingInput(value, defaults);
+  await validateProfileBindingScope(String(binding.scopeType), String(binding.scopeId));
+  await validateProfileForRole(String(binding.profileId), binding.role as AgentRole);
+  const result = await bindStoredAgentProfile(binding);
+  const safe = safeProfileBinding(result);
+  if (!safe) throw profileStoreError('Profile binding was saved but could not be reloaded safely.');
+  res.status(200).json(safe);
+}
+
+async function removeAgentProfileBinding(res: Response, scopeType: string, scopeId: string, role: string): Promise<void> {
+  if (!PROFILE_SCOPE_TYPES.has(scopeType) || !isAgentRole(role)) throw profileClientError('Invalid profile binding scope or role.');
+  await validateProfileBindingScope(scopeType, scopeId);
+  await unbindStoredAgentProfile(scopeType, scopeId, role as AgentRole);
+  res.json({ success: true, scopeType, scopeId, role: role.toLowerCase() });
+}
+
+// Named profiles are global resources. Every route below is protected by the
+// AtrisHub session/Premium middleware installed above; only the safe projection
+// leaves this process and no credentials or runtime config are serialized.
+app.get('/api/agent-profiles/bindings', async (req, res) => {
+  try {
+    const scopeType = String(req.query.scopeType || req.query.scope_type || '').trim().toLowerCase();
+    const scopeId = String(req.query.scopeId || req.query.scope_id || '').trim();
+    if (!PROFILE_SCOPE_TYPES.has(scopeType) || !scopeId) throw profileClientError('scopeType and scopeId are required to list profile bindings.');
+    await validateProfileBindingScope(scopeType, scopeId);
+    await sendAgentProfileBindings(res, scopeType, scopeId);
+  } catch (error: any) {
+    const status = profileErrorStatus(error) || 500;
+    res.status(status).json({ code: error?.code, error: error?.message || 'Failed to list agent profile bindings' });
+  }
+});
+
+app.put('/api/agent-profiles/bindings', async (req, res) => {
+  try { await createOrUpdateAgentProfileBinding(res, req.body); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to save agent profile binding' }); }
+});
+app.post('/api/agent-profiles/bindings', async (req, res) => {
+  try { await createOrUpdateAgentProfileBinding(res, req.body); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to save agent profile binding' }); }
+});
+app.delete('/api/agent-profiles/bindings', async (req, res) => {
+  try {
+    const scopeType = String(req.query.scopeType || req.body?.scopeType || '').trim().toLowerCase();
+    const scopeId = String(req.query.scopeId || req.body?.scopeId || '').trim();
+    const role = String(req.query.role || req.body?.role || '').trim().toLowerCase();
+    await removeAgentProfileBinding(res, scopeType, scopeId, role);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to remove agent profile binding' }); }
+});
+
+app.get('/api/agent-profiles', async (req, res) => {
+  try { await sendAgentProfileList(res, req.query.includeArchived === 'true'); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to list agent profiles' }); }
+});
+
+app.post('/api/agent-profiles', async (req, res) => {
+  try {
+    const profile = normalizeAgentProfileInput(req.body);
+    const created = await callStoredProfileMutation('createAgentProfile', profile);
+    const safe = safeAgentProfile(created);
+    if (!safe) throw profileStoreError('Agent profile was saved but could not be reloaded safely.');
+    res.status(201).json(safe);
+  } catch (error: any) {
+    const message = error?.message || 'Failed to create agent profile';
+    const status = profileErrorStatus(error) || (String(error?.code).includes('UNIQUE') ? 409 : 500);
+    res.status(status).json({ code: error?.code, error: message });
+  }
+});
+
+app.get('/api/agent-profiles/:id', async (req, res) => {
+  try {
+    const profile = await getStoredAgentProfile(routeParam(req.params.id), req.query.includeArchived === 'true');
+    const safe = safeAgentProfile(profile);
+    if (!safe || (safe.archivedAt && req.query.includeArchived !== 'true')) return void res.status(404).json({ error: 'Agent profile not found.' });
+    res.json(safe);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to get agent profile' }); }
+});
+
+app.patch('/api/agent-profiles/:id', async (req, res) => {
+  try {
+    const id = routeParam(req.params.id);
+    const existing = await getStoredAgentProfile(id, true);
+    const safeExisting = safeAgentProfile(existing);
+    if (!safeExisting) return void res.status(404).json({ error: 'Agent profile not found.' });
+    if (safeExisting.archivedAt) return void res.status(409).json({ code: 'AGENT_PROFILE_ARCHIVED', error: 'Archived agent profiles cannot be edited.' });
+    const patch = normalizeAgentProfilePatch(req.body, safeExisting as unknown as AgentProfile);
+    const updated = await callStoredProfileMutation('updateAgentProfile', id, patch);
+    const safe = safeAgentProfile(updated);
+    if (!safe) throw profileStoreError('Agent profile was updated but could not be reloaded safely.');
+    res.json(safe);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to update agent profile' }); }
+});
+
+app.delete('/api/agent-profiles/:id', async (req, res) => {
+  try {
+    const id = routeParam(req.params.id);
+    const existing = await getStoredAgentProfile(id, true);
+    const safeExisting = safeAgentProfile(existing);
+    if (!safeExisting) return void res.status(404).json({ error: 'Agent profile not found.' });
+    if (safeExisting.archivedAt) return res.json(safeExisting);
+    const archived = await callStoredProfileMutation('archiveAgentProfile', id);
+    const safe = safeAgentProfile(archived);
+    if (!safe) throw profileStoreError('Agent profile was archived but could not be reloaded safely.');
+    res.json(safe);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to archive agent profile' }); }
+});
+
+async function nestedProfileBindingsGet(req: Request, res: Response, scopeType: 'workspace' | 'team_template'): Promise<void> {
+  try {
+    const scopeId = routeParam(req.params.id);
+    await validateProfileBindingScope(scopeType, scopeId);
+    await sendAgentProfileBindings(res, scopeType, scopeId);
+  } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to list agent profile bindings' }); }
+}
+
+async function nestedProfileBindingPut(req: Request, res: Response, scopeType: 'workspace' | 'team_template'): Promise<void> {
+  try { await createOrUpdateAgentProfileBinding(res, req.body, { scopeType, scopeId: routeParam(req.params.id), role: routeParam(req.params.role) }); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to save agent profile binding' }); }
+}
+
+async function nestedProfileBindingDelete(req: Request, res: Response, scopeType: 'workspace' | 'team_template'): Promise<void> {
+  try { await removeAgentProfileBinding(res, scopeType, routeParam(req.params.id), routeParam(req.params.role).toLowerCase()); }
+  catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to remove agent profile binding' }); }
+}
+
+for (const scopeType of ['workspace', 'team_template'] as const) {
+  const prefix = scopeType === 'workspace' ? '/api/workspaces' : '/api/team-templates';
+  app.get(`${prefix}/:id/agent-profile-bindings`, (req, res) => void nestedProfileBindingsGet(req, res, scopeType));
+  app.get(`${prefix}/:id/agent-profiles`, (req, res) => void nestedProfileBindingsGet(req, res, scopeType));
+  app.put(`${prefix}/:id/agent-profile-bindings/:role`, (req, res) => void nestedProfileBindingPut(req, res, scopeType));
+  app.put(`${prefix}/:id/agent-profiles/:role`, (req, res) => void nestedProfileBindingPut(req, res, scopeType));
+  app.post(`${prefix}/:id/agent-profile-bindings/:role`, (req, res) => void nestedProfileBindingPut(req, res, scopeType));
+  app.delete(`${prefix}/:id/agent-profile-bindings/:role`, (req, res) => void nestedProfileBindingDelete(req, res, scopeType));
+  app.delete(`${prefix}/:id/agent-profiles/:role`, (req, res) => void nestedProfileBindingDelete(req, res, scopeType));
+}
+
 const validRoles = new Set(['orchestrator', 'builder', 'reviewer', 'researcher', 'qa']);
 const validReasoning = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const validSelectionModes = new Set(['auto', 'prefer', 'fixed']);
@@ -1141,14 +2059,31 @@ function normalizeTeamRoles(roles: Array<Record<string, unknown>>): any[] {
     seen.add(id);
     return true;
   }).map((role) => {
+    const canonicalRole = String(role.role).toLowerCase() as AgentRole;
     const modelCatalogId = String(role.modelCatalogId || role.modelProfileId || '').trim();
     const fallbackCatalogIds = normalizeFallbackCatalogIds(role.fallbackCatalogIds, modelCatalogId);
     const preferredReasoning = validReasoning.has(String(role.preferredReasoning)) ? String(role.preferredReasoning) : undefined;
     const routeSelectionMode = validSelectionModes.has(String(role.routeSelectionMode))
       ? String(role.routeSelectionMode)
       : modelCatalogId ? 'prefer' : 'auto';
+    const rawProfile = role.profile ?? role.agentProfile;
+    let profile: Record<string, unknown> | undefined;
+    if (rawProfile !== undefined) {
+      if (!isRecord(rawProfile)) throw profileClientError(`Profile for role '${canonicalRole}' must be an object.`);
+      const profileId = cleanProfileString(role.profileId)
+        || cleanProfileString(role.agentProfileId)
+        || cleanProfileString(rawProfile.id)
+        || cleanProfileString(rawProfile.profileId);
+      if (!profileId) throw profileClientError(`Profile for role '${canonicalRole}' must include a profileId.`);
+      profile = safeAgentProfile({ ...rawProfile, id: profileId, role: rawProfile.role ?? canonicalRole }) ?? undefined;
+      if (!profile) throw profileClientError(`Profile for role '${canonicalRole}' is invalid.`);
+      if (profile.role !== canonicalRole) throw profileClientError(`Profile for role '${canonicalRole}' is assigned to fixed role '${profile.role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+    }
+    const profileId = cleanProfileString(role.profileId)
+      || cleanProfileString(role.agentProfileId)
+      || (profile ? String(profile.id) : undefined);
     return {
-      role: String(role.role).toLowerCase(),
+      role: canonicalRole,
       modelProfileId: modelCatalogId,
       modelCatalogId,
       accountProfileId: String(role.accountProfileId || '').trim(),
@@ -1157,11 +2092,70 @@ function normalizeTeamRoles(roles: Array<Record<string, unknown>>): any[] {
       routeSelectionMode,
       defaultCapabilities: Array.isArray(role.defaultCapabilities) ? role.defaultCapabilities.map(String) : [],
       accessLevel: String(role.accessLevel || 'read'),
+      ...(profileId ? { profileId, agentProfileId: profileId } : {}),
+      ...(profile ? { profile } : {}),
+      ...(typeof role.isDefault === 'boolean' ? { isDefault: role.isDefault } : {}),
     };
   });
 }
 
-function readTeamTemplate(templateId: string): any | null {
+type NormalizedTemplateProfileFields = {
+  agentProfiles?: Record<string, unknown>[];
+  profiles?: Record<string, unknown>[];
+  profileDefaults?: Partial<Record<AgentRole, string>>;
+  defaultProfileIds?: Partial<Record<AgentRole, string>>;
+};
+
+function normalizeTemplateProfileFields(value: unknown): NormalizedTemplateProfileFields {
+  if (!isRecord(value)) return {};
+  const result: NormalizedTemplateProfileFields = {};
+  for (const key of ['agentProfiles', 'profiles'] as const) {
+    if (value[key] === undefined) continue;
+    if (!Array.isArray(value[key])) throw profileClientError(`${key} must be an array.`);
+    const profiles: Record<string, unknown>[] = [];
+    for (const item of value[key]) {
+      if (!isRecord(item)) throw profileClientError(`${key} entries must be objects.`);
+      const id = cleanProfileString(item.id) || cleanProfileString(item.profileId);
+      if (!id) throw profileClientError(`${key} entries must include a profile id.`);
+      const profile = safeAgentProfile({ ...item, id });
+      if (!profile) throw profileClientError(`${key} contains an invalid agent profile.`);
+      profiles.push(profile);
+    }
+    result[key] = profiles;
+  }
+  for (const key of ['profileDefaults', 'defaultProfileIds'] as const) {
+    if (value[key] === undefined) continue;
+    if (!isRecord(value[key])) throw profileClientError(`${key} must be an object keyed by fixed agent roles.`);
+    const ids: Partial<Record<AgentRole, string>> = {};
+    for (const [rawRole, rawValue] of Object.entries(value[key])) {
+      const role = rawRole.toLowerCase();
+      if (!isAgentRole(role)) throw profileClientError(`Unknown agent profile role '${rawRole}'.`);
+      const id = typeof rawValue === 'string'
+        ? rawValue.trim()
+        : isRecord(rawValue)
+          ? cleanProfileString(rawValue.id) || cleanProfileString(rawValue.profileId) || ''
+          : '';
+      if (!id) throw profileClientError(`${key}.${role} must identify an agent profile.`);
+      ids[role as AgentRole] = id;
+    }
+    result[key] = ids;
+  }
+  return result;
+}
+
+function profileIdForTemplateRole(
+  role: AgentRole,
+  roleEntry: Record<string, unknown> | undefined,
+  profileFields: NormalizedTemplateProfileFields,
+): string | undefined {
+  return cleanProfileString(roleEntry?.profileId)
+    || cleanProfileString(roleEntry?.agentProfileId)
+    || profileFields.defaultProfileIds?.[role]
+    || profileFields.profileDefaults?.[role]
+    || (profileFields.agentProfiles || profileFields.profiles || []).find((profile) => profile.role === role)?.id as string | undefined;
+}
+
+async function readTeamTemplate(templateId: string): Promise<any | null> {
   const template = db.select().from((schema as any).teamTemplates)
     .where(eq((schema as any).teamTemplates.id, templateId)).get() as any;
   if (!template) return null;
@@ -1172,10 +2166,29 @@ function readTeamTemplate(templateId: string): any | null {
     eq((schema as any).executionPolicies.scopeId, templateId),
   )).all() as any[];
   const byRole = new Map(policies.map((policy) => [policy.role, policy]));
+  const profileBindings = await listStoredAgentProfileBindingsIfAvailable('team_template', templateId);
+  const bindingsByRole = new Map<string, Record<string, unknown>>();
+  for (const binding of profileBindings) {
+    const safeBinding = safeProfileBinding(binding);
+    if (safeBinding?.role) bindingsByRole.set(String(safeBinding.role), safeBinding);
+  }
+  const boundProfileRows = await Promise.all([...bindingsByRole.values()].map(async (binding) => {
+    try { return safeAgentProfile(await getStoredAgentProfile(String(binding.profileId))); }
+    catch { return null; }
+  }));
+  const boundProfiles = boundProfileRows.filter((profile): profile is Record<string, unknown> => Boolean(profile));
+  const profileDefaults: Partial<Record<AgentRole, string>> = {};
+  for (const binding of bindingsByRole.values()) {
+    if (binding.isDefault === true && binding.role && binding.profileId) profileDefaults[binding.role as AgentRole] = String(binding.profileId);
+  }
+  const workerPolicy = resolveWorkerPoolPolicy(template);
   return {
     ...template,
+    maxParallelAgents: workerPolicy.maxParallelAgents,
+    workerPools: workerPolicy.pools,
     roles: roles.map((role) => {
       const policy = byRole.get(role.role) as any;
+      const binding = bindingsByRole.get(String(role.role));
       return {
         ...role,
         modelCatalogId: policy?.modelCatalogId || role.modelProfileId || '',
@@ -1183,13 +2196,37 @@ function readTeamTemplate(templateId: string): any | null {
         fallbackCatalogIds: policy?.fallbackCatalogIds || [],
         preferredReasoning: policy?.reasoningLevel || undefined,
         routeSelectionMode: policy?.selectionMode || (role.modelProfileId ? 'prefer' : 'auto'),
+        ...(binding?.profileId ? { profileId: binding.profileId, agentProfileId: binding.profileId } : {}),
+        ...(binding?.override ? { profile: binding.override } : {}),
       };
     }),
+    ...(boundProfiles.length ? { agentProfiles: boundProfiles, profiles: boundProfiles } : {}),
+    ...(Object.keys(profileDefaults).length ? { profileDefaults, defaultProfileIds: profileDefaults } : {}),
   };
 }
 
-function replaceTemplateRoles(templateId: string, inputRoles: any[]): void {
+async function replaceTemplateRoles(templateId: string, inputRoles: any[], inputProfileFields: unknown = {}): Promise<void> {
   const roles = normalizeTeamRoles(inputRoles);
+  const profileFields = normalizeTemplateProfileFields(inputProfileFields);
+  const profileIdsByRole = new Map<AgentRole, string>();
+  for (const role of roles) {
+    const profileId = profileIdForTemplateRole(role.role as AgentRole, role, profileFields);
+    if (profileId) profileIdsByRole.set(role.role as AgentRole, profileId);
+  }
+  const hasProfileData = profileIdsByRole.size > 0
+    || Object.keys(profileFields.profileDefaults || {}).length > 0
+    || Object.keys(profileFields.defaultProfileIds || {}).length > 0;
+  const hasBindingStore = true;
+  if (hasProfileData && !hasBindingStore) throw profileStoreError('Agent profile bindings are unavailable.');
+  if (hasBindingStore) {
+    for (const [role, profileId] of profileIdsByRole) {
+      const stored = await getStoredAgentProfile(profileId);
+      const safe = safeAgentProfile(stored);
+      if (!safe) throw profileClientError(`Agent profile '${profileId}' was not found.`, 'AGENT_PROFILE_NOT_FOUND');
+      if (safe.role !== role) throw profileClientError(`Agent profile '${profileId}' is assigned to fixed role '${safe.role}', not '${role}'.`, 'AGENT_PROFILE_ROLE_MISMATCH');
+      if (safe.archivedAt) throw profileClientError(`Agent profile '${profileId}' is archived and cannot be bound.`, 'AGENT_PROFILE_ARCHIVED');
+    }
+  }
   db.delete((schema as any).teamRoles).where(eq((schema as any).teamRoles.templateId, templateId)).run();
   db.delete((schema as any).executionPolicies).where(and(
     eq((schema as any).executionPolicies.scopeType, 'team_template'),
@@ -1219,22 +2256,42 @@ function replaceTemplateRoles(templateId: string, inputRoles: any[]): void {
       updatedAt: new Date().toISOString(),
     }).run();
   }
+  if (hasBindingStore) {
+    for (const role of AGENT_ROLES) await unbindStoredAgentProfile('team_template', templateId, role);
+    for (const role of roles) {
+      const profileId = profileIdsByRole.get(role.role as AgentRole);
+      if (!profileId) continue;
+      const isDefault = role.isDefault === true
+        || profileFields.defaultProfileIds?.[role.role as AgentRole] === profileId
+        || profileFields.profileDefaults?.[role.role as AgentRole] === profileId;
+      await bindStoredAgentProfile({
+        scopeType: 'team_template',
+        scopeId: templateId,
+        role: role.role,
+        profileId,
+        isDefault,
+        override: safeProfileOverride(role.profile),
+      });
+    }
+  }
 }
 
-app.get('/api/team-templates', (_req, res) => {
+app.get('/api/team-templates', async (_req, res) => {
   try {
     const templates = db.select().from((schema as any).teamTemplates).all() as any[];
-    res.json(templates.map((template) => readTeamTemplate(template.id)));
+    res.json(await Promise.all(templates.map((template) => readTeamTemplate(template.id))));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to fetch team templates' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to fetch team templates' });
   }
 });
 
-app.post('/api/team-templates', (req, res) => {
+app.post('/api/team-templates', async (req, res) => {
   try {
     const name = String(req.body?.name || '').trim();
     const description = String(req.body?.description || '').trim();
     const roles = normalizeTeamRoles(req.body?.roles || []);
+    const profileFields = normalizeTemplateProfileFields(req.body || {});
     if (!name) return void res.status(400).json({ error: 'Template name is required.' });
     if (!roles.length) return void res.status(400).json({ error: 'Select at least one valid agent role.' });
     const duplicate = (db.select().from((schema as any).teamTemplates).all() as any[])
@@ -1244,22 +2301,28 @@ app.post('/api/team-templates', (req, res) => {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     sqlite.transaction(() => {
-      db.insert((schema as any).teamTemplates).values({ id, name, description, isDefault: false, createdAt: now }).run();
-      replaceTemplateRoles(id, roles);
+      const workerPolicy = resolveWorkerPoolPolicy(req.body);
+      db.insert((schema as any).teamTemplates).values({ id, name, description, maxParallelAgents: workerPolicy.maxParallelAgents,
+        workerPools: workerPolicy.pools, isDefault: false, createdAt: now }).run();
     })();
-    res.status(201).json(readTeamTemplate(id));
+    await replaceTemplateRoles(id, roles, profileFields);
+    res.status(201).json(await readTeamTemplate(id));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to create team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to create team template' });
   }
 });
 
-app.patch('/api/team-templates/:id', (req, res) => {
+app.patch('/api/team-templates/:id', async (req, res) => {
   try {
-    const template = readTeamTemplate(req.params.id);
+    const template = await readTeamTemplate(req.params.id);
     if (!template) return void res.status(404).json({ error: 'Team template not found.' });
     const name = String(req.body?.name ?? template.name).trim();
     const description = String(req.body?.description ?? template.description).trim();
     const roles = req.body?.roles === undefined ? template.roles : normalizeTeamRoles(req.body.roles);
+    const profileFields = req.body?.roles === undefined
+      ? normalizeTemplateProfileFields(template)
+      : normalizeTemplateProfileFields(req.body || {});
     if (!name) return void res.status(400).json({ error: 'Template name is required.' });
     if (!roles.length) return void res.status(400).json({ error: 'Select at least one valid agent role.' });
     const duplicate = (db.select().from((schema as any).teamTemplates).all() as any[])
@@ -1267,19 +2330,21 @@ app.patch('/api/team-templates/:id', (req, res) => {
     if (duplicate) return void res.status(409).json({ error: `A team template named '${name}' already exists.` });
 
     sqlite.transaction(() => {
-      db.update((schema as any).teamTemplates).set({ name, description })
+      const workerPolicy = resolveWorkerPoolPolicy(req.body?.maxParallelAgents === undefined && req.body?.workerPools === undefined ? template : req.body);
+      db.update((schema as any).teamTemplates).set({ name, description, maxParallelAgents: workerPolicy.maxParallelAgents, workerPools: workerPolicy.pools })
         .where(eq((schema as any).teamTemplates.id, req.params.id)).run();
-      replaceTemplateRoles(req.params.id, roles);
     })();
-    res.json(readTeamTemplate(req.params.id));
+    await replaceTemplateRoles(req.params.id, roles, profileFields);
+    res.json(await readTeamTemplate(req.params.id));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to update team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to update team template' });
   }
 });
 
-app.post('/api/team-templates/:id/default', (req, res) => {
+app.post('/api/team-templates/:id/default', async (req, res) => {
   try {
-    if (!readTeamTemplate(req.params.id)) return void res.status(404).json({ error: 'Team template not found.' });
+    if (!await readTeamTemplate(req.params.id)) return void res.status(404).json({ error: 'Team template not found.' });
     sqlite.transaction(() => {
       for (const template of db.select().from((schema as any).teamTemplates).all() as any[]) {
         db.update((schema as any).teamTemplates)
@@ -1287,17 +2352,19 @@ app.post('/api/team-templates/:id/default', (req, res) => {
           .where(eq((schema as any).teamTemplates.id, template.id)).run();
       }
     })();
-    res.json(readTeamTemplate(req.params.id));
+    res.json(await readTeamTemplate(req.params.id));
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to set the default team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to set the default team template' });
   }
 });
 
-app.delete('/api/team-templates/:id', (req, res) => {
+app.delete('/api/team-templates/:id', async (req, res) => {
   try {
-    const template = readTeamTemplate(req.params.id);
+    const template = await readTeamTemplate(req.params.id);
     if (!template) return void res.status(404).json({ error: 'Team template not found.' });
     if (template.isDefault) return void res.status(409).json({ error: 'The default template cannot be deleted. Set another template as default first.' });
+    for (const role of AGENT_ROLES) await unbindStoredAgentProfile('team_template', req.params.id, role);
     sqlite.transaction(() => {
       db.delete((schema as any).executionPolicies).where(and(
         eq((schema as any).executionPolicies.scopeType, 'team_template'),
@@ -1308,7 +2375,8 @@ app.delete('/api/team-templates/:id', (req, res) => {
     })();
     res.json({ success: true });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to delete team template' });
+    const profileStatus = profileErrorStatus(error);
+    res.status(profileStatus || 500).json({ code: error?.code, error: error?.message || 'Failed to delete team template' });
   }
 });
 
@@ -1362,10 +2430,22 @@ app.delete('/api/execution-policies/:scopeType/:scopeId', async (req, res) => {
 
 app.get('/api/missions/:id/events', async (req, res) => {
   try {
-    const afterSequence = Math.max(0, Number(req.query.afterSequence) || 0);
-    const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ?
-      ORDER BY sequence`).all(req.params.id, afterSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
-    res.json(rows.map((row) => ({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 })));
+    const cursor = cursorFromQuery(req.query);
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(500, Math.floor(requestedLimit))
+      : 200;
+    const rows = sqlite.prepare(`SELECT id, payload, sequence, schema_version FROM mission_events
+      WHERE mission_id = ? AND sequence > ? ORDER BY sequence LIMIT ?`)
+      .all(req.params.id, cursor.sequence, limit + 1) as Array<{ id: string; payload: string; sequence: number; schema_version: number }>;
+    const hasMore = rows.length > limit;
+    const visibleRows = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore && visibleRows.length > 0
+      ? encodeEventCursor({ sequence: visibleRows[visibleRows.length - 1].sequence, eventId: visibleRows[visibleRows.length - 1].id })
+      : '';
+    res.setHeader('X-Has-More', String(hasMore));
+    if (nextCursor) res.setHeader('X-Next-Cursor', nextCursor);
+    res.json(visibleRows.map((row) => ({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 })));
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to fetch mission events' });
   }
@@ -1383,21 +2463,48 @@ app.get('/api/missions/:id/artifacts', async (req, res) => {
 
 app.get('/api/missions/:id/usage', (req, res) => {
   try {
-    const rows = db.select().from((schema as any).usageSnapshots)
+    const telemetryRows = sqlite.prepare(`SELECT input_tokens AS inputTokens, output_tokens AS outputTokens,
+      outcome, usage_available AS usageAvailable, usage_source AS usageSource, cost, currency,
+      duration_ms AS durationMs, queue_wait_ms AS queueWaitMs, retry_count AS retryCount,
+      worker_utilization AS workerUtilization, recorded_at AS recordedAt
+      FROM runtime_telemetry WHERE mission_id = ? ORDER BY recorded_at`).all(req.params.id) as any[];
+    const snapshotRows = db.select().from((schema as any).usageSnapshots)
       .where(eq((schema as any).usageSnapshots.missionId, req.params.id)).all() as any[];
+    // Runtime telemetry is the authoritative source once available. Keep the
+    // legacy snapshot fallback for missions created before telemetry v5.
+    const rows = telemetryRows.length > 0 ? telemetryRows : snapshotRows;
     const inputTokens = rows.reduce((sum, row) => sum + Number(row.inputTokens || 0), 0);
     const outputTokens = rows.reduce((sum, row) => sum + Number(row.outputTokens || 0), 0);
-    const costValues = rows.map((row) => row.cost).filter((value) => value !== null && value !== undefined);
-    const currencies = [...new Set(rows.map((row) => row.currency).filter(Boolean))];
+    const costRows = rows.filter((row) => row.cost !== null && row.cost !== undefined && row.currency);
+    const currencies = [...new Set(costRows.map((row) => row.currency))];
+    const costsByCurrency = Object.fromEntries(currencies.map((currency) => [
+      currency,
+      costRows.filter((row) => row.currency === currency).reduce((sum, row) => sum + Number(row.cost), 0),
+    ]));
+    const completedCount = telemetryRows.filter((row) => row.outcome === 'completed').length;
+    const failedCount = telemetryRows.filter((row) => row.outcome === 'failed').length;
     res.json({
       available: rows.length > 0,
       inputTokens,
       outputTokens,
       totalTokens: inputTokens + outputTokens,
-      totalCost: costValues.length > 0 ? costValues.reduce((sum, value) => sum + Number(value || 0), 0) : null,
+      usageAvailable: telemetryRows.some((row) => Boolean(row.usageAvailable)),
+      usageSource: telemetryRows.some((row) => Boolean(row.usageAvailable)) ? 'provider_reported' : 'unavailable',
+      totalCost: currencies.length === 1 ? costsByCurrency[currencies[0]] : null,
       currency: currencies.length === 1 ? currencies[0] : null,
+      costsByCurrency,
       snapshotCount: rows.length,
       lastRecordedAt: rows.map((row) => row.recordedAt).filter(Boolean).sort().at(-1) || null,
+      telemetryCount: telemetryRows.length,
+      totalDurationMs: telemetryRows.reduce((sum, row) => sum + Number(row.durationMs || 0), 0),
+      totalQueueWaitMs: telemetryRows.reduce((sum, row) => sum + Number(row.queueWaitMs || 0), 0),
+      retryCount: telemetryRows.reduce((sum, row) => sum + Number(row.retryCount || 0), 0),
+      completedCount,
+      failedCount,
+      successRate: telemetryRows.length > 0 ? completedCount / telemetryRows.length : null,
+      averageWorkerUtilization: telemetryRows.length > 0
+        ? telemetryRows.reduce((sum, row) => sum + Number(row.workerUtilization || 0), 0) / telemetryRows.length
+        : null,
     });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to fetch usage snapshots' });
@@ -1437,6 +2544,25 @@ app.post('/api/missions/:id/retry', async (req, res) => {
   try {
     const mission = await workspaceManager.getMission(req.params.id);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
+    if (isPostApplyVerificationPending(req.params.id)) {
+      await orchestrator.retryPostApplyVerification(req.params.id);
+      return void res.json({ success: true, verificationRetried: true, retriedTasks: [] });
+    }
+    if (claimUnappliedSiblingRetry(sqlite, req.params.id, (record) => {
+      const policy = record.automation_policy ? JSON.parse(record.automation_policy) : null;
+      const decision = actionBroker.authorize({ action: 'workspaceApply', boundary: 'workspace',
+        profile: policy?.profile || (record.execution_mode === 'autonomous' ? 'auto' : 'ask'), overrides: policy?.overrides });
+      if (!decision.allowed || decision.requiresApproval) throw new Error('Publication retry requires workspace apply approval under the current policy.');
+    })) {
+      try {
+        await orchestrator.handleApprovalDecision(req.params.id, 'apply', true);
+      } catch (error) {
+        sqlite.prepare("UPDATE missions SET status = 'blocked', updated_at = ? WHERE id = ? AND status IN ('applying', 'verifying')")
+          .run(new Date().toISOString(), req.params.id);
+        throw error;
+      }
+      return void res.json({ success: true, publicationRetried: true, retriedTasks: [] });
+    }
     const tasks = await workspaceManager.listTasks(req.params.id);
     const retryable = tasks.filter((task) => ['rejected', 'blocked', 'revision_requested'].includes(task.status));
     if (retryable.length === 0) return void res.status(400).json({ error: 'The mission has no failed or blocked task to retry.' });
@@ -1453,25 +2579,123 @@ app.post('/api/tasks/:id/retry', async (req, res) => {
   catch (error: any) { res.status(400).json({ error: error?.message || 'Failed to retry task' }); }
 });
 
+app.post('/api/missions/:id/retry-verification', async (req, res) => {
+  try {
+    if (!await workspaceManager.getMission(req.params.id)) return void res.status(404).json({ error: 'Mission not found' });
+    if (!isPostApplyVerificationPending(req.params.id)) return void res.status(400).json({ error: 'The mission has no pending post-apply verification to retry.' });
+    await orchestrator.retryPostApplyVerification(req.params.id);
+    res.json({ success: true, verificationRetried: true });
+  } catch (error: any) {
+    res.status(400).json({ error: error?.message || 'Failed to retry verification' });
+  }
+});
+
+function claimApproval(approvalId: string, decision: ApprovalDecision): any | null {
+  return approvalOutbox.claim(approvalId, decision);
+}
+
+function deletionMissionIds(operation: DeletionOperation): string[] {
+  return operation.targetType === 'mission' ? [operation.targetId]
+    : operation.manifest.filter((item) => item.startsWith('mission:')).map((item) => item.slice(8));
+}
+
+function isDeletionFenced(targetType: 'mission' | 'workspace', targetId: string): boolean {
+  return Boolean(deletionStore.get(targetType, targetId));
+}
+
+const deletionHandlers: DeletionHandlers = {
+  stop: async (operation) => {
+    const stoppedAt = new Date().toISOString();
+    for (const missionId of deletionMissionIds(operation)) {
+      const cancelRun = (orchestrator as any).cancelRun;
+      if (typeof cancelRun === 'function') cancelRun.call(orchestrator, missionId);
+      await runtimeHost.stopMission(missionId);
+      await workspaceManager.cancelMissionTasks(missionId);
+      sqlite.transaction(() => {
+        sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE mission_id = ? AND status IN ('pending', 'processing')").run(stoppedAt, missionId);
+        sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('queued', 'pending_priority', 'starting', 'running')").run(stoppedAt, missionId);
+        sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')").run(stoppedAt, missionId);
+        sqlite.prepare("UPDATE missions SET status = 'cancelled', active_run_id = NULL, completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE id = ?").run(stoppedAt, stoppedAt, missionId);
+      })();
+    }
+  },
+  runtime: async (operation) => {
+    for (const missionId of deletionMissionIds(operation)) {
+      await runtimeHost.stopMission(missionId).catch(() => undefined);
+      runtimeHost.clearMissionRoutingPreference(missionId, false);
+    }
+  },
+  worktrees: async (operation) => {
+    for (const missionId of deletionMissionIds(operation)) await workspaceManager.removeMissionWorktrees(missionId);
+  },
+  checkpoints: async (operation) => {
+    if (operation.targetType !== 'workspace') return;
+    const workspacePath = operation.manifest.find((item) => item.startsWith('workspace-path:'))?.slice(15);
+    if (workspacePath) workspaceManager.removeWorkspaceCheckpoints(workspacePath);
+  },
+  policy: async (operation) => {
+    for (const missionId of deletionMissionIds(operation)) await workspaceManager.deleteRoleExecutionPolicies('mission', missionId);
+    if (operation.targetType === 'workspace') await workspaceManager.deleteRoleExecutionPolicies('workspace', operation.targetId);
+  },
+  memory: async (operation) => {
+    if (operation.targetType !== 'workspace') return;
+    const projectMemory = orchestrator.getProjectMemoryService();
+    if (!projectMemory) return;
+    if (operation.removeMemory) await projectMemory.removeWorkspaceProvenance(operation.targetId, deletionMissionIds(operation));
+    else await projectMemory.detachWorkspace(operation.targetId);
+  },
+  relational: async (operation) => {
+    sqlite.prepare(`DELETE FROM ${operation.targetType === 'workspace' ? 'workspaces' : 'missions'} WHERE id = ?`).run(operation.targetId);
+  },
+};
+
+async function executeDeletion(operation: DeletionOperation): Promise<DeletionOperation> {
+  return deletionStore.execute(operation, deletionHandlers);
+}
+
+function sendDeletionOutcome(res: Response, operation: DeletionOperation): void {
+  const body = { operationId: operation.id, targetType: operation.targetType, targetId: operation.targetId,
+    removeMemory: operation.removeMemory, phase: operation.phase, status: operation.status,
+    progress: operation.progress, retryable: operation.status === 'retryable', error: operation.error };
+  if (operation.status === 'completed') return void res.status(200).json({ success: true, ...body });
+  if (operation.status === 'running' || operation.status === 'pending') return void res.status(202).json(body);
+  res.status(503).json(body);
+}
+
+function finalizeApproval(approvalId: string, decision: ApprovalDecision): boolean {
+  return approvalOutbox.finalize(approvalId, decision);
+}
+
+function failApproval(approvalId: string, error: unknown): void {
+  approvalOutbox.fail(approvalId, error);
+}
+
+function reconcileApproval(approvalId: string, outcome: 'applied' | 'not_applied'): any | null {
+  return approvalOutbox.reconcile(approvalId, outcome);
+}
+
 app.post('/api/missions/:id/candidates/:taskId/select', async (req, res) => {
+  let claimedApproval: any | null = null;
   try {
     const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
       ? req.body.reason.trim()
       : 'Selected by the user from the Candidate board.';
-    await orchestrator.selectCandidate(req.params.id, req.params.taskId, reason);
     const pendingApprovals = (db.select().from((schema as any).approvals)
       .where(eq((schema as any).approvals.missionId, req.params.id)).all() as any[])
       .filter((approval) => approval.type === 'candidate_selection' && approval.status === 'pending');
+    if (pendingApprovals.length > 0) {
+      claimedApproval = claimApproval(pendingApprovals[0].id, 'approved');
+      if (!claimedApproval) return void res.status(409).json({ error: 'Candidate approval is already being processed.' });
+    }
+    await orchestrator.selectCandidate(req.params.id, req.params.taskId, reason);
     const now = new Date().toISOString();
-    for (const approval of pendingApprovals) {
-      db.update((schema as any).approvals)
-        .set({ status: 'approved', decidedBy: 'user', decidedAt: now })
-        .where(eq((schema as any).approvals.id, approval.id)).run();
+    if (claimedApproval) {
+      if (!finalizeApproval(claimedApproval.id, 'approved')) throw new Error('Candidate approval finalization lost its claim.');
       eventBus.emit({
         id: crypto.randomUUID(),
         type: 'approval_responded',
         missionId: req.params.id,
-        approvalId: approval.id,
+        approvalId: claimedApproval.id,
         approved: true,
         decidedBy: 'user',
         timestamp: now,
@@ -1479,6 +2703,7 @@ app.post('/api/missions/:id/candidates/:taskId/select', async (req, res) => {
     }
     res.json({ success: true, selectedCandidateId: req.params.taskId });
   } catch (error: any) {
+    if (claimedApproval) failApproval(claimedApproval.id, error);
     res.status(400).json({ error: error?.message || 'Failed to select candidate' });
   }
 });
@@ -1493,13 +2718,17 @@ app.get('/api/missions/:id/approvals', async (req, res) => {
 });
 
 app.post('/api/approvals/:id/decide', async (req, res) => {
+  let claimedApproval: any | null = null;
   try {
     const decision = String(req.body?.decision || '').toLowerCase();
     if (!['approved', 'rejected'].includes(decision)) return void res.status(400).json({ error: "decision must be 'approved' or 'rejected'" });
-    const approval = (db.select().from((schema as any).approvals)
+    const existingApproval = (db.select().from((schema as any).approvals)
       .where(eq((schema as any).approvals.id, req.params.id)).all() as any[])[0];
-    if (!approval) return void res.status(404).json({ error: 'Approval not found' });
-    if (approval.status !== 'pending') return void res.status(409).json({ error: `Approval has already been ${approval.status}.` });
+    if (!existingApproval) return void res.status(404).json({ error: 'Approval not found' });
+    if (existingApproval.status !== 'pending') return void res.status(409).json({ error: `Approval has already been ${existingApproval.status}.` });
+    claimedApproval = claimApproval(req.params.id, decision as 'approved' | 'rejected');
+    if (!claimedApproval) return void res.status(409).json({ error: 'Approval is already being processed.' });
+    const approval = claimedApproval;
     const approved = decision === 'approved';
     if (String(approval.id).includes(':')) {
       await runtimeHost.respondToRuntimeApproval(approval.id, approved ? 'approved' : 'rejected');
@@ -1507,13 +2736,13 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
       await orchestrator.handleApprovalDecision(approval.missionId, approval.type, approved, {
         selectedCandidateId: typeof req.body?.selectedCandidateId === 'string' ? req.body.selectedCandidateId : undefined,
         reason: typeof req.body?.reason === 'string' ? req.body.reason : undefined,
+        operationId: approval.operationId,
+        idempotencyKey: approval.idempotencyKey,
       });
     }
 
     const now = new Date().toISOString();
-    db.update((schema as any).approvals)
-      .set({ status: decision, decidedBy: 'user', decidedAt: now })
-      .where(eq((schema as any).approvals.id, req.params.id)).run();
+    if (!finalizeApproval(approval.id, decision as 'approved' | 'rejected')) throw new Error('Approval finalization lost its claim.');
     eventBus.emit({
       id: crypto.randomUUID(),
       type: 'approval_responded',
@@ -1525,6 +2754,7 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
     });
     res.json({ success: true, decision });
   } catch (error: any) {
+    if (claimedApproval) failApproval(claimedApproval.id, error);
     res.status(400).json({ error: error?.message || 'Failed to decide approval' });
   }
 });
@@ -1535,35 +2765,121 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
   const missionId = typeof req.query.missionId === 'string' ? req.query.missionId : undefined;
-  let lastSequence = Math.max(0, Number(req.query.afterSequence) || 0);
+  let lastSequence = cursorFromQuery(req.query).sequence;
   let replaying = Boolean(missionId);
-  const buffered: AgentEvent[] = [];
-  const writeEvent = (event: AgentEvent) => {
-    if (missionId && event.missionId !== missionId) return;
+  let highWaterSequence = 0;
+  let closed = false;
+  const queue = new BoundedEventQueue<AgentEvent>({
+    maxItems: 2_000,
+    maxBytes: 8 * 1024 * 1024,
+    sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), 'utf8'),
+  });
+  const writeEvent = (event: AgentEvent): boolean => {
+    if (missionId && event.missionId !== missionId) return true;
     const sequence = Number(event.sequence || 0);
-    if (missionId && sequence && sequence <= lastSequence) return;
+    if (missionId && sequence && sequence <= lastSequence) return true;
     if (sequence) lastSequence = sequence;
-    res.write(`id: ${sequence || event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    return res.write(`id: ${sequence || event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+  const flush = () => {
+    if (closed || res.writableEnded || res.writableNeedDrain || replaying) return;
+    const dropped = queue.takeDroppedCount();
+    if (dropped > 0 && !res.writableNeedDrain) {
+      res.write(`event: stream_gap\ndata: ${JSON.stringify({ type: 'stream_gap', dropped, afterSequence: lastSequence })}\n\n`);
+    }
+    while (!res.writableNeedDrain && queue.length > 0) {
+      const next = queue.dequeue(1)[0];
+      if (next) writeEvent(next);
+    }
+    if (!res.writableNeedDrain && queue.length > 0) setImmediate(flush);
+  };
+  const enqueue = (event: AgentEvent) => {
+    if (missionId && event.missionId !== missionId) return;
+    if (replaying && Number(event.sequence || 0) <= highWaterSequence) return;
+    queue.enqueue(event);
+    flush();
   };
   const unsubscribe = eventBus.on('*', (event: AgentEvent) => {
-    if (replaying) buffered.push(event);
-    else writeEvent(event);
+    enqueue(event);
   });
   if (missionId) {
-    while (true) {
-      const rows = sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events WHERE mission_id = ? AND sequence > ? ORDER BY sequence LIMIT 1000`)
-        .all(missionId, lastSequence) as Array<{ payload: string; sequence: number; schema_version: number }>;
-      for (const row of rows) writeEvent({ ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent);
-      if (rows.length < 1000) break;
-    }
-    replaying = false;
-    for (const event of buffered) writeEvent(event);
+    highWaterSequence = Number((sqlite.prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM mission_events WHERE mission_id = ?')
+      .get(missionId) as { sequence: number }).sequence);
   }
-  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15_000);
+  const onDrain = () => flush();
+  res.on('drain', onDrain);
+  const heartbeat = setInterval(() => {
+    if (!closed && !res.writableEnded && !res.writableNeedDrain) res.write(': heartbeat\n\n');
+  }, 15_000);
   req.on('close', () => {
+    closed = true;
     clearInterval(heartbeat);
+    res.off('drain', onDrain);
+    queue.clear();
     unsubscribe();
   });
+  if (missionId) void (async () => {
+    for (const rows of replayPages(lastSequence, highWaterSequence, (afterSequence, throughSequence) =>
+      sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events
+        WHERE mission_id = ? AND sequence > ? AND sequence <= ? ORDER BY sequence LIMIT 1000`)
+        .all(missionId, afterSequence, throughSequence) as Array<{ payload: string; sequence: number; schema_version: number }>)) {
+      for (const row of rows) {
+        if (closed || res.writableEnded) return;
+        const event = { ...JSON.parse(row.payload), sequence: row.sequence, schemaVersion: row.schema_version || 1 } as AgentEvent;
+        if (!writeEvent(event)) {
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              res.off('drain', done);
+              req.off('close', done);
+              resolve();
+            };
+            res.once('drain', done);
+            req.once('close', done);
+          });
+        }
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    replaying = false;
+    flush();
+  })().catch((error) => {
+    console.warn('[API Gateway] Failed to replay mission event stream:', error);
+    if (!res.writableEnded) res.end();
+  });
+});
+
+app.post('/api/approvals/:id/reconcile', async (req, res) => {
+  try {
+    const outcome = String(req.body?.outcome || '').toLowerCase();
+    if (outcome !== 'applied' && outcome !== 'not_applied') {
+      return void res.status(400).json({ error: "outcome must be 'applied' or 'not_applied'" });
+    }
+    const reconciled = reconcileApproval(req.params.id, outcome);
+    if (!reconciled) return void res.status(409).json({ error: 'Approval is not awaiting reconciliation.' });
+    const approval = reconciled.approval;
+    eventBus.emit({
+      id: crypto.randomUUID(),
+      type: 'approval_reconciled',
+      missionId: approval.mission_id,
+      approvalId: approval.id,
+      outcome,
+      timestamp: new Date().toISOString(),
+    });
+    if (outcome === 'applied') {
+      eventBus.emit({
+        id: crypto.randomUUID(),
+        type: 'approval_responded',
+        missionId: approval.mission_id,
+        approvalId: approval.id,
+        approved: approval.status === 'approved',
+        decidedBy: 'user',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    res.json({ success: true, outcome, approval });
+  } catch (error: any) {
+    res.status(400).json({ error: error?.message || 'Failed to reconcile approval' });
+  }
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -1617,42 +2933,181 @@ server.on('upgrade', async (request, socket, head) => {
 
 wss.on('connection', (ws: WebSocket) => {
   console.log('[API-Gateway] WebSocket client connected');
+  const queue = new BoundedEventQueue<AgentEvent>({
+    maxItems: 2_000,
+    maxBytes: 8 * 1024 * 1024,
+    sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), 'utf8'),
+  });
+  const MAX_BUFFERED_BYTES = 1 * 1024 * 1024;
+  let closed = false;
+  let slowClientTimer: ReturnType<typeof setTimeout> | undefined;
+  const flush = () => {
+    if (closed || ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      if (!slowClientTimer) {
+        slowClientTimer = setTimeout(() => {
+          slowClientTimer = undefined;
+          if (!closed && ws.readyState === WebSocket.OPEN && ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+            ws.close(1013, 'Client is too slow for the event stream.');
+          }
+        }, 1_000);
+      }
+      return;
+    }
+    if (slowClientTimer) {
+      clearTimeout(slowClientTimer);
+      slowClientTimer = undefined;
+    }
+    const dropped = queue.takeDroppedCount();
+    if (dropped > 0 && ws.bufferedAmount <= MAX_BUFFERED_BYTES) {
+      ws.send(JSON.stringify({ type: 'stream_gap', dropped }));
+    }
+    while (queue.length > 0 && ws.bufferedAmount <= MAX_BUFFERED_BYTES) {
+      const event = queue.dequeue(1)[0];
+      if (event) ws.send(JSON.stringify(event));
+    }
+    if (queue.length > 0) setTimeout(flush, 25);
+  };
   const unsubscribe = eventBus.on('*', (event: AgentEvent) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+    queue.enqueue(event);
+    flush();
   });
   ws.on('close', () => {
+    closed = true;
+    if (slowClientTimer) clearTimeout(slowClientTimer);
+    queue.clear();
     console.log('[API-Gateway] WebSocket client disconnected');
     unsubscribe();
   });
   ws.on('error', (err: unknown) => {
+    closed = true;
+    if (slowClientTimer) clearTimeout(slowClientTimer);
+    queue.clear();
     console.error('[API-Gateway] WebSocket error:', err);
     unsubscribe();
   });
 });
 
+type MissionRecovery = {
+  kind: 'publication_retry' | 'verification_retry' | 'task_retry';
+  label: string;
+  description: string;
+};
+
+function missionRecoveryFor(
+  missionId: string,
+  missionStatus: string,
+  tasks: Array<{ status?: string | null }>,
+): MissionRecovery | null {
+  if (!['blocked', 'failed'].includes(String(missionStatus))) return null;
+  if (isPostApplyVerificationPending(missionId)) {
+    return {
+      kind: 'verification_retry',
+      label: 'Resume verification',
+      description: 'The changes were applied; retry verification without rerunning completed agents.',
+    };
+  }
+
+  const failure = sqlite.prepare("SELECT payload FROM mission_events WHERE mission_id = ? AND type = 'mission_failed' ORDER BY sequence DESC LIMIT 1")
+    .get(missionId) as { payload?: string } | undefined;
+  let reason = '';
+  try { reason = failure?.payload ? String(JSON.parse(failure.payload).reason || '') : ''; } catch { /* Ignore malformed historical telemetry. */ }
+  if (reason === LEGACY_FAILURE) {
+    return {
+      kind: 'publication_retry',
+      label: 'Resume publication',
+      description: 'Resume the existing Builder output without rerunning completed agents.',
+    };
+  }
+
+  if (tasks.some((task) => ['blocked', 'failed', 'rejected', 'revision_requested'].includes(String(task.status)))) {
+    return {
+      kind: 'task_retry',
+      label: 'Retry failed tasks',
+      description: 'Retry only the failed or blocked tasks in the active plan.',
+    };
+  }
+  return null;
+}
+
 const isMain = shouldAutoStartGateway();
-setImmediate(() => {
+function isPostApplyVerificationPending(missionId: string): boolean {
+  const operation = sqlite.prepare(`SELECT 1 FROM apply_verification_operations
+    WHERE mission_id = ? AND apply_phase = 'applied' AND verification_phase IN ('pending', 'blocked')`)
+    .get(missionId);
+  return Boolean(operation);
+}
+
+async function recoverGatewayStartup(): Promise<void> {
   const recoveredAt = new Date().toISOString();
+  deletionStore.recoverInterrupted();
+  for (const operation of deletionStore.listIncomplete()) await executeDeletion(operation);
+  applyVerificationStore.recoverInterrupted();
+  await runtimeHost.reconcileStartup(new Date(recoveredAt));
   sqlite.transaction(() => {
     sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = COALESCE(error, 'Gateway restarted while command was starting') WHERE status = 'processing'")
       .run(recoveredAt);
-    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, error = COALESCE(error, 'Gateway restarted before completion was confirmed') WHERE status IN ('starting', 'running', 'stopping')")
+    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE status IN ('starting', 'running')")
       .run(recoveredAt);
-    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE status IN ('starting', 'running')").run(recoveredAt);
-    sqlite.prepare("UPDATE missions SET status = 'failed', completed_at = ?, active_run_id = NULL WHERE active_run_id IS NOT NULL")
-      .run(recoveredAt);
+    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, heartbeat_at = ?, error = COALESCE(error, 'Gateway restarted before run completion') WHERE status IN ('starting', 'running', 'stopping')")
+      .run(recoveredAt, recoveredAt);
+    sqlite.prepare(`UPDATE missions SET active_run_id = NULL, status = CASE
+        WHEN status IN ('planning', 'running', 'reviewing', 'revising') THEN 'ready' ELSE status END,
+        completed_at = CASE WHEN status IN ('planning', 'running', 'reviewing', 'revising', 'verifying') THEN NULL ELSE completed_at END
+      WHERE active_run_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM mission_runs WHERE mission_runs.id = missions.active_run_id
+          AND mission_runs.status IN ('starting', 'running', 'stopping')
+      )`).run();
   })();
+  const expiredAttempts = sqlite.prepare(`SELECT id, mission_id, task_id, agent_instance_id, error
+    FROM task_attempts WHERE status = 'expired' AND completed_at = ?`).all(recoveredAt) as Array<{
+      id: string; mission_id: string; task_id: string; agent_instance_id: string; error: string | null;
+    }>;
+  for (const attempt of expiredAttempts) {
+    const failure = {
+      id: `restart-${attempt.id}`,
+      type: 'task_failed' as const,
+      missionId: attempt.mission_id,
+      taskId: attempt.task_id,
+      agentInstanceId: attempt.agent_instance_id,
+      error: attempt.error || 'Runtime host restarted before session completion was confirmed',
+      timestamp: recoveredAt,
+    };
+    await orchestrator.handleTaskFailed(failure);
+    eventBus.emit(failure);
+  }
+  approvalOutbox.recoverInterrupted();
+  await orchestrator.recoverPendingCompletions();
+  const activePlans = sqlite.prepare(`SELECT id, plan_id, status FROM missions
+    WHERE status IN ('planning', 'ready', 'running', 'reviewing', 'revising', 'verifying', 'blocked') AND plan_id IS NOT NULL`)
+    .all() as Array<{ id: string; plan_id: string; status: string }>;
+  for (const mission of activePlans) {
+    if ((mission.status === 'verifying' || mission.status === 'blocked') && isPostApplyVerificationPending(mission.id)) {
+      await orchestrator.retryPostApplyVerification(mission.id).catch((error) => {
+        console.warn(`[API-Gateway] Post-apply verification remains pending for mission ${mission.id}:`, error);
+      });
+    }
+    else if (mission.status !== 'blocked') await orchestrator.reconcileMissionPlan(mission.id, mission.plan_id);
+  }
   const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
-  for (const row of pending) void drainMissionCommands(row.mission_id);
-});
+  for (const row of pending) await drainMissionCommands(row.mission_id);
+}
+
+const startupRecovery = recoverGatewayStartup();
 if (isMain && process.env.NODE_ENV !== 'test' && !server.listening) {
-  server.listen(PORT, '127.0.0.1', () => {
-    const ready = emitRuntimeReady(server, gatewayVersion());
-    const origin = ready?.origin || `http://127.0.0.1:${PORT}`;
-    console.log(`[API-Gateway] Server running on ${origin}`);
-    console.log(`[API-Gateway] WebSocket stream ready at ${origin.replace(/^http:/, 'ws:')}/ws/events`);
-    console.log(`[API-Gateway] SSE event stream ready at ${origin}/api/events/stream`);
+  startupRecovery.then(() => {
+    if (shutdownCoordinator.shuttingDown || server.listening) return;
+    server.listen(PORT, '127.0.0.1', () => {
+      const ready = emitRuntimeReady(server, gatewayVersion());
+      const origin = ready?.origin || `http://127.0.0.1:${PORT}`;
+      console.log(`[API-Gateway] Server running on ${origin}`);
+      console.log(`[API-Gateway] WebSocket stream ready at ${origin.replace(/^http:/, 'ws:')}/ws/events`);
+      console.log(`[API-Gateway] SSE event stream ready at ${origin}/api/events/stream`);
+    });
+  }).catch((error) => {
+    console.error('[API-Gateway] Startup recovery failed:', error);
+    void shutdownCoordinator.shutdown('startup-recovery-failed');
   });
 }
 
-export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator };
+export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator, startupRecovery, db };

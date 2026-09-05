@@ -13,6 +13,41 @@ on:
         required: true
         default: true
         type: boolean
+      expected_sha:
+        description: "Exact 40-character main commit SHA already accepted and validated by CI"
+        required: true
+        type: string
+      packaged_clean_install:
+        description: "Packaged clean install accepted on supported production platforms"
+        required: true
+        default: false
+        type: boolean
+      updater_round_trip:
+        description: "Signed updater install and rollback/round-trip accepted"
+        required: true
+        default: false
+        type: boolean
+      production_entitlement:
+        description: "Production authentication and entitlement accepted"
+        required: true
+        default: false
+        type: boolean
+      interactive_visual_keyboard:
+        description: "Interactive visual, theme, constrained-window, and keyboard acceptance completed"
+        required: true
+        default: false
+        type: boolean
+      signing_key_decision:
+        description: "Explicit production updater signing-key decision"
+        required: true
+        type: choice
+        options:
+          - rotate-before-release
+          - approved-production-key
+      signing_key_fingerprint:
+        description: "Approved updater public key SHA-256 fingerprint (64 hex characters)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,8 +61,43 @@ env:
   MANUAL_PRERELEASE: ${{ inputs.prerelease }}
 
 jobs:
+  readiness:
+    if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout exact accepted revision
+        # v4.4.0 (reviewed immutable commit)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.expected_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Require exact revision and explicit release acceptances
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACCEPT_PACKAGED_CLEAN_INSTALL: ${{ inputs.packaged_clean_install }}
+          ACCEPT_UPDATER_ROUND_TRIP: ${{ inputs.updater_round_trip }}
+          ACCEPT_PRODUCTION_ENTITLEMENT: ${{ inputs.production_entitlement }}
+          ACCEPT_INTERACTIVE_VISUAL_KEYBOARD: ${{ inputs.interactive_visual_keyboard }}
+          SIGNING_KEY_DECISION: ${{ inputs.signing_key_decision }}
+          SIGNING_KEY_FINGERPRINT: ${{ inputs.signing_key_fingerprint }}
+        run: node .github/scripts/release-readiness.mjs
+      - name: Require successful CI for the exact SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          count="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&status=success&per_page=100" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length' | awk '{ total += $1 } END { print total + 0 }')"
+          test "$count" -ge 1 || { echo "No successful ci.yml run exists for exact SHA $EXPECTED_SHA"; exit 1; }
+
   build:
     if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
+    needs: readiness
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +132,7 @@ jobs:
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ inputs.expected_sha }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -196,8 +267,9 @@ jobs:
 
   publish:
     if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
-    needs: build
+    needs: [readiness, build]
     runs-on: ubuntu-22.04
+    environment: production-release
     timeout-minutes: 15
     permissions:
       contents: write
@@ -219,6 +291,7 @@ jobs:
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ inputs.expected_sha }}
           persist-credentials: false
           fetch-depth: 1
 
@@ -229,14 +302,42 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Require signed Windows and Linux release packages
+      - name: Setup Node.js for local Tauri signature verification
+        # v4.4.0 (reviewed immutable commit)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.23.1
+          cache: npm
+
+      - name: Install locked Tauri verifier
+        run: npm ci --include=dev --include=optional --prefer-offline --no-audit --no-fund
+
+      - name: Enforce exact versioned artifact allowlist and record hashes
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$(find release-assets -type f \( -iname '*.exe' -o -iname '*.msi' \) -print -quit)"
-          test -n "$(find release-assets -type f -iname '*.AppImage' -print -quit)"
-          test -n "$(find release-assets -type f -iname '*.deb' -print -quit)"
-          test "$(find release-assets -type f -iname '*.sig' | wc -l)" -ge 4
+          node .github/scripts/validate-release-assets.mjs release-assets "$RELEASE_TAG"
+          cat release-assets/SHA256SUMS
+
+      - name: Verify every updater signature with the approved public key
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          SIGNING_KEY_FINGERPRINT: ${{ inputs.signing_key_fingerprint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_UPDATER_PUBLIC_KEY" || { echo "TAURI_UPDATER_PUBLIC_KEY is not configured"; exit 1; }
+          node - <<'NODE'
+          const crypto = require('node:crypto');
+          const actual = crypto.createHash('sha256').update(process.env.TAURI_UPDATER_PUBLIC_KEY.trim()).digest('hex').toUpperCase();
+          const expected = process.env.SIGNING_KEY_FINGERPRINT.replaceAll(':', '').toUpperCase();
+          if (actual !== expected) throw new Error(`Configured updater public key fingerprint ${actual} does not match approved ${expected}`);
+          console.log(`Approved updater public key fingerprint verified: ${actual}`);
+          NODE
+          while IFS= read -r -d '' package; do
+            test -s "$package.sig"
+            npx --no-install tauri signer verify -k "$TAURI_UPDATER_PUBLIC_KEY" "$package.sig" "$package"
+          done < <(find release-assets -maxdepth 1 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' \) -print0)
 
       - name: Generate stable updater manifest
         shell: bash
@@ -258,18 +359,25 @@ jobs:
             FLAGS+=(--prerelease)
           fi
 
-          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "AtrisAgent $RELEASE_TAG" \
-              --generate-notes \
-              "${FLAGS[@]}"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; immutable publication refuses replacement"
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG already exists; immutable publication requires a new version"
+            exit 1
           fi
 
-          mapfile -d '' RELEASE_ASSETS < <(find release-assets -type f -print0)
-          test "${#RELEASE_ASSETS[@]}" -gt 0
-          gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          mapfile -d '' RELEASE_ASSETS < <(find release-assets -maxdepth 1 -type f -print0)
+          expected_count=9
+          if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
+          test "${#RELEASE_ASSETS[@]}" -eq "$expected_count"
+          gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ inputs.expected_sha }}" \
+            --title "AtrisAgent $RELEASE_TAG" \
+            --generate-notes \
+            "${FLAGS[@]}"
 
       - name: Verify published release assets
         env:
@@ -277,11 +385,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          expected_count=9
+          if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
           ASSETS="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          test "$(wc -l <<< "$ASSETS")" -eq "$expected_count"
           grep -Eiq '\.(exe|msi)$' <<< "$ASSETS"
           grep -Eiq '\.AppImage$' <<< "$ASSETS"
           grep -Eiq '\.deb$' <<< "$ASSETS"
           grep -Eiq '\.sig$' <<< "$ASSETS"
+          grep -Fxq 'SHA256SUMS' <<< "$ASSETS"
           if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             grep -Fxq 'latest.json' <<< "$ASSETS"
           fi

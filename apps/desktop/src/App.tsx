@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { AppShell } from '@/components/layout/app-shell';
@@ -6,6 +6,9 @@ import { Sidebar } from '@/components/layout/sidebar';
 import { Titlebar } from '@/components/layout/titlebar';
 import { ChatTimeline } from '@/components/chat/chat-timeline';
 import { ChatComposer } from '@/components/composer/chat-composer';
+import { MissionStateStrip } from '@/components/mission/mission-state-strip';
+import { LiveProcesses } from '@/components/processes/live-processes';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { OnboardingModal } from '@/components/onboarding/OnboardingModal';
 import { InspectorPanel } from '@/components/inspector/inspector-panel';
 import { initEventListener, reconnectEventListener } from '@/lib/event-listener';
@@ -15,13 +18,7 @@ import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useMissionStore } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { ThemeProvider } from '@/components/theme-provider';
-import { AnalyticsDashboard } from '@/components/analytics/Dashboard';
-import { SettingsView } from '@/components/settings/SettingsView';
-import { AccountsView } from '@/components/accounts/AccountsView';
-import { AgentsView } from '@/components/agents/AgentsView';
-import { ProjectsView } from '@/components/projects/ProjectsView';
 import { CommandPalette } from '@/components/search/CommandPalette';
-import { DeveloperConsole } from '@/components/developer/DeveloperConsole';
 import { UpdateManager } from '@/components/update/UpdateManager';
 import { useAccountStore } from '@/stores/account-store';
 import { AuthSessionProvider, useAuthSession } from '@/lib/auth-session';
@@ -32,6 +29,16 @@ import { Loader2 } from 'lucide-react';
 import type { RuntimeBootstrap } from '@/lib/runtime-config';
 
 const RUNTIME_HEALTH_INTERVAL_MS = 8_000;
+const AnalyticsDashboard = lazy(() => import('@/components/analytics/Dashboard').then((module) => ({ default: module.AnalyticsDashboard })));
+const SettingsView = lazy(() => import('@/components/settings/SettingsView').then((module) => ({ default: module.SettingsView })));
+const AccountsView = lazy(() => import('@/components/accounts/AccountsView').then((module) => ({ default: module.AccountsView })));
+const AgentsView = lazy(() => import('@/components/agents/AgentsView').then((module) => ({ default: module.AgentsView })));
+const ProjectsView = lazy(() => import('@/components/projects/ProjectsView').then((module) => ({ default: module.ProjectsView })));
+const DeveloperConsole = lazy(() => import('@/components/developer/DeveloperConsole').then((module) => ({ default: module.DeveloperConsole })));
+
+function ViewLoading() {
+  return <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground" role="status" aria-live="polite"><Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />Loading view…</div>;
+}
 
 function AuthLoadingView() {
   return (
@@ -48,7 +55,13 @@ function WorkspaceApp() {
   const { shellState, session, error, isLoggingIn, isLoggingOut, login, logout, retry } = useAuthSession();
   const fetchWorkspaces = useWorkspaceStore((state) => state.fetchWorkspaces);
   const fetchMissions = useMissionStore((state) => state.fetchMissions);
+  const fetchCommandQueue = useMissionStore((state) => state.fetchCommandQueue);
   const activeView = useSettingsStore((state) => state.activeView);
+  const devMode = useSettingsStore((state) => state.devMode);
+  const activeMissionId = useMissionStore((state) => state.activeMissionId);
+  const [missionSurface, setMissionSurface] = useState<'chat' | 'processes'>('chat');
+
+  useEffect(() => setMissionSurface('chat'), [activeMissionId]);
 
   useEffect(() => {
     if (shellState !== 'workspace') return undefined;
@@ -57,10 +70,11 @@ function WorkspaceApp() {
       await fetchWorkspaces();
       const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
       await fetchMissions(workspaceId || undefined);
-      await useAccountStore.getState().fetchAccounts();
+      if (workspaceId) await fetchCommandQueue(workspaceId);
+      await useAccountStore.getState().fetchAccounts({ refreshModels: true });
     })();
     return disposeEvents;
-  }, [fetchWorkspaces, fetchMissions, shellState, session.token]);
+  }, [fetchCommandQueue, fetchWorkspaces, fetchMissions, shellState, session.token]);
 
   useEffect(() => {
     if (shellState !== 'workspace') return undefined;
@@ -78,7 +92,7 @@ function WorkspaceApp() {
       const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
       await Promise.allSettled([
         fetchMissions(workspaceId || undefined),
-        useAccountStore.getState().fetchAccounts(),
+        useAccountStore.getState().fetchAccounts({ refreshModels: true }),
       ]);
     };
 
@@ -86,10 +100,16 @@ function WorkspaceApp() {
       if (disposed || probing) return;
       probing = true;
       try {
+        const wasOffline = !useAccountStore.getState().serviceOnline;
         await checkApiHealth();
         if (!disposed) useAccountStore.getState().setServiceOnline(true);
+        // The first workspace hydration can race the local gateway startup.
+        // Once health recovers, reload the live catalog instead of leaving the
+        // composer with the empty cache it received during that race.
+        if (wasOffline && !disposed) await restoreClientState();
       } catch (healthError) {
-        if (!disposed) useAccountStore.getState().setServiceOnline(false, healthError instanceof Error ? healthError.message : 'Local service health check failed.');
+        const liveTransportConnected = useMissionStore.getState().transportStatus === 'connected';
+        if (!disposed && !liveTransportConnected) useAccountStore.getState().setServiceOnline(false, healthError instanceof Error ? healthError.message : 'Local service health check failed.');
         try {
           const recovered = await recoverRuntimeConnection();
           if (disposed || recovered.status !== 'ready') return;
@@ -99,7 +119,8 @@ function WorkspaceApp() {
           reconnectEventListener();
           await restoreClientState();
         } catch (recoveryError) {
-          if (!disposed) useAccountStore.getState().setServiceOnline(false, recoveryError instanceof Error ? recoveryError.message : 'Local runtime recovery failed.');
+          const liveTransportConnected = useMissionStore.getState().transportStatus === 'connected';
+          if (!disposed && !liveTransportConnected) useAccountStore.getState().setServiceOnline(false, recoveryError instanceof Error ? recoveryError.message : 'Local runtime recovery failed.');
         }
       } finally {
         probing = false;
@@ -130,25 +151,36 @@ function WorkspaceApp() {
         sidebar={<Sidebar />}
         main={
            <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-            <Titlebar />
-            <CommandPalette />
-            {activeView === 'dashboard' ? (
-              <AnalyticsDashboard />
-            ) : activeView === 'settings' ? (
-              <SettingsView />
-            ) : activeView === 'accounts' ? (
-              <AccountsView />
-            ) : activeView === 'agents' ? (
-              <AgentsView />
-            ) : activeView === 'projects' ? (
-              <ProjectsView />
-            ) : (
-              <>
-                <ChatTimeline />
-                <ChatComposer />
-              </>
-            )}
-            <DeveloperConsole />
+             <Titlebar />
+             <CommandPalette />
+             {activeView === 'chat' && activeMissionId ? (
+               <Tabs value={missionSurface} onValueChange={(value) => setMissionSurface(value as 'chat' | 'processes')} className="shrink-0 gap-0 border-b border-border bg-background px-3">
+                 <TabsList variant="line" className="h-9">
+                   <TabsTrigger value="chat" className="h-8 px-3 text-xs">Chat</TabsTrigger>
+                   <TabsTrigger value="processes" className="h-8 px-3 text-xs">Diagnostics</TabsTrigger>
+                 </TabsList>
+               </Tabs>
+             ) : null}
+             {activeView === 'chat' && missionSurface === 'chat' ? <MissionStateStrip /> : null}
+             <Suspense fallback={<ViewLoading />}>
+               {activeView === 'dashboard' ? (
+                 <AnalyticsDashboard />
+               ) : activeView === 'settings' ? (
+                 <SettingsView />
+               ) : activeView === 'accounts' ? (
+                 <AccountsView />
+               ) : activeView === 'agents' ? (
+                 <AgentsView />
+               ) : activeView === 'projects' ? (
+                 <ProjectsView />
+               ) : (
+                  missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : <>
+                    <ChatTimeline />
+                    <ChatComposer />
+                  </>
+               )}
+             </Suspense>
+             {devMode ? <Suspense fallback={null}><DeveloperConsole /></Suspense> : null}
           </main>
         }
         inspector={activeView === 'chat' ? <InspectorPanel /> : null}
