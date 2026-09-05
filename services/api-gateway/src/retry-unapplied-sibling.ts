@@ -3,7 +3,7 @@ import path from 'node:path';
 import type Database from 'better-sqlite3';
 import { validateDirectChildProjectName } from '@atris-agent-code/domain';
 
-const LEGACY_FAILURE = 'New sibling apply metadata or idempotency key is missing.';
+export const LEGACY_FAILURE = 'New sibling apply metadata or idempotency key is missing.';
 
 /** Narrow repair for the legacy auto-apply bug, not a generic replay of failed writes. */
 export function claimUnappliedSiblingRetry(
@@ -13,7 +13,7 @@ export function claimUnappliedSiblingRetry(
 ): boolean {
   return sqlite.transaction(() => {
     const mission = sqlite.prepare('SELECT * FROM missions WHERE id = ?').get(missionId) as any;
-    if (!mission || mission.status !== 'blocked' || !mission.plan_id || mission.active_run_id) return false;
+    if (!mission || !['blocked', 'failed'].includes(String(mission.status)) || !mission.plan_id || mission.active_run_id) return false;
     const failure = sqlite.prepare("SELECT payload FROM mission_events WHERE mission_id = ? AND type = 'mission_failed' ORDER BY sequence DESC LIMIT 1")
       .get(missionId) as { payload: string } | undefined;
     if (!failure || JSON.parse(failure.payload).reason !== LEGACY_FAILURE) return false;
@@ -68,7 +68,7 @@ export function claimUnappliedSiblingRetry(
       }
     }
     // Transaction owns the transition; a second retry cannot claim this plan.
-    return sqlite.prepare("UPDATE missions SET status = 'applying', completed_at = NULL, updated_at = ? WHERE id = ? AND plan_id = ? AND status = 'blocked' AND active_run_id IS NULL")
+    return sqlite.prepare("UPDATE missions SET status = 'applying', completed_at = NULL, updated_at = ? WHERE id = ? AND plan_id = ? AND status IN ('blocked', 'failed') AND active_run_id IS NULL")
       .run(new Date().toISOString(), missionId, mission.plan_id).changes === 1;
   })();
 }

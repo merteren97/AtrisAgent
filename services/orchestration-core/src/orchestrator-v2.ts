@@ -1929,14 +1929,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!resumingVerification) await manager.updateMission(missionId, { status: 'applying' });
     for (const task of resumingVerification ? [] : tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
       await this.assertMissionActionCurrent(missionId, runId);
-      const operation = options?.operationId || options?.idempotencyKey
-        ? {
-          operationId: options.operationId,
-          idempotencyKey: options.idempotencyKey
-            ? `${options.idempotencyKey}:task:${task.id}`
-            : undefined,
-        }
-        : undefined;
+      const operation = this.applyOperationForTask(missionId, mission.planId, task.id, options);
       const result = await applyTaskChanges(task.id, operation);
       await this.assertMissionActionCurrent(missionId, runId);
       if (!result.success) {

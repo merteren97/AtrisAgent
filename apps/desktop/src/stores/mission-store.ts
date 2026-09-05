@@ -20,6 +20,12 @@ export type MissionStatus =
   | 'failed'
   | 'cancelled';
 
+export interface MissionRecovery {
+  kind: 'publication_retry' | 'verification_retry' | 'task_retry';
+  label: string;
+  description: string;
+}
+
 export interface Mission {
   id: string;
   workspaceId: string;
@@ -32,6 +38,7 @@ export interface Mission {
   taskCount?: number;
   description?: string;
   planId?: string | null;
+  recovery?: MissionRecovery | null;
   deletionState?: ConversationDeletionState;
 }
 
@@ -186,7 +193,7 @@ interface MissionState {
   refreshMission: (missionId: string) => Promise<Mission>;
   fetchCommandQueue: (workspaceId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
-  continueMission: (missionId: string, request: string, options?: StartMissionOptions, skipOptimisticUserMessage?: boolean) => Promise<void>;
+  continueMission: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
   queueMissionTurn: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
   sendMissionCommand: (missionId: string, request: string, delivery: TurnDelivery, options?: StartMissionOptions) => Promise<void>;
   drainQueuedTurn: (missionId: string) => Promise<void>;
@@ -209,6 +216,7 @@ interface MissionState {
 }
 
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
+const CONTINUABLE_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled', 'blocked']);
 let commandQueueRequestId = 0;
 const missionStateRequestIds = new Map<string, number>();
 
@@ -923,7 +931,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 
-  continueMission: async (missionId, request, options, skipOptimisticUserMessage = false) => {
+  continueMission: async (missionId, request, options) => {
     const trimmed = request.trim();
     if (!trimmed) return;
     const mission = get().missions.find((item) => item.id === missionId);
@@ -931,111 +939,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       set({ error: 'The selected conversation no longer exists.' });
       return;
     }
-    if (!TERMINAL_CONVERSATION_STATUSES.has(mission.status)) {
+    if (!CONTINUABLE_CONVERSATION_STATUSES.has(mission.status)) {
       set({ error: 'The current turn is still executing. Send the request through the queued-turn path instead.' });
       return;
     }
-
-    const clientMessageId = crypto.randomUUID();
-    const userMessage: TimelineItem = {
-      id: clientMessageId,
-      type: 'user_message',
-      content: trimmed,
-      timestamp: nowLabel(),
-      metadata: {
-        targetRole: options?.targetRole,
-        routeRole: options?.routeRole,
-        routeScope: options?.routeScope,
-        command: options?.command,
-        modelCatalogId: options?.model,
-        reasoningLevel: options?.reasoningLevel,
-        agentProfileIds: normalizeAgentProfileIds(options?.agentProfileIds),
-        clientMessageId,
-      },
-    };
-
-    set((state) => ({
-      loading: true,
-      error: null,
-      activeTasks: [],
-      timeline: skipOptimisticUserMessage ? state.timeline : [...state.timeline, userMessage],
-      pendingMissionStart: null,
-      missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'starting' } : item),
-    }));
-
-    try {
-      const response = await apiRequestWithHeaders<MissionStartResponse>(`/missions/${missionId}/start`, {
-        method: 'POST',
-        body: JSON.stringify(buildMissionRequestBody(trimmed, mission.workspaceId, options, clientMessageId)),
-      });
-      const data = response.data;
-      if (missionStartDisposition(response.status, data) !== 'accepted') {
-        throw new Error(data.message || 'The conversation turn was not accepted.');
-      }
-
-      set((state) => ({
-        loading: false,
-        activeMissionId: missionId,
-        hydratedMissionId: null,
-        activeTasks: data.tasks || [],
-        error: null,
-        pendingMissionStart: null,
-        missions: state.missions.map((item) => item.id === missionId
-          ? {
-            ...item,
-            status: statusFromStartResponse(data, response.status, 'planning'),
-            planId: data.planId ?? item.planId ?? null,
-            taskCount: data.tasks?.length || 0,
-          }
-          : item),
-      }));
-      void get().fetchCommandQueue(mission.workspaceId);
-      await get().fetchMissionState(missionId);
-    } catch (error: any) {
-      const message = error?.message || 'The local AtrisAgent service is unavailable.';
-      if (isApiRequestTimeout(error)) {
-        const pendingCard: TimelineItem = {
-          id: crypto.randomUUID(),
-          type: 'event',
-          content: 'Conversation turn request timed out. The local service may still be processing it; refresh the mission before retrying.',
-          timestamp: nowLabel(),
-          eventType: 'turn_start_pending',
-          agentRole: 'orchestrator',
-          metadata: { pending: true, clientMessageId, missionId },
-        };
-        set((state) => ({
-          timeline: [...state.timeline, pendingCard],
-          missions: state.missions.map((item) => item.id === missionId ? { ...item, status: 'starting' } : item),
-          loading: false,
-          error: null,
-          pendingMissionStart: {
-            clientMessageId,
-            request: trimmed,
-            workspaceId: mission.workspaceId,
-            missionId,
-            kind: 'continue',
-            reason: 'deadline',
-            startedAt: new Date().toISOString(),
-          },
-        }));
-        return;
-      }
-      const errorCard: TimelineItem = {
-        id: crypto.randomUUID(),
-        type: 'event',
-        content: `Conversation turn could not start: ${message}`,
-        timestamp: nowLabel(),
-        eventType: 'mission_failed',
-        agentRole: 'orchestrator',
-      };
-      set((state) => ({
-        timeline: [...state.timeline, errorCard],
-        missions: state.missions.map((item) => item.id === missionId ? mission : item),
-        loading: false,
-        error: message,
-        pendingMissionStart: null,
-      }));
-    }
+    // Continuations are durable commands. The synchronous start endpoint waits
+    // for provider/orchestrator work and can outlive the desktop HTTP deadline,
+    // while the queue endpoint acknowledges ownership immediately and is
+    // idempotent by design.
+    await get().sendMissionCommand(missionId, trimmed, 'queue', options);
   },
 
   queueMissionTurn: async (missionId, request, options) => {
@@ -1048,6 +960,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     const safeOptions = normalizeMissionOptions(options);
     const queueId = crypto.randomUUID();
     const queuedAt = new Date().toISOString();
+    const previousMissionStatus = get().missions.find((mission) => mission.id === missionId)?.status;
     const userMessage: TimelineItem = {
       id: `queued-user-${queueId}`,
       type: 'user_message',
@@ -1079,6 +992,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       error: null,
       queuedTurns: delivery === 'queue' ? [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options: safeOptions, queuedAt }] : state.queuedTurns,
       timeline: [...state.timeline, userMessage, queuedCard],
+      activeTasks: delivery === 'queue' && CONTINUABLE_CONVERSATION_STATUSES.has(state.missions.find((mission) => mission.id === missionId)?.status || 'draft')
+        ? []
+        : state.activeTasks,
+      missions: state.missions.map((mission) => mission.id === missionId
+        && CONTINUABLE_CONVERSATION_STATUSES.has(mission.status)
+        ? { ...mission, status: 'starting' }
+        : mission),
     }));
 
     try {
@@ -1102,6 +1022,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         timeline: state.timeline.map((item) => item.metadata?.queueId === queueId
           ? { ...item, eventType: item.type === 'event' ? 'turn_cancelled' : item.eventType, content: item.type === 'event' ? `Message could not be delivered: ${error?.message || 'Service unavailable.'}` : item.content, metadata: { ...item.metadata, queued: false, starting: false, failed: true } }
           : item),
+        missions: state.missions.map((mission) => mission.id === missionId && mission.status === 'starting' && previousMissionStatus
+          ? { ...mission, status: previousMissionStatus }
+          : mission),
         error: error?.message || 'Message delivery failed.',
       }));
     }
@@ -1314,7 +1237,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   retryMission: async (id) => {
     try {
       await apiRequest(`/missions/${id}/retry`, { method: 'POST' });
-      set((state) => ({ missions: state.missions.map((mission) => mission.id === id ? { ...mission, status: 'running' } : mission) }));
+      set((state) => ({ missions: state.missions.map((mission) => {
+        if (mission.id !== id) return mission;
+        const status = mission.recovery?.kind === 'publication_retry' ? 'applying'
+          : mission.recovery?.kind === 'verification_retry' ? 'verifying' : 'running';
+        return { ...mission, status };
+      }) }));
       await get().fetchMissionState(id);
     } catch (error: any) {
       const message = error?.message || 'Mission retry failed.';

@@ -85,6 +85,21 @@ export interface ApplyTaskChangesContext {
 const TERMINAL_TASK_STATUSES = new Set(['done', 'superseded', 'cancelled', 'rejected']);
 const ACTIVE_TASK_STATUSES = new Set(['claimed', 'running', 'review', 'revision_requested', 'verified', 'applied']);
 
+function applyOperationForTask(
+  missionId: string,
+  planId: string | null | undefined,
+  taskId: string,
+  options?: ApplyTaskChangesContext,
+): ApplyTaskChangesContext {
+  const operationId = options?.operationId || `apply-verify:${missionId}:${planId || 'unknown'}`;
+  const baseKey = options?.idempotencyKey || operationId;
+  const taskSuffix = `:task:${taskId}`;
+  return {
+    operationId,
+    idempotencyKey: baseKey.endsWith(taskSuffix) ? baseKey : `${baseKey}${taskSuffix}`,
+  };
+}
+
 /**
  * Generate default rule-based task template.
  */
@@ -1573,6 +1588,15 @@ export class Orchestrator {
     await this.assignTask(taskId, task?.assignedRole ?? 'builder');
   }
 
+  protected applyOperationForTask(
+    missionId: string,
+    planId: string | null | undefined,
+    taskId: string,
+    options?: ApplyTaskChangesContext,
+  ): ApplyTaskChangesContext {
+    return applyOperationForTask(missionId, planId, taskId, options);
+  }
+
   async handleApprovalDecision(
     missionId: string,
     approvalType: string,
@@ -1638,14 +1662,7 @@ export class Orchestrator {
 
       await this.workspaceManager.updateMission(missionId, { status: 'applying' });
       for (const task of tasks.filter((item) => item.assignedRole === 'builder' && item.status === 'done')) {
-        const operation = options?.operationId || options?.idempotencyKey
-          ? {
-            operationId: options.operationId,
-            idempotencyKey: options.idempotencyKey
-              ? `${options.idempotencyKey}:task:${task.id}`
-              : undefined,
-          }
-          : undefined;
+        const operation = this.applyOperationForTask(missionId, mission?.planId, task.id, options);
         const result = await this.applyTaskChanges(task.id, operation);
         if (!result.success) {
           await this.workspaceManager.updateMission(missionId, { status: 'blocked' });

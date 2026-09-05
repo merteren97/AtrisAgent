@@ -102,6 +102,10 @@ async function runTests() {
         }
         eventBus.emit({ id: crypto.randomUUID(), type: 'mission_failed', missionId: mission.id,
           reason: 'New sibling apply metadata or idempotency key is missing.', failedTaskId: builder.id, timestamp: new Date().toISOString() });
+        const stateResponse = await authorizedFetch(`${baseUrl}/api/missions/${mission.id}`);
+        const stateBody = await stateResponse.json();
+        assert(stateResponse.status === 200 && stateBody.mission?.recovery?.kind === 'publication_retry',
+          'Blocked legacy publication failures expose an explicit resume recovery action');
         const retry = await authorizedFetch(`${baseUrl}/api/missions/${mission.id}/retry`, { method: 'POST' });
         const body = await retry.json();
         if (retry.status !== 200) console.error('Publication retry fixture error:', body);

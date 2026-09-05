@@ -34,6 +34,7 @@ export function AccountsView() {
     runtimes,
     discoveredModels,
     loading,
+    modelCatalogLoading,
     serviceOnline,
     error,
     fetchAccounts,
@@ -297,8 +298,8 @@ export function AccountsView() {
         <section className="space-y-3">
           <div className="flex items-center justify-between">
             <div><h2 className="text-lg font-semibold">Account profiles</h2><p className="text-xs text-muted-foreground">{connectedCount} connected · {discoveredModels.length} catalog routes</p></div>
-            <Button variant="ghost" size="sm" disabled={!connectedCount} onClick={() => runAction('all-models', () => refreshModels(), 'All connected model catalogs refreshed.')}>
-              <Activity className="mr-2 h-4 w-4" /> Refresh catalogs
+            <Button variant="ghost" size="sm" disabled={!connectedCount || modelCatalogLoading} onClick={() => runAction('all-models', () => refreshModels(), 'All connected model catalogs refreshed.')}>
+              <Activity className={cn('mr-2 h-4 w-4', modelCatalogLoading && 'animate-pulse')} /> {modelCatalogLoading ? 'Refreshing catalogs…' : 'Refresh catalogs'}
             </Button>
           </div>
 

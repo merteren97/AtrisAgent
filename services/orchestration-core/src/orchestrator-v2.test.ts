@@ -1057,6 +1057,29 @@ async function runTests() {
       'Cancellation during apply emits no stale apply or completion event');
   }
 
+  // Automatic/manual apply must carry deterministic new-sibling metadata even
+  // when the optional durable apply-verification coordinator is unavailable.
+  {
+    const missionId = 'mission-apply-fallback-operation';
+    const planId = 'plan-apply-fallback-operation';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission = { ...manager.mission, status: 'waiting_for_approval' };
+    manager.tasks.set('builder', task({ id: 'builder', missionId, planId, role: 'builder', status: 'done' }));
+    manager.tasks.set('reviewer', task({ id: 'reviewer', missionId, planId, role: 'reviewer', status: 'done' }));
+    manager.tasks.set('qa', task({ id: 'qa', missionId, planId, role: 'qa', status: 'done' }));
+    let operationContext: { operationId?: string; idempotencyKey?: string } | undefined;
+    const orchestrator = new OrchestratorV2({
+      workspacePath: 'test',
+      workspaceManager: manager as unknown as WorkspaceManager,
+      applyTaskChanges: async (_taskId, operation) => { operationContext = operation; return { success: true }; },
+      postApplyVerification: async () => ({ passed: true, summary: 'Fallback apply verified', evidence: ['fallback'] }),
+    }, new LocalEventBus(), undefined, manager as unknown as WorkspaceManager);
+    await orchestrator.handleApprovalDecision(missionId, 'apply', true);
+    assert(operationContext?.operationId === `apply-verify:${missionId}:${planId}`
+      && operationContext.idempotencyKey === `apply-verify:${missionId}:${planId}:task:builder`,
+    'Apply fallback always supplies deterministic operation and idempotency metadata');
+  }
+
   // Apply completion waits for base-workspace evidence. Restarting from the
   // durable verifying state retries verification without applying twice.
   {

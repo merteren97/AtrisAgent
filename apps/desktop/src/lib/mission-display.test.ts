@@ -26,6 +26,11 @@ assert.equal(isMissionCancellable('starting'), true);
 assert.equal(canRetryMission('failed', ['done', 'rejected']), true);
 assert.equal(canRetryMission('completed', ['rejected']), false);
 assert.equal(canRetryMission('failed', ['done']), false);
+assert.equal(canRetryMission('blocked', ['done'], {
+  kind: 'publication_retry',
+  label: 'Resume publication',
+  description: 'Resume the existing Builder output.',
+}), true, 'publication recovery is retryable even when every worker already completed');
 assert.equal(projectMissionLifecycle('starting').label, 'Starting');
 assert.equal(projectMissionLifecycle('starting').isPending, true);
 assert.equal(projectMissionLifecycle('completed').isTerminal, true);

@@ -1,4 +1,4 @@
-import type { MissionStatus, TimelineItem } from '@/stores/mission-store';
+import type { MissionRecovery, MissionStatus, TimelineItem } from '@/stores/mission-store';
 
 export type EffectiveTaskStatus = 'completed' | 'preparing' | 'running' | 'failed' | 'cancelled' | 'planned';
 
@@ -69,7 +69,8 @@ export function isMissionCancellable(status: MissionStatus): boolean {
   return CANCELLABLE_STATUSES.has(status);
 }
 
-export function canRetryMission(status: MissionStatus, taskStatuses: string[]): boolean {
+export function canRetryMission(status: MissionStatus, taskStatuses: string[], recovery?: MissionRecovery | null): boolean {
+  if (recovery && (status === 'blocked' || status === 'failed')) return true;
   return (status === 'blocked' || status === 'failed') && taskStatuses.some((taskStatus) => RETRYABLE_TASK_STATUSES.has(taskStatus));
 }
 

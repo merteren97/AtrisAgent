@@ -131,6 +131,7 @@ async function runTests() {
   const resolutionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-path-resolution-'));
   try {
     fs.writeFileSync(path.join(resolutionRoot, 'atris-cli.cmd'), '@echo off\r\n', 'utf8');
+    fs.writeFileSync(path.join(resolutionRoot, 'atris-cli.ps1'), 'Write-Output ignored\r\n', 'utf8');
     const resolvedBareCommand = prepareRuntimeCommand(
       'atris-cli',
       ['--version'],
@@ -140,7 +141,7 @@ async function runTests() {
     assert(resolvedBareCommand.command === 'powershell.exe', 'resolves a bare Windows CLI name before entering the static bridge');
     assert(
       decodeBase64(resolvedBareCommand.env?.ATRIS_RUNTIME_COMMAND_B64).endsWith('atris-cli.cmd'),
-      'keeps the resolved PATH shim as an opaque bridge value',
+      'prefers the native cmd shim when a PowerShell shim would collapse argv',
     );
   } finally {
     fs.rmSync(resolutionRoot, { recursive: true, force: true });

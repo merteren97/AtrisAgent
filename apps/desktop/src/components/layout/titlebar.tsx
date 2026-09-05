@@ -51,7 +51,7 @@ export function Titlebar() {
   const canStop = Boolean(activeMission && isMissionCancellable(activeMission.status));
   const canCancelBeforeStart = Boolean(activeMission && ['draft', 'queued', 'starting'].includes(activeMission.status));
   const canRetry = Boolean(activeMission && hydratedMissionId === activeMission.id
-    && canRetryMission(activeMission.status, activeTasks.map((task) => task.status)));
+    && canRetryMission(activeMission.status, activeTasks.map((task) => task.status), activeMission.recovery));
   const viewTitle = activeView === 'dashboard' ? 'Command Center'
     : activeView === 'projects' ? 'Projects'
       : activeView === 'agents' ? 'Agents'
@@ -173,7 +173,15 @@ export function Titlebar() {
           </Button>
         )}
         {showMissionControls && canRetry && (
-          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('retry')} disabled={Boolean(pendingAction)} title={t('Retry')} aria-label="Retry failed mission tasks">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 shrink-0"
+            onClick={() => void runMissionAction('retry')}
+            disabled={Boolean(pendingAction)}
+            title={activeMission?.recovery?.label || t('Retry')}
+            aria-label={activeMission?.recovery?.description || 'Retry failed mission tasks'}
+          >
             <RotateCcw className="h-3.5 w-3.5" />
           </Button>
         )}

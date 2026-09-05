@@ -34,6 +34,10 @@ target/
 **/.cache/
 **/.npm-cache/
 **/next-dev-cache/
+
+# Local test scratch and runtime data; never part of the source tree.
+/.codex-api-test-tmp/
+
 .DS_Store
 *.log
 .turbo/

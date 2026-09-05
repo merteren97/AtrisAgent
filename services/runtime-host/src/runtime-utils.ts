@@ -175,9 +175,12 @@ export function normalizeExecutablePath(rawCommand: string): string {
 function commandPriority(candidate: string): number {
   const extension = path.extname(normalizeExecutablePath(candidate)).toLowerCase();
   if (extension === '.exe' || extension === '.com') return 0;
-  if (extension === '.ps1') return 1;
-  if (extension === '.cmd') return 2;
-  if (extension === '.bat') return 3;
+  // PowerShell script shims can collapse multiple argv values when invoked
+  // through the non-interactive bridge (for example `npm run check`). Prefer
+  // the native cmd launcher when both wrappers are available.
+  if (extension === '.cmd') return 1;
+  if (extension === '.bat') return 2;
+  if (extension === '.ps1') return 3;
   return 4;
 }
 
@@ -216,7 +219,7 @@ function resolveWindowsExecutableSync(command: string, env: NodeJS.ProcessEnv): 
     .split(';')
     .map(normalizeExecutablePath)
     .filter(Boolean);
-  const extensions = ['.exe', '.com', '.ps1', '.cmd', '.bat'];
+  const extensions = ['.exe', '.com', '.cmd', '.bat', '.ps1'];
   for (const directory of directories) {
     for (const extension of extensions) {
       const candidate = path.join(directory, `${command}${extension}`);

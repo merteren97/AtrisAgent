@@ -1249,6 +1249,7 @@ export class WorkspaceManager {
     const targetKey = task.targetDescriptor.projectName.toLocaleLowerCase('en-US');
     const duplicates = (await this.listTasks(task.missionId))
       .filter((candidate) => candidate.assignedRole === 'builder'
+        && candidate.planId === task.planId
         && candidate.targetDescriptor?.kind === 'new_sibling_project'
         && candidate.targetDescriptor.projectName.toLocaleLowerCase('en-US') === targetKey
         && !['cancelled', 'rejected', 'superseded'].includes(String(candidate.status)))

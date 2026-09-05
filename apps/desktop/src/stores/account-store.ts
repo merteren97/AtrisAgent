@@ -51,10 +51,13 @@ interface AccountState {
   runtimes: RuntimeStatus[];
   discoveredModels: DiscoveredModel[];
   loading: boolean;
+  modelCatalogLoading: boolean;
+  modelCatalogReady: boolean;
+  modelCatalogError: string | null;
   serviceOnline: boolean;
   error: string | null;
   setServiceOnline: (online: boolean, error?: string | null) => void;
-  fetchAccounts: () => Promise<void>;
+  fetchAccounts: (options?: { refreshModels?: boolean }) => Promise<void>;
   discoverModels: () => void;
   discoverLocalClis: () => Promise<void>;
   addProfile: (
@@ -143,13 +146,21 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
   runtimes: [],
   discoveredModels: [],
   loading: false,
+  modelCatalogLoading: false,
+  modelCatalogReady: false,
+  modelCatalogError: null,
   serviceOnline: false,
   error: null,
 
   setServiceOnline: (online, error = null) => set({ serviceOnline: online, error: error ?? (online ? null : get().error) }),
 
-  fetchAccounts: async () => {
-    set({ loading: true, error: null });
+  fetchAccounts: async (options = {}) => {
+    const shouldRefreshModels = options.refreshModels === true;
+    set({
+      loading: true,
+      error: null,
+      ...(shouldRefreshModels ? { modelCatalogLoading: true, modelCatalogError: null } : {}),
+    });
     try {
       // Gateway liveness and catalog freshness are different concerns. Once
       // health succeeds, an individual discovery endpoint may degrade without
@@ -158,32 +169,43 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
       const [accountsResult, runtimesResult, modelsResult] = await Promise.allSettled([
         apiRequest<AccountProfile[]>('/accounts'),
         apiRequest<RuntimeStatus[]>('/runtimes'),
-        apiRequest<ModelDescriptor[]>('/models'),
+        apiRequest<ModelDescriptor[]>(shouldRefreshModels ? '/models?refresh=true' : '/models'),
       ]);
       const current = get();
       const accounts = accountsResult.status === 'fulfilled' ? accountsResult.value : current.accounts;
       const runtimes = runtimesResult.status === 'fulfilled' ? runtimesResult.value : current.runtimes;
-      const discoveredModels = modelsResult.status === 'fulfilled'
+      // A cache read that races a live startup refresh must not overwrite the
+      // verified catalog when it completes later. Before the first live
+      // refresh, cached routes are still useful as an interim UI snapshot.
+      const applyModels = modelsResult.status === 'fulfilled'
+        && (shouldRefreshModels || !current.modelCatalogReady);
+      const discoveredModels = applyModels
         ? mapModels(modelsResult.value, accounts)
         : current.discoveredModels;
       const endpointErrors = [accountsResult, runtimesResult, modelsResult]
         .map(rejectionMessage)
         .filter((value): value is string => Boolean(value));
+      const modelError = rejectionMessage(modelsResult);
       set({
         accounts,
         runtimes,
         discoveredModels,
         serviceOnline: true,
         loading: false,
+        modelCatalogLoading: shouldRefreshModels ? false : current.modelCatalogLoading,
+        modelCatalogReady: shouldRefreshModels ? true : current.modelCatalogReady,
+        modelCatalogError: shouldRefreshModels ? (modelError || null) : current.modelCatalogError,
         error: endpointErrors.length
           ? `Local service is online, but some runtime data could not be refreshed. Showing cached data. ${endpointErrors[0]}`
           : null,
       });
     } catch (error: any) {
+      const message = error?.message || 'AtrisAgent local service is unavailable. Cached profiles and model routes are shown below.';
       set({
         serviceOnline: false,
         loading: false,
-        error: error?.message || 'AtrisAgent local service is unavailable. Cached profiles and model routes are shown below.',
+        ...(shouldRefreshModels ? { modelCatalogLoading: false, modelCatalogReady: false, modelCatalogError: message } : {}),
+        error: message,
       });
     }
   },
@@ -272,6 +294,7 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
   },
 
   refreshModels: async (profileId) => {
+    set({ modelCatalogLoading: true, modelCatalogError: null });
     try {
       if (profileId) {
         await apiRequest(`/accounts/${profileId}/models/refresh`, { method: 'POST' });
@@ -280,9 +303,18 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
       }
       const accounts = await apiRequest<AccountProfile[]>('/accounts');
       const models = await apiRequest<ModelDescriptor[]>('/models');
-      set({ accounts, discoveredModels: mapModels(models, accounts), serviceOnline: true, error: null });
+      set({
+        accounts,
+        discoveredModels: mapModels(models, accounts),
+        modelCatalogLoading: false,
+        modelCatalogReady: true,
+        modelCatalogError: null,
+        serviceOnline: true,
+        error: null,
+      });
     } catch (error: any) {
-      set({ error: error?.message || 'Model catalog refresh failed.' });
+      const message = error?.message || 'Model catalog refresh failed.';
+      set({ modelCatalogLoading: false, modelCatalogReady: true, modelCatalogError: message, error: message });
       throw error;
     }
   },

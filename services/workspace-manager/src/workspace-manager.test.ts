@@ -145,6 +145,54 @@ async function runTests() {
     sqlite.prepare('DELETE FROM agent_profile_bindings').run();
     sqlite.prepare('DELETE FROM agent_profiles').run();
     const attemptWorkspace = profileWorkspace;
+    const targetScopeMission = await attemptManager.createMission({
+      id: 'target-scope-mission',
+      workspaceId: attemptWorkspace.id,
+      title: 'Plan-scoped Builder target ownership',
+    });
+    await attemptManager.createTask({
+      id: 'previous-plan-builder',
+      missionId: targetScopeMission.id,
+      planId: 'previous-plan',
+      title: 'Create AtrisTask (previous plan)',
+      assignedRole: 'builder',
+      status: 'done',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+    });
+    const followUpBuilder = await attemptManager.createTask({
+      id: 'follow-up-builder',
+      missionId: targetScopeMission.id,
+      planId: 'follow-up-plan',
+      title: 'Create AtrisTask (follow-up plan)',
+      assignedRole: 'builder',
+      status: 'planned',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' },
+    });
+    let crossPlanRejected = false;
+    try { await attemptManager.preflightTaskTarget(followUpBuilder.id); } catch { crossPlanRejected = true; }
+    assert(!crossPlanRejected, 'a completed Builder from a previous conversation plan does not block a new plan target');
+    await attemptManager.createTask({
+      id: 'a-same-plan-owner',
+      missionId: targetScopeMission.id,
+      planId: 'same-plan',
+      title: 'Same-plan target owner',
+      assignedRole: 'builder',
+      status: 'done',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'SamePlanTarget' },
+    });
+    const samePlanDuplicate = await attemptManager.createTask({
+      id: 'b-same-plan-duplicate',
+      missionId: targetScopeMission.id,
+      planId: 'same-plan',
+      title: 'Same-plan target duplicate',
+      assignedRole: 'builder',
+      status: 'planned',
+      targetDescriptor: { kind: 'new_sibling_project', projectName: 'SamePlanTarget' },
+    });
+    let samePlanRejected = false;
+    try { await attemptManager.preflightTaskTarget(samePlanDuplicate.id); } catch { samePlanRejected = true; }
+    assert(samePlanRejected, 'duplicate Builder targets remain rejected within the same execution plan');
+
     const attemptTasks = await Promise.all([0, 1, 2].map((index) => attemptManager.createTask({
       id: `attempt-task-${index}`,
       missionId: attemptMission.id,

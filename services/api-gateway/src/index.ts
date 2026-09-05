@@ -49,7 +49,7 @@ import { persistRuntimeTelemetry } from './runtime-telemetry-store';
 import { ApprovalOutbox, type ApprovalDecision } from './approval-outbox';
 import { verifyAppliedMission } from './post-apply-verification';
 import { ApplyVerificationOperationStore, executeApplyVerificationOperation } from './apply-verification-operation';
-import { claimUnappliedSiblingRetry } from './retry-unapplied-sibling';
+import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-sibling';
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 
 import path from 'path';
@@ -832,7 +832,7 @@ const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 // claimed and the orchestrator has materialized the first turn. Keeping this
 // status drainable lets the existing command lifecycle do the actual work
 // without making the HTTP request wait for provider startup.
-const DRAINABLE_MISSION_STATUSES = new Set(['draft', 'ready', 'planning', ...TERMINAL_MISSION_STATUSES]);
+const DRAINABLE_MISSION_STATUSES = new Set(['draft', 'ready', 'planning', 'blocked', ...TERMINAL_MISSION_STATUSES]);
 const missionDrains = new Map<string, Promise<void>>();
 const missionTurnOperations = new Map<string, Set<Promise<void>>>();
 const missionStartIdempotencyOperations = new Map<string, Promise<Record<string, unknown>>>();
@@ -1442,7 +1442,13 @@ app.get('/api/missions/:id', async (req: Request, res: Response) => {
     const missionId = routeParam(req.params.id);
     const state = await orchestrator.getMissionState(missionId);
     if (!state.mission) return void res.status(404).json({ error: 'Mission not found' });
-    res.json(state);
+    res.json({
+      ...state,
+      mission: {
+        ...state.mission,
+        recovery: missionRecoveryFor(missionId, state.mission.status, state.tasks),
+      },
+    });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to get mission state' });
   }
@@ -2981,6 +2987,48 @@ wss.on('connection', (ws: WebSocket) => {
     unsubscribe();
   });
 });
+
+type MissionRecovery = {
+  kind: 'publication_retry' | 'verification_retry' | 'task_retry';
+  label: string;
+  description: string;
+};
+
+function missionRecoveryFor(
+  missionId: string,
+  missionStatus: string,
+  tasks: Array<{ status?: string | null }>,
+): MissionRecovery | null {
+  if (!['blocked', 'failed'].includes(String(missionStatus))) return null;
+  if (isPostApplyVerificationPending(missionId)) {
+    return {
+      kind: 'verification_retry',
+      label: 'Resume verification',
+      description: 'The changes were applied; retry verification without rerunning completed agents.',
+    };
+  }
+
+  const failure = sqlite.prepare("SELECT payload FROM mission_events WHERE mission_id = ? AND type = 'mission_failed' ORDER BY sequence DESC LIMIT 1")
+    .get(missionId) as { payload?: string } | undefined;
+  let reason = '';
+  try { reason = failure?.payload ? String(JSON.parse(failure.payload).reason || '') : ''; } catch { /* Ignore malformed historical telemetry. */ }
+  if (reason === LEGACY_FAILURE) {
+    return {
+      kind: 'publication_retry',
+      label: 'Resume publication',
+      description: 'Resume the existing Builder output without rerunning completed agents.',
+    };
+  }
+
+  if (tasks.some((task) => ['blocked', 'failed', 'rejected', 'revision_requested'].includes(String(task.status)))) {
+    return {
+      kind: 'task_retry',
+      label: 'Retry failed tasks',
+      description: 'Retry only the failed or blocked tasks in the active plan.',
+    };
+  }
+  return null;
+}
 
 const isMain = shouldAutoStartGateway();
 function isPostApplyVerificationPending(missionId: string): boolean {

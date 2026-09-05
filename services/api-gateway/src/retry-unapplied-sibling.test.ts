@@ -44,6 +44,15 @@ function fixture() {
   } finally { f.close(); }
 }
 
+{
+  const f = fixture();
+  try {
+    f.db.exec("UPDATE missions SET status = 'failed'");
+    assert.equal(claimUnappliedSiblingRetry(f.db, 'mission', () => {}), true, 'legacy publication retry also claims a failed mission');
+    assert.equal((f.db.prepare('SELECT status FROM missions').get() as any).status, 'applying');
+  } finally { f.close(); }
+}
+
 const rejections: Array<[string, (f: ReturnType<typeof fixture>) => void]> = [
   ['unpassed QA', (f) => { f.db.exec("UPDATE mission_events SET payload = '{\"passed\":false}' WHERE task_id = 'qa'"); }],
   ['missing QA', (f) => { f.db.exec("DELETE FROM tasks WHERE id = 'qa'"); }],

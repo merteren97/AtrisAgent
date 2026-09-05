@@ -161,6 +161,21 @@ await assert.rejects(() => useMissionStore.getState().stopMission(mission.id), /
 await assert.rejects(() => useMissionStore.getState().retryMission(mission.id), /Runtime did not acknowledge cancellation/, 'retry failures are throwable for action callers');
 globalThis.fetch = originalFetch;
 
+const continuationCalls: Array<{ url: string; body?: string }> = [];
+globalThis.fetch = (async (input, init) => {
+  const url = String(input);
+  continuationCalls.push({ url, body: typeof init?.body === 'string' ? init.body : undefined });
+  if (url.includes('/mission-commands?')) return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  return new Response(JSON.stringify({ turnId: 'queued-continuation-turn', status: 'queued' }), { status: 202, headers: { 'content-type': 'application/json' } });
+}) as typeof fetch;
+const blockedMission: Mission = { ...mission, id: 'blocked-continuation', status: 'blocked' };
+useMissionStore.setState({ missions: [blockedMission], activeMissionId: blockedMission.id, timeline: [], activeTasks: [], queuedTurns: [], loading: false, error: null });
+await useMissionStore.getState().continueMission(blockedMission.id, 'Continue from the blocked run');
+const continuationRequest = continuationCalls.find((call) => call.url.endsWith('/missions/blocked-continuation/messages'));
+assert(Boolean(continuationRequest) && JSON.parse(continuationRequest?.body || '{}').delivery === 'queue', 'blocked conversation continuation uses the durable message queue');
+assert.equal(useMissionStore.getState().missions[0]?.status, 'starting', 'queued continuation leaves the blocked mission in a truthful starting state');
+globalThis.fetch = originalFetch;
+
 globalThis.fetch = async () => { throw new ApiRequestTimeoutError(30_000); };
 await useMissionStore.getState().startMission('Timed mission start', 'workspace-timeout');
 const timeoutState = useMissionStore.getState();

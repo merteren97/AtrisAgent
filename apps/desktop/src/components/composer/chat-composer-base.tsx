@@ -39,7 +39,7 @@ const COMMANDS = [
   { id: 'review', label: 'Request a focused review' },
   { id: 'summarize', label: 'Summarize current mission state' },
 ] as const;
-const TERMINAL_CONVERSATION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_CONVERSATION_STATUSES = new Set(['completed', 'failed', 'cancelled', 'blocked']);
 
 function titleCase(value: string): string {
   return value === 'xhigh' ? 'Extra High' : value.charAt(0).toUpperCase() + value.slice(1);
@@ -71,6 +71,9 @@ export function ChatComposer() {
   const setComposerInput = useMissionStore((state) => state.setComposerInput);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
   const discoveredModels = useAccountStore((state) => state.discoveredModels);
+  const modelCatalogLoading = useAccountStore((state) => state.modelCatalogLoading);
+  const modelCatalogReady = useAccountStore((state) => state.modelCatalogReady);
+  const modelCatalogError = useAccountStore((state) => state.modelCatalogError);
   const serviceOnline = useAccountStore((state) => state.serviceOnline);
   const refreshModels = useAccountStore((state) => state.refreshModels);
 
@@ -127,9 +130,10 @@ export function ChatComposer() {
 
   useEffect(() => {
     if (!selectedModel) return;
+    if (!modelCatalogReady || modelCatalogLoading) return;
     if (selectedModelObject?.available && modelSupportsRole(selectedModelObject, 'Orchestrator')) return;
     setSelectedModel('');
-  }, [selectedModel, selectedModelObject, setSelectedModel]);
+  }, [modelCatalogLoading, modelCatalogReady, selectedModel, selectedModelObject, setSelectedModel]);
 
   useEffect(() => {
     if (!selectedModelObject) return;
@@ -385,8 +389,8 @@ export function ChatComposer() {
                       <p className="mt-0.5 text-[9px] text-muted-foreground">{directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : 'This picker overrides Orchestrator only. Child roles keep their role policies.'}</p>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" onClick={(event) => { event.preventDefault(); void refreshModels(); }}>
-                        <RefreshCw className="h-3 w-3" />Refresh routes
+                      <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" disabled={modelCatalogLoading} onClick={(event) => { event.preventDefault(); void refreshModels().catch(() => undefined); }}>
+                        <RefreshCw className={cn('h-3 w-3', modelCatalogLoading && 'animate-spin')} />{modelCatalogLoading ? 'Discovering…' : 'Refresh routes'}
                       </Button>
                       <Badge variant="outline" className="text-[9px]">{trustMode}</Badge>
                     </div>
@@ -427,8 +431,15 @@ export function ChatComposer() {
 
                   <div className="max-h-[240px] overflow-y-auto p-2">
                     {!matchingModels.length && (
-                      <div className="flex items-center gap-2 rounded-lg border border-dashed border-border p-4 text-[10px] text-muted-foreground">
-                        <AlertCircle className="h-4 w-4" />No compatible connected routes. <button type="button" className="ml-auto text-primary hover:underline" onClick={() => setActiveView('accounts')}>Accounts</button>
+                      <div className="flex items-start gap-2 rounded-lg border border-dashed border-border p-4 text-[10px] text-muted-foreground">
+                        {modelCatalogLoading ? <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" /> : <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+                        {modelCatalogLoading ? (
+                          <span>Discovering connected model routes…</span>
+                        ) : modelCatalogError ? (
+                          <><span className="min-w-0 flex-1">Model discovery failed. Check the connected runtime and retry.</span><button type="button" className="shrink-0 text-primary hover:underline" onClick={() => { void refreshModels().catch(() => undefined); }}>Retry</button></>
+                        ) : (
+                          <><span className="min-w-0 flex-1">No compatible connected routes.</span><button type="button" className="shrink-0 text-primary hover:underline" onClick={() => setActiveView('accounts')}>Accounts</button></>
+                        )}
                       </div>
                     )}
                     {recommendedModels.length > 0 && <div className="mb-1 px-2 text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Recommended</div>}

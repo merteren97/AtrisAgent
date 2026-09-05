@@ -71,7 +71,7 @@ function WorkspaceApp() {
       const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
       await fetchMissions(workspaceId || undefined);
       if (workspaceId) await fetchCommandQueue(workspaceId);
-      await useAccountStore.getState().fetchAccounts();
+      await useAccountStore.getState().fetchAccounts({ refreshModels: true });
     })();
     return disposeEvents;
   }, [fetchCommandQueue, fetchWorkspaces, fetchMissions, shellState, session.token]);
@@ -92,7 +92,7 @@ function WorkspaceApp() {
       const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
       await Promise.allSettled([
         fetchMissions(workspaceId || undefined),
-        useAccountStore.getState().fetchAccounts(),
+        useAccountStore.getState().fetchAccounts({ refreshModels: true }),
       ]);
     };
 
@@ -100,8 +100,13 @@ function WorkspaceApp() {
       if (disposed || probing) return;
       probing = true;
       try {
+        const wasOffline = !useAccountStore.getState().serviceOnline;
         await checkApiHealth();
         if (!disposed) useAccountStore.getState().setServiceOnline(true);
+        // The first workspace hydration can race the local gateway startup.
+        // Once health recovers, reload the live catalog instead of leaving the
+        // composer with the empty cache it received during that race.
+        if (wasOffline && !disposed) await restoreClientState();
       } catch (healthError) {
         const liveTransportConnected = useMissionStore.getState().transportStatus === 'connected';
         if (!disposed && !liveTransportConnected) useAccountStore.getState().setServiceOnline(false, healthError instanceof Error ? healthError.message : 'Local service health check failed.');
