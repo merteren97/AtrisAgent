@@ -49,6 +49,7 @@ import { persistRuntimeTelemetry } from './runtime-telemetry-store';
 import { ApprovalOutbox, type ApprovalDecision } from './approval-outbox';
 import { verifyAppliedMission } from './post-apply-verification';
 import { ApplyVerificationOperationStore, executeApplyVerificationOperation } from './apply-verification-operation';
+import { claimUnappliedSiblingRetry } from './retry-unapplied-sibling';
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 
 import path from 'path';
@@ -2540,6 +2541,21 @@ app.post('/api/missions/:id/retry', async (req, res) => {
     if (isPostApplyVerificationPending(req.params.id)) {
       await orchestrator.retryPostApplyVerification(req.params.id);
       return void res.json({ success: true, verificationRetried: true, retriedTasks: [] });
+    }
+    if (claimUnappliedSiblingRetry(sqlite, req.params.id, (record) => {
+      const policy = record.automation_policy ? JSON.parse(record.automation_policy) : null;
+      const decision = actionBroker.authorize({ action: 'workspaceApply', boundary: 'workspace',
+        profile: policy?.profile || (record.execution_mode === 'autonomous' ? 'auto' : 'ask'), overrides: policy?.overrides });
+      if (!decision.allowed || decision.requiresApproval) throw new Error('Publication retry requires workspace apply approval under the current policy.');
+    })) {
+      try {
+        await orchestrator.handleApprovalDecision(req.params.id, 'apply', true);
+      } catch (error) {
+        sqlite.prepare("UPDATE missions SET status = 'blocked', updated_at = ? WHERE id = ? AND status IN ('applying', 'verifying')")
+          .run(new Date().toISOString(), req.params.id);
+        throw error;
+      }
+      return void res.json({ success: true, publicationRetried: true, retriedTasks: [] });
     }
     const tasks = await workspaceManager.listTasks(req.params.id);
     const retryable = tasks.filter((task) => ['rejected', 'blocked', 'revision_requested'].includes(task.status));

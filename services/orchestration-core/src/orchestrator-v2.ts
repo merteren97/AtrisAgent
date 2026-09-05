@@ -1870,6 +1870,28 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     return bundle;
   }
 
+  protected override async applyAutomaticallyApprovedPlan(event: TaskCompleted): Promise<boolean> {
+    if (!this.v2WorkspaceManager) return false;
+    // Already inside the mission queue. Do not enqueue an approval recursively.
+    await this.assertTaskCompletionCurrent(event);
+    try {
+      await this.applyApprovedChanges(event.missionId);
+    } catch (error) {
+      const mission = await this.v2WorkspaceManager.getMission(event.missionId);
+      if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status))
+        || (event.runId && (this.cancelledRunIds.has(event.runId)
+          || (mission.activeRunId && mission.activeRunId !== event.runId)))) throw error;
+      await this.v2WorkspaceManager.updateMission(event.missionId, { status: 'blocked', completedAt: null });
+      this.emitEvent({
+        id: crypto.randomUUID(), type: 'mission_failed', missionId: event.missionId,
+        runId: event.runId, turnId: event.turnId,
+        reason: String(redactSensitiveValue(error instanceof Error ? error.message : String(error))),
+        failedTaskId: null, timestamp: new Date().toISOString(),
+      });
+    }
+    return true;
+  }
+
   private async applyApprovedChanges(
     missionId: string,
     options?: { operationId?: string; idempotencyKey?: string },
@@ -1879,8 +1901,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!manager || !applyTaskChanges) throw new Error('No deterministic apply coordinator is configured.');
 
     const lifecycle = this.lifecycleByMission.get(missionId);
-    const runId = lifecycle?.runId;
-    const mission = await this.assertMissionActionCurrent(missionId, runId);
+    const mission = await this.assertMissionActionCurrent(missionId, lifecycle?.runId);
+    const runId = lifecycle?.runId || mission.activeRunId || undefined;
     if (!mission.planId) throw new Error('Changes cannot be applied without an active plan.');
 
     const tasks = (await manager.listTasks(missionId)).filter((task) => task.planId === mission.planId);
@@ -1898,6 +1920,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (this.v2ExecuteApplyVerificationOperation) {
       if (!resumingVerification) await manager.updateMission(missionId, { status: 'applying' });
       operationVerification = await this.v2ExecuteApplyVerificationOperation({ missionId, planId: mission.planId, runId, builderTaskIds });
+      await this.assertMissionActionCurrent(missionId, runId);
       for (const taskId of operationVerification.appliedTaskIds) this.emitEvent({
         id: `changes-applied:${operationVerification.operationId}:${taskId}`,
         type: 'changes_applied', missionId, taskId, filesChanged: 0, checkpointId: '', timestamp: new Date().toISOString(),

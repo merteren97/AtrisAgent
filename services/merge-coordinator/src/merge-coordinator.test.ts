@@ -73,6 +73,32 @@ async function runTests() {
     assert(pack.riskyOperations.some((r) => r.includes('schema')), 'Detects risky schema alteration');
     assert(pack.buildResult?.passed === true, 'Build result attached correctly');
 
+    const countCoordinator = new MergeCoordinator({
+      ...mockWorkspaceManager,
+      getWorktreeManager: () => ({
+        getChangedFiles: async () => [
+          { path: 'small.ts', status: 'modified' },
+          { path: 'large.ts', status: 'added' },
+          { path: 'deleted.ts', status: 'deleted' },
+          { path: 'space name.ts', status: 'added' },
+        ],
+        getDiff: async () => [
+          '--- a/small.ts', '+++ b/small.ts', '-old', '+new',
+          '--- /dev/null', '+++ b/large.ts', ...Array(201).fill('+line'),
+          'diff --git a/deleted.ts b/deleted.ts', '--- a/deleted.ts', '+++ /dev/null', '-one', '-two',
+          'diff --git "a/space name.ts" "b/space name.ts"', '--- /dev/null', '+++ "b/space name.ts"', '+++content',
+        ].join('\n'),
+      }),
+    } as unknown as WorkspaceManager);
+    const counted = await countCoordinator.generateReviewPack('t1');
+    assert(counted.changedFiles[0].additions === 1 && counted.changedFiles[0].deletions === 1,
+      'Small file counts do not include subsequent files');
+    assert(counted.changedFiles[1].additions === 201 && counted.changedFiles[2].deletions === 2,
+      'New and deleted Git files count their own sections');
+    assert(counted.changedFiles[3].additions === 1, 'Quoted paths and plus-prefixed content are counted');
+    assert(counted.riskyOperations.filter((risk) => risk.startsWith('Large diff')).length === 1,
+      'Only the genuinely large file receives a large-diff warning');
+
     // Test 2: Apply Worktree & Pre-Merge Checkpoint
     const mergeResult = await coordinator.applyWorktree('t1', undefined, {
       operationId: 'approval-1',

@@ -8,7 +8,7 @@
   "scripts": {
     "start": "tsx src/entry.ts",
     "dev": "tsx src/entry.ts",
-    "pretest": "npx tsx src/watchdog-orchestration.test.ts",
+    "pretest": "npx tsx src/watchdog-orchestration.test.ts && npx tsx src/auto-apply.test.ts && npx tsx src/retry-unapplied-sibling.test.ts",
     "test": "npx tsx src/api-gateway.test.ts && npx tsx src/approval-outbox.test.ts && npx tsx src/deletion-operation.test.ts && npx tsx src/auth.test.ts && npx tsx src/auth-avatar.test.ts && npx tsx src/control-plane.test.ts && npx tsx src/entry-auth.test.ts && npx tsx src/runtime-protocol.test.ts && npx tsx src/runtime-lifecycle.test.ts && npx tsx src/project-memory.test.ts && npx tsx src/project-memory-lifecycle.test.ts && npx tsx src/memory-export-policy.test.ts && npx tsx src/post-apply-verification.test.ts && npx tsx src/apply-verification-operation.test.ts && npx tsx src/runtime-telemetry-store.test.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -1,5 +1,6 @@
 import http from 'http';
 import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'net';
 import { WebSocket } from 'ws';
@@ -76,6 +77,47 @@ async function runTests() {
   let createdTeamTemplateId = '';
 
   try {
+    // Historical auto-apply failures resume publication via the existing Retry
+    // endpoint, preserving all completed workers and enforcing target checks.
+    {
+      const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'atris-retry-api-')));
+      const manager = gateway.workspaceManager;
+      const workspace = await manager.createWorkspace({ name: 'Publication retry', path: root });
+      const mission = await manager.createMission({ workspaceId: workspace.id, title: 'Publication retry',
+        status: 'blocked', planId: 'publication-retry-plan', executionMode: 'autonomous' });
+      try {
+        const builder = await manager.createTask({ missionId: mission.id, planId: mission.planId!,
+          title: 'Create AtrisTask', assignedRole: 'builder', status: 'done',
+          targetDescriptor: { kind: 'new_sibling_project', projectName: 'AtrisTask' } });
+        const staging = await manager.createWorktreeForTask(builder.id);
+        fs.writeFileSync(path.join(staging, 'package.json'), JSON.stringify({ name: 'retry-fixture',
+          scripts: { check: 'node -e "process.exit(0)"' } }));
+        for (const role of ['reviewer', 'qa'] as const) {
+          const task = await manager.createTask({ missionId: mission.id, planId: mission.planId!, title: role, assignedRole: role, status: 'done' });
+          eventBus.emit(role === 'reviewer'
+            ? { id: crypto.randomUUID(), type: 'review_completed', missionId: mission.id, taskId: task.id,
+                reviewerAgentId: 'reviewer', approved: true, findings: 'Approved', timestamp: new Date().toISOString() }
+            : { id: crypto.randomUUID(), type: 'verification_completed', missionId: mission.id, taskId: task.id,
+                passed: true, summary: 'Checks passed', findingCount: 0, timestamp: new Date().toISOString() });
+        }
+        eventBus.emit({ id: crypto.randomUUID(), type: 'mission_failed', missionId: mission.id,
+          reason: 'New sibling apply metadata or idempotency key is missing.', failedTaskId: builder.id, timestamp: new Date().toISOString() });
+        const retry = await authorizedFetch(`${baseUrl}/api/missions/${mission.id}/retry`, { method: 'POST' });
+        const body = await retry.json();
+        if (retry.status !== 200) console.error('Publication retry fixture error:', body);
+        assert(retry.status === 200 && body.publicationRetried === true && body.retriedTasks.length === 0,
+          'Mission Retry resumes only publication when every quality-gated worker is already done');
+        assert(fs.existsSync(path.join(root, 'AtrisTask', 'package.json')) && fs.existsSync(path.join(staging, 'package.json')),
+          'Retry creates the named workspace child and preserves original staging');
+        assert((await manager.getMission(mission.id))?.status === 'completed',
+          'Retry completes only after checks run against the applied target');
+        assert(Boolean((await manager.getWorktreeForTask(builder.id))?.appliedOperationKey),
+          'Retry records durable per-task publication ownership');
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+
     // 1. GET /health
     {
       const res = await fetch(`${baseUrl}/health`, { headers: { 'X-Atris-Runtime-Token': 'gateway-runtime-secret' } });

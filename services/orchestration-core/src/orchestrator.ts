@@ -1369,6 +1369,10 @@ export class Orchestrator {
         return;
       }
 
+      // Newer orchestrators own durable apply and post-apply verification.
+      // Keep policy/quality checks above shared, but never bypass that owner.
+      if (await this.applyAutomaticallyApprovedPlan(event)) return;
+
       if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'applying' });
       const builderTasks = allTasks.filter((task) => task.assignedRole === 'builder' && task.status === 'done');
       for (const builderTask of builderTasks) {
@@ -1671,6 +1675,10 @@ export class Orchestrator {
     }
 
     throw new Error(`Approval type '${approvalType}' does not have a resumable action.`);
+  }
+
+  protected async applyAutomaticallyApprovedPlan(_event: TaskCompleted): Promise<boolean> {
+    return false;
   }
 
   async selectCandidate(missionId: string, selectedTaskId: string, reason: string): Promise<void> {
