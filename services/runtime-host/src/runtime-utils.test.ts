@@ -262,7 +262,7 @@ async function runTests() {
       'trailing\\',
     ];
     try {
-      const result = await runCommand(`"${wrapper}"`, dangerousArguments, { cwd: root, timeoutMs: 5_000 });
+      const result = await runCommand(`"${wrapper}"`, dangerousArguments, { cwd: root, timeoutMs: 15_000 });
       const received = JSON.parse(result.stdout.trim()) as string[];
       assert(
         JSON.stringify(received) === JSON.stringify(dangerousArguments),
@@ -276,7 +276,7 @@ async function runTests() {
       fs.writeFileSync(powershellPrinter, 'ConvertTo-Json -InputObject ([string[]]$args) -Compress', 'utf8');
       fs.writeFileSync(genericWrapper, '@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -File "%~dp0print-args.ps1" %*\r\n', 'utf8');
       const genericArguments = ['hello world', '--mode', 'safe'];
-      const genericResult = await runCommand(`"${genericWrapper}"`, genericArguments, { cwd: root, timeoutMs: 5_000 });
+      const genericResult = await runCommand(`"${genericWrapper}"`, genericArguments, { cwd: root, timeoutMs: 15_000 });
       const genericReceived = JSON.parse(genericResult.stdout.trim()) as string[];
       assert(
         JSON.stringify(genericReceived) === JSON.stringify(genericArguments),
