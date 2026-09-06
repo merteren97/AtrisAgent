@@ -103,6 +103,9 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.doesNotMatch(release, /--clobber/, "immutable release publication must never replace assets");
   assert.match(release, /Release \$RELEASE_TAG already exists/, "existing releases must fail closed");
   assert.match(release, /Tag \$RELEASE_TAG already exists/, "existing tags must fail closed");
+  assert.match(release, /- name: Stage release artifacts/, "release builds must stage artifacts into a flat directory");
+  assert.match(release, /release-artifacts\/\*\.exe/, "release upload must point directly to staged installers");
+  assert.match(release, /- name: Normalize downloaded release assets/, "publication must normalize downloaded assets");
 });
 
 test("release publishing requires a complete signed Tauri updater configuration", () => {
