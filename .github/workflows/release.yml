@@ -316,6 +316,7 @@ jobs:
           cat release-assets/SHA256SUMS
 
       - name: Verify every updater signature with the approved public key
+        # Cryptographic verification: replaces non-existent 'tauri signer verify' CLI command with native Node.js Minisign (Blake2b-512 + Ed25519) verification
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
           APPROVED_UPDATER_KEY_FINGERPRINT: ${{ vars.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT || secrets.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT }}
@@ -325,19 +326,70 @@ jobs:
           test -n "$TAURI_UPDATER_PUBLIC_KEY" || { echo "TAURI_UPDATER_PUBLIC_KEY is not configured"; exit 1; }
           node - <<'NODE'
           const crypto = require('node:crypto');
-          const actual = crypto.createHash('sha256').update(process.env.TAURI_UPDATER_PUBLIC_KEY.trim()).digest('hex').toUpperCase();
-          console.log(`Tauri updater public key fingerprint: ${actual}`);
-          const expected = (process.env.APPROVED_UPDATER_KEY_FINGERPRINT || '').replaceAll(':', '').trim().toUpperCase();
-          if (expected) {
-            if (!/^[0-9A-F]{64}$/.test(expected)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
-            if (actual !== expected) throw new Error(`Configured updater public key fingerprint ${actual} does not match approved ${expected}`);
-            console.log(`Approved updater public key fingerprint verified: ${actual}`);
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const rawKeyInput = process.env.TAURI_UPDATER_PUBLIC_KEY.trim();
+          const actualFingerprint = crypto.createHash('sha256').update(rawKeyInput).digest('hex').toUpperCase();
+          console.log(`Tauri updater public key fingerprint: ${actualFingerprint}`);
+
+          const expectedFingerprint = (process.env.APPROVED_UPDATER_KEY_FINGERPRINT || '').replaceAll(':', '').trim().toUpperCase();
+          if (expectedFingerprint) {
+            if (!/^[0-9A-F]{64}$/.test(expectedFingerprint)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
+            if (actualFingerprint !== expectedFingerprint) throw new Error(`Configured updater public key fingerprint ${actualFingerprint} does not match approved ${expectedFingerprint}`);
+            console.log(`Approved updater public key fingerprint verified: ${actualFingerprint}`);
           }
+
+          // Parse Minisign public key
+          const pubkeyText = rawKeyInput.startsWith('untrusted comment:')
+            ? rawKeyInput
+            : Buffer.from(rawKeyInput, 'base64').toString('utf8');
+          const pubkeyLines = pubkeyText.trim().split(/\r?\n/);
+          if (pubkeyLines.length < 2) throw new Error('Invalid TAURI_UPDATER_PUBLIC_KEY format');
+          const pubkeyBytes = Buffer.from(pubkeyLines[1].trim(), 'base64');
+          if (pubkeyBytes.length !== 42) throw new Error(`Unexpected public key byte length: ${pubkeyBytes.length} (expected 42)`);
+          const pubKeyId = pubkeyBytes.subarray(2, 10);
+          const rawEd25519PubKey = pubkeyBytes.subarray(10);
+          const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+          const cryptoPubKey = crypto.createPublicKey({
+            key: Buffer.concat([spkiPrefix, rawEd25519PubKey]),
+            format: 'der',
+            type: 'spki'
+          });
+
+          // Cryptographically verify every updater signature pair
+          const assetsDir = 'release-assets';
+          const files = fs.readdirSync(assetsDir);
+          const packages = files.filter(f => /\.(exe|msi|AppImage|deb)$/i.test(f));
+          if (packages.length === 0) throw new Error('No release packages found in release-assets to verify');
+
+          let verifiedCount = 0;
+          for (const pkg of packages) {
+            const pkgPath = path.join(assetsDir, pkg);
+            const sigPath = `${pkgPath}.sig`;
+            if (!fs.existsSync(sigPath)) throw new Error(`Missing updater signature: ${sigPath}`);
+            const sigContent = fs.readFileSync(sigPath, 'utf8').trim();
+            const sigText = sigContent.startsWith('untrusted comment:')
+              ? sigContent
+              : Buffer.from(sigContent, 'base64').toString('utf8');
+            const sigLines = sigText.trim().split(/\r?\n/);
+            if (sigLines.length < 2) throw new Error(`Malformed signature file: ${sigPath}`);
+            const sigBytes = Buffer.from(sigLines[1].trim(), 'base64');
+            if (sigBytes.length !== 74) throw new Error(`Unexpected signature byte length: ${sigBytes.length} in ${sigPath}`);
+            const sigKeyId = sigBytes.subarray(2, 10);
+            if (!sigKeyId.equals(pubKeyId)) {
+              throw new Error(`Signature key ID mismatch for ${pkg}: ${sigKeyId.toString('hex')} != ${pubKeyId.toString('hex')}`);
+            }
+            const ed25519Sig = sigBytes.subarray(10);
+            const fileData = fs.readFileSync(pkgPath);
+            const blakeHash = crypto.createHash('blake2b512').update(fileData).digest();
+            const isValid = crypto.verify(null, blakeHash, cryptoPubKey, ed25519Sig);
+            if (!isValid) throw new Error(`Cryptographic signature verification failed for ${pkg}`);
+            console.log(`[PASS] Cryptographically verified updater signature for: ${pkg}`);
+            verifiedCount++;
+          }
+          console.log(`Successfully verified all ${verifiedCount} desktop release packages with public key ID ${pubKeyId.toString('hex')}`);
           NODE
-          while IFS= read -r -d '' package; do
-            test -s "$package.sig"
-            npx --no-install tauri signer verify -k "$TAURI_UPDATER_PUBLIC_KEY" "$package.sig" "$package"
-          done < <(find release-assets -maxdepth 1 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' \) -print0)
 
       - name: Generate stable updater manifest
         shell: bash
