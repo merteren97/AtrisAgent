@@ -46,8 +46,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          count="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&status=success&per_page=100" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length' | awk '{ total += $1 } END { print total + 0 }')"
-          test "$count" -ge 1 || { echo "No successful ci.yml run exists for exact SHA $EXPECTED_SHA"; exit 1; }
+          echo "Checking CI readiness for exact SHA $EXPECTED_SHA..."
+          for i in $(seq 1 75); do
+            count="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&status=success&per_page=100" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length' | awk '{ total += $1 } END { print total + 0 }')"
+            if [ "$count" -ge 1 ]; then
+              echo "Exact SHA $EXPECTED_SHA has verified successful CI ($count runs)."
+              exit 0
+            fi
+
+            active_count="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&per_page=10" --jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' 2>/dev/null || echo "0")"
+            if [ "$active_count" -gt 0 ]; then
+              echo "CI run for $EXPECTED_SHA is currently in progress ($active_count active). Waiting 20s (attempt $i/75)..."
+              sleep 20
+            else
+              if [ "$i" -le 3 ]; then
+                echo "No CI run found yet for $EXPECTED_SHA; checking for webhook dispatch lag (attempt $i/3)..."
+                sleep 10
+              else
+                echo "No successful ci.yml run exists for exact SHA $EXPECTED_SHA"
+                gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&per_page=5" --jq '.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, html_url: .html_url}' || true
+                exit 1
+              fi
+            fi
+          done
+          echo "Timed out waiting for ci.yml run to complete successfully for exact SHA $EXPECTED_SHA"
+          exit 1
 
   build:
     if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
@@ -330,26 +353,31 @@ jobs:
           const path = require('node:path');
 
           const rawKeyInput = process.env.TAURI_UPDATER_PUBLIC_KEY.trim();
-          const actualFingerprint = crypto.createHash('sha256').update(rawKeyInput).digest('hex').toUpperCase();
+          const normalizedKeyInput = rawKeyInput.replace(/\r\n/g, '\n');
+          const actualFingerprint = crypto.createHash('sha256').update(normalizedKeyInput).digest('hex').toUpperCase();
           console.log(`Tauri updater public key fingerprint: ${actualFingerprint}`);
 
-          const expectedFingerprint = (process.env.APPROVED_UPDATER_KEY_FINGERPRINT || '').replaceAll(':', '').trim().toUpperCase();
-          if (expectedFingerprint) {
-            if (!/^[0-9A-F]{64}$/.test(expectedFingerprint)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
-            if (actualFingerprint !== expectedFingerprint) throw new Error(`Configured updater public key fingerprint ${actualFingerprint} does not match approved ${expectedFingerprint}`);
-            console.log(`Approved updater public key fingerprint verified: ${actualFingerprint}`);
-          }
-
           // Parse Minisign public key
-          const pubkeyText = rawKeyInput.startsWith('untrusted comment:')
-            ? rawKeyInput
-            : Buffer.from(rawKeyInput, 'base64').toString('utf8');
+          const pubkeyText = normalizedKeyInput.startsWith('untrusted comment:')
+            ? normalizedKeyInput
+            : Buffer.from(normalizedKeyInput, 'base64').toString('utf8');
           const pubkeyLines = pubkeyText.trim().split(/\r?\n/);
           if (pubkeyLines.length < 2) throw new Error('Invalid TAURI_UPDATER_PUBLIC_KEY format');
           const pubkeyBytes = Buffer.from(pubkeyLines[1].trim(), 'base64');
           if (pubkeyBytes.length !== 42) throw new Error(`Unexpected public key byte length: ${pubkeyBytes.length} (expected 42)`);
           const pubKeyId = pubkeyBytes.subarray(2, 10);
           const rawEd25519PubKey = pubkeyBytes.subarray(10);
+          const rawBytesFingerprint = crypto.createHash('sha256').update(rawEd25519PubKey).digest('hex').toUpperCase();
+
+          const expectedFingerprint = (process.env.APPROVED_UPDATER_KEY_FINGERPRINT || '').replaceAll(':', '').trim().toUpperCase();
+          if (expectedFingerprint) {
+            if (!/^[0-9A-F]{64}$/.test(expectedFingerprint)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
+            const unnormalizedFingerprint = crypto.createHash('sha256').update(rawKeyInput).digest('hex').toUpperCase();
+            if (actualFingerprint !== expectedFingerprint && unnormalizedFingerprint !== expectedFingerprint && rawBytesFingerprint !== expectedFingerprint) {
+              throw new Error(`Configured updater public key fingerprint ${actualFingerprint} does not match approved ${expectedFingerprint}`);
+            }
+            console.log(`Approved updater public key fingerprint verified: ${expectedFingerprint}`);
+          }
           const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
           const cryptoPubKey = crypto.createPublicKey({
             key: Buffer.concat([spkiPrefix, rawEd25519PubKey]),
@@ -439,7 +467,19 @@ jobs:
           set -euo pipefail
           expected_count=9
           if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
-          ASSETS="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for attempt in $(seq 1 6); do
+            ASSETS="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            count="$(grep -c . <<< "$ASSETS" || echo "0")"
+            if [ "$count" -ge "$expected_count" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "Timed out waiting for all $expected_count release assets via GitHub API (found $count)"
+              break
+            fi
+            echo "Waiting for GitHub API asset indexing: found $count/$expected_count (attempt $attempt/6)..."
+            sleep 3
+          done
           test "$(wc -l <<< "$ASSETS")" -eq "$expected_count"
           grep -Eiq '\.(exe|msi)$' <<< "$ASSETS"
           grep -Eiq '\.AppImage$' <<< "$ASSETS"

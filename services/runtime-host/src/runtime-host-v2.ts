@@ -175,11 +175,18 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
 
   private scheduleSupervisorEviction(missionId: string, session: SupervisorSession): void {
     if (session.evictionTimer) clearTimeout(session.evictionTimer);
-    session.evictionTimer = setTimeout(() => {
-      if (!session.busy && Date.now() - session.lastUsedAt >= this.supervisorIdleTtlMs) {
+    const checkEviction = () => {
+      if (session.busy) return;
+      const elapsed = Date.now() - session.lastUsedAt;
+      const remaining = this.supervisorIdleTtlMs - elapsed;
+      if (remaining <= 0) {
         void this.discardSupervisorSession(missionId);
+      } else {
+        session.evictionTimer = setTimeout(checkEviction, Math.max(1, remaining));
+        session.evictionTimer.unref?.();
       }
-    }, this.supervisorIdleTtlMs);
+    };
+    session.evictionTimer = setTimeout(checkEviction, this.supervisorIdleTtlMs);
     session.evictionTimer.unref?.();
   }
 

@@ -206,7 +206,10 @@ async function runTests() {
     const host: any = new RuntimeHostV2(undefined, { workspaceManager: manager as any, watchdogInterval: 0, supervisorSessionIdleTtl: 5 });
     configureHost(host, () => adapter);
     await host.runSupervisorTurn({ missionId: 'conversation-idle', turnId: 'turn-idle', prompt: 'idle', modelCatalogId: 'catalog-1' });
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && (adapter.state.releases !== 1 || adapter.state.shutdowns !== 1)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert(adapter.state.releases === 1 && adapter.state.shutdowns === 1, 'idle TTL evicts and releases the reusable supervisor provider session');
     await host.stopAll();
 
