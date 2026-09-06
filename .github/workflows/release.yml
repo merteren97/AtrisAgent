@@ -5,47 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Enter v0.2.1-1 (prerelease) or v0.2.1 (stable); v/V prefix is accepted"
-        required: true
-        type: string
-      prerelease:
-        description: "Mark as prerelease"
-        required: true
-        default: true
-        type: boolean
-      expected_sha:
-        description: "Exact 40-character main commit SHA already accepted and validated by CI"
-        required: true
-        type: string
-      packaged_clean_install:
-        description: "Packaged clean install accepted on supported production platforms"
-        required: true
-        default: false
-        type: boolean
-      updater_round_trip:
-        description: "Signed updater install and rollback/round-trip accepted"
-        required: true
-        default: false
-        type: boolean
-      production_entitlement:
-        description: "Production authentication and entitlement accepted"
-        required: true
-        default: false
-        type: boolean
-      interactive_visual_keyboard:
-        description: "Interactive visual, theme, constrained-window, and keyboard acceptance completed"
-        required: true
-        default: false
-        type: boolean
-      signing_key_decision:
-        description: "Explicit production updater signing-key decision"
-        required: true
-        type: choice
-        options:
-          - rotate-before-release
-          - approved-production-key
-      signing_key_fingerprint:
-        description: "Approved updater public key SHA-256 fingerprint (64 hex characters)"
+        description: "Enter 0.3.7 or 0.3.7-1; an optional v/V prefix is accepted"
         required: true
         type: string
 
@@ -58,7 +18,7 @@ concurrency:
 
 env:
   RELEASE_TAG: ${{ inputs.release_version }}
-  MANUAL_PRERELEASE: ${{ inputs.prerelease }}
+  RELEASE_SHA: ${{ github.sha }}
 
 jobs:
   readiness:
@@ -68,27 +28,21 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: Checkout exact accepted revision
+      - name: Checkout exact workflow revision
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.expected_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Require exact revision and explicit release acceptances
+      - name: Validate automatic release revision
         env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
-          ACCEPT_PACKAGED_CLEAN_INSTALL: ${{ inputs.packaged_clean_install }}
-          ACCEPT_UPDATER_ROUND_TRIP: ${{ inputs.updater_round_trip }}
-          ACCEPT_PRODUCTION_ENTITLEMENT: ${{ inputs.production_entitlement }}
-          ACCEPT_INTERACTIVE_VISUAL_KEYBOARD: ${{ inputs.interactive_visual_keyboard }}
-          SIGNING_KEY_DECISION: ${{ inputs.signing_key_decision }}
-          SIGNING_KEY_FINGERPRINT: ${{ inputs.signing_key_fingerprint }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: node .github/scripts/release-readiness.mjs
       - name: Require successful CI for the exact SHA
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -119,12 +73,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^[vV]?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
             echo "Unsupported release tag: $RELEASE_TAG"
-            echo "Use v0.2.8 (stable) or v0.2.8-1 (prerelease). The V prefix is case-insensitive."
+            echo "Use 0.2.8 (stable) or 0.2.8-1 (prerelease). An optional v/V prefix is accepted."
             exit 1
           fi
-          normalized_tag="v${RELEASE_TAG:1}"
+          normalized_version="$RELEASE_TAG"
+          if [[ "$normalized_version" == v* || "$normalized_version" == V* ]]; then
+            normalized_version="${normalized_version:1}"
+          fi
+          normalized_tag="v$normalized_version"
           echo "RELEASE_TAG=$normalized_tag" >> "$GITHUB_ENV"
           echo "Using canonical release tag: $normalized_tag"
 
@@ -132,7 +90,7 @@ jobs:
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.expected_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -279,11 +237,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^[vV]?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
             echo "Unsupported release tag: $RELEASE_TAG"
+            echo "Use 0.2.8 (stable) or 0.2.8-1 (prerelease). An optional v/V prefix is accepted."
             exit 1
           fi
-          normalized_tag="v${RELEASE_TAG:1}"
+          normalized_version="$RELEASE_TAG"
+          if [[ "$normalized_version" == v* || "$normalized_version" == V* ]]; then
+            normalized_version="${normalized_version:1}"
+          fi
+          normalized_tag="v$normalized_version"
           echo "RELEASE_TAG=$normalized_tag" >> "$GITHUB_ENV"
           echo "Using canonical release tag: $normalized_tag"
 
@@ -291,7 +254,7 @@ jobs:
         # v4.4.0 (reviewed immutable commit)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.expected_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
 
@@ -322,15 +285,17 @@ jobs:
       - name: Verify every updater signature with the approved public key
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
-          SIGNING_KEY_FINGERPRINT: ${{ inputs.signing_key_fingerprint }}
+          APPROVED_UPDATER_KEY_FINGERPRINT: ${{ vars.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$TAURI_UPDATER_PUBLIC_KEY" || { echo "TAURI_UPDATER_PUBLIC_KEY is not configured"; exit 1; }
+          test -n "$APPROVED_UPDATER_KEY_FINGERPRINT" || { echo "TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT repository/environment variable is not configured"; exit 1; }
           node - <<'NODE'
           const crypto = require('node:crypto');
           const actual = crypto.createHash('sha256').update(process.env.TAURI_UPDATER_PUBLIC_KEY.trim()).digest('hex').toUpperCase();
-          const expected = process.env.SIGNING_KEY_FINGERPRINT.replaceAll(':', '').toUpperCase();
+          const expected = process.env.APPROVED_UPDATER_KEY_FINGERPRINT.replaceAll(':', '').toUpperCase();
+          if (!/^[0-9A-F]{64}$/.test(expected)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
           if (actual !== expected) throw new Error(`Configured updater public key fingerprint ${actual} does not match approved ${expected}`);
           console.log(`Approved updater public key fingerprint verified: ${actual}`);
           NODE
@@ -343,7 +308,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             node .github/scripts/generate-updater-manifest.mjs release-assets "$GITHUB_REPOSITORY" "$RELEASE_TAG"
             test -s release-assets/latest.json
           fi
@@ -355,7 +320,7 @@ jobs:
         run: |
           set -euo pipefail
           FLAGS=()
-          if [[ "$MANUAL_PRERELEASE" == "true" || ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             FLAGS+=(--prerelease)
           fi
 
@@ -370,11 +335,11 @@ jobs:
 
           mapfile -d '' RELEASE_ASSETS < <(find release-assets -maxdepth 1 -type f -print0)
           expected_count=9
-          if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
           test "${#RELEASE_ASSETS[@]}" -eq "$expected_count"
           gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "${{ inputs.expected_sha }}" \
+            --target "$RELEASE_SHA" \
             --title "AtrisAgent $RELEASE_TAG" \
             --generate-notes \
             "${FLAGS[@]}"
@@ -386,7 +351,7 @@ jobs:
         run: |
           set -euo pipefail
           expected_count=9
-          if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then expected_count=10; fi
           ASSETS="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
           test "$(wc -l <<< "$ASSETS")" -eq "$expected_count"
           grep -Eiq '\.(exe|msi)$' <<< "$ASSETS"
@@ -394,6 +359,6 @@ jobs:
           grep -Eiq '\.deb$' <<< "$ASSETS"
           grep -Eiq '\.sig$' <<< "$ASSETS"
           grep -Fxq 'SHA256SUMS' <<< "$ASSETS"
-          if [[ "$MANUAL_PRERELEASE" != "true" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             grep -Fxq 'latest.json' <<< "$ASSETS"
           fi

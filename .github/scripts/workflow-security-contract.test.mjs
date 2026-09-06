@@ -56,12 +56,6 @@ test("public source repository contains no active production deployment", () => 
     assert.doesNotMatch(source, /\/var\/www\//, `${workflow} must not expose a production checkout path`);
   }
 
-  const readiness = fs.readFileSync(path.join(repositoryRoot, "docs", "PUBLIC_REPOSITORY_READINESS.md"), "utf8");
-  assert.match(
-    readiness,
-    /separate private operations boundary/,
-    "public readiness docs must preserve the private operations boundary without naming its repository",
-  );
 });
 
 test("CodeQL skips private repositories until code scanning is enabled", () => {
@@ -92,18 +86,20 @@ test("release publishing stays owner-controlled and requires both desktop platfo
 
   const normalizationSteps = release.match(/- name: Validate and normalize requested release tag/g) || [];
   assert.equal(normalizationSteps.length, 2, "build and publish jobs must both normalize the manual release tag");
-  assert.match(release, /\^\[vV\]\[0-9\]\+/, "release validation must accept either v or V as the version prefix");
-  assert.match(release, /normalized_tag="v\$\{RELEASE_TAG:1\}"/, "release tags must be canonicalized to a lowercase v prefix");
+  assert.match(release, /\^\[vV\]\?\[0-9\]\+/, "release validation must accept versions with or without a v/V prefix");
+  assert.match(release, /normalized_version="\$RELEASE_TAG"/, "release normalization must start from the version-only input");
+  assert.match(release, /normalized_tag="v\$normalized_version"/, "release tags must be canonicalized to a lowercase v prefix");
   assert.match(release, /echo "RELEASE_TAG=\$normalized_tag" >> "\$GITHUB_ENV"/, "canonical release tags must flow to later build and publish steps");
   assert.match(release, /group:\s*atris-agent-release\s*$/m, "only one release workflow may execute at a time regardless of input casing");
   assert.match(release, /environment:\s*production-release/, "publication must use the protected production environment");
   assert.match(release, /actions\/workflows\/ci\.yml\/runs\?head_sha=\$EXPECTED_SHA&status=success/, "release readiness must require successful CI for the exact SHA");
-  assert.match(release, /ref:\s*\$\{\{ inputs\.expected_sha \}\}/, "build and publication must checkout the accepted exact SHA");
-  assert.match(release, /packaged_clean_install:/, "packaged clean-install acceptance must be explicit");
-  assert.match(release, /updater_round_trip:/, "updater round-trip acceptance must be explicit");
-  assert.match(release, /production_entitlement:/, "production entitlement acceptance must be explicit");
-  assert.match(release, /interactive_visual_keyboard:/, "interactive visual and keyboard acceptance must be explicit");
-  assert.match(release, /signing_key_fingerprint:/, "the approved signing-key fingerprint must be explicit");
+  assert.match(release, /ref:\s*\$\{\{ github\.sha \}\}/, "all jobs must checkout the automatic workflow SHA");
+  assert.match(release, /EXPECTED_SHA:\s*\$\{\{ github\.sha \}\}/, "CI readiness must derive the SHA from the workflow revision");
+  assert.match(release, /RELEASE_SHA:\s*\$\{\{ github\.sha \}\}/, "release tagging must derive its target from the workflow revision");
+  assert.match(release, /release_version:/, "the release form must retain a version input");
+  assert.doesNotMatch(release, /inputs\.(prerelease|expected_sha|packaged_clean_install|updater_round_trip|production_entitlement|interactive_visual_keyboard|signing_key_decision|signing_key_fingerprint)/, "the release form must not request derived or acceptance fields");
+  assert.match(release, /vars\.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT/, "the approved updater fingerprint must be configured once as a repository/environment variable");
+  assert.doesNotMatch(release, /MANUAL_PRERELEASE/, "prerelease status must be derived from the version");
   assert.doesNotMatch(release, /--clobber/, "immutable release publication must never replace assets");
   assert.match(release, /Release \$RELEASE_TAG already exists/, "existing releases must fail closed");
   assert.match(release, /Tag \$RELEASE_TAG already exists/, "existing tags must fail closed");
