@@ -208,6 +208,33 @@ jobs:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
         run: npm run tauri:build -w @atris-agent-code/desktop -- --target "${{ matrix.rustTarget }}" --bundles "${{ matrix.bundles }}" --config src-tauri/tauri.release.conf.json
 
+      - name: Stage release artifacts
+        env:
+          RUST_TARGET: ${{ matrix.rustTarget }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const srcDir = path.join('apps/desktop/src-tauri/target', process.env.RUST_TARGET, 'release/bundle');
+          const destDir = 'release-artifacts';
+          fs.mkdirSync(destDir, { recursive: true });
+          function walk(dir) {
+            for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, item.name);
+              if (item.isDirectory()) walk(full);
+              else if (/\.(exe|msi|AppImage|deb|sig)$/i.test(item.name)) {
+                fs.copyFileSync(full, path.join(destDir, item.name));
+              }
+            }
+          }
+          walk(srcDir);
+          const staged = fs.readdirSync(destDir);
+          if (staged.length === 0) throw new Error(`No release artifacts staged from ${srcDir}`);
+          console.log(`Staged ${staged.length} release artifacts:\n${staged.join('\n')}`);
+          NODE
+
       - name: Upload release artifacts
         # v7 (reviewed immutable commit)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -217,11 +244,11 @@ jobs:
           retention-days: 3
           compression-level: 0
           path: |
-            apps/desktop/src-tauri/target/**/release/bundle/**/*.exe
-            apps/desktop/src-tauri/target/**/release/bundle/**/*.msi
-            apps/desktop/src-tauri/target/**/release/bundle/**/*.AppImage
-            apps/desktop/src-tauri/target/**/release/bundle/**/*.deb
-            apps/desktop/src-tauri/target/**/release/bundle/**/*.sig
+            release-artifacts/*.exe
+            release-artifacts/*.msi
+            release-artifacts/*.AppImage
+            release-artifacts/*.deb
+            release-artifacts/*.sig
 
   publish:
     if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
@@ -274,6 +301,12 @@ jobs:
 
       - name: Install locked Tauri verifier
         run: npm ci --include=dev --include=optional --prefer-offline --no-audit --no-fund
+
+      - name: Normalize downloaded release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/validate-release-assets.mjs --normalize release-assets
 
       - name: Enforce exact versioned artifact allowlist and record hashes
         shell: bash

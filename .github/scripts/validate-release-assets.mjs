@@ -15,6 +15,26 @@ export function expectedReleaseAssets(tag) {
   return { packages, signedAssets: packages.flatMap((name) => [name, `${name}.sig`]) };
 }
 
+export function normalizeReleaseAssets(directory) {
+  if (!fs.existsSync(directory)) throw new Error(`Release asset directory does not exist: ${directory}`);
+  function walk(current) {
+    for (const item of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, item.name);
+      if (item.isDirectory()) {
+        walk(full);
+      } else if (current !== directory) {
+        fs.renameSync(full, path.join(directory, item.name));
+      }
+    }
+  }
+  walk(directory);
+  for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (item.isDirectory()) {
+      fs.rmSync(path.join(directory, item.name), { recursive: true, force: true });
+    }
+  }
+}
+
 export function validateReleaseAssets(directory, tag) {
   const { packages, signedAssets } = expectedReleaseAssets(tag);
   const entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -36,10 +56,17 @@ export function validateReleaseAssets(directory, tag) {
 const invokedFile = process.argv[1] ? path.resolve(process.argv[1]) : "";
 if (invokedFile === fileURLToPath(import.meta.url)) {
   try {
-    const [directory, tag] = process.argv.slice(2);
-    if (!directory || !tag) throw new Error("Usage: node validate-release-assets.mjs <directory> <canonical-tag>");
-    const result = validateReleaseAssets(directory, tag);
-    console.log(`Validated ${result.packages.length} exact signed packages and wrote SHA256SUMS`);
+    if (process.argv[2] === "--normalize") {
+      const directory = process.argv[3];
+      if (!directory) throw new Error("Usage: node validate-release-assets.mjs --normalize <directory>");
+      normalizeReleaseAssets(directory);
+      console.log(`Normalized release assets in ${directory}`);
+    } else {
+      const [directory, tag] = process.argv.slice(2);
+      if (!directory || !tag) throw new Error("Usage: node validate-release-assets.mjs <directory> <canonical-tag>");
+      const result = validateReleaseAssets(directory, tag);
+      console.log(`Validated ${result.packages.length} exact signed packages and wrote SHA256SUMS`);
+    }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
