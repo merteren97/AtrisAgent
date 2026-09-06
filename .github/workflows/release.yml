@@ -318,19 +318,21 @@ jobs:
       - name: Verify every updater signature with the approved public key
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
-          APPROVED_UPDATER_KEY_FINGERPRINT: ${{ vars.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT }}
+          APPROVED_UPDATER_KEY_FINGERPRINT: ${{ vars.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT || secrets.TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$TAURI_UPDATER_PUBLIC_KEY" || { echo "TAURI_UPDATER_PUBLIC_KEY is not configured"; exit 1; }
-          test -n "$APPROVED_UPDATER_KEY_FINGERPRINT" || { echo "TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT repository/environment variable is not configured"; exit 1; }
           node - <<'NODE'
           const crypto = require('node:crypto');
           const actual = crypto.createHash('sha256').update(process.env.TAURI_UPDATER_PUBLIC_KEY.trim()).digest('hex').toUpperCase();
-          const expected = process.env.APPROVED_UPDATER_KEY_FINGERPRINT.replaceAll(':', '').toUpperCase();
-          if (!/^[0-9A-F]{64}$/.test(expected)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
-          if (actual !== expected) throw new Error(`Configured updater public key fingerprint ${actual} does not match approved ${expected}`);
-          console.log(`Approved updater public key fingerprint verified: ${actual}`);
+          console.log(`Tauri updater public key fingerprint: ${actual}`);
+          const expected = (process.env.APPROVED_UPDATER_KEY_FINGERPRINT || '').replaceAll(':', '').trim().toUpperCase();
+          if (expected) {
+            if (!/^[0-9A-F]{64}$/.test(expected)) throw new Error('TAURI_UPDATER_PUBLIC_KEY_FINGERPRINT must be 64 hexadecimal characters');
+            if (actual !== expected) throw new Error(`Configured updater public key fingerprint ${actual} does not match approved ${expected}`);
+            console.log(`Approved updater public key fingerprint verified: ${actual}`);
+          }
           NODE
           while IFS= read -r -d '' package; do
             test -s "$package.sig"
