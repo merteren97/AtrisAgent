@@ -4,6 +4,7 @@ import { Bot, Code2, MessageSquare, Plus, Send, Square, X, Loader2, RotateCcw } 
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
 import { MarkdownContent } from '@/components/chat/markdown-content';
 import { useManualStore, type ManualAgent, type ManualMessage } from '@/stores/manual-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -15,16 +16,17 @@ import { ManualTerminal, ensureManualTerminal, type TerminalSnapshot } from './m
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode'].includes(kind || '');
-const cliName = (kind: string) => ({ claude_code: 'Claude Code', codex: 'Codex', opencode: 'OpenCode' }[kind] || kind);
+const cliName = (kind: string) => ({ claude_code: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', antigravity: 'Antigravity' }[kind] || kind);
 const selectStyle = 'h-9 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
 export { ConversationChoice } from '@/components/layout/workspace-home';
 
-function AgentDialog({ conversationId, onClose, onCreated }: { conversationId?: string; onClose: () => void; onCreated: (agent: ManualAgent) => Promise<void> }) {
+function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversationId?: string; onClose: () => void; onCreated: (agent: ManualAgent) => Promise<void> }) {
   const models = useAccountStore(s => s.discoveredModels);
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
   const [title, setTitle] = useState(''); const [name, setName] = useState('');
   const [runtime, setRuntime] = useState('claude_code'); const [catalogId, setCatalogId] = useState('');
+  const [panes, setPanes] = useState(1);
   const [pending, setPending] = useState(false); const [error, setError] = useState<string | null>(null);
   const conversationKey = useRef(crypto.randomUUID()); const agentKey = useRef(crypto.randomUUID());
   const createdConversation = useRef<string | undefined>(conversationId);
@@ -39,24 +41,56 @@ function AgentDialog({ conversationId, onClose, onCreated }: { conversationId?: 
         createdConversation.current = conversation.id;
       }
       const agent = await useManualStore.getState().addAgent(createdConversation.current, name.trim() || `${cliName(runtime)} agent`, selected.catalogId, agentKey.current);
+      if (!conversationId) useManualStore.getState().setLayout(createdConversation.current, panes);
       // Creation is durable before launch. A failed launch remains visible and can be retried explicitly.
-      await onCreated(agent); onClose();
+      await onCreated(agent);
     } catch (e) { setError(errorText(e)); } finally { setPending(false); }
   };
-  return <Dialog open onOpenChange={open => { if (!open && !pending) onClose(); }}><DialogContent>
-    <DialogHeader><DialogTitle>{conversationId ? 'Add an independent agent' : 'New manual conversation'}</DialogTitle><DialogDescription>Each agent has its own session and context. Agents use this project’s files and stay open until you close them.</DialogDescription></DialogHeader>
-    <form className="grid min-w-0 gap-4" onSubmit={e => { e.preventDefault(); void submit(); }}>
-      {!conversationId && <label className="grid gap-1.5 text-xs font-medium">Conversation name<Input value={title} onChange={e => setTitle(e.target.value)} maxLength={200} autoFocus placeholder="e.g. Interface improvements" required /></label>}
-      <label className="grid gap-1.5 text-xs font-medium">Agent name<Input value={name} onChange={e => setName(e.target.value)} maxLength={200} placeholder={`${cliName(runtime)} agent`} /></label>
-      <div className="grid gap-3 sm:grid-cols-2"><label className="grid min-w-0 gap-1.5 text-xs font-medium">CLI<select className={selectStyle} value={runtime} onChange={e => { setRuntime(e.target.value); setCatalogId(''); }}><option value="claude_code">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select></label>
-      <label className="grid min-w-0 gap-1.5 text-xs font-medium">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => setCatalogId(e.target.value)} disabled={!options.length}>{!options.length && <option value="">No available model</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label></div>
-      {runtime === 'codex' && <p className="text-xs leading-5 text-muted-foreground">Codex uses a session history hook for Chat. Review and trust the AtrisAgent hook in the CLI’s /hooks screen when prompted.</p>}
-      {!options.length && <Button type="button" variant="outline" onClick={() => { useSettingsStore.getState().setActiveView('accounts'); onClose(); }}>Connect a CLI in Accounts</Button>}
-      {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Open the desktop app to launch interactive terminals. Conversation history is available here.</p>}
-      {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
-      <DialogFooter><Button type="button" variant="outline" onClick={onClose} disabled={pending}>Cancel</Button><Button type="submit" disabled={pending || !selected || (!conversationId && !title.trim())}>{pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{conversationId ? 'Add agent' : 'Create conversation'}</Button></DialogFooter>
-    </form>
-  </DialogContent></Dialog>;
+  return <section aria-label="Manual agent setup" className="min-h-0 flex-1 overflow-y-auto bg-background">
+    <div className="mx-auto w-full max-w-4xl px-6 py-6 lg:px-10 lg:py-8">
+      <Button variant="ghost" size="sm" className="-ml-3 mb-5 text-muted-foreground" onClick={onClose} disabled={pending}>← Back to workspace</Button>
+      <p className="text-xs font-medium text-primary">Manual workspace</p>
+      <h1 className="mt-2 text-3xl font-semibold tracking-tight">{conversationId ? 'Add an independent agent' : 'Choose your AI. Make it your workspace.'}</h1>
+      <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">Each agent has its own context and terminal. Switch between Chat and Code, work side by side, and close agents only when you decide.</p>
+      <form className="mt-6 space-y-6" onSubmit={e => { e.preventDefault(); void submit(); }}>
+        <fieldset><legend className="mb-3 text-sm font-medium">1. Choose an AI provider</legend>
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {RUNTIME_BRANDS.map(provider => {
+              const count = models.filter(model => model.runtimeType === provider.id && model.available).length;
+              return <label key={provider.id} className={`relative flex cursor-pointer flex-col rounded-2xl border p-4 transition-colors focus-within:ring-2 focus-within:ring-ring ${runtime === provider.id ? 'border-primary bg-primary/5 shadow-sm' : 'border-border bg-card hover:border-primary/40 hover:bg-accent/30'}`}>
+                <input type="radio" name="provider" value={provider.id} checked={runtime === provider.id} onChange={() => { setRuntime(provider.id); setCatalogId(''); }} className="absolute right-4 top-4 h-4 w-4 accent-primary" />
+                <RuntimeBrandIcon runtimeId={provider.id} className="mb-5 h-8 w-8 text-foreground" />
+                <span className="text-sm font-semibold">{cliName(provider.id)}</span>
+                <span className="mt-1 text-xs leading-5 text-muted-foreground">{count ? `${count} available model${count === 1 ? '' : 's'}` : 'Connect in Accounts'}</span>
+              </label>;
+            })}
+          </div>
+        </fieldset>
+        <div className="rounded-2xl border border-border bg-card p-5 sm:p-6">
+          <h2 className="text-sm font-medium">2. Set up your agent</h2>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            {!conversationId && <label className="grid gap-2 text-xs font-medium">Conversation name<Input value={title} onChange={e => setTitle(e.target.value)} maxLength={200} placeholder="e.g. Interface improvements" required /></label>}
+            <label className="grid gap-2 text-xs font-medium">Agent name<Input value={name} onChange={e => setName(e.target.value)} maxLength={200} placeholder={cliName(runtime) + ' agent'} /></label>
+            <label className="grid min-w-0 gap-2 text-xs font-medium sm:col-span-2">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => setCatalogId(e.target.value)} disabled={!options.length}>{!options.length && <option value="">No verified model available</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label>
+          </div>
+          {runtime === 'codex' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Chat uses a session history hook. Review the AtrisAgent hook in the CLI's /hooks screen when prompted.</p>}
+          {runtime === 'antigravity' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Antigravity opens in Code using your existing CLI account. Structured Chat history is not available yet. Reopening starts a fresh CLI session.</p>}
+          {!options.length && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted/40 p-3"><p className="text-xs leading-5 text-muted-foreground">Connect or verify this provider to load its available models.</p><Button type="button" variant="outline" size="sm" onClick={() => { useSettingsStore.getState().setActiveView('accounts'); onClose(); }}>Open Accounts</Button></div>}
+        </div>
+        {!conversationId && <fieldset><legend className="mb-3 text-sm font-medium">3. Choose your terminal layout</legend>
+          <div className="grid grid-cols-3 gap-3">{[1, 2, 4].map(count => <label key={count} className={`relative cursor-pointer rounded-xl border p-3 focus-within:ring-2 focus-within:ring-ring sm:p-4 ${panes === count ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-accent/30'}`}>
+            <input type="radio" name="layout" value={count} checked={panes === count} onChange={() => setPanes(count)} className="sr-only" />
+            <span aria-hidden="true" className={`mb-3 grid h-12 gap-1 ${count > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>{Array.from({ length: count }, (_, index) => <span key={index} className={`rounded border ${panes === count ? 'border-primary/30 bg-primary/10' : 'border-border bg-muted/50'}`} />)}</span>
+            <span className="text-xs font-medium">{count === 1 ? 'Focus' : count + ' panes'}</span>
+          </label>)}</div>
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">Start with one agent. Add more independently whenever you need them; the layout arranges your open terminals.</p>
+        </fieldset>}
+        {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Use the desktop app to launch interactive terminals.</p>}
+        {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
+        <div className="sticky bottom-0 z-10 flex items-center justify-end gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm"><Button type="button" variant="ghost" onClick={onClose} disabled={pending}>Cancel</Button><Button type="submit" className="rounded-xl px-6" disabled={pending || !selected || (!conversationId && !title.trim())}>{pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{conversationId ? 'Add agent' : 'Create conversation'}</Button></div>
+      </form>
+    </div>
+  </section>;
 }
 
 export function ManualWorkspace() {
@@ -71,7 +105,10 @@ export function ManualWorkspace() {
   const actionPending = useRef(false);
   const [messages, setMessages] = useState<ManualMessage[]>([]); const [truncated, setTruncated] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
-  const [generation, setGeneration] = useState(0); const [grid, setGrid] = useState(1);
+  const [generation, setGeneration] = useState(0);
+  const layouts = useManualStore(s => s.layoutByConversation);
+  const grid = conversation ? layouts[conversation.id] || 1 : 1;
+  const setGrid = (panes: number) => { if (conversation) useManualStore.getState().setLayout(conversation.id, panes); };
   const [search, setSearch] = useState('');
   const messageEnd = useRef<HTMLDivElement>(null); const scroller = useRef<HTMLDivElement>(null); const following = useRef(true);
   const native = isTauriRuntime();
@@ -79,7 +116,7 @@ export function ManualWorkspace() {
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
 
   useEffect(() => { setMessages([]); setTruncated(false); setBound(false); setError(null); setClosing(false); following.current = true; }, [agentId]);
-  useEffect(() => { setSearch(''); setGrid(1); setAdding(false); }, [conversation?.id]);
+  useEffect(() => { setSearch(''); setAdding(false); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
     let disposed = false; let timer: ReturnType<typeof setTimeout>;
@@ -130,8 +167,9 @@ export function ManualWorkspace() {
   };
   const created = async (target: ManualAgent) => {
     try { await launch(target); } catch (e) { setError(`Agent saved. ${errorText(e)} Use Open agent to retry.`); }
+    setCreating(false); setAdding(false);
   };
-  const closeDialog = () => { setCreating(false); setAdding(false); };
+  const closeDialog = () => { if (creating) useManualStore.getState().setMode('choose'); setCreating(false); setAdding(false); };
   const visibleAgents = conversation?.agents.filter(a => `${a.name} ${a.model} ${cliName(a.runtimeType)}`.toLowerCase().includes(search.toLowerCase())) || [];
   const codeAgents = agent ? [agent, ...(conversation?.agents.filter(a => a.id !== agent.id) || [])].slice(0, grid) : [];
   const live = agent && statuses[agent.id] === 'open';
@@ -142,6 +180,8 @@ export function ManualWorkspace() {
     await invoke('manual_terminal_write', { id: agent.id, data: text, paste: true });
     if (useManualStore.getState().drafts[agent.id] === draft) setDraft(agent.id, '');
   });
+
+  if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
 
   return <section className="manual-workspace flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground" aria-label="Manual conversation">
     <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
@@ -177,7 +217,6 @@ export function ManualWorkspace() {
         {supportsChat(agent.runtimeType) && <form className="shrink-0 border-t border-border px-4 py-3" onSubmit={e => { e.preventDefault(); void send(); }}><div className="mx-auto max-w-3xl"><div className="mb-2 flex items-center justify-between text-[11px] text-muted-foreground"><span>To {agent.name} · {agent.model}</span><button type="button" className="underline underline-offset-2" onClick={() => setSurface(conversation.id, 'code')}>CLI approvals & live output</button></div><div className="rounded-2xl border border-input bg-card p-3 shadow-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-ring/15"><textarea aria-label={`Message ${agent.name}`} value={draft} onChange={e => setDraft(agent.id, e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} placeholder={live ? 'Message this agent…' : 'Open the agent to continue…'} rows={3} maxLength={32000} className="max-h-40 min-h-20 w-full resize-y bg-transparent px-2 py-1 text-sm outline-none" /><div className="flex items-center justify-between px-1"><span className="text-[10px] text-muted-foreground">{live ? 'CLI open · Shift+Enter for a new line' : 'Session disconnected · history preserved'}</span><Button type="submit" size="sm" disabled={!live || !native || Boolean(pending) || !draft.trim()}>{pending === 'send' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">Send</span></Button></div></div></div></form>}
       </>}
     </>}
-    {(creating || adding) && <AgentDialog conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />}
     <Dialog open={closing} onOpenChange={setClosing}><DialogContent><DialogHeader><DialogTitle>Close {agent?.name}?</DialogTitle><DialogDescription>This stops this agent and its running commands. Other agents continue. Chat history is kept.</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setClosing(false)}>Keep open</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => agent && void action('close', async () => { await invoke('manual_terminal_close', { id: agent.id }); setStatuses(previous => ({ ...previous, [agent.id]: 'closed' })); setClosing(false); })}>Close agent</Button></DialogFooter></DialogContent></Dialog>
   </section>;
 }

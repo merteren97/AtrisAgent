@@ -17,6 +17,8 @@ interface ManualState {
   activeByWorkspace: Record<string, string>;
   agentByConversation: Record<string, string>;
   surfaceByConversation: Record<string, 'chat' | 'code'>;
+  layoutByConversation: Record<string, number>;
+  setLayout: (conversationId: string, panes: number) => void;
   drafts: Record<string, string>;
   error: string | null;
   setMode: (mode: ManualMode) => void;
@@ -37,6 +39,8 @@ export function migrateManualNavigation(persisted: unknown) {
 export const useManualStore = create<ManualState>()(persist((set, get) => ({
   creating: false, setCreating: creating => set({ creating }),
   mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, error: null,
+  layoutByConversation: {},
+  setLayout: (conversationId, panes) => set(state => ({ layoutByConversation: { ...state.layoutByConversation, [conversationId]: [1, 2, 4].includes(panes) ? panes : 1 } })),
   setMode: mode => set({ mode }),
   select: conversation => set(state => ({ mode: 'manual', activeByWorkspace: { ...state.activeByWorkspace, [conversation.workspaceId]: conversation.id } })),
   selectAgent: (conversationId, id) => set(state => ({ agentByConversation: { ...state.agentByConversation, [conversationId]: id } })),
@@ -70,4 +74,4 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   },
 }), { name: 'atris-manual-navigation', version: 1,
   migrate: migrateManualNavigation,
-  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation }) }));
+  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation }) }));

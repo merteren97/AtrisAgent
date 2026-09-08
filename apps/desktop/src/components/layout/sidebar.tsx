@@ -265,8 +265,8 @@ export function Sidebar() {
   };
 
   const handleWorkspaceSelect = (workspaceId: string) => {
-    setActiveWorkspace(workspaceId);
-    setActiveView('chat');
+    useManualStore.getState().setCreating(false);
+    handleNewChat(workspaceId);
   };
 
   const handleNewChat = (workspaceId = activeWorkspaceId) => {
@@ -449,13 +449,13 @@ export function Sidebar() {
               {!sidebarCollapsed && isActiveWorkspace && (
                 <div className="ml-3 mt-1 border-l border-sidebar-border/70 pl-2">
                   <div className="mb-1 flex items-center justify-between px-2">
-                    <span className="text-[9px] font-semibold uppercase tracking-wider text-sidebar-muted">Manual</span>
+                    <span className="text-xs font-medium tracking-normal text-sidebar-muted">Manual</span>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
                   {(manual.conversations[workspace.id] || []).map(conversation => <button key={conversation.id} type="button" aria-current={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'page' : undefined} onClick={() => { manual.select(conversation); setActiveView('chat'); }} className={`mb-0.5 flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left text-xs ${manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'bg-primary/10 text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent'}`}><Bot className="h-3 w-3 shrink-0" /><span className="truncate">{conversation.title}</span><span className="ml-auto text-[10px]">{conversation.agents.length}</span></button>)}
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
                   <div className="mb-1 flex items-center justify-between px-2">
-                    <span className="text-[11px] font-medium text-sidebar-muted">Orchestrator</span>
+                    <span className="text-xs font-medium tracking-normal text-sidebar-muted">Orchestrator</span>
                     {workspaceMissions.length > 0 && <span className="text-[8px] tabular-nums text-sidebar-muted/70">{workspaceMissions.length}</span>}
                   </div>
 

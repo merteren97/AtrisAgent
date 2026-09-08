@@ -72,6 +72,18 @@ try {
   assert.ok(JSON.parse(fs.readFileSync(launchRequest.args[5], 'utf8')).hooks.SessionStart, 'Claude lifecycle bridge stays scoped to this launch');
   assert.ok(!launchRequest.args.some((arg: string) => arg.includes('skip-permissions')), 'Provider approvals stay enabled');
   assert.deepEqual(launchRequest.env, {}, 'Shared CLI authentication is inherited, never copied');
+  profile.runtimeType = 'antigravity';
+  model.runtimeModelId = 'antigravity-active-route';
+  const agy = await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID(), name: 'Antigravity'});
+  assert.equal(agy.status, 200, 'Verified Antigravity models can create independent manual agents');
+  const agyAgent = await agy.json();
+  const agyLaunch = await (await post(`/agents/${agyAgent.id}/launch`, {})).json();
+  assert.deepEqual(agyLaunch.args, [], 'Active route uses the CLI default without invalid model or global continue flags');
+  assert.deepEqual(agyLaunch.env, {}, 'Antigravity credentials stay in the native keyring');
+  model.runtimeModelId = 'gemini-test';
+  const routed = await (await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).json();
+  const routedLaunch = await (await post(`/agents/${routed.id}/launch`, {})).json();
+  assert.deepEqual(routedLaunch.args, ['--model', 'gemini-test'], 'Concrete models are routed explicitly');
   model.availability = 'unknown';
   assert.equal((await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).status, 400);
   profile.authStatus = 'reauth_required';

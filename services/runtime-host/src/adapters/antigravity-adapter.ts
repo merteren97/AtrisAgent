@@ -1,4 +1,6 @@
 import os from 'os';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type {
@@ -23,6 +25,22 @@ import type {
 import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
 import { parseAntigravityStreamLine } from './antigravity-stream';
 import { resolveAntigravityPrintTimeout } from '../antigravity-run-policy';
+
+/** The Windows installer may update PATH after the desktop/sidecar has started. */
+export async function findAntigravityExecutable(options: {
+  platform?: string;
+  localAppData?: string;
+  lookup?: typeof findExecutable;
+  isFile?: (candidate: string) => Promise<boolean>;
+} = {}): Promise<string | undefined> {
+  const fromPath = await (options.lookup || findExecutable)('agy');
+  if (fromPath) return fromPath;
+  const localAppData = options.localAppData ?? process.env.LOCALAPPDATA;
+  if ((options.platform || process.platform) !== 'win32' || !localAppData || !path.win32.isAbsolute(localAppData)) return undefined;
+  const candidate = path.win32.join(localAppData, 'agy', 'bin', 'agy.exe');
+  const isFile = options.isFile || (async (file: string) => (await fs.stat(file)).isFile());
+  try { return await isFile(candidate) ? candidate : undefined; } catch { return undefined; }
+}
 import {
   parseAntigravityModelsOutput,
   resolveAntigravityModelRoute,
@@ -38,7 +56,6 @@ import {
 import {
   findExecutable,
   getHelpText,
-  launchInteractiveTerminal,
   redactSecrets,
   runCommand,
   spawnHidden,
@@ -192,8 +209,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   }
 
   async discoverInstallation(): Promise<InstallationStatus> {
-    const executable = await findExecutable('agy');
-    if (!executable) return { installed: false, error: 'Antigravity CLI (`agy`) was not found in PATH.' };
+    const executable = await findAntigravityExecutable();
+    if (!executable) return { installed: false, error: 'Antigravity CLI (`agy`) was not found in PATH or its standard per-user installation directory.' };
     try {
       const version = (await runCommand(executable, ['--version'], {
         timeoutMs: AGY_VERSION_TIMEOUT_MS,
@@ -252,9 +269,9 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     return [
       {
         id: 'native_keyring',
-        name: 'Google browser / native keyring',
+        name: 'Use existing Antigravity session',
         type: 'os_keyring',
-        description: 'Opens Antigravity in a real terminal. The official CLI uses Windows Credential Manager, macOS Keychain, or Linux Secret Service and opens Google Sign-In when needed.',
+        description: 'Verifies your existing official CLI session in the background. No terminal window is opened and credentials remain in the operating-system keyring.',
       },
     ];
   }
@@ -265,7 +282,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     if (!install.installed || !install.path) return { authId, method, status: 'failed', instructions: install.error };
 
     try {
-      await launchInteractiveTerminal(install.path, [], { cwd: os.homedir(), title: 'Antigravity CLI Sign-In' });
       this.authFlows.set(authId, { launchedAt: new Date().toISOString(), output: '' });
       this.lastVerification = undefined;
       return {
@@ -273,14 +289,14 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         method,
         status: 'pending',
         instructions: [
-          'A separate Antigravity terminal window was opened.',
-          'Complete the Google Sign-In in your browser, then wait until the Antigravity prompt is ready.',
-          'Return to AtrisAgent and press “Check connection”.',
+          'Your existing Antigravity session will be verified in the background.',
+          'Press “Check connection” to run a sandboxed connection check. No terminal window will open.',
+          'If the session has expired, sign in through the official CLI, then check again.',
           'Credentials remain in the operating-system keyring; AtrisAgent never reads or copies the token.',
         ].join('\n'),
       };
     } catch (error: any) {
-      return { authId, method, status: 'failed', instructions: error?.message || 'Could not open the Antigravity sign-in terminal.' };
+      return { authId, method, status: 'failed', instructions: error?.message || 'Could not prepare the Antigravity connection check.' };
     }
   }
 
@@ -371,7 +387,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         checkedAt: Date.now(),
         activeModel: finalStatus === 'connected' ? this.extractModelId(result.stdout) : undefined,
         message: finalStatus === 'error'
-          ? 'Antigravity returned an unrecognized authentication status. Use the visible sign-in terminal to verify setup.'
+          ? 'The background connection check was inconclusive. Confirm the official CLI session is ready, then retry verification.'
           : undefined,
       };
       return finalStatus;
@@ -387,7 +403,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         status,
         checkedAt: Date.now(),
         message: status === 'login_required'
-          ? 'Antigravity requires interactive setup. Start sign-in and finish setup in the visible terminal, then check the connection again.'
+          ? 'Antigravity requires sign-in through the official CLI. Complete that setup, then retry the background connection check.'
           : message || 'Antigravity authentication status could not be determined from the CLI probe.',
       };
       return status;

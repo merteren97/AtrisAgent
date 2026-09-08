@@ -239,7 +239,7 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
   },
 
   authenticateProfile: async (profileId) => {
-    const updated = await apiRequest<AccountProfile>(`/accounts/${profileId}/verify`, { method: 'POST' });
+    const updated = await apiRequest<AccountProfile>(`/accounts/${profileId}/verify`, { method: 'POST', timeoutMs: 150_000 });
     set((state) => ({ accounts: state.accounts.map((account) => account.id === profileId ? updated : account) }));
     if (updated.authStatus === 'connected') await get().refreshModels(profileId);
   },
@@ -254,7 +254,8 @@ export const useAccountStore = create<AccountState>()(persist((set, get) => ({
   },
 
   pollAuthentication: async (profileId, authId) => {
-    const result = await apiRequest<{ status: AccountProfile['authStatus']; message?: string }>(`/accounts/${profileId}/auth/${authId}`);
+    // Antigravity's bounded print probe can take 75s, followed by live catalog refresh.
+    const result = await apiRequest<{ status: AccountProfile['authStatus']; message?: string }>(`/accounts/${profileId}/auth/${authId}`, { timeoutMs: 150_000 });
     await get().fetchAccounts();
     return result;
   },

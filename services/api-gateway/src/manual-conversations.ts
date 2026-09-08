@@ -124,7 +124,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (!descriptor || descriptor.availability !== 'available') return fail('Select an available model from Accounts.');
     const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
     if (!profile || profile.authStatus !== 'connected') return fail('The selected CLI account is not connected.');
-    if (!['claude_code', 'codex', 'opencode'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
+    if (!['claude_code', 'codex', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
     const workspace = store.workspace(conversation.workspaceId);
     const cwd = fs.realpathSync(workspace.path);
     const agent: ManualAgent = { id, conversationId: conversation.id, name: required(req.body.name, 'agent name'),
@@ -152,6 +152,9 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     let args = agent.runtimeType === 'claude_code'
       ? bridge.prepareClaude(agent, Boolean(transcriptPath(agent)))
       : ['--model', agent.model];
+    // The active-route sentinel is app metadata, not a CLI model name. Never resume
+    // the globally latest conversation: manual agents must remain independent.
+    if (agent.runtimeType === 'antigravity' && agent.model === 'antigravity-active-route') args = [];
     if (agent.runtimeType === 'codex') {
       const help = await runCommand(installation.path, ['--help'], {timeoutMs: 5000});
       if (!help.stdout.includes('.config.toml')) return fail('Update Codex to a version supporting layered CLI profiles before opening a manual Chat/Code session.');
