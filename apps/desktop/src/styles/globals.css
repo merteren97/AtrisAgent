@@ -47,7 +47,7 @@
   --secondary: 225 15% 15%;
   --secondary-foreground: 210 20% 88%;
   --muted: 225 15% 14%;
-  --muted-foreground: 215 12% 50%;
+  --muted-foreground: 215 12% 64%;
   --accent: 225 15% 16%;
   --accent-foreground: 210 20% 92%;
   --destructive: 0 72% 51%;
@@ -63,7 +63,7 @@
   --sidebar-border: 225 15% 15%;
   --sidebar-accent: 225 15% 14%;
   --sidebar-accent-foreground: 210 20% 92%;
-  --sidebar-muted: 215 12% 45%;
+  --sidebar-muted: 215 12% 62%;
 }
 
 @theme {
@@ -124,6 +124,28 @@ body {
 #root {
   height: 100vh;
   width: 100vw;
+}
+
+/* A stable desktop frame: navigation is chrome, the workspace is the canvas. */
+.atris-workspace-shell > main {
+  margin: 8px 8px 8px 0;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--color-background);
+  container-type: inline-size;
+}
+.workspace-home { container-type: inline-size; }
+.workspace-sidebar { border-right: 0; }
+.workspace-sidebar > [data-tauri-drag-region] { height: 64px; border-bottom: 0; }
+.workspace-sidebar [class*="text-[8px]"],
+.workspace-sidebar [class*="text-[9px]"] { font-size: 11px; letter-spacing: .025em; }
+.workspace-sidebar [class*="border-l"] { border-left: 0; margin-left: 0; padding-left: 0; }
+.workspace-sidebar [class*="group/workspace"] { min-height: 38px; }
+.workspace-sidebar [class*="group/conversation"] button { min-height: 34px; }
+.workspace-sidebar button:focus-visible { outline: 2px solid var(--color-ring); outline-offset: -2px; }
+@media (max-width: 800px) {
+  .atris-workspace-shell > main { margin: 4px 4px 4px 0; border-radius: 10px; }
 }
 
 /* Scrollbar styling */

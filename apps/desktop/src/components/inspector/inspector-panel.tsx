@@ -1,6 +1,10 @@
-import { Fragment, useRef, useEffect, useState } from 'react';
+import { useRef } from 'react';
+import { Dialog as DialogPrimitive } from 'radix-ui';
 import * as Tabs from '@radix-ui/react-tabs';
+import { ClipboardList, Layers3, PanelRightOpen, Users, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { useSettingsStore, type InspectorTab } from '@/stores/settings-store';
 import { PlanTab } from './plan-tab';
 import { BoardTab } from './board-tab';
 import { AgentsTab } from './agents-tab';
@@ -10,288 +14,50 @@ import { ChecksTab } from './checks-tab';
 import { MemoryTab } from './memory-tab';
 import { ArtifactsTab } from './artifacts-tab';
 import { ActivityTab } from './activity-tab';
-import { useSettingsStore, type InspectorTab } from '@/stores/settings-store';
-import { Maximize2, Minimize2, PanelRightClose, PanelRightOpen } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
-type WorkbenchSection = 'plan' | 'team' | 'output';
-
-const WORKBENCH_SECTIONS: Array<{ id: WorkbenchSection; label: string; views: Array<{ id: InspectorTab; label: string }> }> = [
-  { id: 'plan', label: 'Plan', views: [{ id: 'plan', label: 'Overview' }, { id: 'board', label: 'Tasks' }] },
-  { id: 'team', label: 'Team', views: [{ id: 'agents', label: 'Agents' }, { id: 'activity', label: 'Activity' }] },
-  { id: 'output', label: 'Output', views: [
-    { id: 'changes', label: 'Changes' },
-    { id: 'checks', label: 'Checks' },
-    { id: 'artifacts', label: 'Artifacts' },
-    { id: 'context', label: 'Context' },
-    { id: 'memory', label: 'Memory' },
-  ] },
-];
+const sections = [
+  { label: 'Plan', icon: ClipboardList, description: 'Direction and execution', views: [{ id: 'plan', label: 'Overview', component: PlanTab }, { id: 'board', label: 'Tasks', component: BoardTab }] },
+  { label: 'Team', icon: Users, description: 'Agents and live activity', views: [{ id: 'agents', label: 'Agents', component: AgentsTab }, { id: 'activity', label: 'Activity', component: ActivityTab }] },
+  { label: 'Output', icon: Layers3, description: 'Changes and verification', views: [{ id: 'changes', label: 'Changes', component: ChangesTab }, { id: 'checks', label: 'Checks', component: ChecksTab }, { id: 'artifacts', label: 'Artifacts', component: ArtifactsTab }, { id: 'context', label: 'Context', component: ContextTab }, { id: 'memory', label: 'Memory', component: MemoryTab }] },
+] as const;
 
 export function InspectorPanel() {
-  const {
-    inspectorCollapsed,
-    inspectorWidth,
-    inspectorExpanded,
-    inspectorTab,
-    toggleInspector,
-    setInspectorWidth,
-    toggleInspectorExpanded,
-    setInspectorExpanded,
-    setInspectorTab,
-  } = useSettingsStore();
-  const isResizing = useRef(false);
-  const panelRef = useRef<HTMLElement>(null);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-  const [constrained, setConstrained] = useState(() => window.matchMedia('(max-width: 1099px)').matches);
-  const overlay = inspectorExpanded || constrained;
-  const activeSection = WORKBENCH_SECTIONS.find((section) => section.views.some((view) => view.id === inspectorTab)) || WORKBENCH_SECTIONS[0];
+  const { inspectorCollapsed, inspectorTab, setInspectorTab } = useSettingsStore();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const section = sections.find(item => item.views.some(view => view.id === inspectorTab)) || sections[0];
+  const setOpen = (open: boolean) => useSettingsStore.setState({ inspectorCollapsed: !open, inspectorExpanded: open });
 
-  const focusSection = (index: number) => {
-    const nextIndex = (index + WORKBENCH_SECTIONS.length) % WORKBENCH_SECTIONS.length;
-    setInspectorTab(WORKBENCH_SECTIONS[nextIndex].views[0].id);
-    requestAnimationFrame(() => document.getElementById(`workbench-section-${WORKBENCH_SECTIONS[nextIndex].id}`)?.focus());
-  };
-
-  const focusView = (index: number) => {
-    const views = activeSection.views;
-    const nextIndex = (index + views.length) % views.length;
-    setInspectorTab(views[nextIndex].id);
-    requestAnimationFrame(() => document.getElementById(`workbench-view-${views[nextIndex].id}`)?.focus());
-  };
-
-  useEffect(() => {
-    const query = window.matchMedia('(max-width: 1099px)');
-    const update = () => {
-      setConstrained(query.matches);
-      useSettingsStore.setState({ inspectorCollapsed: true, inspectorExpanded: false });
-    };
-    if (query.matches) useSettingsStore.setState({ inspectorCollapsed: true, inspectorExpanded: false });
-    query.addEventListener('change', update);
-    return () => query.removeEventListener('change', update);
-  }, []);
-
-  useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isResizing.current || overlay) return;
-      const newWidth = window.innerWidth - e.clientX;
-      const maxWidth = Math.min(720, Math.max(360, window.innerWidth * 0.55));
-      if (newWidth >= 300 && newWidth <= maxWidth) setInspectorWidth(newWidth);
-    };
-
-    const handleMouseUp = () => {
-      if (!isResizing.current) return;
-      isResizing.current = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-      handleMouseUp();
-    };
-  }, [overlay, setInspectorWidth]);
-
-  useEffect(() => {
-    if (!overlay || inspectorCollapsed) return;
-    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const getFocusable = () => panelRef.current
-      ? Array.from(panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])')).filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0)
-      : [];
-    getFocusable()[0]?.focus();
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented) return;
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        constrained ? toggleInspector() : setInspectorExpanded(false);
-      }
-      if (event.key !== 'Tab' || !panelRef.current) return;
-      const focusable = getFocusable();
-      if (!focusable.length) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      previousFocusRef.current?.focus();
-    };
-  }, [constrained, inspectorCollapsed, overlay, setInspectorExpanded, toggleInspector]);
-
-  if (inspectorCollapsed) {
-    return (
-      <div className="absolute right-0 top-1/2 z-10 -translate-y-1/2">
-        <Button
-          variant="outline"
-          size="icon"
-          className="h-12 w-8 rounded-l-md rounded-r-none border-r-0 bg-card shadow-sm hover:bg-accent"
-          onClick={toggleInspector}
-          aria-label={constrained ? 'Open Mission Workbench overlay' : 'Open Mission Workbench'}
-        >
-          <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
-        </Button>
-      </div>
-    );
-  }
-
-  return (
-    <Fragment>
-    {overlay && (
-      <button type="button" className="fixed inset-0 z-[69] cursor-default bg-background/55 backdrop-blur-[1px]" onClick={() => constrained ? toggleInspector() : setInspectorExpanded(false)} aria-label="Close inspector overlay" />
-    )}
-    <aside
-      id="mission-workbench"
-      ref={panelRef}
-       tabIndex={overlay ? -1 : undefined}
-       role={overlay ? 'dialog' : undefined}
-       aria-modal={overlay || undefined}
-      aria-label="Mission Workbench"
-      className={cn(
-        'flex min-w-0 flex-col overflow-hidden border-l border-border bg-card',
-         overlay
-          ? 'fixed bottom-3 right-3 top-3 z-[70] rounded-xl border border-border shadow-2xl outline-none'
-          : 'relative shrink-0 transition-[width] duration-0',
-      )}
-        style={overlay
-        ? { width: constrained ? 'min(480px, calc(100vw - 24px))' : 'min(960px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)' }
-        : { width: inspectorWidth, minWidth: 'min(300px, 100vw)', maxWidth: '55vw' }}
-    >
-       {!overlay && (
-        <div
-          role="separator"
-          tabIndex={0}
-          aria-label="Resize Mission Workbench"
-          aria-controls="mission-workbench"
-          aria-orientation="vertical"
-          aria-valuemin={300}
-          aria-valuemax={Math.floor(Math.min(720, Math.max(360, window.innerWidth * 0.55)))}
-          aria-valuenow={Math.round(inspectorWidth)}
-          className="absolute bottom-0 left-0 top-0 z-20 w-1 cursor-col-resize transition-colors hover:bg-primary/50 focus-visible:bg-primary focus-visible:outline-none active:bg-primary"
-          onKeyDown={(event) => {
-            const maxWidth = Math.floor(Math.min(720, Math.max(360, window.innerWidth * 0.55)));
-            const nextWidth = event.key === 'ArrowLeft' ? inspectorWidth + 16
-              : event.key === 'ArrowRight' ? inspectorWidth - 16
-                : event.key === 'Home' ? 300 : event.key === 'End' ? maxWidth : null;
-            if (nextWidth === null) return;
-            event.preventDefault();
-            setInspectorWidth(Math.max(300, Math.min(maxWidth, nextWidth)));
-          }}
-          onMouseDown={() => {
-            isResizing.current = true;
-            document.body.style.cursor = 'col-resize';
-            document.body.style.userSelect = 'none';
-          }}
-        />
-      )}
-
-      <div className="flex min-w-0 shrink-0 items-center gap-1 border-b border-border bg-muted/10 px-2">
-        <div className="min-w-0 flex-1">
-          <div className="px-1 pt-2 text-[9px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Mission Workbench</div>
-          <nav aria-label="Workbench sections" className="no-scrollbar flex h-10 min-w-0 items-center gap-0.5 overflow-x-auto pr-1">
-            {WORKBENCH_SECTIONS.map((section) => (
-              <button
-                type="button"
-                id={`workbench-section-${section.id}`}
-                aria-current={activeSection.id === section.id ? 'page' : undefined}
-                tabIndex={activeSection.id === section.id ? 0 : -1}
-                key={section.id}
-                onClick={() => setInspectorTab(section.views[0].id)}
-                onKeyDown={(event) => {
-                  const index = WORKBENCH_SECTIONS.findIndex((item) => item.id === section.id);
-                  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { event.preventDefault(); focusSection(index + 1); }
-                  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') { event.preventDefault(); focusSection(index - 1); }
-                  if (event.key === 'Home') { event.preventDefault(); focusSection(0); }
-                  if (event.key === 'End') { event.preventDefault(); focusSection(WORKBENCH_SECTIONS.length - 1); }
-                }}
-                className={cn(
-                  'shrink-0 whitespace-nowrap rounded-md px-2 py-1.5 text-[10px] transition-colors',
-                  activeSection.id === section.id
-                    ? 'bg-accent font-medium text-accent-foreground'
-                    : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
-                )}
-              >
-                {section.label}
-              </button>
-            ))}
+  return <DialogPrimitive.Root open={!inspectorCollapsed} onOpenChange={setOpen}>
+    <DialogPrimitive.Trigger asChild>
+      <Button ref={triggerRef} variant="outline" size="icon" className="absolute right-0 top-1/2 z-10 h-12 w-8 -translate-y-1/2 rounded-l-lg rounded-r-none border-r-0 bg-card shadow-sm" aria-label="Open Mission Workbench">
+        <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
+      </Button>
+    </DialogPrimitive.Trigger>
+    <DialogPrimitive.Portal>
+      <DialogPrimitive.Overlay className="fixed inset-0 z-[100] bg-background/60 backdrop-blur-md data-[state=open]:animate-in data-[state=open]:fade-in-0 motion-reduce:animate-none" />
+      <DialogPrimitive.Content id="mission-workbench" aria-describedby="workbench-description" onCloseAutoFocus={event => { event.preventDefault(); triggerRef.current?.focus(); }} className="fixed inset-3 z-[110] flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl outline-none sm:inset-5 lg:inset-6">
+        <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-5 py-5 sm:px-8">
+          <div className="min-w-0">
+            <p className="mb-1 text-xs font-medium text-muted-foreground">Orchestrator</p>
+            <DialogPrimitive.Title className="text-xl font-semibold tracking-tight sm:text-2xl">Mission Workbench</DialogPrimitive.Title>
+            <DialogPrimitive.Description id="workbench-description" className="mt-1 text-sm text-muted-foreground">Follow the plan, coordinate your team, and review the results.</DialogPrimitive.Description>
+          </div>
+          <DialogPrimitive.Close asChild><Button variant="outline" size="icon" className="h-10 w-10 shrink-0 rounded-xl" aria-label="Close inspector"><X className="h-4 w-4" /></Button></DialogPrimitive.Close>
+        </header>
+        <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+          <nav aria-label="Workbench sections" className="flex shrink-0 gap-1 border-b border-border bg-muted/15 p-3 sm:w-56 sm:flex-col sm:border-b-0 sm:border-r sm:p-4">
+            {sections.map(item => <button type="button" key={item.label} aria-current={section.label === item.label ? 'page' : undefined} onClick={() => setInspectorTab(item.views[0].id)} className={cn('flex min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:flex-none', section.label === item.label ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-accent hover:text-foreground')}>
+              <item.icon className="h-5 w-5 shrink-0" /><span className="min-w-0"><span className="block text-sm font-medium">{item.label}</span><span className="mt-0.5 hidden text-xs leading-5 text-muted-foreground sm:block">{item.description}</span></span>
+            </button>)}
           </nav>
+          <Tabs.Root value={inspectorTab} onValueChange={value => setInspectorTab(value as InspectorTab)} className="flex min-h-0 min-w-0 flex-1 flex-col">
+            <Tabs.List aria-label={section.label + ' views'} className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-4 py-3 sm:px-6">
+              {section.views.map(view => <Tabs.Trigger key={view.id} value={view.id} className="shrink-0 rounded-lg px-4 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=active]:bg-accent data-[state=active]:text-foreground">{view.label}</Tabs.Trigger>)}
+            </Tabs.List>
+            {sections.flatMap(item => item.views.map(view => <Tabs.Content key={view.id} value={view.id} className="m-0 min-h-0 min-w-0 flex-1 overflow-auto p-2 outline-none sm:p-4"><view.component /></Tabs.Content>))}
+          </Tabs.Root>
         </div>
-
-        {!constrained && <Tooltip delayDuration={0}>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-              onClick={toggleInspectorExpanded}
-              aria-label={inspectorExpanded ? 'Restore inspector' : 'Expand inspector'}
-            >
-              {inspectorExpanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{inspectorExpanded ? 'Restore inspector (Esc)' : 'Focus inspector'}</TooltipContent>
-        </Tooltip>}
-
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-          onClick={toggleInspector}
-          aria-label="Close inspector"
-        >
-          <PanelRightClose className="h-4 w-4" />
-        </Button>
-      </div>
-
-      {activeSection.views.length > 1 && (
-        <div role="tablist" className="no-scrollbar flex shrink-0 items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border bg-muted/5 px-3 py-1.5" aria-label={`${activeSection.label} views`}>
-          {activeSection.views.map((view) => (
-            <button
-              key={view.id}
-              id={`workbench-view-${view.id}`}
-              type="button"
-              role="tab"
-              aria-selected={inspectorTab === view.id}
-              aria-controls={`workbench-content-${view.id}`}
-              tabIndex={inspectorTab === view.id ? 0 : -1}
-              onClick={() => setInspectorTab(view.id)}
-              onKeyDown={(event) => {
-                const index = activeSection.views.findIndex((item) => item.id === view.id);
-                if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { event.preventDefault(); focusView(index + 1); }
-                if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') { event.preventDefault(); focusView(index - 1); }
-                if (event.key === 'Home') { event.preventDefault(); focusView(0); }
-                if (event.key === 'End') { event.preventDefault(); focusView(activeSection.views.length - 1); }
-              }}
-              className={cn('rounded px-2 py-1 text-[10px]', inspectorTab === view.id ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground')}
-            >
-              {view.label}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <Tabs.Root value={inspectorTab} onValueChange={(value) => setInspectorTab(value as InspectorTab)} className="min-h-0 flex-1 overflow-hidden">
-        <Tabs.Content id="workbench-content-plan" aria-labelledby="workbench-view-plan" value="plan" className="m-0 h-full min-w-0 border-none outline-none"><PlanTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-board" aria-labelledby="workbench-view-board" value="board" className="m-0 h-full min-w-0 border-none outline-none"><BoardTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-agents" aria-labelledby="workbench-view-agents" value="agents" className="m-0 h-full min-w-0 border-none outline-none"><AgentsTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-context" aria-labelledby="workbench-view-context" value="context" className="m-0 h-full min-w-0 border-none outline-none"><ContextTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-changes" aria-labelledby="workbench-view-changes" value="changes" className="m-0 h-full min-w-0 border-none outline-none"><ChangesTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-checks" aria-labelledby="workbench-view-checks" value="checks" className="m-0 h-full min-w-0 border-none outline-none"><ChecksTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-memory" aria-labelledby="workbench-view-memory" value="memory" className="m-0 h-full min-w-0 border-none outline-none"><MemoryTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-artifacts" aria-labelledby="workbench-view-artifacts" value="artifacts" className="m-0 h-full min-w-0 border-none outline-none"><ArtifactsTab /></Tabs.Content>
-        <Tabs.Content id="workbench-content-activity" aria-labelledby="workbench-view-activity" value="activity" className="m-0 h-full min-w-0 border-none outline-none"><ActivityTab /></Tabs.Content>
-      </Tabs.Root>
-    </aside>
-    </Fragment>
-  );
+      </DialogPrimitive.Content>
+    </DialogPrimitive.Portal>
+  </DialogPrimitive.Root>;
 }

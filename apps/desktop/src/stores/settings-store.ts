@@ -99,7 +99,7 @@ export const useSettingsStore = create<SettingsState>()(
       },
       sidebarCollapsed: false,
       sidebarWidth: 256,
-      inspectorCollapsed: false,
+      inspectorCollapsed: true,
       inspectorWidth: 320,
       inspectorExpanded: false,
       inspectorTab: 'plan',
@@ -143,7 +143,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 11,
+      version: 12,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
         const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
@@ -160,6 +160,7 @@ export const useSettingsStore = create<SettingsState>()(
             : 'summary',
           inspectorTab: validInspectorTabs.includes(state.inspectorTab as InspectorTab) ? state.inspectorTab : 'plan',
           inspectorExpanded: false,
+          inspectorCollapsed: true,
           automationSettings: { fileWrite: null, gitCommit: null, packageInstall: null },
           // Direct role selection is now an advanced capability; normal missions always
           // enter through the orchestrator and @mentions can still target specialists.

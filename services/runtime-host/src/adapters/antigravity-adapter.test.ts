@@ -1,4 +1,4 @@
-import { AntigravityAdapter, resolveAntigravityExecutionMode } from './antigravity-adapter';
+import { AntigravityAdapter, findAntigravityExecutable, resolveAntigravityExecutionMode } from './antigravity-adapter';
 
 async function runTests() {
   console.log('--- Starting Antigravity Authentication Probe Tests ---');
@@ -17,6 +17,12 @@ async function runTests() {
 
   assert(resolveAntigravityExecutionMode('workspace-write') === 'accept-edits', 'maps Builder write access to Antigravity accept-edits mode');
   assert(resolveAntigravityExecutionMode('read-only') === 'plan', 'maps read-only agent access to Antigravity plan mode');
+  const installDiscovery = { platform: 'win32', localAppData: 'C:\\Users\\test\\AppData\\Local', lookup: async () => undefined, isFile: async () => true };
+  assert(await findAntigravityExecutable(installDiscovery) === 'C:\\Users\\test\\AppData\\Local\\agy\\bin\\agy.exe', 'finds the standard Windows installation when inherited PATH is stale');
+  assert(await findAntigravityExecutable({ ...installDiscovery, lookup: async () => 'D:\\tools\\agy.exe' }) === 'D:\\tools\\agy.exe', 'respects an explicit CLI installation on PATH');
+  assert(await findAntigravityExecutable({ ...installDiscovery, localAppData: 'relative' }) === undefined, 'rejects relative installation roots');
+  assert(await findAntigravityExecutable({ ...installDiscovery, isFile: async () => false }) === undefined, 'does not report a missing executable as installed');
+  assert(await findAntigravityExecutable({ ...installDiscovery, isFile: async () => { throw new Error('denied'); } }) === undefined, 'handles unavailable installation directories without crashing installDiscovery');
 
   const passiveInvocations: string[][] = [];
   const unsupported = new AntigravityAdapter(undefined, {
@@ -44,6 +50,9 @@ async function runTests() {
     },
   });
   supported.discoverInstallation = async () => ({ installed: true, path: 'agy.exe' });
+  const flow = await supported.beginAuthentication();
+  assert(flow.status === 'pending' && Boolean(flow.instructions?.includes('background')), 'prepares existing-session attachment without launching an interactive terminal');
+  assert(supportedInvocations.length === 0, 'attachment initiation does not execute an interactive login command');
   assert(await supported.verifyAuthentication() === 'connected', 'accepts authentication confirmed by a successful structured print probe');
   assert(
     JSON.stringify(supportedInvocations) === JSON.stringify([[

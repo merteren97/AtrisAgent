@@ -119,8 +119,14 @@ export function AccountsView() {
       if (authMethod.includes('api_key') || authMethod.includes('token') || authMethod.includes('secret')) options.secret = secret;
       const flow = await beginAuthentication(profile.id, authMethod, options);
       setAuthFlow(flow);
-      notify(flow.status === 'completed' ? 'Account connected.' : 'Official authentication flow started.');
+      notify(flow.status === 'failed' ? (flow.instructions || 'Connection could not be started.') : flow.status === 'completed' ? 'Account connected.' : 'Official authentication flow started.');
       if (flow.status === 'completed') await refreshModels(profile.id);
+      if (runtimeType === 'antigravity' && flow.status === 'pending') {
+        notify('Checking your existing Antigravity session in the background…');
+        const result = await pollAuthentication(profile.id, flow.authId);
+        notify(result.message || `Connection: ${result.status}`);
+        if (result.status === 'connected') { await refreshModels(profile.id); setDialogOpen(false); }
+      }
     } catch (cause: any) {
       notify(cause?.message || 'Profile creation failed.');
     } finally {
@@ -151,7 +157,12 @@ export function AccountsView() {
     try {
       const flow = await beginAuthentication(createdProfileId, authMethod, {});
       setAuthFlow(flow);
-      notify(flow.status === 'failed' ? (flow.instructions || 'Authentication could not be started.') : 'The official sign-in window was opened again.');
+      notify(flow.instructions || 'Connection check prepared.');
+      if (runtimeType === 'antigravity' && flow.status === 'pending') {
+        const result = await pollAuthentication(createdProfileId, flow.authId);
+        notify(result.message || `Connection: ${result.status}`);
+        if (result.status === 'connected') { await refreshModels(createdProfileId); setDialogOpen(false); }
+      }
     } catch (cause: any) {
       notify(cause?.message || 'Authentication could not be restarted.');
     } finally {
@@ -183,6 +194,12 @@ export function AccountsView() {
       setAuthFlow(flow);
       setDialogOpen(true);
       notify(flow.instructions || 'Official authentication flow started.');
+      if (profile.runtimeType === 'antigravity' && flow.status === 'pending') {
+        notify('Checking your existing Antigravity session in the background…');
+        const result = await pollAuthentication(profile.id, flow.authId);
+        notify(result.message || `Connection: ${result.status}`);
+        if (result.status === 'connected') { await refreshModels(profile.id); setDialogOpen(false); }
+      }
     } catch (cause: any) {
       notify(cause?.message || 'Authentication could not be started.');
     } finally {
@@ -393,8 +410,8 @@ export function AccountsView() {
               {authFlow?.url && <div className="rounded-xl border border-border p-3"><div className="mb-2 text-xs font-medium">Authorization URL</div><div className="flex gap-2"><Input readOnly value={authFlow.url} className="font-mono text-xs" /><Button variant="outline" size="icon" onClick={() => navigator.clipboard.writeText(authFlow.url!)}><Copy className="h-4 w-4" /></Button><Button variant="outline" size="icon" asChild><a href={authFlow.url} target="_blank" rel="noreferrer"><ExternalLink className="h-4 w-4" /></a></Button></div></div>}
               {authFlow?.userCode && <div className="rounded-xl border border-border p-3"><div className="mb-2 text-xs font-medium">Device code</div><div className="flex items-center justify-between rounded-lg bg-muted px-4 py-3 font-mono text-lg tracking-widest"><span>{authFlow.userCode}</span><Button variant="ghost" size="icon" onClick={() => navigator.clipboard.writeText(authFlow.userCode!)}><Copy className="h-4 w-4" /></Button></div></div>}
               <div className="flex flex-col gap-2 rounded-xl border border-border/70 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-xs text-muted-foreground">The app never fabricates a successful connection. Verification runs against the installed CLI. Antigravity authentication must finish in the separate terminal window.</p>
-                {runtimeType === 'antigravity' && <Button type="button" variant="outline" size="sm" disabled={busyAction === 'restart-auth'} onClick={() => void restartAuthentication()}>{busyAction === 'restart-auth' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ExternalLink className="mr-2 h-4 w-4" />}Reopen sign-in</Button>}
+                <p className="text-xs leading-5 text-muted-foreground">Verification uses the installed CLI. Antigravity checks your existing session in the background; no terminal window is opened. An expired session must be renewed through the official CLI.</p>
+                {runtimeType === 'antigravity' && <Button type="button" variant="outline" size="sm" disabled={Boolean(busyAction)} onClick={() => void restartAuthentication()}>{busyAction === 'restart-auth' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Retry verification</Button>}
               </div>
             </div>
           )}
@@ -405,7 +422,7 @@ export function AccountsView() {
           )}
           <DialogFooter>
             <Button variant="ghost" onClick={() => setDialogOpen(false)}>Close</Button>
-            {!createdProfileId ? <Button disabled={!profileName.trim() || !authMethod || (runtimeType === 'opencode' && !['existing_cli', 'existing_store'].includes(authMethod) && !providerId.trim()) || busyAction === 'create'} onClick={createAndConnect}>{busyAction === 'create' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{runtimeType === 'opencode' && authMethod === 'existing_cli' ? 'Attach CLI' : 'Create & connect'}</Button> : <Button disabled={!authFlow || busyAction === 'poll'} onClick={checkAuth}>{busyAction === 'poll' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Check connection</Button>}
+            {!createdProfileId ? <Button disabled={!profileName.trim() || !authMethod || (runtimeType === 'opencode' && !['existing_cli', 'existing_store'].includes(authMethod) && !providerId.trim()) || busyAction === 'create'} onClick={createAndConnect}>{busyAction === 'create' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{runtimeType === 'opencode' && authMethod === 'existing_cli' ? 'Attach CLI' : 'Create & connect'}</Button> : <Button disabled={!authFlow || Boolean(busyAction)} onClick={checkAuth}>{busyAction === 'poll' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Check connection</Button>}
           </DialogFooter>
         </DialogContent>
       </Dialog>

@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { useMissionStore } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useSettingsStore } from '@/stores/settings-store';
+import { useManualStore } from '@/stores/manual-store';
 import { useLanguageStore, t } from '@/stores/language-store';
 import { canRetryMission, isMissionCancellable, missionStatusLabel } from '@/lib/mission-display';
 
@@ -45,7 +46,8 @@ export function Titlebar() {
     setComposerInput,
   } = useMissionStore();
   const { workspaces, activeWorkspaceId } = useWorkspaceStore();
-  const activeMission = missions.find((mission) => mission.id === activeMissionId);
+  const manual = useManualStore();
+  const activeMission = manual.mode === 'orchestrator' ? missions.find((mission) => mission.id === activeMissionId) : undefined;
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
   const showMissionControls = activeView === 'chat' && Boolean(activeMission);
   const canStop = Boolean(activeMission && isMissionCancellable(activeMission.status));
@@ -57,7 +59,7 @@ export function Titlebar() {
       : activeView === 'agents' ? 'Agents'
         : activeView === 'accounts' ? 'Accounts'
           : activeView === 'settings' ? 'Settings'
-            : activeMission?.title || (activeWorkspace ? 'New chat' : 'AtrisAgent');
+            : manual.mode === 'choose' ? 'Workspace overview' : manual.mode === 'manual' ? 'Manual workspace' : activeMission?.title || 'New orchestrated conversation';
 
   const reportWindowError = (action: WindowAction, error: unknown) => {
     const details = getErrorMessage(error);
@@ -106,6 +108,7 @@ export function Titlebar() {
 
   const handleNewChat = () => {
     if (!activeWorkspaceId) return;
+    useManualStore.getState().setMode('choose');
     clearActiveMission();
     setComposerInput('');
     setActiveView('chat');
@@ -119,6 +122,7 @@ export function Titlebar() {
       if (target?.closest('input, textarea, [contenteditable="true"]')) return;
       if (!activeWorkspaceId) return;
       event.preventDefault();
+      useManualStore.getState().setMode('choose');
       clearActiveMission();
       setComposerInput('');
       setActiveView('chat');

@@ -25,6 +25,7 @@ import {
   MoreHorizontal,
   Trash2,
   LogOut,
+  House,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
@@ -40,6 +41,7 @@ import { useWorkspaceStore } from '../../stores/workspace-store';
 import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
+import { useManualStore } from '@/stores/manual-store';
 import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
 import { ThemeToggle } from '../theme-toggle';
@@ -60,7 +62,8 @@ function SidebarItem({ icon, label, badge, isActive, onClick, collapsed }: Sideb
     <button
       onClick={onClick}
       aria-label={collapsed ? label : undefined}
-      className={`group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${isActive ? 'bg-sidebar-accent text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
+      aria-current={isActive ? 'page' : undefined}
+      className={`group flex min-h-9 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${isActive ? 'bg-sidebar-accent font-medium text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
     >
       {icon}
       {!collapsed && <span>{label}</span>}
@@ -176,6 +179,7 @@ function SidebarAgentTree({
 }
 
 export function Sidebar() {
+  const manual = useManualStore();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
@@ -199,6 +203,10 @@ export function Sidebar() {
   } = useSettingsStore();
 
   useEffect(() => {
+    if (activeWorkspaceId) void useManualStore.getState().refresh(activeWorkspaceId);
+  }, [activeWorkspaceId]);
+
+  useEffect(() => {
     if (!activeWorkspaceId) {
       clearActiveMission();
       return;
@@ -219,7 +227,7 @@ export function Sidebar() {
       const currentMissions = useMissionStore.getState().missions;
       const preferredMissionId = useWorkspaceStore.getState().lastMissionByWorkspace[activeWorkspaceId];
       if (preferredMissionId && currentMissions.some((mission) => mission.id === preferredMissionId)) {
-        setActiveMission(preferredMissionId);
+        setActiveMission(preferredMissionId, false);
         return;
       }
       const currentMissionId = useMissionStore.getState().activeMissionId;
@@ -257,12 +265,13 @@ export function Sidebar() {
   };
 
   const handleWorkspaceSelect = (workspaceId: string) => {
-    setActiveWorkspace(workspaceId);
-    setActiveView('chat');
+    useManualStore.getState().setCreating(false);
+    handleNewChat(workspaceId);
   };
 
   const handleNewChat = (workspaceId = activeWorkspaceId) => {
     if (!workspaceId) return;
+    useManualStore.getState().setMode('choose');
     setComposerInput('');
     setActiveView('chat');
 
@@ -277,12 +286,14 @@ export function Sidebar() {
   };
 
   const handleMissionSelect = (missionId: string) => {
+    useManualStore.getState().setMode('orchestrator');
     if (activeWorkspaceId) rememberMission(activeWorkspaceId, missionId);
     setActiveMission(missionId);
     setActiveView('chat');
   };
 
   const handleAgentSelect = (agent: AgentInstance) => {
+    useManualStore.getState().setMode('orchestrator');
     setSelectedAgent(agent.id);
     setActiveView('chat');
     openInspector('agents');
@@ -300,13 +311,13 @@ export function Sidebar() {
     ? missions.find((mission) => mission.id === pendingDeleteMission.id) || pendingDeleteMission
     : null;
 
-  const currentWidth = sidebarCollapsed ? 48 : sidebarWidth;
+  const currentWidth = sidebarCollapsed ? 56 : `clamp(208px, 24vw, ${sidebarWidth}px)`;
 
   return (
     <aside
       aria-label="Project navigation"
-      className="relative flex flex-col select-none border-r border-sidebar-border bg-sidebar transition-[width] duration-300 ease-in-out"
-      style={{ width: currentWidth, minWidth: currentWidth }}
+      className="workspace-sidebar relative flex flex-col select-none border-r border-sidebar-border bg-sidebar transition-[width] duration-200 motion-reduce:transition-none"
+      style={{ width: currentWidth, minWidth: sidebarCollapsed ? 56 : 208, flexShrink: 0 }}
     >
       <div className="absolute bottom-0 right-0 top-0 z-50 w-1 cursor-col-resize transition-colors hover:bg-primary/50" onMouseDown={handleDrag} />
 
@@ -319,7 +330,7 @@ export function Sidebar() {
             draggable={false}
             className="h-6 w-6 shrink-0 object-contain"
           />
-          {!sidebarCollapsed && <span data-tauri-drag-region className="whitespace-nowrap text-sm font-semibold text-sidebar-foreground">AtrisAgent</span>}
+          {!sidebarCollapsed && <span data-tauri-drag-region className="whitespace-nowrap text-sm font-semibold tracking-tight text-sidebar-foreground">AtrisAgent</span>}
         </div>
         <div className={`flex items-center gap-1 ${sidebarCollapsed ? 'flex-col' : ''}`}>
           {!sidebarCollapsed && <ThemeToggle compact />}
@@ -329,7 +340,10 @@ export function Sidebar() {
         </div>
       </div>
 
-      <div className="px-2 py-2">
+      <div className="space-y-2 px-3 pb-2 pt-4">
+        <Button className={`h-10 w-full gap-2 rounded-lg ${sidebarCollapsed ? 'px-0' : 'justify-start px-3'}`} onClick={() => { clearActiveMission(); manual.setMode('choose'); setActiveView('chat'); }} aria-label="New conversation">
+          <Plus className="h-4 w-4 shrink-0" />{!sidebarCollapsed && <><span>New conversation</span><span className="ml-auto text-[10px] opacity-70">Ctrl N</span></>}
+        </Button>
         <button
           type="button"
           aria-label="Search workspaces and missions"
@@ -337,7 +351,7 @@ export function Sidebar() {
           className={`flex w-full items-center rounded-md border border-sidebar-border/70 bg-sidebar-accent py-1.5 text-xs text-sidebar-muted transition-colors hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-2.5'}`}
         >
           <Search className="h-3.5 w-3.5 shrink-0" />
-          {!sidebarCollapsed && <><span>Search</span><kbd className="ml-auto rounded border border-sidebar-border bg-sidebar px-1 py-0.5 font-sans text-[9px]">⌘K</kbd></>}
+          {!sidebarCollapsed && <><span className="min-w-0 truncate">Search conversations</span><kbd className="ml-auto shrink-0 whitespace-nowrap rounded border border-sidebar-border bg-sidebar px-1 py-0.5 font-sans text-[10px]">Ctrl K</kbd></>}
         </button>
       </div>
 
@@ -345,14 +359,15 @@ export function Sidebar() {
         <div className="space-y-0.5">
           <SidebarItem
             collapsed={sidebarCollapsed}
-            icon={<BarChart2 className="h-3.5 w-3.5 text-primary" />}
+            icon={<House className="h-4 w-4" />}
             label="Home"
-            isActive={activeView === 'dashboard'}
-            onClick={() => setActiveView('dashboard')}
+            isActive={activeView === 'chat' && manual.mode === 'choose'}
+            onClick={() => { manual.setMode('choose'); setActiveView('chat'); }}
             badge={attentionCount > 0 ? <Badge variant="secondary" className="ml-auto h-4 min-w-4 px-1 text-[9px]">{attentionCount}</Badge> : undefined}
           />
           <SidebarItem collapsed={sidebarCollapsed} icon={<FolderGit2 className="h-3.5 w-3.5 text-primary" />} label="Projects" isActive={activeView === 'projects'} onClick={() => setActiveView('projects')} />
           <SidebarItem collapsed={sidebarCollapsed} icon={<History className="h-3.5 w-3.5 text-muted-foreground" />} label="History" onClick={() => setIsHistoryDialogOpen(true)} />
+          <SidebarItem collapsed={sidebarCollapsed} icon={<BarChart2 className="h-4 w-4" />} label="Insights" isActive={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
         </div>
       </div>
 
@@ -434,7 +449,13 @@ export function Sidebar() {
               {!sidebarCollapsed && isActiveWorkspace && (
                 <div className="ml-3 mt-1 border-l border-sidebar-border/70 pl-2">
                   <div className="mb-1 flex items-center justify-between px-2">
-                    <span className="text-[8px] font-semibold uppercase tracking-[0.14em] text-sidebar-muted/80">Conversations</span>
+                    <span className="text-xs font-medium tracking-normal text-sidebar-muted">Manual</span>
+                    <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
+                  </div>
+                  {(manual.conversations[workspace.id] || []).map(conversation => <button key={conversation.id} type="button" aria-current={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'page' : undefined} onClick={() => { manual.select(conversation); setActiveView('chat'); }} className={`mb-0.5 flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left text-xs ${manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'bg-primary/10 text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent'}`}><Bot className="h-3 w-3 shrink-0" /><span className="truncate">{conversation.title}</span><span className="ml-auto text-[10px]">{conversation.agents.length}</span></button>)}
+                  {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
+                  <div className="mb-1 flex items-center justify-between px-2">
+                    <span className="text-xs font-medium tracking-normal text-sidebar-muted">Orchestrator</span>
                     {workspaceMissions.length > 0 && <span className="text-[8px] tabular-nums text-sidebar-muted/70">{workspaceMissions.length}</span>}
                   </div>
 
@@ -444,10 +465,10 @@ export function Sidebar() {
                       onClick={() => handleNewChat(workspace.id)}
                       className="w-full rounded-md border border-dashed border-sidebar-border/70 px-2 py-2 text-left text-[10px] leading-relaxed text-sidebar-muted transition-colors hover:border-primary/30 hover:text-sidebar-foreground"
                     >
-                      No conversations yet. Hover the project and use the compose icon to start one.
+                      Start an orchestrated conversation
                     </button>
                   ) : workspaceMissions.map((mission) => {
-                    const isActiveMission = mission.id === activeMissionId;
+                    const isActiveMission = manual.mode === 'orchestrator' && mission.id === activeMissionId;
                     const missionAgents = isActiveMission ? activeMissionAgents : [];
                     const missionCancelled = mission.status === 'cancelled';
                      const runningAgents = missionCancelled ? 0 : missionAgents.filter((agent) => agent.status === 'running').length;

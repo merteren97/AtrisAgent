@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { apiRequest } from '@/lib/api-client';
+import { invoke } from '@tauri-apps/api/core';
+import { isTauriRuntime } from '@/lib/secure-storage';
+import type { ManualConversation } from './manual-store';
 
 export interface Workspace {
   id: string;
@@ -106,6 +109,13 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       removeWorkspace: async (id, removeMemory = false) => {
         set({ loading: true, error: null });
         try {
+          const manual = await apiRequest<ManualConversation[]>(`/manual/conversations?workspaceId=${encodeURIComponent(id)}`);
+          const agents = manual.flatMap(conversation => conversation.agents);
+          if (agents.length) {
+            if (!isTauriRuntime()) throw new Error('Remove this project in the desktop app so its manual terminals can be checked first.');
+            const states = await Promise.all(agents.map(agent => invoke<{status: string}>('manual_terminal_snapshot', { id: agent.id, after: 0, statusOnly: true })));
+            if (states.some(state => state.status === 'open')) throw new Error('Close the project’s manual agents before removing it. Their sessions will not be closed automatically.');
+          }
           await apiRequest(`/workspaces/${id}`, {
             method: 'DELETE',
             body: JSON.stringify({ removeMemory }),
