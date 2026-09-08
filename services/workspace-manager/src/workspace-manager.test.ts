@@ -335,6 +335,8 @@ async function runTests() {
     assert(fs.existsSync(path.join(mirrorPath, '.cargo-targeted', 'source.txt')), 'Mirror preserves similarly named source folders');
     assert(fs.existsSync(path.join(mirrorPath, 'local-release', 'notes.txt')), 'Mirror preserves local-release user files');
     assert(fs.existsSync(path.join(mirrorPath, 'scratch', 'notes.txt')), 'Mirror preserves scratch user files');
+    await worktreeManager.removeWorktree(mirrorPath);
+    assert(!fs.existsSync(mirrorPath), 'Non-Git mirror worktree is removed asynchronously');
 
     const mirrorCheckpointId = await checkpointManager.createCheckpoint(mirrorSource, 'mirror-safety');
     const mirrorSnapshotPath = path.join(mirrorSource, '.atris-checkpoints', mirrorCheckpointId);

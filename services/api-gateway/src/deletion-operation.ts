@@ -52,17 +52,42 @@ export class DeletionOperationStore {
       WHERE status = 'running'`).run(now);
   }
 
+  /** Mark an unexpected runner failure retryable, without clobbering another owner. */
+  markRetryable(id: string, error: unknown, ownerToken?: string): void {
+    const message = String(error instanceof Error ? error.message : error).slice(0, 2048);
+    const where = ownerToken
+      ? "status <> 'completed' AND (status <> 'running' OR owner_token = ?)"
+      : "status IN ('pending', 'retryable')";
+    const args = ownerToken
+      ? [message || 'Deletion runner failed unexpectedly; retry is safe', new Date().toISOString(), id, ownerToken]
+      : [message || 'Deletion runner failed unexpectedly; retry is safe', new Date().toISOString(), id];
+    this.sqlite.prepare(`UPDATE deletion_operations SET status = 'retryable', error = ?, owner_token = NULL,
+      lease_expires_at = NULL, updated_at = ? WHERE id = ? AND ${where}`).run(...args);
+  }
+
   async execute(operation: DeletionOperation, handlers: DeletionHandlers): Promise<DeletionOperation> {
     let current = operation;
+    const owner = crypto.randomUUID();
+    let ownsCurrentPhase = false;
     while (current.status !== 'completed') {
-      const owner = crypto.randomUUID();
-      if (!this.claim(current.id, current.phase as DeletionPhase, owner)) return this.get(current.targetType, current.targetId)!;
+      if (!ownsCurrentPhase) {
+        if (!this.claim(current.id, current.phase as DeletionPhase, owner)) return this.get(current.targetType, current.targetId)!;
+        ownsCurrentPhase = true;
+      }
+      const heartbeatInterval = Math.max(1, Math.floor(this.leaseMs / 3));
+      const heartbeat = setInterval(() => {
+        try { this.renew(current.id, owner); } catch { /* The handler result will surface the database failure. */ }
+      }, heartbeatInterval);
       try {
         await handlers[current.phase as DeletionPhase](current);
-        this.advance(current.id, current.phase as DeletionPhase, owner);
+        if (!this.advance(current.id, current.phase as DeletionPhase, owner)) {
+          return this.get(current.targetType, current.targetId)!;
+        }
       } catch (error: any) {
         this.fail(current.id, owner, error?.message || String(error));
         return this.get(current.targetType, current.targetId)!;
+      } finally {
+        clearInterval(heartbeat);
       }
       current = this.get(current.targetType, current.targetId)!;
     }
@@ -73,22 +98,36 @@ export class DeletionOperationStore {
     const now = new Date();
     const result = this.sqlite.prepare(`UPDATE deletion_operations SET status = 'running', owner_token = ?,
       lease_expires_at = ?, attempt_count = attempt_count + 1, updated_at = ?, error = NULL
-      WHERE id = ? AND phase = ? AND status IN ('pending', 'retryable')`)
-      .run(owner, new Date(now.getTime() + this.leaseMs).toISOString(), now.toISOString(), id, phase);
+      WHERE id = ? AND phase = ? AND (status IN ('pending', 'retryable')
+        OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))`)
+      .run(owner, new Date(now.getTime() + this.leaseMs).toISOString(), now.toISOString(), id, phase, now.toISOString());
     return result.changes === 1;
   }
 
-  private advance(id: string, phase: DeletionPhase, owner: string): void {
+  private renew(id: string, owner: string): void {
+    const now = new Date();
+    this.sqlite.prepare(`UPDATE deletion_operations SET lease_expires_at = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND owner_token = ?`)
+      .run(new Date(now.getTime() + this.leaseMs).toISOString(), now.toISOString(), id, owner);
+  }
+
+  private advance(id: string, phase: DeletionPhase, owner: string): boolean {
     const index = DELETION_PHASES.indexOf(phase);
     const next = DELETION_PHASES[index + 1];
     const now = new Date().toISOString();
     const progress = JSON.stringify({ completedPhases: DELETION_PHASES.slice(0, index + 1), completedCount: index + 1, totalCount: DELETION_PHASES.length });
-    if (next) this.sqlite.prepare(`UPDATE deletion_operations SET phase = ?, status = 'pending', progress = ?,
-      owner_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND owner_token = ? AND phase = ?`)
-      .run(next, progress, now, id, owner, phase);
-    else this.sqlite.prepare(`UPDATE deletion_operations SET phase = 'relational', status = 'completed', progress = ?,
+    if (next) {
+      const result = this.sqlite.prepare(`UPDATE deletion_operations SET phase = ?, status = 'running', progress = ?,
+      lease_expires_at = ?, updated_at = ? WHERE id = ? AND owner_token = ? AND phase = ?`)
+      .run(next, progress, new Date(Date.now() + this.leaseMs).toISOString(), now, id, owner, phase);
+      if (result.changes !== 1) return false;
+      const row = this.sqlite.prepare('SELECT phase, status, owner_token FROM deletion_operations WHERE id = ?').get(id) as { phase: DeletionPhase; status: Row['status']; owner_token: string | null } | undefined;
+      return row?.phase === next && row.status === 'running' && row.owner_token === owner;
+    }
+    const result = this.sqlite.prepare(`UPDATE deletion_operations SET phase = 'relational', status = 'completed', progress = ?,
       owner_token = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ? WHERE id = ? AND owner_token = ? AND phase = ?`)
       .run(progress, now, now, id, owner, phase);
+    return result.changes === 1;
   }
 
   private fail(id: string, owner: string, error: string): void {

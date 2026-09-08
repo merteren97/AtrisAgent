@@ -31,7 +31,12 @@ import {
   resolveAgentProfile,
 } from '@atris-agent-code/domain';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
-import { ActionBroker, type AutomationAction, type TrustProfile } from '@atris-agent-code/policy-engine';
+import {
+  ActionBroker,
+  trustProfileForExecutionMode,
+  type AutomationAction,
+  type TrustProfile,
+} from '@atris-agent-code/policy-engine';
 import { BaseRuntimeAdapter } from './adapters/base-adapter';
 import { CodexAdapter } from './adapters/codex-adapter';
 import { AntigravityAdapter } from './adapters/antigravity-adapter';
@@ -114,6 +119,31 @@ function isUnverifiedCatalogRoute(model?: ModelDescriptor): boolean {
   return model.source === 'cached' || model.availability === 'unknown';
 }
 
+type RuntimeMissionPolicy = {
+  workspaceId?: string;
+  executionMode?: string;
+  automationPolicy?: {
+    profile?: string;
+    overrides?: Partial<Record<AutomationAction, 'ask' | 'review' | 'auto' | 'deny'>>;
+  } | null;
+} | null;
+
+/**
+ * Resolve the effective trust profile at the runtime boundary. New missions
+ * carry an automationPolicy snapshot, while older start routes may persist
+ * only executionMode. Only autonomous/review_driven encode an unambiguous
+ * fallback; balanced and candidate remain the conservative review default.
+ */
+function runtimeTrustProfile(mission: RuntimeMissionPolicy): TrustProfile {
+  const configured = mission?.automationPolicy?.profile;
+  if (configured === 'ask' || configured === 'review' || configured === 'auto') return configured;
+  const mode = mission?.executionMode;
+  const inferred = mode === 'autonomous' || mode === 'review_driven'
+    ? trustProfileForExecutionMode(mode)
+    : undefined;
+  return inferred || 'review';
+}
+
 export class RuntimeHost {
   protected config: RuntimeHostConfig;
   private eventBus?: LocalEventBus;
@@ -123,6 +153,7 @@ export class RuntimeHost {
     adapterId: string;
     session: AgentSession;
     missionId?: string;
+    runId?: string;
     taskId?: string;
     accountProfileId?: string;
     agentProfileId?: string;
@@ -934,21 +965,23 @@ export class RuntimeHost {
       `[RuntimeHost] ${role}/${agentProfile.name} route -> ${route.adapterId}/${route.profile?.profileName || 'profile'}/${route.model?.displayName || 'runtime-default'} (${route.reasons.join('; ') || 'scheduler'})`,
     );
     const adapter = this.requireAdapter(route.adapterId as RuntimeType);
-    const mission = this.workspaceManager ? await this.workspaceManager.getMission(event.missionId) : null;
-    const automationPolicy = mission?.automationPolicy as {
-      profile?: TrustProfile;
-      overrides?: Partial<Record<AutomationAction, 'ask' | 'review' | 'auto' | 'deny'>>;
-    } | null;
-    const governedActions: AutomationAction[] = role === 'builder' && automationPolicy
+    const mission = (this.workspaceManager ? await this.workspaceManager.getMission(event.missionId) : null) as RuntimeMissionPolicy;
+    const automationPolicy = mission?.automationPolicy;
+    const effectiveTrustProfile = runtimeTrustProfile(mission);
+    // A missing policy snapshot is normally handled conservatively. An
+    // autonomous execution mode is an explicit legacy Auto selection, so it
+    // still receives the same governed runtime checks as a snapshotted policy.
+    const hasGovernedPolicy = Boolean(automationPolicy) || mission?.executionMode === 'autonomous';
+    const governedActions: AutomationAction[] = role === 'builder' && hasGovernedPolicy
       ? ['fileWrite', 'commandExecution', 'packageInstall', 'gitCommit']
-      : role === 'qa' && automationPolicy
+      : role === 'qa' && hasGovernedPolicy
         ? ['commandExecution']
         : [];
     const actionBroker = new ActionBroker();
     const runtimeCapabilities = await adapter.probeCapabilities(route.profile?.id);
     const actionDecisions = governedActions.map((action) => actionBroker.authorize({
       action,
-      profile: automationPolicy?.profile || 'review',
+      profile: effectiveTrustProfile,
       overrides: automationPolicy?.overrides,
       requiredCapabilities: workerRequest.capabilities,
       role,
@@ -981,11 +1014,11 @@ export class RuntimeHost {
       agentProfile.instructions ? `Profile instructions:\n${agentProfile.instructions}` : undefined,
       execution.promptContext,
       role === 'builder'
-         ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
+         ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed. Inspect installed framework versions and project scripts before selecting checks. Fix invalid verification scripts rather than deleting or bypassing checks; Next.js 16+ requires a configured ESLint CLI or another supported linter, not next lint. Build success is not evidence that lint passed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
         : role === 'reviewer'
           ? 'Review only. Do not modify source files. Return exactly one QualityResultEnvelope JSON object: {"type":"quality_result","version":1,"role":"reviewer","verdict":"pass|fail","summary":"...","findings":["..."],"evidence":["file:line ..."]}. Do not wrap it in prose or Markdown.'
           : role === 'qa'
-            ? 'Validate the selected Builder result without implementing product changes. Return exactly one QualityResultEnvelope JSON object: {"type":"quality_result","version":1,"role":"qa","verdict":"pass|fail","summary":"...","findings":["..."],"evidence":["exact command and result"]}. Do not wrap it in prose or Markdown.'
+            ? 'Validate the selected Builder result without implementing product changes. Inspect project scripts, installed tool versions and configuration before choosing commands. A broken verification script is an unresolved finding, not a passing check. For Next.js 16+, next lint is unavailable and next build does not run lint. Do not silently skip or replace required checks. Return exactly one QualityResultEnvelope JSON object: {"type":"quality_result","version":1,"role":"qa","verdict":"pass|fail","summary":"...","findings":["..."],"evidence":["exact command and result"]}. Use verdict fail if any required check failed, could not run, or remains unresolved; describe the blocker and repair needed in summary/findings. Use verdict pass only when all required checks have successful evidence, with no contradictory failure findings. A finished QA session is not itself a passing quality gate. Do not wrap it in prose or Markdown.'
             : role === 'orchestrator'
               ? 'Plan, coordinate, and evaluate. Do not implement source changes directly.'
               : 'Investigate and report evidence. Do not modify source files.',
@@ -1073,6 +1106,7 @@ export class RuntimeHost {
       adapterId: adapter.id,
       session,
       missionId: event.missionId,
+      runId: event.runId,
       taskId: event.taskId,
       accountProfileId: route.profile?.id,
       agentProfileId: agentProfile.id,
@@ -1378,16 +1412,15 @@ export class RuntimeHost {
       throw new Error(`Runtime approval ${requestId} does not belong to the active session.`);
     }
     if (decision === 'approved') {
-      const mission = this.workspaceManager ? await this.workspaceManager.getMission(pending?.missionId || active.missionId || '') : null;
-      const workspace = mission && this.workspaceManager ? await this.workspaceManager.getWorkspace(mission.workspaceId) : null;
-      const automationPolicy = mission?.automationPolicy as {
-        profile?: TrustProfile;
-        overrides?: Partial<Record<AutomationAction, 'ask' | 'review' | 'auto' | 'deny'>>;
-      } | null;
+      const mission = (this.workspaceManager ? await this.workspaceManager.getMission(pending?.missionId || active.missionId || '') : null) as RuntimeMissionPolicy;
+      const automationPolicy = mission?.automationPolicy;
+      const workspace = mission?.workspaceId && this.workspaceManager
+        ? await this.workspaceManager.getWorkspace(mission.workspaceId)
+        : null;
       const runtimeCapabilities = await adapter.probeCapabilities();
       new ActionBroker().assertAllowed({
         action: automationActionForApproval(pending?.approvalType || 'tool'),
-        profile: automationPolicy?.profile || 'review',
+        profile: runtimeTrustProfile(mission),
         overrides: automationPolicy?.overrides,
         role: active.role,
         toolName: pending?.toolName,
@@ -1402,9 +1435,9 @@ export class RuntimeHost {
     this.pendingRuntimeApprovals.delete(requestId);
   }
 
-  async stopMission(missionId: string): Promise<void> {
+  async stopMission(missionId: string, runId?: string): Promise<void> {
     const sessionIds = [...this.activeSessions.entries()]
-      .filter(([, active]) => active.missionId === missionId)
+      .filter(([, active]) => active.missionId === missionId && (!runId || active.runId === runId))
       .map(([sessionId]) => sessionId);
     for (const sessionId of sessionIds) {
       const active = this.activeSessions.get(sessionId);
@@ -1413,15 +1446,16 @@ export class RuntimeHost {
           id: crypto.randomUUID(),
           type: 'agent_cancelled',
           missionId,
+          runId: active.runId,
           taskId: active.taskId || null,
           agentInstanceId: active.session.agentInstanceId || sessionId,
-          reason: 'Mission cancelled by the user.',
+          reason: runId ? 'Orchestration retry could not start.' : 'Mission cancelled by the user.',
           timestamp: new Date().toISOString(),
         });
       }
       await this.stopSession(sessionId);
     }
-    this.clearMissionRoutingPreference(missionId);
+    if (!runId) this.clearMissionRoutingPreference(missionId);
   }
 
   async stopAll(): Promise<void> {

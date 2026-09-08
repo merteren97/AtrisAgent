@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
 import { ApiError, apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 
 export type MissionStatus =
   | 'draft'
@@ -66,6 +67,13 @@ export interface ConversationDeletionResponse {
 export type ConversationDeletionResult =
   | { status: 'completed' | 'not_found'; operationId?: string }
   | (ConversationDeletionState & { status: 'pending' | 'retryable' });
+
+/** Durable client-side deletion evidence, retained when the mission leaves the visible list. */
+export interface ConversationDeletionTracking {
+  workspaceId?: string;
+  result: ConversationDeletionResult;
+  updatedAt: number;
+}
 
 export interface TaskItem {
   id: string;
@@ -175,6 +183,7 @@ export type EventTransportStatus = 'idle' | 'connecting' | 'connected' | 'reconn
 
 interface MissionState {
   missions: Mission[];
+  deletionTracking: Record<string, ConversationDeletionTracking>;
   activeMissionId: string | null;
   hydratedMissionId: string | null;
   timeline: TimelineItem[];
@@ -199,6 +208,7 @@ interface MissionState {
   drainQueuedTurn: (missionId: string) => Promise<void>;
   setTransportStatus: (status: EventTransportStatus, error?: string | null) => void;
   deleteMission: (id: string) => Promise<ConversationDeletionResult>;
+  checkMissionDeletion: (id: string, signal?: AbortSignal) => Promise<ConversationDeletionResult>;
   addMission: (mission: Mission) => void;
   setActiveMission: (id: string) => void;
   clearActiveMission: () => void;
@@ -218,7 +228,10 @@ interface MissionState {
 const TERMINAL_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
 const CONTINUABLE_CONVERSATION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled', 'blocked']);
 let commandQueueRequestId = 0;
+let missionListRequestId = 0;
 const missionStateRequestIds = new Map<string, number>();
+
+const MAX_TERMINAL_DELETION_TRACKING = 64;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -260,6 +273,133 @@ function deletionStateFromResult(result: Extract<ConversationDeletionResult, { s
     progress: result.progress,
     error: result.error,
   };
+}
+
+function withDeletionTracking(
+  tracking: Record<string, ConversationDeletionTracking>,
+  id: string,
+  result: ConversationDeletionResult,
+  workspaceId?: string,
+): Record<string, ConversationDeletionTracking> {
+  const next = {
+    ...tracking,
+    [id]: {
+      workspaceId: workspaceId || tracking[id]?.workspaceId,
+      result,
+      updatedAt: Date.now(),
+    },
+  };
+  const terminalEntries = Object.entries(next)
+    .filter(([, entry]) => entry.result.status === 'completed' || entry.result.status === 'not_found')
+    .sort(([, left], [, right]) => left.updatedAt - right.updatedAt);
+  for (const [trackedId] of terminalEntries.slice(0, Math.max(0, terminalEntries.length - MAX_TERMINAL_DELETION_TRACKING))) {
+    delete next[trackedId];
+  }
+  return next;
+}
+
+function isConfirmedDeletion(result: ConversationDeletionResult | undefined): boolean {
+  return result?.status === 'completed' || result?.status === 'not_found';
+}
+
+function mergeLiveTaskSnapshot(
+  snapshot: TaskItem[],
+  liveTasks: TaskItem[],
+  tasksAtRequest: TaskItem[],
+  activePlanId?: string | null,
+): TaskItem[] {
+  const inPlan = (task: TaskItem) => !activePlanId || !task.planId || task.planId === activePlanId;
+  const baseline = new Map(tasksAtRequest.map((task) => [task.id, task]));
+  const liveById = new Map(liveTasks.filter(inPlan).map((task) => [task.id, task]));
+  const merged = snapshot.map((task) => {
+    const live = liveById.get(task.id);
+    if (!live) return task;
+    const previous = baseline.get(task.id);
+    return previous && JSON.stringify(previous) === JSON.stringify(live)
+      ? task
+      : { ...task, ...live };
+  });
+  const snapshotIds = new Set(snapshot.map((task) => task.id));
+  for (const live of liveById.values()) {
+    if (!snapshotIds.has(live.id) && (!baseline.has(live.id) || JSON.stringify(baseline.get(live.id)) !== JSON.stringify(live))) {
+      merged.push(live);
+    }
+  }
+  return merged;
+}
+
+function reconcileConversationDeletion(id: string, result: ConversationDeletionResult): ConversationDeletionResult {
+  const currentMission = useMissionStore.getState().missions.find((item) => item.id === id);
+  const trackedWorkspaceId = useMissionStore.getState().deletionTracking[id]?.workspaceId;
+  if (result.status === 'pending' || result.status === 'retryable') {
+    useMissionStore.setState((state) => ({
+      ...(isConfirmedDeletion(state.deletionTracking[id]?.result) ? {}
+        : {
+          deletionTracking: withDeletionTracking(state.deletionTracking, id, result, currentMission?.workspaceId || trackedWorkspaceId),
+          missions: state.missions.map((mission) => mission.id === id
+            ? { ...mission, deletionState: deletionStateFromResult(result) }
+            : mission),
+        }),
+    }));
+    const authoritative = useMissionStore.getState().deletionTracking[id]?.result;
+    return isConfirmedDeletion(authoritative) ? authoritative : result;
+  }
+
+  // Fence snapshots started before deletion so they cannot restore a removed row.
+  missionStateRequestIds.set(id, (missionStateRequestIds.get(id) || 0) + 1);
+  const workspaceId = currentMission?.workspaceId || trackedWorkspaceId;
+  if (workspaceId) useWorkspaceStore.getState().forgetMission(workspaceId, id);
+  useAgentStore.getState().clearMissionAgents(id);
+  useMissionStore.setState((state) => ({
+    deletionTracking: withDeletionTracking(state.deletionTracking, id, result, workspaceId),
+    missions: state.missions.filter((item) => item.id !== id),
+    queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
+    commandQueue: state.commandQueue.filter((command) => command.missionId !== id),
+    ...(state.activeMissionId === id ? {
+      activeMissionId: null,
+      hydratedMissionId: null,
+      timeline: [],
+      activeTasks: [],
+      pendingMissionStart: null,
+      missionStateLoading: false,
+      missionStateError: null,
+    } : {}),
+  }));
+  return result;
+}
+
+async function requestConversationDeletion(id: string, method: 'GET' | 'DELETE', signal?: AbortSignal): Promise<ConversationDeletionResult> {
+  try {
+    const response = await apiRequestWithHeaders<ConversationDeletionResponse>(
+      `/missions/${encodeURIComponent(id)}${method === 'GET' ? '/deletion' : ''}`,
+      { method, signal },
+    );
+    if (signal?.aborted) throw signal.reason;
+    return reconcileConversationDeletion(id, deletionResultFromResponse(response.status, response.data));
+  } catch (error: unknown) {
+    if (signal?.aborted) throw error;
+    if (error instanceof ApiError && (error.status === 404 || error.status === 503)) {
+      // A missing operation is not proof that the conversation was deleted.
+      if (error.status === 404 && method === 'GET' && isRecord(error.details) && error.details.code === 'DELETION_NOT_FOUND') {
+        return reconcileConversationDeletion(id, { status: 'retryable', error: 'Deletion has not started. Retry to remove this conversation.' });
+      }
+      return reconcileConversationDeletion(id, deletionResultFromResponse(error.status, error.details));
+    }
+    if (isApiRequestTimeout(error) || error instanceof TypeError) {
+      const store = useMissionStore.getState();
+      const tracked = store.deletionTracking[id]?.result;
+      const previous = store.missions.find((mission) => mission.id === id)?.deletionState
+        || (tracked?.status === 'pending' || tracked?.status === 'retryable' ? deletionStateFromResult(tracked) : undefined);
+      return reconcileConversationDeletion(id, {
+        ...previous,
+        status: 'pending',
+        error: 'Waiting for the service to confirm deletion. Status will update automatically when it reconnects.',
+      });
+    }
+    const message = error instanceof Error ? error.message : 'Conversation deletion failed.';
+    useMissionStore.setState({ error: message });
+    throw new Error(message);
+  }
 }
 
 const KNOWN_MISSION_STATUSES = new Set<MissionStatus>([
@@ -479,7 +619,7 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
     agentRole: event.type === 'user_message'
       ? undefined
       : event.role || event.agentRole
-        || (event.type?.includes('verification') || event.type?.includes('review') ? 'reviewer' : event.type?.includes('check') ? 'qa' : undefined),
+        || (event.type?.includes('verification') || event.type?.includes('check') ? 'qa' : event.type?.includes('review') ? 'reviewer' : undefined),
     metadata: event,
   };
 }
@@ -662,6 +802,7 @@ export function buildMissionRequestBody(request: string, workspaceId: string | u
 
 export const useMissionStore = create<MissionState>((set, get) => ({
   missions: [],
+  deletionTracking: {},
   activeMissionId: null,
   hydratedMissionId: null,
   timeline: [],
@@ -683,14 +824,19 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   setMissionFilter: (filter) => set({ missionFilter: filter }),
 
   fetchMissions: async (workspaceId) => {
+    const requestId = ++missionListRequestId;
     set({ loading: true, error: null });
     try {
       const query = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : '';
       const fetched = await apiRequest<Mission[]>(`/missions${query}`);
+      if (requestId !== missionListRequestId) return;
       const current = get().activeMissionId;
       const previousMissions = new Map(get().missions.map((mission) => [mission.id, mission]));
-      const reconciled = fetched.map((mission) => {
-        const deletionState = previousMissions.get(mission.id)?.deletionState;
+      const reconciled = fetched.filter((mission) => !isConfirmedDeletion(get().deletionTracking[mission.id]?.result)).map((mission) => {
+        const trackedResult = get().deletionTracking[mission.id]?.result;
+        const deletionState = trackedResult && (trackedResult.status === 'pending' || trackedResult.status === 'retryable')
+          ? deletionStateFromResult(trackedResult)
+          : mission.deletionState || previousMissions.get(mission.id)?.deletionState;
         return deletionState ? { ...mission, deletionState } : mission;
       });
       const nextActive = current && reconciled.some((mission) => mission.id === current)
@@ -714,6 +860,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         set({ timeline: [], activeTasks: [], hydratedMissionId: null });
       }
     } catch (error: any) {
+      if (requestId !== missionListRequestId) return;
       set({ loading: false, error: error?.message || 'Failed to fetch missions.' });
     }
   },
@@ -732,6 +879,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   fetchMissionState: async (missionId) => {
     const requestId = (missionStateRequestIds.get(missionId) || 0) + 1;
     missionStateRequestIds.set(missionId, requestId);
+    const taskSnapshotAtRequest = get().activeTasks;
     if (get().activeMissionId === missionId) set({ missionStateLoading: true, missionStateError: null });
     try {
       const [state, events] = await Promise.all([
@@ -757,12 +905,18 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       useAgentStore.getState().hydrateMissionFromEvents(missionId, [...events, ...liveAgentEvents]);
 
       set((current) => {
-        const missions = state.mission
+        const confirmedDeleted = isConfirmedDeletion(current.deletionTracking[missionId]?.result);
+        const missions = confirmedDeleted ? current.missions.filter((mission) => mission.id !== missionId) : state.mission
           ? current.missions.some((mission) => mission.id === missionId)
             ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission!, ...(mission.deletionState ? { deletionState: mission.deletionState } : {}) } : mission)
             : [state.mission!, ...current.missions]
           : current.missions;
 
+        if (confirmedDeleted) {
+          return current.activeMissionId === missionId
+            ? { missions, activeMissionId: null, hydratedMissionId: null, timeline: [], activeTasks: [], missionStateLoading: false, missionStateError: null, pendingMissionStart: null }
+            : { missions };
+        }
         if (current.activeMissionId !== missionId) return { missions };
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
         const liveOnlyItems = current.timeline.filter((item) => (
@@ -775,7 +929,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
             || typeof item.metadata?.sequence === 'number')
         ));
         const activePlanId = state.mission?.planId;
-        const activeTasks = (state.tasks || []).filter((task) => !activePlanId || !task.planId || task.planId === activePlanId);
+        const snapshotTasks = (state.tasks || []).filter((task) => !activePlanId || !task.planId || task.planId === activePlanId);
+        const activeTasks = mergeLiveTaskSnapshot(snapshotTasks, current.activeTasks, taskSnapshotAtRequest, activePlanId);
         return {
           missions,
           activeTasks,
@@ -802,6 +957,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     try {
       const state = await apiRequest<{ mission?: Mission }>(`/missions/${missionId}`);
       if (!state.mission) throw new Error('Conversation was not found.');
+      if (isConfirmedDeletion(get().deletionTracking[missionId]?.result)) throw new Error('Conversation was not found.');
       set((current) => ({
         missions: current.missions.some((mission) => mission.id === missionId)
           ? current.missions.map((mission) => mission.id === missionId ? { ...mission, ...state.mission!, ...(mission.deletionState ? { deletionState: mission.deletionState } : {}) } : mission)
@@ -1036,78 +1192,16 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
 
   deleteMission: async (id) => {
-    try {
-      const response = await apiRequestWithHeaders<ConversationDeletionResponse>(`/missions/${id}`, { method: 'DELETE' });
-      const result = deletionResultFromResponse(response.status, response.data);
-      if (result.status === 'pending' || result.status === 'retryable') {
-        set((state) => ({
-          missions: state.missions.map((mission) => mission.id === id
-            ? { ...mission, deletionState: deletionStateFromResult(result) }
-            : mission),
-          error: result.status === 'retryable' ? result.error || 'Conversation deletion needs to be retried.' : null,
-        }));
-        return result;
-      }
-
-      useAgentStore.getState().clearMissionAgents(id);
-      set((state) => {
-        const wasActive = state.activeMissionId === id;
-        return {
-          missions: state.missions.filter((mission) => mission.id !== id),
-          queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
-          commandQueue: state.commandQueue.filter((command) => command.missionId !== id),
-          error: null,
-          ...(wasActive ? {
-            activeMissionId: null,
-            hydratedMissionId: null,
-            timeline: [],
-            activeTasks: [],
-            pendingMissionStart: null,
-          } : {}),
-        };
-      });
-      return result;
-    } catch (error: unknown) {
-      if (error instanceof ApiError && (error.status === 404 || error.status === 503)) {
-        const result = deletionResultFromResponse(error.status, error.details);
-        if (result.status === 'not_found') {
-          useAgentStore.getState().clearMissionAgents(id);
-          set((state) => {
-            const wasActive = state.activeMissionId === id;
-            return {
-              missions: state.missions.filter((mission) => mission.id !== id),
-              queuedTurns: state.queuedTurns.filter((turn) => turn.missionId !== id),
-              commandQueue: state.commandQueue.filter((command) => command.missionId !== id),
-              error: null,
-              ...(wasActive ? {
-                activeMissionId: null,
-                hydratedMissionId: null,
-                timeline: [],
-                activeTasks: [],
-                pendingMissionStart: null,
-              } : {}),
-            };
-          });
-          return result;
-        }
-        if (result.status === 'retryable') {
-          set((state) => ({
-            missions: state.missions.map((mission) => mission.id === id
-              ? { ...mission, deletionState: deletionStateFromResult(result) }
-              : mission),
-            error: result.error || 'Conversation deletion needs to be retried.',
-          }));
-          return result;
-        }
-      }
-
-      const message = error instanceof Error ? error.message : 'Conversation deletion failed.';
-      set({ error: message });
-      throw new Error(message);
-    }
+    const result = await requestConversationDeletion(id, 'DELETE');
+    set({ error: result.status === 'retryable' ? result.error || 'Conversation deletion needs to be retried.' : null });
+    return result;
   },
 
-  addMission: (mission) => set((state) => ({ missions: [mission, ...state.missions.filter((item) => item.id !== mission.id)] })),
+  checkMissionDeletion: (id, signal) => requestConversationDeletion(id, 'GET', signal),
+
+  addMission: (mission) => set((state) => (isConfirmedDeletion(state.deletionTracking[mission.id]?.result)
+    ? state
+    : { missions: [mission, ...state.missions.filter((item) => item.id !== mission.id)] })),
 
   setActiveMission: (id) => {
     if (!id) return;

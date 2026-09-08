@@ -52,3 +52,35 @@ useAgentStore.getState().hydrateMissionFromEvents(replayMissionId, [
 const replayRoles = useAgentStore.getState().getAgentsByMission(replayMissionId).map((agent) => agent.role).sort();
 assert.deepEqual(replayRoles, ['builder', 'qa', 'reviewer'], 'hydration retains later fixed-role agents across replay pages and assignment-only records');
 console.log('agent late-role replay regression tests passed');
+
+const liveAssignmentMissionId = 'mission-agent-live-assignment';
+useAgentStore.getState().ensureAgentFromAssignment({
+  type: 'task_assigned',
+  missionId: liveAssignmentMissionId,
+  agentInstanceId: 'live-researcher',
+  role: 'researcher',
+  taskId: 'research-live',
+  timestamp: '2026-09-05T11:01:00Z',
+});
+let liveAssignment = useAgentStore.getState().getAgentsByMission(liveAssignmentMissionId).find((agent) => agent.id === 'live-researcher');
+assert.equal(liveAssignment?.status, 'idle', 'live assignment immediately creates an observable agent session');
+assert.equal(liveAssignment?.taskId, 'research-live');
+
+useAgentStore.getState().upsertAgent({ ...liveAssignment!, status: 'running' });
+useAgentStore.getState().ensureAgentFromAssignment({
+  type: 'task_created',
+  missionId: liveAssignmentMissionId,
+  agentInstanceId: 'live-researcher',
+  assignedRole: 'researcher',
+  taskId: 'research-live',
+  timestamp: '2026-09-05T11:01:01Z',
+});
+liveAssignment = useAgentStore.getState().getAgentsByMission(liveAssignmentMissionId).find((agent) => agent.id === 'live-researcher');
+assert.equal(liveAssignment?.status, 'running', 'duplicate assignment events do not regress a live agent');
+useAgentStore.getState().ensureAgentFromAssignment({
+  type: 'task_assigned',
+  missionId: 'mission-without-role',
+  agentInstanceId: 'roleless-agent',
+});
+assert.equal(useAgentStore.getState().getAgentsByMission('mission-without-role').length, 0, 'assignment without a role does not fabricate an agent');
+console.log('agent live assignment projection regression tests passed');

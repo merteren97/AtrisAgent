@@ -81,8 +81,9 @@ export function InspectorPanel() {
     };
 
     const handleMouseUp = () => {
+      if (!isResizing.current) return;
       isResizing.current = false;
-      document.body.style.cursor = 'default';
+      document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
 
@@ -91,18 +92,23 @@ export function InspectorPanel() {
     return () => {
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
+      handleMouseUp();
     };
   }, [overlay, setInspectorWidth]);
 
   useEffect(() => {
-    if (!overlay) return;
+    if (!overlay || inspectorCollapsed) return;
     previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const getFocusable = () => panelRef.current
-      ? Array.from(panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+      ? Array.from(panelRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])')).filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0)
       : [];
     getFocusable()[0]?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') constrained ? toggleInspector() : setInspectorExpanded(false);
+      if (event.defaultPrevented) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        constrained ? toggleInspector() : setInspectorExpanded(false);
+      }
       if (event.key !== 'Tab' || !panelRef.current) return;
       const focusable = getFocusable();
       if (!focusable.length) return;
@@ -145,6 +151,7 @@ export function InspectorPanel() {
       <button type="button" className="fixed inset-0 z-[69] cursor-default bg-background/55 backdrop-blur-[1px]" onClick={() => constrained ? toggleInspector() : setInspectorExpanded(false)} aria-label="Close inspector overlay" />
     )}
     <aside
+      id="mission-workbench"
       ref={panelRef}
        tabIndex={overlay ? -1 : undefined}
        role={overlay ? 'dialog' : undefined}
@@ -162,7 +169,24 @@ export function InspectorPanel() {
     >
        {!overlay && (
         <div
-          className="absolute bottom-0 left-0 top-0 z-20 w-1 cursor-col-resize transition-colors hover:bg-primary/50 active:bg-primary"
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize Mission Workbench"
+          aria-controls="mission-workbench"
+          aria-orientation="vertical"
+          aria-valuemin={300}
+          aria-valuemax={Math.floor(Math.min(720, Math.max(360, window.innerWidth * 0.55)))}
+          aria-valuenow={Math.round(inspectorWidth)}
+          className="absolute bottom-0 left-0 top-0 z-20 w-1 cursor-col-resize transition-colors hover:bg-primary/50 focus-visible:bg-primary focus-visible:outline-none active:bg-primary"
+          onKeyDown={(event) => {
+            const maxWidth = Math.floor(Math.min(720, Math.max(360, window.innerWidth * 0.55)));
+            const nextWidth = event.key === 'ArrowLeft' ? inspectorWidth + 16
+              : event.key === 'ArrowRight' ? inspectorWidth - 16
+                : event.key === 'Home' ? 300 : event.key === 'End' ? maxWidth : null;
+            if (nextWidth === null) return;
+            event.preventDefault();
+            setInspectorWidth(Math.max(300, Math.min(maxWidth, nextWidth)));
+          }}
           onMouseDown={() => {
             isResizing.current = true;
             document.body.style.cursor = 'col-resize';

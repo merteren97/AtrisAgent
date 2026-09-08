@@ -768,6 +768,27 @@ async function runTests() {
     assert(contradictoryManager.tasks.get('reviewer')?.status === 'rejected' && contradictoryManager.mission.status === 'failed',
       'Structured pass with contradictory judgment findings remains fail-closed');
 
+    const lintManager = new FakeWorkspaceManager('mission-qa-lint', 'plan-qa-lint');
+    lintManager.tasks.set('qa', task({ id: 'qa', missionId: 'mission-qa-lint', planId: 'plan-qa-lint', role: 'qa', status: 'running', assignedAgentId: 'agent-qa-lint' }));
+    const lintBus = new LocalEventBus();
+    const lintEvents: AgentEvent[] = [];
+    lintBus.on('*', (event) => { lintEvents.push(event); });
+    const lintOrchestrator = new OrchestratorV2(
+      { workspacePath: 'test', workspaceManager: lintManager as unknown as WorkspaceManager },
+      lintBus, undefined, lintManager as unknown as WorkspaceManager,
+    );
+    await lintOrchestrator.handleTaskCompleted({
+      id: crypto.randomUUID(), type: 'task_completed', missionId: 'mission-qa-lint', taskId: 'qa', agentInstanceId: 'agent-qa-lint',
+      result: JSON.stringify({ type: 'quality_result', version: 1, role: 'qa', verdict: 'pass', summary: 'Build and 20 tests passed.', findings: ['npm run lint failed because next lint is unavailable.'], evidence: ['npm run lint -> Exit code 1'] }),
+      timestamp: new Date().toISOString(),
+    });
+    const lintFailure = lintEvents.find((event) => event.type === 'mission_failed');
+    assert(lintManager.tasks.get('qa')?.status === 'rejected'
+      && lintFailure?.type === 'mission_failed'
+      && lintFailure.reason.includes('agent reported pass but also reported a failed check')
+      && lintFailure.reason.indexOf('npm run lint failed') < lintFailure.reason.indexOf('Build and 20 tests passed.'),
+    'QA pass with failed lint is rejected with actionable blocker before successful-check details');
+
     const invalidManager = new FakeWorkspaceManager('mission-invalid-envelope', 'plan-invalid-envelope');
     invalidManager.tasks.set('qa', task({ id: 'qa', missionId: 'mission-invalid-envelope', planId: 'plan-invalid-envelope', role: 'qa', status: 'running', assignedAgentId: 'agent-invalid' }));
     const invalidOrchestrator = new OrchestratorV2(
@@ -781,6 +802,39 @@ async function runTests() {
     });
     assert(invalidManager.tasks.get('qa')?.status === 'rejected' && invalidManager.mission.status === 'failed',
       'Malformed structured quality envelope fails closed');
+  }
+
+  // Retry binds a new durable lifecycle while preserving completed work.
+  {
+    const missionId = 'mission-quality-retry';
+    const planId = 'plan-quality-retry';
+    const manager = new FakeWorkspaceManager(missionId, planId);
+    manager.mission.activeRunId = 'new-retry-run';
+    manager.tasks.set('builder', task({ id: 'builder', missionId, planId, role: 'builder', status: 'done' }));
+    manager.tasks.set('reviewer', task({ id: 'reviewer', missionId, planId, role: 'reviewer', status: 'rejected', dependsOn: ['builder'] }));
+    manager.tasks.set('qa', task({ id: 'qa', missionId, planId, role: 'qa', status: 'cancelled', dependsOn: ['reviewer'] }));
+    const bus = new LocalEventBus();
+    const dispatched: Extract<AgentEvent, { type: 'task_created' }>[] = [];
+    bus.on('task_created', (event) => { dispatched.push(event); });
+    const orchestrator = new OrchestratorV2({ workspacePath: 'test', workspaceManager: manager as unknown as WorkspaceManager }, bus, undefined, manager as unknown as WorkspaceManager);
+    (orchestrator as any).lifecycleByMission.set(missionId, { runId: 'failed-old-run', turnId: 'old-turn' });
+    const context = { runId: 'new-retry-run', turnId: 'retry-turn', planId };
+    let invalidRetryRejected = false;
+    try { await orchestrator.retryTasks(missionId, ['builder'], context); } catch { invalidRetryRejected = true; }
+    assert(invalidRetryRejected && manager.tasks.get('builder')?.status === 'done', 'quality retry cannot restart completed Builder output');
+    await orchestrator.retryTasks(missionId, ['reviewer'], context);
+    assert(dispatched.length === 1 && dispatched[0]?.taskId === 'reviewer'
+      && dispatched[0]?.runId === context.runId && dispatched[0]?.turnId === context.turnId,
+    'quality retry dispatches only failed task under fresh run and turn identities');
+    assert(manager.tasks.get('qa')?.status === 'planned' && manager.tasks.get('builder')?.status === 'done',
+      'quality retry restores cancelled downstream QA without rerunning completed Builder');
+    const agentId = manager.tasks.get('reviewer')?.assignedAgentId;
+    await orchestrator.handleTaskCompleted({ id: crypto.randomUUID(), type: 'task_completed', missionId, taskId: 'reviewer', agentInstanceId: agentId!, runId: 'failed-old-run', result: 'Review approved.', timestamp: new Date().toISOString() });
+    assert(manager.tasks.get('reviewer')?.status === 'running', 'late completion from failed run cannot finish the retried quality task');
+    await orchestrator.handleTaskCompleted({ id: crypto.randomUUID(), type: 'task_completed', missionId, taskId: 'reviewer', agentInstanceId: agentId!, runId: context.runId, turnId: context.turnId, result: 'Review approved. No blocking findings.', timestamp: new Date().toISOString() });
+    assert(manager.tasks.get('reviewer')?.status === 'done' && manager.tasks.get('qa')?.status === 'running'
+      && dispatched.some((event) => event.taskId === 'qa' && event.runId === context.runId),
+    'successful retried review resumes downstream QA under the same fresh run');
   }
 
   // A Reviewer that omits the required recommendation is also ambiguous and
