@@ -18,6 +18,7 @@ import { recoverRuntimeConnection } from '@/lib/runtime-config';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useMissionStore } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
+import { useManualStore } from '@/stores/manual-store';
 import { ThemeProvider } from '@/components/theme-provider';
 import { CommandPalette } from '@/components/search/CommandPalette';
 import { UpdateManager } from '@/components/update/UpdateManager';
@@ -36,6 +37,8 @@ const AccountsView = lazy(() => import('@/components/accounts/AccountsView').the
 const AgentsView = lazy(() => import('@/components/agents/AgentsView').then((module) => ({ default: module.AgentsView })));
 const ProjectsView = lazy(() => import('@/components/projects/ProjectsView').then((module) => ({ default: module.ProjectsView })));
 const DeveloperConsole = lazy(() => import('@/components/developer/DeveloperConsole').then((module) => ({ default: module.DeveloperConsole })));
+const ManualWorkspace = lazy(() => import('@/components/manual/manual-workspace').then(module => ({ default: module.ManualWorkspace })));
+const ConversationChoice = lazy(() => import('@/components/layout/workspace-home').then(module => ({ default: module.ConversationChoice })));
 
 function ViewLoading() {
   return <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground" role="status" aria-live="polite"><Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />Loading view…</div>;
@@ -60,6 +63,8 @@ function WorkspaceApp() {
   const activeView = useSettingsStore((state) => state.activeView);
   const devMode = useSettingsStore((state) => state.devMode);
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
+  const conversationMode = useManualStore(state => state.mode);
+  const orchestrated = conversationMode === 'orchestrator';
   const [missionSurface, setMissionSurface] = useState<'chat' | 'processes'>('chat');
 
   useEffect(() => setMissionSurface('chat'), [activeMissionId]);
@@ -155,7 +160,7 @@ function WorkspaceApp() {
            <main className="flex min-h-0 min-w-0 flex-1 flex-col">
              <Titlebar />
              <CommandPalette />
-             {activeView === 'chat' && activeMissionId ? (
+             {activeView === 'chat' && orchestrated && activeMissionId ? (
                <Tabs value={missionSurface} onValueChange={(value) => setMissionSurface(value as 'chat' | 'processes')} className="shrink-0 gap-0 border-b border-border bg-background px-3">
                  <TabsList variant="line" className="h-9">
                    <TabsTrigger value="chat" className="h-8 px-3 text-xs">Chat</TabsTrigger>
@@ -163,7 +168,7 @@ function WorkspaceApp() {
                  </TabsList>
                </Tabs>
              ) : null}
-             {activeView === 'chat' && missionSurface === 'chat' ? <MissionStateStrip /> : null}
+             {activeView === 'chat' && orchestrated && missionSurface === 'chat' ? <MissionStateStrip /> : null}
              <Suspense fallback={<ViewLoading />}>
                {activeView === 'dashboard' ? (
                  <AnalyticsDashboard />
@@ -175,6 +180,10 @@ function WorkspaceApp() {
                  <AgentsView />
                ) : activeView === 'projects' ? (
                  <ProjectsView />
+               ) : conversationMode === 'manual' ? (
+                 <ManualWorkspace />
+               ) : conversationMode === 'choose' ? (
+                 <ConversationChoice />
                ) : (
                   missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : <>
                     <ChatTimeline />
@@ -185,7 +194,7 @@ function WorkspaceApp() {
              {devMode ? <Suspense fallback={null}><DeveloperConsole /></Suspense> : null}
           </main>
         }
-        inspector={activeView === 'chat' ? <InspectorPanel /> : null}
+        inspector={activeView === 'chat' && orchestrated && activeMissionId ? <InspectorPanel /> : null}
       />
     </>
   );

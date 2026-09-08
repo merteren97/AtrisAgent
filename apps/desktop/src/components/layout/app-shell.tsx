@@ -8,7 +8,7 @@ interface AppShellProps {
 
 export function AppShell({ sidebar, main, inspector }: AppShellProps) {
   return (
-    <div className="relative flex h-screen w-screen min-w-0 overflow-hidden bg-background text-foreground select-none">
+    <div className="atris-workspace-shell relative flex h-screen w-screen min-w-0 overflow-hidden bg-sidebar text-foreground select-none">
       {sidebar}
       {main}
       {inspector}

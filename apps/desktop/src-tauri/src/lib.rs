@@ -12,6 +12,7 @@ const SESSION_TOKEN_KEY: &str = "session:atris-token";
 mod app_lifecycle;
 mod app_updater;
 mod runtime;
+mod manual_terminal;
 #[cfg(windows)]
 mod session_store;
 
@@ -336,6 +337,7 @@ pub fn run() {
 
     let app = builder
         .manage(runtime::RuntimeState::default())
+        .manage(manual_terminal::ManualTerminals::default())
         .manage(CloseBehaviorState::default())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
@@ -363,6 +365,11 @@ pub fn run() {
             check_for_updates,
             install_update,
             get_runtime_config,
+            manual_terminal::manual_terminal_start,
+            manual_terminal::manual_terminal_snapshot,
+            manual_terminal::manual_terminal_write,
+            manual_terminal::manual_terminal_resize,
+            manual_terminal::manual_terminal_close,
             store_local_secret,
             read_local_secret,
             delete_local_secret
@@ -371,6 +378,7 @@ pub fn run() {
         .expect("error while building AtrisAgent");
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            app_handle.state::<manual_terminal::ManualTerminals>().shutdown();
             app_handle.state::<runtime::RuntimeState>().shutdown();
         }
     });

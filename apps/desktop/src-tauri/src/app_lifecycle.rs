@@ -68,6 +68,11 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn close_main_window(app: &AppHandle, state: &CloseBehaviorState) -> Result<(), String> {
+    if app.state::<crate::manual_terminal::ManualTerminals>().has_live_sessions() {
+        #[cfg(desktop)]
+        if let Some(tray) = app.tray_by_id(TRAY_ID) { tray.set_visible(true).map_err(|e| e.to_string())?; }
+        return app.get_webview_window("main").ok_or("Main window was not found")?.hide().map_err(|e| e.to_string());
+    }
     match state.get()? {
         CloseBehavior::Quit => {
             app.exit(0);
@@ -106,7 +111,7 @@ pub fn set_close_behavior(
 #[cfg(desktop)]
 pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, TRAY_SHOW_ID, "Show AtrisAgent", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit AtrisAgent", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit and close all agents", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -163,8 +168,9 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
     };
 
     let state = window.app_handle().state::<CloseBehaviorState>();
-    if matches!(state.get(), Ok(CloseBehavior::Tray)) {
+    if matches!(state.get(), Ok(CloseBehavior::Tray)) || window.app_handle().state::<crate::manual_terminal::ManualTerminals>().has_live_sessions() {
         api.prevent_close();
+        if let Some(tray) = window.app_handle().tray_by_id(TRAY_ID) { let _ = tray.set_visible(true); }
         if let Err(error) = window.hide() {
             eprintln!("[AtrisAgent] Could not minimize the main window to the tray: {error}");
         }

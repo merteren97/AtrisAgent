@@ -3,6 +3,7 @@ import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
 import { ApiError, apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useManualStore } from '@/stores/manual-store';
 
 export type MissionStatus =
   | 'draft'
@@ -210,7 +211,7 @@ interface MissionState {
   deleteMission: (id: string) => Promise<ConversationDeletionResult>;
   checkMissionDeletion: (id: string, signal?: AbortSignal) => Promise<ConversationDeletionResult>;
   addMission: (mission: Mission) => void;
-  setActiveMission: (id: string) => void;
+  setActiveMission: (id: string, navigate?: boolean) => void;
   clearActiveMission: () => void;
   updateMissionStatus: (id: string, status: MissionStatus) => void;
   addTimelineItem: (item: TimelineItem) => void;
@@ -1203,8 +1204,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     ? state
     : { missions: [mission, ...state.missions.filter((item) => item.id !== mission.id)] })),
 
-  setActiveMission: (id) => {
+  setActiveMission: (id, navigate = true) => {
     if (!id) return;
+    if (navigate) useManualStore.getState().setMode('orchestrator');
     const sameMission = get().activeMissionId === id;
     if (!sameMission) useAgentStore.getState().setSelectedAgent(null);
     set({

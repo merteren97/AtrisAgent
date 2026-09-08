@@ -51,6 +51,7 @@ import { verifyAppliedMission } from './post-apply-verification';
 import { ApplyVerificationOperationStore, executeApplyVerificationOperation } from './apply-verification-operation';
 import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-sibling';
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
+import { installManualConversations } from './manual-conversations';
 
 import path from 'path';
 import fs from 'fs';
@@ -511,6 +512,7 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
 // boundary for every request.
 installRuntimeShutdownRoute(app, RUNTIME_TOKEN, shutdownCoordinator);
 installAuthRoutes(app, authService);
+installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 
 function routeParam(value: string | string[]): string {
   return Array.isArray(value) ? value[0] || '' : value;
