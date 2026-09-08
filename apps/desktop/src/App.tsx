@@ -12,6 +12,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { OnboardingModal } from '@/components/onboarding/OnboardingModal';
 import { InspectorPanel } from '@/components/inspector/inspector-panel';
 import { initEventListener, reconnectEventListener } from '@/lib/event-listener';
+import { startConversationDeletionMonitor } from '@/lib/deletion-monitor';
 import { checkApiHealth } from '@/lib/api-client';
 import { recoverRuntimeConnection } from '@/lib/runtime-config';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -66,6 +67,7 @@ function WorkspaceApp() {
   useEffect(() => {
     if (shellState !== 'workspace') return undefined;
     const disposeEvents = initEventListener();
+    const disposeDeletions = startConversationDeletionMonitor();
     void (async () => {
       await fetchWorkspaces();
       const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
@@ -73,7 +75,7 @@ function WorkspaceApp() {
       if (workspaceId) await fetchCommandQueue(workspaceId);
       await useAccountStore.getState().fetchAccounts({ refreshModels: true });
     })();
-    return disposeEvents;
+    return () => { disposeEvents(); disposeDeletions(); };
   }, [fetchCommandQueue, fetchWorkspaces, fetchMissions, shellState, session.token]);
 
   useEffect(() => {

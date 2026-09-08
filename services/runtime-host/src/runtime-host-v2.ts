@@ -127,7 +127,9 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     this.observationBus = eventBus;
   }
 
-  override async stopMission(missionId: string): Promise<void> {
+  override async stopMission(missionId: string, runId?: string): Promise<void> {
+    // A task-only retry does not own the persistent supervisor conversation.
+    if (runId) return super.stopMission(missionId, runId);
     const turns = [...(this.activeSupervisorTurns.get(missionId) || [])];
     if (turns.length > 0) {
       for (const turn of turns) turn.cancel();

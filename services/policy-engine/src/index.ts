@@ -1,4 +1,4 @@
-export { PolicyEngine, resolveAutomationAction } from './policy';
+export { PolicyEngine, resolveAutomationAction, trustProfileForExecutionMode } from './policy';
 export { ActionBroker, missingRuntimeCapabilities, normalizeRuntimeCapability, requiredRuntimeCapabilities } from './action-broker';
 export type { ActionBoundary, ActionBrokerDecision, ActionBrokerRequest } from './action-broker';
 export type {

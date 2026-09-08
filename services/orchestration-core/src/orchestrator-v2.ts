@@ -24,7 +24,7 @@ import type {
   PostApplyVerificationResult,
 } from '@atris-agent-code/domain';
 import { parseQualityResultEnvelope } from '@atris-agent-code/domain';
-import { resolveAutomationAction } from '@atris-agent-code/policy-engine';
+import { resolveAutomationAction, trustProfileForExecutionMode } from '@atris-agent-code/policy-engine';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator as LegacyOrchestrator } from './orchestrator';
 import type {
@@ -154,9 +154,13 @@ function inferQualityVerdict(
     const judgment = [envelope.summary, ...(envelope.findings || [])].join('\n');
     const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(judgment);
     const passed = envelope.verdict === 'pass' && !contradictory;
+    const failureDetails = [envelope.summary, ...(envelope.findings || [])].filter(hasQualityFailureSignal);
+    const resultSummary = contradictory
+      ? `Quality approval was not accepted: the agent reported pass but also reported a failed check or unresolved issue. ${failureDetails.join('\n')}\nResolve the reported issue and rerun the quality gate before applying changes.\n\n${detail}`
+      : detail;
     return {
       passed,
-      summary: String(redactSensitiveValue(detail)).slice(0, MAX_QUALITY_SUMMARY_CHARS),
+      summary: String(redactSensitiveValue(resultSummary)).slice(0, MAX_QUALITY_SUMMARY_CHARS),
       findingCount: passed ? 0 : Math.max(1, envelope.findings?.length || 0),
       reason: passed ? 'approved' : contradictory ? 'ambiguous' : 'failed',
     };
@@ -448,6 +452,54 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
     this.emitEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId, content,
       previousPlanId: previousPlanId || null, timestamp: new Date().toISOString() });
+  }
+
+  /** Resume existing tasks only after the gateway has claimed a fresh durable run. */
+  async retryTasks(missionId: string, taskIds: string[], context: { runId: string; turnId: string; planId: string }): Promise<TaskSelect[]> {
+    const manager = this.v2WorkspaceManager;
+    if (!manager) throw new Error('Task retry requires a durable workspace manager.');
+    const mission = await manager.getMission(missionId);
+    if (!mission || mission.activeRunId !== context.runId || mission.planId !== context.planId
+      || !context.runId || !context.turnId || !SCHEDULABLE_MISSION_STATUSES.has(String(mission.status))) {
+      throw new Error('Task retry does not own the current durable run and plan.');
+    }
+    const planTasks = (await manager.listTasks(missionId)).filter((task) => task.planId === context.planId);
+    const ids = new Set(taskIds);
+    const selected = planTasks.filter((task) => ids.has(task.id));
+    if (!ids.size || selected.length !== ids.size
+      || selected.some((task) => !['rejected', 'blocked', 'revision_requested', 'failed'].includes(String(task.status)))) {
+      throw new Error('Only failed tasks in the current plan can be retried.');
+    }
+    // Do not start a validation task before its failed prerequisite has passed.
+    const ready = selected.filter((task) => ((task.dependsOn as string[]) || []).every((id) =>
+      planTasks.some((dependency) => dependency.id === id && ['done', 'superseded'].includes(dependency.status))));
+    if (!ready.length) throw new Error('Retry tasks have unresolved dependencies.');
+    this.lifecycleByMission.set(missionId, { runId: context.runId, turnId: context.turnId });
+    const resumable = new Set(ids);
+    // A rejected Reviewer cancels its downstream QA. Restore only validation
+    // descendants; never restart completed Builders or unrelated cancelled work.
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const task of planTasks) {
+        if (task.status !== 'cancelled' || !['reviewer', 'qa'].includes(task.assignedRole || '') || resumable.has(task.id)) continue;
+        const dependencies = (task.dependsOn as string[]) || [];
+        if (dependencies.some((id) => resumable.has(id)) && dependencies.every((id) => resumable.has(id)
+          || planTasks.some((dependency) => dependency.id === id && ['done', 'superseded'].includes(dependency.status)))) {
+          resumable.add(task.id);
+          changed = true;
+        }
+      }
+    }
+    const readyIds = new Set(ready.map((task) => task.id));
+    for (const id of resumable) {
+      await manager.updateTask(id, { completedAt: null, ...(readyIds.has(id) ? {} : { status: 'planned', assignedAgentId: null }) });
+    }
+    const retried: TaskSelect[] = [];
+    for (const task of ready) {
+      await this.assertMissionActionCurrent(missionId, context.runId);
+      retried.push(await super.retryTask(task.id));
+    }
+    return retried;
   }
 
   override async assignTask(taskId: string, agentRole?: AgentRole): Promise<TaskSelect> {
@@ -1024,13 +1076,18 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const mission = await manager.getMission(params.missionId);
     const builderTasks = createdTasks.filter((task) => task.assignedRole === 'builder');
     const automationPolicy = mission?.automationPolicy;
-    // A missing policy is treated as approval-required for a plan-only Builder
-    // lane. Older missions may not have a policy snapshot, and silently
-    // executing their plan would bypass the user's current safety setting.
-    const planDecision = automationPolicy
-      ? resolveAutomationAction(automationPolicy.profile, 'plan', automationPolicy.overrides)
+    // Older missions may lack a policy snapshot. Only autonomous is an
+    // unambiguous legacy permission declaration; balanced/candidate remain
+    // approval-required until a durable policy is present.
+    const inferredProfile = trustProfileForExecutionMode(mission?.executionMode || 'balanced');
+    const effectiveProfile = automationPolicy?.profile || inferredProfile;
+    const planDecision = effectiveProfile
+      ? resolveAutomationAction(effectiveProfile, 'plan', automationPolicy?.overrides)
       : 'ask';
+    const explicitAutoPlan = planDecision === 'auto'
+      && (effectiveProfile === 'auto' || automationPolicy?.overrides?.plan === 'auto');
     const autoContinue = builderTasks.length === 0
+      || explicitAutoPlan
       || (!params.decision.needsUserApproval && (planDecision === 'auto' || planDecision === 'review'));
 
     if (builderTasks.length > 0 && planDecision === 'deny') {

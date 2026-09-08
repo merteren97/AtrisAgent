@@ -16,6 +16,18 @@ const PROFILE_ACTIONS: Record<TrustProfile, Record<AutomationAction, AutomationD
   auto: { plan: 'auto', fileWrite: 'auto', deleteFiles: 'auto', commandExecution: 'auto', packageInstall: 'auto', gitCommit: 'auto', databaseMigration: 'review', workspaceApply: 'auto', gitPush: 'ask', pullRequest: 'auto' },
 };
 
+/**
+ * Recover the only unambiguous trust profile encoded by a legacy execution
+ * mode. Balanced/candidate missions intentionally return undefined so an
+ * absent durable policy remains approval-required rather than silently
+ * inheriting a broader permission set.
+ */
+export function trustProfileForExecutionMode(mode: ExecutionMode): TrustProfile | undefined {
+  if (mode === 'autonomous') return 'auto';
+  if (mode === 'review_driven') return 'ask';
+  return undefined;
+}
+
 export function resolveAutomationAction(profile: TrustProfile, action: AutomationAction, overrides: Partial<Record<AutomationAction, AutomationDecision>> = {}): AutomationDecision {
   return overrides[action] || PROFILE_ACTIONS[profile]?.[action] || 'deny';
 }

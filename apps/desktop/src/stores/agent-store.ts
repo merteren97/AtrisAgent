@@ -29,6 +29,7 @@ interface AgentState {
   selectedAgentId: string | null;
   addAgent: (agent: AgentInstance) => void;
   upsertAgent: (agent: AgentInstance) => void;
+  ensureAgentFromAssignment: (event: Record<string, any>) => void;
   patchAgent: (id: string, patch: Partial<AgentInstance>) => void;
   updateAgentStatus: (id: string, status: AgentStatus) => void;
   removeAgent: (id: string) => void;
@@ -52,6 +53,37 @@ function mergeDefined<T extends object>(current: T, patch: Partial<T>): T {
 
 const TERMINAL_AGENT_STATUSES = new Set<AgentStatus>(['completed', 'failed', 'cancelled']);
 
+function agentFromAssignmentEvent(event: Record<string, any>): AgentInstance | undefined {
+  const id = typeof event.agentInstanceId === 'string' && event.agentInstanceId.trim()
+    ? event.agentInstanceId
+    : undefined;
+  const role = typeof event.role === 'string' && event.role.trim()
+    ? event.role
+    : typeof event.assignedRole === 'string' && event.assignedRole.trim()
+      ? event.assignedRole
+      : undefined;
+  const missionId = typeof event.missionId === 'string' ? event.missionId : '';
+  if (!id || !role || !missionId) return undefined;
+  const timestamp = typeof event.timestamp === 'string' ? event.timestamp : undefined;
+  return {
+    id,
+    missionId,
+    role,
+    model: event.model || event.modelCatalogId || 'Scheduler selected',
+    status: 'idle',
+    parentAgentId: event.parentAgentId ?? null,
+    displayName: event.displayName || defaultName(role),
+    specialty: event.specialty,
+    taskId: event.taskId ?? null,
+    spawnReason: event.spawnReason,
+    workspaceMode: event.workspaceMode,
+    progress: 0,
+    unreadMessages: 0,
+    createdAt: timestamp,
+    lastActivityAt: timestamp,
+  };
+}
+
 function mergeAgent(current: AgentInstance, patch: Partial<AgentInstance>): AgentInstance {
   // Agent IDs identify attempts. A retry gets a new ID; buffered progress or
   // duplicate startup events must not revive an already terminal attempt.
@@ -68,25 +100,9 @@ function applyEvent(map: Map<string, AgentInstance>, missionId: string, event: R
   // startup event (or when startup was emitted while the desktop was offline).
   // Keep the assigned role visible so later agents are not lost on hydration.
   if ((event.type === 'task_assigned' || event.type === 'task_created') && agentId && !existing) {
-    const role = event.role || event.assignedRole;
-    if (typeof role === 'string' && role.trim()) {
-      map.set(agentId, {
-        id: agentId,
-        missionId,
-        role,
-        model: event.model || event.modelCatalogId || 'Scheduler selected',
-        status: 'idle',
-        parentAgentId: event.parentAgentId ?? null,
-        displayName: event.displayName || defaultName(role),
-        specialty: event.specialty,
-        taskId: event.taskId ?? null,
-        spawnReason: event.spawnReason,
-        workspaceMode: event.workspaceMode,
-        progress: 0,
-        unreadMessages: 0,
-        createdAt: timestamp,
-        lastActivityAt: timestamp,
-      });
+    const assigned = agentFromAssignmentEvent({ ...event, missionId });
+    if (assigned) {
+      map.set(agentId, assigned);
       return;
     }
   }
@@ -208,6 +224,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
         ? state.agents.map((item) => item.id === agent.id ? mergeAgent(item, agent) : item)
         : [...state.agents, agent],
     };
+  }),
+
+  ensureAgentFromAssignment: (event) => set((state) => {
+    const agent = agentFromAssignmentEvent(event);
+    if (!agent || state.agents.some((item) => item.id === agent.id)) return state;
+    return { agents: [...state.agents, agent] };
   }),
 
   patchAgent: (id, patch) => set((state) => ({

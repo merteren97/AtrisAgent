@@ -13,6 +13,8 @@ import { AccountProfileManager } from './account-profile-manager';
 import { runtimeProfileEnv } from './runtime-utils';
 import { isReadOnlyAgentRole } from './adapters/base-adapter';
 import { RuntimeHost } from './runtime-host';
+import { RuntimeHostV2 } from './runtime-host-v2';
+import { ActionBroker } from '@atris-agent-code/policy-engine';
 
 async function runTests() {
   console.log('--- Starting RuntimeHost & Adapters Tests ---');
@@ -838,6 +840,69 @@ async function runTests() {
     }
   }
 
+  // A legacy mission may carry the explicit autonomous execution mode without
+  // the newer automationPolicy snapshot. Runtime authorization must still use
+  // the Auto profile at this boundary, rather than silently falling back to
+  // Review and producing approval requests.
+  {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-runtime-auto-policy-'));
+    const worktreePath = path.join(tempRoot, 'builder-worktree');
+    fs.mkdirSync(worktreePath);
+    const task = {
+      id: 'task-auto-policy', missionId: 'mission-auto-policy', assignedRole: 'builder',
+      description: 'Run the autonomous Builder task', priority: 'medium', requiredCapabilities: [],
+      assignedAgentId: null, worktreeId: null, dependsOn: [], title: 'Auto policy task',
+    };
+    const manager: any = {
+      async getTask() { return task; },
+      async getMission() { return { workspaceId: 'workspace-auto-policy', executionMode: 'autonomous', automationPolicy: null }; },
+      async getWorkspace() { return { path: tempRoot }; },
+      async listTasks() { return [task]; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+      async createWorktreeForTask() { return worktreePath; },
+      async claimTaskAttempt() { return { id: 'attempt-auto-policy', attemptNumber: 1 }; },
+      async markTaskAttemptRunning() { return true; },
+      async updateTask() {},
+    };
+    const host = new RuntimeHost(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    const adapter: any = {
+      id: 'codex', runtimeType: 'codex', name: 'Auto policy test', setEventBus() {}, configureProfile() {},
+      async probeCapabilities() { return { worktreeAwareness: true, structuredEventStreaming: true }; },
+      async spawnAgent(input: any) { return { id: 'session-auto-policy', agentInstanceId: input.sessionId }; },
+      async shutdown() {}, async cancel() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-auto-policy', provider: 'openai', runtimeType: 'codex', profileName: 'Auto policy', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-auto-policy'], usageScope: null, createdAt: '', updatedAt: '',
+      allowedRoles: ['builder'], schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true, structuredEventStreaming: true },
+    }];
+    (host as any).catalogService.getCachedCatalog = () => [{
+      catalogId: 'catalog-auto-policy', runtimeId: 'codex', accountProfileId: 'profile-auto-policy', providerId: 'openai',
+      runtimeModelId: 'gpt-auto-policy', displayName: 'GPT Auto Policy', supportedRoles: ['builder'], supportedReasoning: ['medium'],
+      inputModalities: ['text'], availability: 'available', source: 'discovered',
+    }];
+    const originalAuthorize = ActionBroker.prototype.authorize;
+    const observedProfiles: string[] = [];
+    ActionBroker.prototype.authorize = function (request: any) {
+      observedProfiles.push(request.profile);
+      return originalAuthorize.call(this, request);
+    };
+    try {
+      await host.handleTaskCreated({
+        id: 'event-auto-policy', type: 'task_created', missionId: 'mission-auto-policy', taskId: task.id,
+        agentInstanceId: 'agent-auto-policy', assignedRole: 'builder', title: task.title, timestamp: new Date().toISOString(),
+      } as any);
+    } finally {
+      ActionBroker.prototype.authorize = originalAuthorize;
+      (host as any).activeSessions.clear();
+      await host.stopAll();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+    assert(observedProfiles.length === 4 && observedProfiles.every((profile) => profile === 'auto'),
+      'autonomous execution mode supplies the Auto profile to every governed Builder runtime action');
+  }
+
   // An explicit persisted profile id must resolve to a known profile. Human
   // readable task metadata must not silently manufacture a new profile.
   {
@@ -931,8 +996,8 @@ async function runTests() {
     try {
       async function executeAccessCase(options: {
         name: string;
-        eventRole: 'builder' | 'researcher';
-        persistedRole: 'builder' | 'researcher';
+        eventRole: 'builder' | 'researcher' | 'qa';
+        persistedRole: 'builder' | 'researcher' | 'qa';
         worktreePath: string;
       }) {
         let spawnOptions: any;
@@ -1013,12 +1078,19 @@ async function runTests() {
         'persisted Builder role controls the isolated worktree and write-capable provider route',
       );
       assert(fs.readdirSync(builderWorktree).length === 0, 'Builder writeability preflight removes its contained Atris probe file');
+      assert(builder.spawnOptions?.prompt?.includes('Fix invalid verification scripts rather than deleting or bypassing checks'), 'Builder prompt requires repairing verification tooling instead of bypassing checks');
 
       const researcher = await executeAccessCase({
         name: 'persisted-researcher', eventRole: 'builder', persistedRole: 'researcher', worktreePath: path.join(tempRoot, 'unused-worktree'),
       });
       assert(!researcher.error && researcher.spawnOptions?.role === 'researcher' && researcher.spawnOptions?.accessMode === 'read-only' && researcher.spawnOptions?.isolated === false, 'persisted read-only role stays read-only despite a conflicting Builder event role');
       assert(researcher.worktreeCalls === 0, 'read-only execution does not create or write-probe a Builder worktree');
+
+      const qa = await executeAccessCase({ name: 'qa-check-contract', eventRole: 'qa', persistedRole: 'qa', worktreePath: builderWorktree });
+      assert(!qa.error && qa.spawnOptions?.accessMode === 'read-only'
+        && qa.spawnOptions?.prompt?.includes('Use verdict fail if any required check failed')
+        && qa.spawnOptions?.prompt?.includes('A finished QA session is not itself a passing quality gate'),
+      'QA prompt distinguishes session completion from successful checks without granting write access');
 
       const unwritable = await executeAccessCase({
         name: 'unwritable-builder', eventRole: 'builder', persistedRole: 'builder', worktreePath: path.join(tempRoot, 'missing-parent', 'worktree'),
@@ -1046,6 +1118,23 @@ async function runTests() {
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  }
+
+  {
+    const host = new RuntimeHostV2(undefined, { watchdogInterval: 0 });
+    const stopped: string[] = [];
+    const sessions = (host as any).activeSessions as Map<string, any>;
+    sessions.set('failed-retry-session', { missionId: 'retry-mission', runId: 'failed-retry', session: { id: 'failed-retry-session' } });
+    sessions.set('new-run-session', { missionId: 'retry-mission', runId: 'new-run', session: { id: 'new-run-session' } });
+    (host as any).stopSession = async (id: string) => { stopped.push(id); sessions.delete(id); };
+    let supervisorCancelled = false;
+    (host as any).activeSupervisorTurns.set('retry-mission', [{ cancel() { supervisorCancelled = true; }, adapter: { async shutdown() {} } }]);
+    await host.stopMission('retry-mission', 'failed-retry');
+    assert(stopped.length === 1 && stopped[0] === 'failed-retry-session' && sessions.has('new-run-session') && !supervisorCancelled,
+      'failed retry cleanup stops only its own run and preserves replacement workers and supervisor');
+    (host as any).activeSupervisorTurns.clear();
+    sessions.clear();
+    await host.stopAll();
   }
 
   const siblingStagingPath = path.join(os.tmpdir(), 'atris-runtime-target', '.atris-worktrees', 'mission-new', 'task-new');

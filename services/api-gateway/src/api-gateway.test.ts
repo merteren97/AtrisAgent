@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { AddressInfo } from 'net';
 import { WebSocket } from 'ws';
 import { eq } from 'drizzle-orm';
+import * as schema from '@atris-agent-code/database';
 
 async function runTests() {
   console.log('--- Starting API Gateway REST, SSE & WebSocket Tests ---');
@@ -76,6 +77,18 @@ async function runTests() {
   const wsUrl = `ws://127.0.0.1:${port}/ws/events`;
   let createdTeamTemplateId = '';
 
+  async function waitForDeletion(pathname: string): Promise<{ response: Response; body: any }> {
+    let response: Response;
+    let body: any;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      response = await authorizedFetch(`${baseUrl}${pathname}`);
+      body = await response.json();
+      if (response.status === 200 && body.status === 'completed') return { response, body };
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Deletion did not complete: ${pathname}`);
+  }
+
   try {
     // Historical auto-apply failures resume publication via the existing Retry
     // endpoint, preserving all completed workers and enforcing target checks.
@@ -119,6 +132,99 @@ async function runTests() {
           'Retry records durable per-task publication ownership');
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    // Generic QA/task retries must claim a fresh durable run and never reuse a
+    // failed run or retry completed work from an older plan.
+    {
+      const manager = gateway.workspaceManager;
+      const db = (manager as any).db;
+      const { conversationTurns, missionCommands, missionRuns, tasks } = await import('@atris-agent-code/database');
+      const workspace = await manager.createWorkspace({ name: 'Durable task retry', path: fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'atris-task-retry-'))) });
+      const planId = `retry-plan-${Date.now()}`;
+      const mission = await manager.createMission({ workspaceId: workspace.id, title: 'Durable task retry', status: 'failed', planId });
+      const builder = await manager.createTask({ missionId: mission.id, planId, title: 'Completed Builder', assignedRole: 'builder', status: 'done' });
+      const qa = await manager.createTask({ missionId: mission.id, planId, title: 'Rejected QA', assignedRole: 'qa', status: 'rejected' });
+      const stale = await manager.createTask({ missionId: mission.id, planId: `${planId}-old`, title: 'Rejected stale QA', assignedRole: 'qa', status: 'rejected' });
+      const now = new Date().toISOString();
+      const oldTurnId = `retry-old-turn-${Date.now()}`;
+      const oldRunId = `retry-old-run-${Date.now()}`;
+      db.insert(conversationTurns).values({ id: oldTurnId, missionId: mission.id, content: 'Old failed turn', delivery: 'queue', options: {}, status: 'failed', createdAt: now, startedAt: now, completedAt: now }).run();
+      db.insert(missionRuns).values({ id: oldRunId, missionId: mission.id, turnId: oldTurnId, status: 'failed', planId, startedAt: now, completedAt: now, heartbeatAt: now }).run();
+
+      const originalRetryTasks = (gateway.orchestrator as any).retryTasks;
+      let capturedRetry: any = null;
+      (gateway.orchestrator as any).retryTasks = async (missionId: string, taskIds: string[], options: any) => {
+        capturedRetry = { missionId, taskIds, options };
+        return [{ id: qa.id }];
+      };
+      try {
+        const retry = await authorizedFetch(`${baseUrl}/api/missions/${mission.id}/retry`, { method: 'POST' });
+        const retryBody = await retry.json();
+        const missionRow = db.select().from(schema.missions).where(eq(schema.missions.id, mission.id)).all()[0] as any;
+        const retryRuns = db.select().from(missionRuns).where(eq(missionRuns.missionId, mission.id)).all() as any[];
+        const retryTurns = db.select().from(conversationTurns).where(eq(conversationTurns.missionId, mission.id)).all() as any[];
+        const retryCommands = db.select().from(missionCommands).where(eq(missionCommands.missionId, mission.id)).all() as any[];
+        assert(retry.status === 200 && retryBody.success === true && retryBody.retriedTasks.length === 1 && retryBody.retriedTasks[0] === qa.id,
+          'mission retry returns only current-plan retryable tasks');
+        assert(capturedRetry?.missionId === mission.id && capturedRetry.taskIds.length === 1 && capturedRetry.taskIds[0] === qa.id
+          && capturedRetry.options.planId === planId && capturedRetry.options.runId === missionRow.activeRunId,
+        'mission retry dispatches the selected QA task under the fresh run context without retrying the completed Builder');
+        assert(missionRow.status === 'running' && typeof missionRow.activeRunId === 'string' && missionRow.activeRunId !== oldRunId
+          && retryRuns.length === 2 && retryRuns.some((run) => run.id === oldRunId && run.status === 'failed')
+          && retryRuns.some((run) => run.id === missionRow.activeRunId && run.status === 'running'),
+        'mission retry persists a new running run and preserves the failed run fence');
+        const retryTurn = retryTurns.find((turn) => turn.id !== oldTurnId);
+        const retryCommand = retryCommands.find((command) => command.id === retryTurn?.commandId);
+        assert(retryTurn?.status === 'running' && retryCommand?.status === 'completed' && retryTurn?.id !== oldTurnId,
+          'mission retry completes its durable command while leaving the new run active for worker completion');
+        assert(stale.id !== qa.id && builder.id !== qa.id, 'retry fixture keeps older-plan and completed Builder tasks distinct');
+      } finally {
+        (gateway.orchestrator as any).retryTasks = originalRetryTasks;
+        const activeRun = db.select().from(missionRuns).where(eq(missionRuns.missionId, mission.id)).all().find((run: any) => run.status === 'starting');
+        if (activeRun) db.update(missionRuns).set({ status: 'failed', completedAt: new Date().toISOString() }).where(eq(missionRuns.id, activeRun.id)).run();
+        db.update(schema.missions).set({ status: 'failed', activeRunId: null, completedAt: now }).where(eq(schema.missions.id, mission.id)).run();
+      }
+
+      const conflictMission = await manager.createMission({ workspaceId: workspace.id, title: 'Retry conflict', status: 'failed', planId });
+      const conflictTask = await manager.createTask({ missionId: conflictMission.id, planId, title: 'Conflict QA', assignedRole: 'qa', status: 'rejected' });
+      const conflictTurnId = `retry-conflict-turn-${Date.now()}`;
+      const conflictRunId = `retry-conflict-run-${Date.now()}`;
+      db.insert(conversationTurns).values({ id: conflictTurnId, missionId: conflictMission.id, content: 'Already active', delivery: 'queue', options: {}, status: 'running', createdAt: now, startedAt: now }).run();
+      db.insert(missionRuns).values({ id: conflictRunId, missionId: conflictMission.id, turnId: conflictTurnId, status: 'running', planId, startedAt: now, heartbeatAt: now }).run();
+      await manager.updateMission(conflictMission.id, { status: 'failed', activeRunId: conflictRunId });
+      const conflictRetry = await authorizedFetch(`${baseUrl}/api/tasks/${conflictTask.id}/retry`, { method: 'POST' });
+      const conflictBody = await conflictRetry.json();
+      assert(conflictRetry.status === 409 && conflictBody.code === 'MISSION_RETRY_CONFLICT',
+        'task retry rejects a concurrent active run without creating a replacement run');
+
+      const failedStart = await manager.createMission({ workspaceId: workspace.id, title: 'Retry dispatch failure', status: 'failed', planId });
+      const failedQA = await manager.createTask({ missionId: failedStart.id, planId, title: 'QA', assignedRole: 'qa', status: 'rejected' });
+      const originalStop = gateway.runtimeHost.stopMission;
+      let stoppedRun: string | undefined;
+      let failureEvent: any;
+      const unsubscribeFailure = gateway.eventBus.on('mission_failed', (event) => { if (event.missionId === failedStart.id) failureEvent = event; });
+      gateway.runtimeHost.stopMission = async (_missionId, runId) => { stoppedRun = runId; };
+      gateway.orchestrator.retryTasks = async () => {
+        await manager.updateTask(failedQA.id, { status: 'running' });
+        throw new Error('Test route unavailable');
+      };
+      try {
+        const response = await authorizedFetch(`${baseUrl}/api/tasks/${failedQA.id}/retry`, { method: 'POST' });
+        const runs = db.select().from(missionRuns).where(eq(missionRuns.missionId, failedStart.id)).all() as any[];
+        const turns = db.select().from(conversationTurns).where(eq(conversationTurns.missionId, failedStart.id)).all() as any[];
+        const commands = db.select().from(missionCommands).where(eq(missionCommands.missionId, failedStart.id)).all() as any[];
+        const row = await manager.getMission(failedStart.id);
+        assert(response.status === 400 && row?.status === 'failed' && row.activeRunId === null
+          && runs.length === 1 && runs[0].status === 'failed' && turns[0]?.status === 'failed' && commands[0]?.status === 'failed',
+        'failed retry dispatch terminalizes its own durable run, turn and command');
+        assert(stoppedRun === runs[0]?.id && failureEvent?.runId === stoppedRun && (await manager.getTask(failedQA.id))?.status === 'rejected',
+          'failed retry cleanup is run-scoped, observable and leaves the task retryable');
+      } finally {
+        gateway.orchestrator.retryTasks = originalRetryTasks;
+        gateway.runtimeHost.stopMission = originalStop;
+        unsubscribeFailure();
       }
     }
 
@@ -319,9 +425,13 @@ async function runTests() {
       const continuation = await authorizedFetch(`${baseUrl}/api/missions/${durableMissionId}/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ request: 'Please clarify this follow-up' }),
+        body: JSON.stringify({ request: 'Please clarify this follow-up', executionMode: 'autonomous', trustProfile: 'ask', automationOverrides: { plan: 'deny' } }),
       });
       assert(continuation.status === 200, 'starting a continuation turn succeeds');
+      const continuationMission = await gateway.workspaceManager.getMission(durableMissionId);
+      assert(continuationMission?.executionMode === 'autonomous' && continuationMission.automationPolicy?.profile === 'ask'
+        && continuationMission.automationPolicy?.overrides?.plan === 'deny',
+      'direct mission start persists explicit autonomous mode with an ask profile and deny override');
       const continuationEventsResponse = await authorizedFetch(`${baseUrl}/api/missions/${durableMissionId}/events`);
       const continuationEvents = await continuationEventsResponse.json();
       const continuationMessages = continuationEvents.filter((event: any) => event.type === 'user_message');
@@ -329,6 +439,76 @@ async function runTests() {
       assert(followUpMessages.length === 1 && typeof followUpMessages[0]?.turnId === 'string'
         && new Set(continuationMessages.map((event: any) => event.turnId)).size === continuationMessages.length,
       'continuation persists one new turn-correlated user_message without duplicating history');
+    }
+
+    // Mission automation policy is a durable snapshot: queued overrides validate
+    // at enqueue, remain invisible while a run is active, and merge atomically
+    // when the replacement command is claimed.
+    {
+      const missingStart = await authorizedFetch(`${baseUrl}/api/missions/missing-policy-mission/start`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request: 'missing' }),
+      });
+      assert(missingStart.status === 404, 'starting a nonexistent mission returns 404');
+
+      const policyMission = await gateway.workspaceManager.createMission({
+        workspaceId: createdWorkspaceId,
+        title: 'Durable policy snapshot test',
+        status: 'running',
+        executionMode: 'autonomous',
+        automationPolicy: { profile: 'auto', strategy: 'standard', overrides: {} },
+      });
+      const policyDb = (gateway.workspaceManager as any).db;
+      const { conversationTurns: policyTurns, missionRuns: policyRuns } = await import('@atris-agent-code/database');
+      const policyNow = new Date().toISOString();
+      const activePolicyTurnId = `policy-active-turn-${Date.now()}`;
+      const activePolicyRunId = `policy-active-run-${Date.now()}`;
+      policyDb.insert(policyTurns).values({
+        id: activePolicyTurnId, missionId: policyMission.id, content: 'Current run', delivery: 'queue', options: {},
+        status: 'running', createdAt: policyNow, startedAt: policyNow,
+      }).run();
+      policyDb.insert(policyRuns).values({
+        id: activePolicyRunId, missionId: policyMission.id, turnId: activePolicyTurnId, status: 'running',
+        startedAt: policyNow, heartbeatAt: policyNow,
+      }).run();
+      await gateway.workspaceManager.updateMission(policyMission.id, { status: 'running', activeRunId: activePolicyRunId });
+
+      const invalidPolicy = await authorizedFetch(`${baseUrl}/api/missions/${policyMission.id}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Reject this policy', delivery: 'queue', options: { automationOverrides: { notAnAction: 'auto' } } }),
+      });
+      const invalidPolicyBody = await invalidPolicy.json();
+      assert(invalidPolicy.status === 400 && invalidPolicyBody.code === 'INVALID_AUTOMATION_POLICY',
+        'invalid nested automation overrides are rejected at enqueue');
+
+      const queuedPolicy = await authorizedFetch(`${baseUrl}/api/missions/${policyMission.id}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Apply this policy on the next turn', delivery: 'queue', options: {
+          automationSettings: { fileWrite: false }, automationOverrides: { commandExecution: 'deny' },
+        } }),
+      });
+      assert(queuedPolicy.status === 202, 'valid policy override is durably queued');
+      const activeSnapshot = await gateway.workspaceManager.getMission(policyMission.id);
+      assert(activeSnapshot?.executionMode === 'autonomous' && activeSnapshot.automationPolicy?.profile === 'auto'
+        && Object.keys(activeSnapshot.automationPolicy?.overrides || {}).length === 0,
+      'queued policy override does not mutate the active turn snapshot');
+
+      policyDb.update(policyRuns).set({ status: 'cancelled', completedAt: new Date().toISOString() }).where(eq(policyRuns.id, activePolicyRunId)).run();
+      policyDb.update(policyTurns).set({ status: 'cancelled', completedAt: new Date().toISOString() }).where(eq(policyTurns.id, activePolicyTurnId)).run();
+      await gateway.workspaceManager.updateMission(policyMission.id, { status: 'draft', activeRunId: null });
+      const triggerPolicyDrain = await authorizedFetch(`${baseUrl}/api/missions/${policyMission.id}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Trigger the queued policy turn', delivery: 'queue', options: {} }),
+      });
+      assert(triggerPolicyDrain.status === 202, 'policy queue remains claimable after the active run is fenced');
+      let claimedSnapshot = await gateway.workspaceManager.getMission(policyMission.id);
+      for (let attempt = 0; attempt < 100 && claimedSnapshot?.automationPolicy?.overrides?.fileWrite === undefined; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        claimedSnapshot = await gateway.workspaceManager.getMission(policyMission.id);
+      }
+      assert(claimedSnapshot?.executionMode === 'autonomous' && claimedSnapshot.automationPolicy?.profile === 'auto'
+        && claimedSnapshot.automationPolicy?.overrides?.fileWrite === 'ask'
+        && claimedSnapshot.automationPolicy?.overrides?.commandExecution === 'deny',
+      'claimed queued turn atomically persists inherited profile and explicit ask/deny overrides before orchestration');
     }
 
     // Direct start is fenced atomically while a research turn is active, and an
@@ -941,8 +1121,23 @@ async function runTests() {
         body: JSON.stringify({ workspaceId: createdWorkspaceId, title: 'Active conversation cannot be deleted' }),
       });
       const protectedMission = await protectedMissionRes.json();
-      const protectedDeleteRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`, { method: 'DELETE' });
-      assert(protectedDeleteRes.status === 200, 'DELETE /api/missions/:id fences, stops, and removes a nonterminal conversation');
+      const originalStopMission = (gateway.runtimeHost as any).stopMission;
+      (gateway.runtimeHost as any).stopMission = async (missionId: string) => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return originalStopMission.call(gateway.runtimeHost, missionId);
+      };
+      try {
+        const startedAt = Date.now();
+        const protectedDeleteRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`, { method: 'DELETE' });
+        const elapsedMs = Date.now() - startedAt;
+        assert(protectedDeleteRes.status === 202 && elapsedMs < 500,
+          'DELETE /api/missions/:id returns a bounded handoff before delayed runtime cleanup completes');
+        const protectedDeletion = await waitForDeletion(`/api/missions/${protectedMission.id}/deletion`);
+        assert(protectedDeletion.response.status === 200 && protectedDeletion.body.status === 'completed',
+          'Conversation deletion status reaches completed after background cleanup');
+      } finally {
+        (gateway.runtimeHost as any).stopMission = originalStopMission;
+      }
       const preservedMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`);
       assert(preservedMissionRes.status === 404, 'Conversation is removed only after its cleanup operation completes');
       const repeatedMissionDelete = await authorizedFetch(`${baseUrl}/api/missions/${protectedMission.id}`, { method: 'DELETE' });
@@ -973,10 +1168,16 @@ async function runTests() {
       assert(cancelRes.status === 200 && cancelBody.status === 'cancelled', 'POST /api/missions/:id/cancel makes a conversation deletable');
 
       const deleteMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}`, { method: 'DELETE' });
-      assert(deleteMissionRes.status === 200, 'DELETE /api/missions/:id removes a terminal conversation');
+      assert(deleteMissionRes.status === 202, 'DELETE /api/missions/:id hands off terminal conversation cleanup without blocking');
+      const terminalDeletion = await waitForDeletion(`/api/missions/${createdMissionId}/deletion`);
+      assert(terminalDeletion.body.status === 'completed', 'Terminal conversation deletion completes durably');
 
       const deletedMissionRes = await authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}`);
       assert(deletedMissionRes.status === 404, 'Deleted conversation is no longer available');
+      const missingDeletionRes = await authorizedFetch(`${baseUrl}/api/missions/missing-deletion-operation/deletion`);
+      const missingDeletionBody = await missingDeletionRes.json();
+      assert(missingDeletionRes.status === 404 && missingDeletionBody.code === 'DELETION_NOT_FOUND',
+        'GET conversation deletion status distinguishes an operation that does not exist');
 
       const childMissionRes = await authorizedFetch(`${baseUrl}/api/missions`, {
         method: 'POST',
@@ -1001,7 +1202,7 @@ async function runTests() {
 
       await gateway.workspaceManager.updateMission(childMissionId, { status: 'running' });
       const activeWorkspaceDeleteRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`, { method: 'DELETE' });
-      assert(activeWorkspaceDeleteRes.status === 200, 'DELETE /api/workspaces/:id fences active conversations and completes external cleanup first');
+      assert(activeWorkspaceDeleteRes.status === 200, 'DELETE /api/workspaces/:id fences active conversations and completes cleanup before returning');
       assert((await gateway.workspaceManager.getWorkspace(createdWorkspaceId)) === null, 'workspace row is removed after cleanup completes');
 
       const deleteWorkspaceRes = await authorizedFetch(`${baseUrl}/api/workspaces/${createdWorkspaceId}`, {

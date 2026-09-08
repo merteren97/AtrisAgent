@@ -544,7 +544,7 @@ export class WorktreeManager {
       try {
         await git(['worktree', 'remove', ...(force ? ['--force'] : []), worktreePath], cwd);
       } catch {
-        if (fs.existsSync(worktreePath)) fs.rmSync(worktreePath, { recursive: true, force: true });
+        if (fs.existsSync(worktreePath)) await fs.promises.rm(worktreePath, { recursive: true, force: true });
       }
       try {
         await git(['worktree', 'prune'], cwd);
@@ -552,7 +552,7 @@ export class WorktreeManager {
         // Ignore cleanup-only prune failures.
       }
     } else if (fs.existsSync(worktreePath)) {
-      fs.rmSync(worktreePath, { recursive: true, force: true });
+      await fs.promises.rm(worktreePath, { recursive: true, force: true });
     }
   }
 

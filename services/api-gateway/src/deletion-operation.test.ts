@@ -51,6 +51,68 @@ for (const phase of DELETION_PHASES) {
 {
   const sqlite = database();
   const store = new DeletionOperationStore(sqlite);
+  const operation = store.begin('mission', 'lost-owner', false, []);
+  sqlite.exec(`CREATE TRIGGER steal_phase_owner AFTER UPDATE OF phase ON deletion_operations
+    WHEN NEW.phase = 'runtime' BEGIN
+      UPDATE deletion_operations SET owner_token = 'replacement-owner',
+        lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = NEW.id;
+    END;`);
+  const calls: string[] = [];
+  const lost = await store.execute(operation, handlers(calls));
+  assert.equal(lost.status, 'running', 'lost owner does not report a false completion');
+  assert.equal(lost.phase, 'runtime', 'lost owner leaves the next phase for its replacement');
+  assert.deepEqual(calls, ['stop'], 'lost owner cannot execute a phase after its CAS is replaced');
+  const resumedCalls: string[] = [];
+  const resumed = await store.execute(lost, handlers(resumedCalls));
+  assert.equal(resumed.status, 'completed', 'replacement owner safely resumes the operation');
+  assert.equal(resumedCalls[0], 'runtime', 'replacement resumes at the durable next phase');
+  sqlite.close();
+}
+
+{
+  const sqlite = database();
+  const store = new DeletionOperationStore(sqlite);
+  const operation = store.begin('mission', 'safe-error', false, []);
+  sqlite.prepare("UPDATE deletion_operations SET status = 'running', owner_token = 'other-owner' WHERE id = ?").run(operation.id);
+  store.markRetryable(operation.id, new Error('stale runner failure'));
+  assert.equal(store.get('mission', 'safe-error')?.status, 'running', 'unexpected failure cannot clobber another owner');
+  sqlite.close();
+}
+
+{
+  const sqlite = database();
+  const store = new DeletionOperationStore(sqlite, 20);
+  const operation = store.begin('mission', 'expired-lease', false, []);
+  sqlite.prepare(`UPDATE deletion_operations SET status = 'running', owner_token = 'expired-owner',
+    lease_expires_at = ? WHERE id = ?`).run(new Date(Date.now() - 1).toISOString(), operation.id);
+  const calls: string[] = [];
+  const recovered = await store.execute(store.get('mission', 'expired-lease')!, handlers(calls));
+  assert.equal(recovered.status, 'completed', 'expired leases are reclaimed safely');
+  assert.equal(calls[0], 'stop', 'expired lease resumes at its durable phase');
+  sqlite.close();
+}
+
+{
+  const sqlite = database();
+  const store = new DeletionOperationStore(sqlite, 100);
+  const operation = store.begin('mission', 'heartbeat', false, []);
+  let calls = 0;
+  const delayedHandlers = Object.fromEntries(DELETION_PHASES.map((phase) => [phase, async () => {
+    calls++;
+    if (phase === 'stop') await new Promise((resolve) => setTimeout(resolve, 300));
+  }])) as unknown as DeletionHandlers;
+  const running = store.execute(operation, delayedHandlers);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const concurrent = await store.execute(store.get('mission', 'heartbeat')!, delayedHandlers);
+  assert(['running', 'completed'].includes(concurrent.status), 'heartbeat keeps a long-running phase owned');
+  await running;
+  assert.equal(calls, DELETION_PHASES.length, 'long-running phase is not duplicated after lease renewal');
+  sqlite.close();
+}
+
+{
+  const sqlite = database();
+  const store = new DeletionOperationStore(sqlite);
   const first = store.begin('mission', 'concurrent', false, []);
   const repeated = store.begin('mission', 'concurrent', true, []);
   assert.equal(repeated.id, first.id, 'concurrent DELETE owns one operation');

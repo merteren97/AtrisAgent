@@ -1,4 +1,4 @@
-import { PolicyEngine, resolveAutomationAction } from './policy';
+import { PolicyEngine, resolveAutomationAction, trustProfileForExecutionMode } from './policy';
 
 async function runPolicyTests() {
   console.log('--- Starting PolicyEngine Security Controls Tests ---');
@@ -62,6 +62,10 @@ async function runPolicyTests() {
   assert(resolveAutomationAction('review', 'workspaceApply') === 'review', 'Review profile preserves a distinct reviewed workspace apply');
   assert(resolveAutomationAction('auto', 'gitPush') === 'ask', 'Auto profile still requires explicit push approval');
   assert(resolveAutomationAction('auto', 'packageInstall', { packageInstall: 'deny' }) === 'deny', 'per-action override wins over profile defaults');
+  assert(trustProfileForExecutionMode('autonomous') === 'auto', 'autonomous execution mode recovers the auto trust profile');
+  assert(trustProfileForExecutionMode('review_driven') === 'ask', 'review-driven execution mode recovers the ask trust profile');
+  assert(trustProfileForExecutionMode('balanced') === undefined && trustProfileForExecutionMode('candidate') === undefined,
+    'balanced and candidate modes do not infer permissions when a policy snapshot is absent');
 
   console.log(`\nPolicy Test Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) {

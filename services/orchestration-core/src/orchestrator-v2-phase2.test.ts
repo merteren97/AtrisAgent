@@ -386,6 +386,42 @@ async function runTests() {
     assert(planApprovals === 0 && manager.mission.status === 'running', 'auto-approved plan-only lane continues without a chat approval gate');
   }
 
+  // The desktop's legacy start route may persist executionMode without the
+  // newer automationPolicy snapshot. Autonomous is still an explicit Auto
+  // choice, and supervisor-generated approval text must not reintroduce a
+  // plan gate for that choice.
+  {
+    const missionId = 'conversation-plan-only-autonomous-legacy';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Auto-run a legacy mission.' });
+    manager.mission = {
+      ...manager.mission,
+      executionMode: 'autonomous',
+      automationPolicy: null,
+    };
+    const eventBus = new LocalEventBus();
+    let planApprovals = 0;
+    eventBus.on('approval_requested', (event) => {
+      if (event.approvalType === 'plan') planApprovals += 1;
+    });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'plan_only',
+      needsUserApproval: true,
+      response: 'Supervisor requested a review checkpoint.',
+      delegations: [{ id: 'b-legacy-auto', role: 'builder', objective: 'Refactor the scanner.', requiredCapabilities: ['implementation'] }],
+    }));
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    const result = await orchestrator.startMission(missionId, 'Prepare and continue the legacy refactor.', { command: 'plan' });
+    assert(result.tasks.length === 3 && manager.mission.status === 'running',
+      'autonomous execution mode infers Auto for a mission without an automation snapshot');
+    assert(planApprovals === 0, 'autonomous mode ignores a supervisor-generated plan approval request');
+  }
+
   // Default identities are pinned before dispatch, and bad explicit identities
   // cannot be swallowed by the supervisor's rule-based fallback.
   {

@@ -497,7 +497,8 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
     server.closeAllConnections?.();
     server.close(() => resolve());
   }),
-  closeDatabase: () => {
+  closeDatabase: async () => {
+    await waitForDeletionExecutions();
     if ((sqlite as Database.Database).open) sqlite.close();
   },
 }, {
@@ -687,7 +688,23 @@ function normalizeAgentProfileIds(value: unknown): AgentProfileIdMap | undefined
     if (seen.has(canonicalRole)) throw profileClientError(`Duplicate agent profile role '${rawRole}'.`);
     if (typeof rawId !== 'string' || !rawId.trim()) throw profileClientError(`Agent profile ID for role '${canonicalRole}' must be a non-empty string.`);
     seen.add(canonicalRole);
-    result[canonicalRole] = rawId.trim();
+    switch (canonicalRole) {
+      case 'orchestrator':
+        result.orchestrator = rawId.trim();
+        break;
+      case 'builder':
+        result.builder = rawId.trim();
+        break;
+      case 'reviewer':
+        result.reviewer = rawId.trim();
+        break;
+      case 'researcher':
+        result.researcher = rawId.trim();
+        break;
+      case 'qa':
+        result.qa = rawId.trim();
+        break;
+    }
   }
   return result;
 }
@@ -849,6 +866,107 @@ function missionStartIdempotencyKey(value: unknown): string | undefined {
   return raw ? `mission-start:${raw}` : undefined;
 }
 
+type MissionExecutionMode = import('@atris-agent-code/domain').ExecutionMode;
+type MissionAutomationPolicy = import('@atris-agent-code/domain').MissionAutomationPolicy;
+
+const AUTOMATION_ACTIONS = new Set([
+  'plan', 'fileWrite', 'deleteFiles', 'commandExecution', 'packageInstall',
+  'gitCommit', 'databaseMigration', 'workspaceApply', 'gitPush', 'pullRequest',
+]);
+const AUTOMATION_DECISIONS = new Set(['ask', 'review', 'auto', 'deny']);
+
+function automationPolicyError(message: string): GatewayError {
+  const error = new Error(message) as GatewayError;
+  error.statusCode = 400;
+  error.code = 'INVALID_AUTOMATION_POLICY';
+  return error;
+}
+
+function normalizeExecutionModeValue(value: unknown): MissionExecutionMode | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const normalized = String(value).trim().toLowerCase().replace(/-/g, '_');
+  if (normalized === 'review_driven' || normalized === 'balanced' || normalized === 'autonomous' || normalized === 'candidate') {
+    return normalized;
+  }
+  throw automationPolicyError(`Invalid execution mode: ${String(value)}`);
+}
+
+function executionModeFromTrustMode(value: unknown): MissionExecutionMode | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const normalized = String(value).trim().toLowerCase().replace(/-/g, '_');
+  if (normalized === 'review driven' || normalized === 'review_driven' || normalized === 'review') return 'review_driven';
+  if (normalized === 'balanced') return 'balanced';
+  if (normalized === 'autonomous' || normalized === 'auto') return 'autonomous';
+  if (normalized === 'candidate') return 'candidate';
+  throw automationPolicyError(`Invalid trust mode: ${String(value)}`);
+}
+
+function requestedExecutionMode(body: Record<string, any>): MissionExecutionMode | undefined {
+  return normalizeExecutionModeValue(body.executionMode) || executionModeFromTrustMode(body.trustMode);
+}
+
+function hasExplicitAutomationPolicy(body: unknown): boolean {
+  if (!isRecord(body)) return false;
+  return ['trustMode', 'executionMode', 'automationSettings', 'automationOverrides', 'trustProfile', 'executionStrategy']
+    .some((field) => body[field] !== undefined);
+}
+
+function parseStoredAutomationPolicy(value: unknown): MissionAutomationPolicy | undefined {
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  if (!isRecord(value)) return undefined;
+  const profile = value.profile;
+  const strategy = value.strategy;
+  if ((profile !== 'ask' && profile !== 'review' && profile !== 'auto')
+    || (strategy !== 'standard' && strategy !== 'candidate')) return undefined;
+  return { profile, strategy, overrides: isRecord(value.overrides) ? { ...value.overrides } : {} } as MissionAutomationPolicy;
+}
+
+function normalizeAutomationPolicy(body: Record<string, any>, inherited?: MissionAutomationPolicy): MissionAutomationPolicy {
+  const explicitMode = requestedExecutionMode(body);
+  const profile = body.trustProfile !== undefined
+    ? (body.trustProfile === 'ask' || body.trustProfile === 'review' || body.trustProfile === 'auto'
+      ? body.trustProfile
+      : (() => { throw automationPolicyError(`Invalid trust profile: ${String(body.trustProfile)}`); })())
+    : explicitMode === 'autonomous' ? 'auto'
+      : explicitMode === 'review_driven' ? 'ask'
+        : explicitMode ? 'review' : inherited?.profile || 'review';
+  const strategyValue = body.executionStrategy !== undefined
+    ? body.executionStrategy
+    : explicitMode ? (explicitMode === 'candidate' ? 'candidate' : 'standard') : inherited?.strategy || 'standard';
+  if (strategyValue !== 'candidate' && strategyValue !== 'standard') {
+    throw automationPolicyError(`Invalid execution strategy: ${String(strategyValue)}`);
+  }
+
+  const overrides: Record<string, string> = { ...(inherited?.overrides || {}) };
+  if (body.automationSettings !== undefined) {
+    if (!isRecord(body.automationSettings)) throw automationPolicyError('automationSettings must be an object.');
+    for (const [action, enabled] of Object.entries(body.automationSettings)) {
+      if (!AUTOMATION_ACTIONS.has(action) || (enabled !== null && typeof enabled !== 'boolean')) {
+        throw automationPolicyError(`Invalid automation setting: ${action}`);
+      }
+      if (enabled === null) delete overrides[action];
+      else overrides[action] = enabled ? 'auto' : 'ask';
+    }
+  }
+  if (body.automationOverrides !== undefined) {
+    if (!isRecord(body.automationOverrides)) throw automationPolicyError('automationOverrides must be an object.');
+    for (const [action, decision] of Object.entries(body.automationOverrides)) {
+      if (!AUTOMATION_ACTIONS.has(action) || !AUTOMATION_DECISIONS.has(String(decision))) {
+        throw automationPolicyError(`Invalid automation override: ${action}`);
+      }
+      overrides[action] = String(decision);
+    }
+  }
+  return { profile, strategy: strategyValue, overrides } as MissionAutomationPolicy;
+}
+
+function executionModeForNewMission(body: Record<string, any>, policy: MissionAutomationPolicy): MissionExecutionMode {
+  return requestedExecutionMode(body)
+    || (body.trustProfile === 'auto' ? 'autonomous' : body.trustProfile === 'ask' ? 'review_driven' : policy.strategy === 'candidate' ? 'candidate' : 'balanced');
+}
+
 function normalizeMissionStartOptions(body: Record<string, any>, automationPolicy?: unknown): Record<string, any> {
   const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId.trim()
     ? body.modelCatalogId.trim()
@@ -865,7 +983,12 @@ function normalizeMissionStartOptions(body: Record<string, any>, automationPolic
     targetRole: body.targetRole,
     command: body.command,
     teamTemplate: body.teamTemplate,
-    executionMode: body.executionMode,
+    executionMode: requestedExecutionMode(body),
+    trustMode: body.trustMode,
+    automationSettings: body.automationSettings,
+    automationOverrides: body.automationOverrides,
+    trustProfile: body.trustProfile,
+    executionStrategy: body.executionStrategy,
     agentProfileIds,
     automationPolicy,
     clientMessageId: body.clientMessageId,
@@ -950,26 +1073,6 @@ function turnDto(turn: any, command?: any): Record<string, unknown> {
   };
 }
 
-function normalizeAutomationPolicy(body: Record<string, any>): import('@atris-agent-code/domain').MissionAutomationPolicy {
-  const legacy = String(body.trustMode || body.executionMode || '').toLowerCase();
-  const profile = body.trustProfile === 'ask' || body.trustProfile === 'review' || body.trustProfile === 'auto'
-    ? body.trustProfile
-    : legacy.includes('review driven') || legacy === 'review_driven' ? 'ask'
-      : legacy.includes('autonomous') || legacy === 'autonomous' ? 'auto' : 'review';
-  const strategy = body.executionStrategy === 'candidate' || legacy === 'candidate' ? 'candidate' : 'standard';
-  const allowedActions = new Set(['plan', 'fileWrite', 'deleteFiles', 'commandExecution', 'packageInstall', 'gitCommit', 'databaseMigration', 'workspaceApply', 'gitPush', 'pullRequest']);
-  const allowedDecisions = new Set(['ask', 'review', 'auto', 'deny']);
-  const overrides: Record<string, string> = {};
-  for (const [action, decision] of Object.entries(body.automationOverrides || {})) {
-    if (!allowedActions.has(action) || !allowedDecisions.has(String(decision))) throw new Error(`Invalid automation override: ${action}`);
-    overrides[action] = String(decision);
-  }
-  for (const [action, enabled] of Object.entries(body.automationSettings || {})) {
-    if (allowedActions.has(action) && typeof enabled === 'boolean' && overrides[action] === undefined) overrides[action] = enabled ? 'auto' : 'ask';
-  }
-  return { profile, strategy, overrides } as import('@atris-agent-code/domain').MissionAutomationPolicy;
-}
-
 function emitTurnEvent(event: AgentEvent): void {
   eventBus.emit(event);
 }
@@ -982,6 +1085,19 @@ function activeRunIsResearchOnly(missionId: string): boolean {
   if (rows.length === 0) return false;
   if (rows.some((row) => row.status === 'starting' || row.plan_id === null)) return true;
   return rows.every((row) => row.role === 'researcher');
+}
+
+function applyMissionPolicyAtTurnClaim(missionId: string, options: Record<string, any>): void {
+  if (!hasExplicitAutomationPolicy(options)) return;
+  const current = sqlite.prepare('SELECT execution_mode, automation_policy FROM missions WHERE id = ?').get(missionId) as {
+    execution_mode: MissionExecutionMode;
+    automation_policy: unknown;
+  } | undefined;
+  if (!current) throw new Error('Mission not found while claiming the queued turn.');
+  const policy = normalizeAutomationPolicy(options, parseStoredAutomationPolicy(current.automation_policy));
+  const selectedMode = requestedExecutionMode(options) || current.execution_mode || executionModeForNewMission(options, policy);
+  sqlite.prepare('UPDATE missions SET execution_mode = ?, automation_policy = ?, updated_at = ? WHERE id = ?')
+    .run(selectedMode, JSON.stringify(policy), new Date().toISOString(), missionId);
 }
 
 async function startDurableTurn(command: any, turn: any): Promise<void> {
@@ -1040,14 +1156,23 @@ function drainMissionCommands(missionId: string): Promise<void> {
       const mission = await workspaceManager.getMission(missionId);
       if (!mission || !DRAINABLE_MISSION_STATUSES.has(String(mission.status))) return;
       const claimed = sqlite.transaction(() => {
-      const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
-      if (activeRun) return null;
-      const candidate = sqlite.prepare(`SELECT * FROM mission_commands WHERE mission_id = ? AND status = 'pending'
-        ORDER BY priority DESC, created_at, id LIMIT 1`).get(missionId) as any;
-      if (!candidate) return null;
-      const claim = sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
-        .run(new Date().toISOString(), candidate.id) as { changes: number };
-      return claim.changes === 1 ? candidate : null;
+        const activeRun = sqlite.prepare("SELECT id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1").get(missionId);
+        if (activeRun) return null;
+        const candidate = sqlite.prepare(`SELECT * FROM mission_commands WHERE mission_id = ? AND status = 'pending'
+          ORDER BY priority DESC, created_at, id LIMIT 1`).get(missionId) as any;
+        if (!candidate) return null;
+        const turn = sqlite.prepare('SELECT options FROM conversation_turns WHERE id = ?').get(candidate.turn_id) as { options: unknown } | undefined;
+        if (!turn) {
+          sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = 'Conversation turn is missing' WHERE id = ? AND status = 'pending'")
+            .run(new Date().toISOString(), candidate.id);
+          return null;
+        }
+        const claim = sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
+          .run(new Date().toISOString(), candidate.id) as { changes: number };
+        if (claim.changes !== 1) return null;
+        const options = typeof turn.options === 'string' ? JSON.parse(turn.options || '{}') : (isRecord(turn.options) ? turn.options : {});
+        applyMissionPolicyAtTurnClaim(missionId, options);
+        return candidate;
       })();
       const command = claimed as any;
       if (!command) return;
@@ -1080,6 +1205,7 @@ async function startMissionWithDurability(missionId: string, content: string, op
         Object.assign(error, { code: 'TURN_ALREADY_RUNNING' });
         throw error;
       }
+      applyMissionPolicyAtTurnClaim(missionId, options);
       sqlite.prepare(`INSERT INTO conversation_turns
         (id, mission_id, content, delivery, options, status, created_at, started_at)
         VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
@@ -1113,6 +1239,166 @@ async function startMissionWithDurability(missionId: string, content: string, op
       sqlite.prepare("UPDATE missions SET active_run_id = NULL, status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'failed' END, completed_at = CASE WHEN status IN ('completed', 'cancelled') THEN completed_at ELSE ? END, updated_at = ? WHERE id = ? AND active_run_id = ?")
         .run(failedAt, failedAt, missionId, runId);
     })();
+    throw error;
+  }
+}
+
+type DurableMissionRetryContext = {
+  missionId: string;
+  planId: string;
+  taskIds: string[];
+  turnId: string;
+  commandId: string;
+  runId: string;
+};
+
+function missionRetryError(message: string, statusCode = 400, code = 'MISSION_RETRY_UNAVAILABLE'): GatewayError {
+  const error = new Error(message) as GatewayError;
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+function createDurableMissionRetry(missionId: string, requestedTaskIds?: string[]): DurableMissionRetryContext {
+  if (isDeletionFenced('mission', missionId)) {
+    throw missionRetryError('Conversation deletion is in progress.', 409, 'DELETION_IN_PROGRESS');
+  }
+
+  const now = new Date().toISOString();
+  const turnId = crypto.randomUUID();
+  const commandId = crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  const retryContent = requestedTaskIds?.length ? 'Retry selected failed mission tasks.' : 'Retry failed mission tasks.';
+  const retryOptions = { retryTaskIds: requestedTaskIds || null };
+  const requestHash = turnRequestHash(missionId, retryContent, 'queue', retryOptions);
+
+  return sqlite.transaction(() => {
+    const mission = sqlite.prepare(`SELECT id, status, plan_id, active_run_id
+      FROM missions WHERE id = ?`).get(missionId) as {
+      id: string;
+      status: string;
+      plan_id: string | null;
+      active_run_id: string | null;
+    } | undefined;
+    if (!mission) throw missionRetryError('Mission not found', 404, 'MISSION_NOT_FOUND');
+    if (mission.status !== 'failed' && mission.status !== 'blocked') {
+      throw missionRetryError(`Mission '${missionId}' is ${mission.status} and cannot be retried.`);
+    }
+    const activeRun = sqlite.prepare(`SELECT id FROM mission_runs
+      WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping') LIMIT 1`).get(missionId);
+    if (activeRun || mission.active_run_id) {
+      throw missionRetryError('The mission already has an active orchestration run.', 409, 'MISSION_RETRY_CONFLICT');
+    }
+    const pendingCommand = sqlite.prepare(`SELECT id FROM mission_commands
+      WHERE mission_id = ? AND status IN ('pending', 'processing') LIMIT 1`).get(missionId);
+    if (pendingCommand) {
+      throw missionRetryError('The mission already has a queued command.', 409, 'MISSION_RETRY_CONFLICT');
+    }
+    if (!mission.plan_id) throw missionRetryError('The mission has no current plan to retry.');
+
+    const retryableStatuses = new Set(['rejected', 'blocked', 'revision_requested', 'failed']);
+    const planTasks = sqlite.prepare(`SELECT id, plan_id, status FROM tasks
+      WHERE mission_id = ? AND plan_id = ?`).all(missionId, mission.plan_id) as Array<{
+      id: string;
+      plan_id: string;
+      status: string;
+    }>;
+    const taskById = new Map(planTasks.map((task) => [task.id, task]));
+    const taskIds = requestedTaskIds
+      ? [...new Set(requestedTaskIds)]
+      : planTasks.filter((task) => retryableStatuses.has(task.status)).map((task) => task.id);
+    if (taskIds.length === 0) throw missionRetryError('The mission has no failed or blocked task to retry.');
+    for (const taskId of taskIds) {
+      const task = taskById.get(taskId);
+      if (!task) throw missionRetryError(`Task '${taskId}' does not belong to the mission's current plan.`);
+      if (!retryableStatuses.has(task.status)) {
+        throw missionRetryError(`Task '${taskId}' is ${task.status} and cannot be retried.`);
+      }
+    }
+    const activeTask = planTasks.find((task) => ['claimed', 'running', 'review', 'verified', 'applied'].includes(task.status));
+    if (activeTask) {
+      throw missionRetryError(`Task '${activeTask.id}' is still active and cannot be retried with this mission.`, 409, 'MISSION_RETRY_CONFLICT');
+    }
+    const activeAttempt = sqlite.prepare(`SELECT id FROM task_attempts
+      WHERE mission_id = ? AND status IN ('claimed', 'running') LIMIT 1`).get(missionId);
+    if (activeAttempt) {
+      throw missionRetryError('The mission still has an active task attempt.', 409, 'MISSION_RETRY_CONFLICT');
+    }
+
+    sqlite.prepare(`INSERT INTO conversation_turns
+      (id, mission_id, content, delivery, options, status, request_hash, command_id, created_at, started_at)
+      VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?, ?, ?)`).run(
+      turnId, missionId, retryContent, JSON.stringify(retryOptions), requestHash, commandId, now, now,
+    );
+    sqlite.prepare(`INSERT INTO mission_commands
+      (id, mission_id, turn_id, type, status, priority, claimed_at, attempt_count, request_hash, created_at)
+      VALUES (?, ?, ?, 'queue', 'processing', 0, ?, 1, ?, ?)`).run(
+      commandId, missionId, turnId, now, requestHash, now,
+    );
+    sqlite.prepare(`INSERT INTO mission_runs
+      (id, mission_id, turn_id, command_id, status, plan_id, started_at, heartbeat_at)
+      VALUES (?, ?, ?, ?, 'starting', ?, ?, ?)`).run(
+      runId, missionId, turnId, commandId, mission.plan_id, now, now,
+    );
+    const updated = sqlite.prepare(`UPDATE missions SET active_run_id = ?, status = 'running',
+      completed_at = NULL, updated_at = ?
+      WHERE id = ? AND status IN ('failed', 'blocked') AND active_run_id IS NULL`).run(runId, now, missionId) as { changes: number };
+    if (updated.changes !== 1) {
+      throw missionRetryError('The mission changed before retry could be claimed.', 409, 'MISSION_RETRY_CONFLICT');
+    }
+    return { missionId, planId: mission.plan_id, taskIds, turnId, commandId, runId };
+  })();
+}
+
+async function retryMissionTasksWithDurability(missionId: string, requestedTaskIds?: string[]): Promise<{
+  context: DurableMissionRetryContext;
+  tasks: any[];
+}> {
+  const context = createDurableMissionRetry(missionId, requestedTaskIds);
+  const startedAt = new Date().toISOString();
+  emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId: context.turnId,
+    runId: context.runId, content: requestedTaskIds?.length ? 'Retry selected failed mission tasks.' : 'Retry failed mission tasks.',
+    delivery: 'queue', timestamp: startedAt });
+  try {
+    const tasks = await orchestrator.retryTasks(missionId, context.taskIds, {
+      runId: context.runId, turnId: context.turnId, planId: context.planId,
+    });
+    const completedAt = new Date().toISOString();
+    sqlite.transaction(() => {
+      sqlite.prepare(`UPDATE mission_commands SET status = 'completed', processed_at = ?
+        WHERE id = ? AND status = 'processing'`).run(completedAt, context.commandId);
+      sqlite.prepare(`UPDATE conversation_turns SET status = 'running'
+        WHERE id = ? AND status = 'starting'`).run(context.turnId);
+      sqlite.prepare(`UPDATE mission_runs SET status = 'running', heartbeat_at = ?
+        WHERE id = ? AND status = 'starting'`).run(completedAt, context.runId);
+    })();
+    return { context, tasks: Array.isArray(tasks) ? tasks : [] };
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    const failure = error instanceof Error ? error.message : String(error);
+    orchestrator.cancelRun(missionId, context.runId);
+    await runtimeHost.stopMission(missionId, context.runId).catch(() => undefined);
+    const failedOwnedRun = sqlite.transaction(() => {
+      sqlite.prepare(`UPDATE mission_commands SET status = 'failed', processed_at = ?, error = ?
+        WHERE id = ? AND status = 'processing'`).run(failedAt, failure, context.commandId);
+      sqlite.prepare(`UPDATE conversation_turns SET status = 'failed', completed_at = ?
+        WHERE id = ? AND status IN ('starting', 'running')`).run(failedAt, context.turnId);
+      sqlite.prepare(`UPDATE mission_runs SET status = 'failed', completed_at = ?, error = ?
+        WHERE id = ? AND status IN ('starting', 'running', 'stopping')`).run(failedAt, failure, context.runId);
+      for (const taskId of context.taskIds) {
+        sqlite.prepare(`UPDATE tasks SET status = 'rejected', completed_at = ?, updated_at = ?
+          WHERE id = ? AND mission_id = ? AND plan_id = ? AND status IN ('claimed', 'running', 'review')
+          AND EXISTS (SELECT 1 FROM missions WHERE id = ? AND active_run_id = ?)`)
+          .run(failedAt, failedAt, taskId, missionId, context.planId, missionId, context.runId);
+      }
+      const changed = sqlite.prepare(`UPDATE missions SET active_run_id = NULL,
+        status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'failed' END,
+        completed_at = CASE WHEN status IN ('completed', 'cancelled') THEN completed_at ELSE ? END,
+        updated_at = ? WHERE id = ? AND active_run_id = ? AND status NOT IN ('completed', 'cancelled')`).run(failedAt, failedAt, missionId, context.runId);
+      return changed.changes === 1;
+    })();
+    if (failedOwnedRun) emitTurnEvent({ id: crypto.randomUUID(), type: 'mission_failed', missionId,
+      runId: context.runId, turnId: context.turnId, failedTaskId: null, reason: `Task retry could not start: ${failure}`, timestamp: failedAt });
     throw error;
   }
 }
@@ -1381,7 +1667,10 @@ app.post('/api/missions', async (req: Request, res: Response) => {
 });
 
 app.get('/api/missions', async (req: Request, res: Response) => {
-  try { res.json(await workspaceManager.listMissions(req.query.workspaceId as string | undefined)); }
+  try {
+    const missions = await workspaceManager.listMissions(req.query.workspaceId as string | undefined);
+    res.json(missions.map((mission) => ({ ...mission, ...deletionStateForMission(mission.id, mission.workspaceId) })));
+  }
   catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to list missions' }); }
 });
 
@@ -1458,14 +1747,34 @@ app.delete('/api/missions/:id', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
     const existingOperation = deletionStore.get('mission', missionId);
-    if (existingOperation) return void sendDeletionOutcome(res, await executeDeletion(existingOperation));
+    if (existingOperation) {
+      scheduleDeletion(existingOperation);
+      return void sendDeletionOutcome(res, deletionStore.get('mission', missionId)!);
+    }
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Conversation not found' });
 
     const operation = deletionStore.begin('mission', missionId, false, [`mission:${missionId}`, `workspace:${mission.workspaceId}`]);
-    sendDeletionOutcome(res, await executeDeletion(operation));
+    scheduleDeletion(operation);
+    sendDeletionOutcome(res, deletionStore.get('mission', missionId)!);
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to delete conversation' });
+  }
+});
+
+app.get('/api/missions/:id/deletion', async (req: Request, res: Response) => {
+  try {
+    const missionId = routeParam(req.params.id);
+    let operation = deletionStore.get('mission', missionId);
+    if (!operation) {
+      const mission = await workspaceManager.getMission(missionId);
+      const workspaceOperation = mission ? deletionStore.get('workspace', mission.workspaceId) : null;
+      if (workspaceOperation && deletionMissionIds(workspaceOperation).includes(missionId)) operation = workspaceOperation;
+    }
+    if (!operation) return void res.status(404).json({ code: 'DELETION_NOT_FOUND', targetType: 'mission', targetId: missionId });
+    sendDeletionOutcome(res, operation);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to get conversation deletion status' });
   }
 });
 
@@ -1486,7 +1795,10 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     const turnId = crypto.randomUUID();
     const commandId = crypto.randomUUID();
     const now = new Date().toISOString();
-    const requestedOptions = req.body?.options && typeof req.body.options === 'object' ? req.body.options : {};
+    if (req.body?.options !== undefined && !isRecord(req.body.options)) {
+      return void res.status(400).json({ code: 'INVALID_AUTOMATION_POLICY', error: 'options must be an object.' });
+    }
+    const requestedOptions = isRecord(req.body?.options) ? req.body.options : {};
     const agentProfileIds = normalizeAgentProfileIds(requestedOptions.agentProfileIds);
     const turnOptions = {
       ...requestedOptions,
@@ -1494,6 +1806,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       agentProfileIds,
     };
     delete turnOptions.model;
+    if (hasExplicitAutomationPolicy(turnOptions)) normalizeAutomationPolicy(turnOptions);
     await validateAgentProfileIds(agentProfileIds, missionId);
     const queuedImplementationFollowUp = active && delivery === 'steer' && activeRunIsResearchOnly(missionId)
       && hasExplicitImplementationIntent({
@@ -1616,6 +1929,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
   } catch (error: any) {
     const profileStatus = profileErrorStatus(error);
     if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: error?.message || 'Invalid agent profile selection.' });
+    if (error?.code === 'INVALID_AUTOMATION_POLICY') return void res.status(400).json({ code: error.code, error: error.message });
     if (String(error?.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
       const missionId = routeParam(req.params.id);
       const key = String(req.header('Idempotency-Key') || '').trim();
@@ -1642,8 +1956,10 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     const missionId = routeParam(req.params.id);
     if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const existingMission = await workspaceManager.getMission(missionId);
+    if (!existingMission) return void res.status(404).json({ error: 'Mission not found' });
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
-    const startOptions = normalizeMissionStartOptions(req.body || {});
+    const requestedPolicy = hasExplicitAutomationPolicy(req.body) ? normalizeAutomationPolicy(req.body, existingMission.automationPolicy || undefined) : undefined;
+    const startOptions = normalizeMissionStartOptions(req.body || {}, requestedPolicy);
     await validateAgentProfileIds(startOptions.agentProfileIds, missionId);
     await configureMissionRouting(missionId, req.body || {});
     res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, startOptions)));
@@ -1654,6 +1970,7 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     if (error?.code === 'TURN_ALREADY_RUNNING') {
       return void res.status(409).json({ code: 'TURN_ALREADY_RUNNING', error: message });
     }
+    if (error?.code === 'INVALID_AUTOMATION_POLICY') return void res.status(400).json({ code: error.code, error: message });
     res.status(/^Invalid automation override:/.test(message) ? 400 : 500).json({ error: message });
   }
 });
@@ -1673,6 +1990,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
       executionStrategy,
     } = req.body || {};
     const automationPolicy = normalizeAutomationPolicy({ trustMode, executionMode, automationSettings, automationOverrides, trustProfile, executionStrategy });
+    const normalizedExecutionMode = executionModeForNewMission(req.body || {}, automationPolicy);
     const promptText = request || title;
     if (!promptText) return void res.status(400).json({ error: 'title or request is required' });
 
@@ -1686,6 +2004,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
 
     const startOptions: Record<string, any> = {
       ...normalizeMissionStartOptions(req.body || {}, automationPolicy),
+      executionMode: normalizedExecutionMode,
       // Keep workspace scope in the idempotency fingerprint without relying on
       // the generated mission id, which would make retries impossible to match.
       workspaceId: targetWorkspaceId,
@@ -1707,7 +2026,8 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
     const message = error?.message || 'Failed to start mission';
     const profileStatus = profileErrorStatus(error);
     if (profileStatus) return void res.status(profileStatus).json({ code: error?.code, error: message });
-    const status = /^Invalid automation override:/.test(message)
+    const status = error?.code === 'INVALID_AUTOMATION_POLICY'
+      || /^Invalid automation override:/.test(message)
       || error?.code === 'IDEMPOTENCY_KEY_REUSED'
       || error?.code === 'IDEMPOTENCY_RECORD_INVALID' ? 400 : 500;
     res.status(status).json({ code: error?.code, error: message });
@@ -2564,19 +2884,34 @@ app.post('/api/missions/:id/retry', async (req, res) => {
       return void res.json({ success: true, publicationRetried: true, retriedTasks: [] });
     }
     const tasks = await workspaceManager.listTasks(req.params.id);
-    const retryable = tasks.filter((task) => ['rejected', 'blocked', 'revision_requested'].includes(task.status));
+    const currentPlanId = mission.planId;
+    const retryable = tasks.filter((task) => task.planId === currentPlanId
+      && ['rejected', 'blocked', 'revision_requested', 'failed'].includes(task.status));
     if (retryable.length === 0) return void res.status(400).json({ error: 'The mission has no failed or blocked task to retry.' });
-    await workspaceManager.updateMission(req.params.id, { status: 'running' });
-    for (const task of retryable) await orchestrator.retryTask(task.id);
+    await trackMissionTurn(req.params.id, () => retryMissionTasksWithDurability(req.params.id, retryable.map((task) => task.id)));
     res.json({ success: true, retriedTasks: retryable.map((task) => task.id) });
   } catch (error: any) {
-    res.status(400).json({ error: error?.message || 'Failed to retry mission' });
+    const status = profileErrorStatus(error) || 400;
+    res.status(status).json({ code: error?.code, error: error?.message || 'Failed to retry mission' });
   }
 });
 
 app.post('/api/tasks/:id/retry', async (req, res) => {
-  try { res.json(await orchestrator.retryTask(req.params.id)); }
-  catch (error: any) { res.status(400).json({ error: error?.message || 'Failed to retry task' }); }
+  try {
+    const task = await workspaceManager.getTask(req.params.id);
+    if (!task) return void res.status(404).json({ error: 'Task not found' });
+    if (isDeletionFenced('mission', task.missionId)) {
+      return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
+    }
+    const result = await trackMissionTurn(task.missionId, () => retryMissionTasksWithDurability(task.missionId, [task.id]));
+    const retriedTask = result.tasks[0];
+    if (!retriedTask) throw missionRetryError('The task was not dispatched for retry.');
+    res.json(retriedTask);
+  }
+  catch (error: any) {
+    const status = profileErrorStatus(error) || 400;
+    res.status(status).json({ code: error?.code, error: error?.message || 'Failed to retry task' });
+  }
 });
 
 app.post('/api/missions/:id/retry-verification', async (req, res) => {
@@ -2651,6 +2986,48 @@ const deletionHandlers: DeletionHandlers = {
 
 async function executeDeletion(operation: DeletionOperation): Promise<DeletionOperation> {
   return deletionStore.execute(operation, deletionHandlers);
+}
+
+const activeDeletionExecutions = new Map<string, Promise<void>>();
+
+function scheduleDeletion(operation: DeletionOperation): void {
+  if (activeDeletionExecutions.has(operation.id)) return;
+  const execution = new Promise<void>((resolve) => {
+    setImmediate(() => {
+      void executeDeletion(operation)
+        .catch((error) => {
+          try {
+            deletionStore.markRetryable(operation.id, error);
+          } catch (persistError) {
+            console.warn('[API-Gateway] Failed to persist unexpected deletion runner failure:', persistError);
+          }
+        })
+        .finally(() => {
+          activeDeletionExecutions.delete(operation.id);
+          resolve();
+        });
+    });
+  });
+  activeDeletionExecutions.set(operation.id, execution);
+}
+
+function waitForDeletionExecutions(): Promise<void> {
+  return Promise.allSettled([...activeDeletionExecutions.values()]).then(() => undefined);
+}
+
+function deletionStateForMission(missionId: string, workspaceId: string): { deletionState?: Record<string, unknown> } {
+  const operation = deletionStore.get('mission', missionId)
+    || deletionStore.get('workspace', workspaceId);
+  if (!operation || operation.status === 'completed') return {};
+  return {
+    deletionState: {
+      status: operation.status === 'retryable' ? 'retryable' : 'pending',
+      operationId: operation.id,
+      phase: operation.phase,
+      progress: operation.progress,
+      error: operation.error,
+    },
+  };
 }
 
 function sendDeletionOutcome(res: Response, operation: DeletionOperation): void {

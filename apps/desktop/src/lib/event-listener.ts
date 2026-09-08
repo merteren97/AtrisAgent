@@ -11,6 +11,7 @@ let transportActive = false;
 let needsReconcile = false;
 let unsubscribeMission: (() => void) | null = null;
 const highestSequenceByMission = new Map<string, number>();
+const refreshedPlanByMission = new Map<string, string>();
 
 function timestampLabel(value?: string): string {
   const date = value ? new Date(value) : new Date();
@@ -102,6 +103,10 @@ export function handleIncomingEvent(eventData: any): void {
       append(eventData, eventData.summary || `Generated ${eventData.taskCount || 0} executable tasks.`, {
         agentRole: 'orchestrator', metadata: { taskCount: eventData.taskCount, planId: eventData.planId },
       });
+      if (eventData.missionId && eventData.planId && refreshedPlanByMission.get(eventData.missionId) !== eventData.planId) {
+        refreshedPlanByMission.set(eventData.missionId, eventData.planId);
+        void missions.fetchMissionState(eventData.missionId);
+      }
       break;
 
     case 'plan_revised':
@@ -113,6 +118,7 @@ export function handleIncomingEvent(eventData: any): void {
     case 'task_created': {
       const role = optionalString(eventData.assignedRole) || 'orchestrator';
       append(eventData, `Task ready: ${eventData.title || eventData.taskId}`, { agentRole: role });
+      agents.ensureAgentFromAssignment(eventData);
       if (eventData.taskId) missions.patchTask(eventData.taskId, {
         status: 'ready',
         assignedRole: optionalString(eventData.assignedRole),
@@ -124,6 +130,7 @@ export function handleIncomingEvent(eventData: any): void {
     case 'task_assigned': {
       const assignedAgentId = optionalString(eventData.agentInstanceId);
       append(eventData, `Task assigned to ${eventData.role}: ${eventData.taskId}`, { agentRole: eventData.role });
+      agents.ensureAgentFromAssignment(eventData);
       if (eventData.taskId) missions.patchTask(eventData.taskId, {
         status: 'ready',
         assignedRole: optionalString(eventData.role),
@@ -354,16 +361,16 @@ export function handleIncomingEvent(eventData: any): void {
     }
 
     case 'verification_started':
-      append(eventData, 'Verification started.', { agentRole: 'reviewer' });
+      append(eventData, 'Verification started.', { agentRole: 'qa' });
       if (eventData.missionId) missions.updateMissionStatus(eventData.missionId, 'verifying');
       break;
 
     case 'verification_finding':
-      append(eventData, `${String(eventData.severity || 'finding').toUpperCase()}: ${eventData.title || eventData.description}`, { agentRole: 'reviewer' });
+      append(eventData, `${String(eventData.severity || 'finding').toUpperCase()}: ${eventData.title || eventData.description}`, { agentRole: 'qa' });
       break;
 
     case 'verification_completed':
-      append(eventData, `${eventData.passed ? 'Verification passed' : 'Verification found issues'} — ${eventData.summary || `${eventData.findingCount || 0} findings`}`, { agentRole: 'reviewer' });
+      append(eventData, `${eventData.passed ? 'Verification passed' : 'Verification found issues'} — ${eventData.summary || `${eventData.findingCount || 0} findings`}`, { agentRole: 'qa' });
       break;
 
     case 'review_completed':

@@ -32,6 +32,7 @@ assert.deepEqual(
 const namedProfileBody = buildMissionRequestBody('Use the selected specialists', 'workspace-1', {
   agentProfileIds: { builder: ' builder-ui ', reviewer: 'review-profile' },
 });
+assert.equal(restoreMissionTimeline(undefined, [{ id: 'qa-history', type: 'verification_completed', passed: false, summary: 'Lint failed.' }])[0]?.agentRole, 'qa', 'historical QA verification is not mislabeled as Reviewer');
 assert.deepEqual(namedProfileBody.agentProfileIds, { builder: 'builder-ui', reviewer: 'review-profile' }, 'mission requests carry named profile selections');
 assert.equal(buildMissionRequestBody('Use defaults', 'workspace-1', {}).agentProfileIds, undefined, 'legacy mission requests omit empty profile selections');
 
@@ -114,7 +115,7 @@ assert.equal(useMissionStore.getState().commandQueue.length, 0, 'deleted convers
 assert.equal(useMissionStore.getState().activeMissionId, null, 'deleting the active conversation returns to a blank chat');
 assert.equal(useMissionStore.getState().timeline.length, 0, 'deleting the active conversation clears its timeline');
 
-useMissionStore.setState({ missions: [mission], activeMissionId: mission.id, error: null });
+useMissionStore.setState({ missions: [mission], activeMissionId: mission.id, error: null, deletionTracking: {} });
 globalThis.fetch = async () => new Response(JSON.stringify({
   operationId: 'delete-op-1',
   phase: 'runtime',
@@ -126,6 +127,33 @@ assert.equal(pendingDelete.status, 'pending', '202 conversation deletion remains
 assert.equal(useMissionStore.getState().missions.length, 1, 'pending deletion keeps the conversation visible');
 assert.equal(useMissionStore.getState().missions[0]?.deletionState?.status, 'pending', 'pending deletion is visible in mission state');
 assert.equal(useMissionStore.getState().missions[0]?.deletionState?.operationId, 'delete-op-1', 'pending deletion keeps the durable operation ID');
+
+const hiddenMission = { ...mission, id: 'hidden-delete', workspaceId: 'workspace-hidden' };
+useMissionStore.setState({ missions: [mission, hiddenMission], activeMissionId: null });
+globalThis.fetch = async () => new Response(JSON.stringify({ operationId: 'hidden-op', status: 'running' }), { status: 202, headers: { 'content-type': 'application/json' } });
+await useMissionStore.getState().deleteMission(hiddenMission.id);
+useMissionStore.setState({ missions: [mission], activeMissionId: null });
+globalThis.fetch = async () => new Response(JSON.stringify({ success: true, operationId: 'hidden-op', status: 'completed' }), { status: 200, headers: { 'content-type': 'application/json' } });
+await useMissionStore.getState().checkMissionDeletion(hiddenMission.id);
+assert.equal(useMissionStore.getState().deletionTracking[hiddenMission.id]?.result.status, 'completed', 'completion remains observable after the mission leaves the visible list');
+
+const lateDeletionStatus = deferred<Response>();
+const terminalDeletionStatus = deferred<Response>();
+const raceMission = { ...mission, id: 'race-delete', workspaceId: 'workspace-race-delete' };
+useMissionStore.setState({ missions: [raceMission], activeMissionId: null, error: 'keep unrelated error' });
+let raceFetchCount = 0;
+globalThis.fetch = (async () => (++raceFetchCount === 1 ? lateDeletionStatus.promise : terminalDeletionStatus.promise)) as typeof fetch;
+// Both status reads overlap. The terminal observation wins even when the older
+// pending response resolves afterward.
+const lateStatus = useMissionStore.getState().checkMissionDeletion(raceMission.id);
+const terminalStatus = useMissionStore.getState().checkMissionDeletion(raceMission.id);
+useMissionStore.setState({ missions: [mission] });
+terminalDeletionStatus.resolve(new Response(JSON.stringify({ success: true, status: 'completed' }), { status: 200, headers: { 'content-type': 'application/json' } }));
+await terminalStatus;
+lateDeletionStatus.resolve(new Response(JSON.stringify({ status: 'running', operationId: 'late-op' }), { status: 202, headers: { 'content-type': 'application/json' } }));
+await lateStatus;
+assert.equal(useMissionStore.getState().deletionTracking[raceMission.id]?.result.status, 'completed', 'late nonterminal deletion status cannot overwrite confirmed completion');
+assert.equal(useMissionStore.getState().error, 'keep unrelated error', 'hidden deletion completion does not clear unrelated store errors');
 
 globalThis.fetch = async () => new Response(JSON.stringify({
   operationId: 'delete-op-1',
@@ -155,6 +183,29 @@ globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Stop or fin
 await assert.rejects(() => useMissionStore.getState().deleteMission(mission.id), /Stop or finish this conversation before deleting it/, 'rejected conversation deletion remains retryable');
 assert.equal(useMissionStore.getState().missions.length, 1, 'failed deletion preserves the conversation');
 assert.equal(useMissionStore.getState().error, 'Stop or finish this conversation before deleting it.', 'failed deletion exposes the server reason');
+
+useMissionStore.setState({ missions: [mission], activeMissionId: mission.id, error: null, deletionTracking: {} });
+globalThis.fetch = async () => { throw new ApiRequestTimeoutError(30_000); };
+const uncertainDelete = await useMissionStore.getState().deleteMission(mission.id);
+assert.equal(uncertainDelete.status, 'pending', 'a deletion timeout is reconciled instead of claiming failure or success');
+assert.equal(useMissionStore.getState().missions.length, 1, 'an uncertain deletion retains its conversation');
+globalThis.fetch = async (input, init) => {
+  assert(String(input).endsWith(`/missions/${mission.id}/deletion`), 'deletion reconciliation uses the status resource');
+  assert.equal(init?.method, 'GET', 'polling never repeats a deletion write');
+  return new Response(JSON.stringify({ code: 'DELETION_NOT_FOUND' }), { status: 404, headers: { 'content-type': 'application/json' } });
+};
+assert.equal((await useMissionStore.getState().checkMissionDeletion(mission.id)).status, 'retryable', 'a missing operation requires an explicit retry');
+assert.equal(useMissionStore.getState().missions.length, 1, 'missing operation does not remove an existing conversation');
+
+let resolveOldList!: (response: Response) => void;
+globalThis.fetch = () => new Promise<Response>((resolve) => { resolveOldList = resolve; });
+const oldList = useMissionStore.getState().fetchMissions(mission.workspaceId);
+globalThis.fetch = async () => new Response(JSON.stringify({ status: 'completed' }), { status: 200, headers: { 'content-type': 'application/json' } });
+await useMissionStore.getState().checkMissionDeletion(mission.id);
+resolveOldList(new Response(JSON.stringify([mission]), { status: 200, headers: { 'content-type': 'application/json' } }));
+await oldList;
+assert.equal(useMissionStore.getState().missions.length, 0, 'an in-flight list snapshot cannot resurrect a deleted conversation');
+assert.equal(useMissionStore.getState().missionStateLoading, false, 'confirmed deletion clears stale detail loading');
 
 globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Runtime did not acknowledge cancellation.' }), { status: 503, headers: { 'content-type': 'application/json' } });
 await assert.rejects(() => useMissionStore.getState().stopMission(mission.id), /Runtime did not acknowledge cancellation/, 'stop failures are throwable for dialog callers');
@@ -226,11 +277,11 @@ await assert.rejects(() => fetchMissionEvents('missing-cursor-mission'), /cursor
 globalThis.fetch = originalFetch;
 console.log('mission event pagination regression tests passed');
 
-const deferred = <T,>() => {
+function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => { resolve = res; });
   return { promise, resolve };
-};
+}
 const missionAResponse = deferred<Response>();
 const missionBResponse = deferred<Response>();
 globalThis.fetch = (async (input) => {
@@ -277,17 +328,19 @@ globalThis.fetch = (async (input) => {
   if (url.endsWith('/missions/background-race')) return new Response(JSON.stringify({ mission: { id: 'background-race' }, tasks: [] }));
   return new Response(JSON.stringify([]), { headers: { 'content-type': 'application/json' } });
 }) as typeof fetch;
-useMissionStore.setState({ activeMissionId: 'live-race', timeline: [], activeTasks: [], hydratedMissionId: null });
+useMissionStore.setState({ activeMissionId: 'live-race', timeline: [], activeTasks: [{ id: 'live-task', missionId: 'live-race', planId: 'live-plan', title: 'Live task', description: '', status: 'running' }], hydratedMissionId: null });
 const loadingLive = useMissionStore.getState().fetchMissionState('live-race');
 await useMissionStore.getState().fetchMissionState('background-race');
 const liveStarted = { id: 'live-start', type: 'agent_started', missionId: 'live-race', agentInstanceId: 'live-builder', role: 'builder', sequence: 502, timestamp: '2026-09-05T12:02:00Z' };
 const liveCompleted = { id: 'live-complete', type: 'task_completed', missionId: 'live-race', agentInstanceId: 'live-builder', sequence: 503, timestamp: '2026-09-05T12:03:00Z' };
 useMissionStore.setState({ timeline: [liveStarted, liveCompleted].map((event) => ({ id: event.id, type: 'event', content: event.type, timestamp: event.timestamp, eventType: event.type, metadata: event })) });
+useMissionStore.getState().patchTask('live-task', { status: 'done' });
 useAgentStore.getState().upsertAgent({ id: 'live-builder', missionId: 'live-race', role: 'builder', model: 'test', status: 'completed' });
-liveSnapshot.resolve(new Response(JSON.stringify({ mission: { id: 'live-race', workspaceId: 'workspace-race', title: 'Live', status: 'running', createdAt: '2026-09-05T12:00:00Z' }, tasks: [] }), { headers: { 'content-type': 'application/json' } }));
+liveSnapshot.resolve(new Response(JSON.stringify({ mission: { id: 'live-race', workspaceId: 'workspace-race', title: 'Live', planId: 'live-plan', status: 'running', createdAt: '2026-09-05T12:00:00Z' }, tasks: [{ id: 'live-task', missionId: 'live-race', planId: 'live-plan', title: 'Live task', description: '', status: 'running' }] }), { headers: { 'content-type': 'application/json' } }));
 await loadingLive;
 assert.equal(useMissionStore.getState().hydratedMissionId, 'live-race', 'background fetch does not invalidate active hydration');
 assert.equal(useMissionStore.getState().missionStateLoading, false, 'active loading state settles after background fetch');
+assert.equal(useMissionStore.getState().activeTasks.find((task) => task.id === 'live-task')?.status, 'done', 'live task status survives an older server snapshot');
 assert.equal(useAgentStore.getState().getAgentsByMission('live-race').find((agent) => agent.id === 'live-builder')?.status, 'completed', 'live agent startup/completion survives an older server snapshot');
 globalThis.fetch = originalFetch;
 console.log('live event hydration merge regression tests passed');
