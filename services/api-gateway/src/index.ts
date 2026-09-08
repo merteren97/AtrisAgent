@@ -688,7 +688,23 @@ function normalizeAgentProfileIds(value: unknown): AgentProfileIdMap | undefined
     if (seen.has(canonicalRole)) throw profileClientError(`Duplicate agent profile role '${rawRole}'.`);
     if (typeof rawId !== 'string' || !rawId.trim()) throw profileClientError(`Agent profile ID for role '${canonicalRole}' must be a non-empty string.`);
     seen.add(canonicalRole);
-    result[canonicalRole] = rawId.trim();
+    switch (canonicalRole) {
+      case 'orchestrator':
+        result.orchestrator = rawId.trim();
+        break;
+      case 'builder':
+        result.builder = rawId.trim();
+        break;
+      case 'reviewer':
+        result.reviewer = rawId.trim();
+        break;
+      case 'researcher':
+        result.researcher = rawId.trim();
+        break;
+      case 'qa':
+        result.qa = rawId.trim();
+        break;
+    }
   }
   return result;
 }
@@ -2882,15 +2898,12 @@ app.post('/api/missions/:id/retry', async (req, res) => {
 
 app.post('/api/tasks/:id/retry', async (req, res) => {
   try {
-    const task = sqlite.prepare('SELECT id, mission_id FROM tasks WHERE id = ?').get(req.params.id) as {
-      id: string;
-      mission_id: string;
-    } | undefined;
+    const task = await workspaceManager.getTask(req.params.id);
     if (!task) return void res.status(404).json({ error: 'Task not found' });
-    if (isDeletionFenced('mission', task.mission_id)) {
+    if (isDeletionFenced('mission', task.missionId)) {
       return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     }
-    const result = await trackMissionTurn(task.mission_id, () => retryMissionTasksWithDurability(task.mission_id, [task.id]));
+    const result = await trackMissionTurn(task.missionId, () => retryMissionTasksWithDurability(task.missionId, [task.id]));
     const retriedTask = result.tasks[0];
     if (!retriedTask) throw missionRetryError('The task was not dispatched for retry.');
     res.json(retriedTask);
