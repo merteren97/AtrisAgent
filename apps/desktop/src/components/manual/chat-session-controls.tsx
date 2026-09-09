@@ -1,0 +1,29 @@
+import { useState } from 'react';
+import { ChevronDown, Search, Plus, RotateCcw } from 'lucide-react';
+import { Popover } from 'radix-ui';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
+import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
+import type { ManualAgent } from '@/stores/manual-store';
+
+export function ChatSessionControls({ agent, agents, pending, onApply }: { agent: ManualAgent; agents: ManualAgent[]; pending: boolean; onApply: (model: DiscoveredModel, independent: boolean) => void }) {
+  const models = useAccountStore(state => state.discoveredModels);
+  const current = models.find(model => model.catalogId === agent.catalogId);
+  const [expanded, setExpanded] = useState(false);
+  const [runtime, setRuntime] = useState(agent.runtimeType);
+  const [chosen, setChosen] = useState(agent.catalogId);
+  const [query, setQuery] = useState('');
+  const selected = models.find(model => model.catalogId === chosen && model.runtimeType === runtime);
+  const independent = !!selected && (selected.runtimeType !== agent.runtimeType || selected.accountProfileId !== agent.accountProfileId || selected.runtimeType === 'antigravity');
+  const options = models.filter(model => model.runtimeType === runtime && `${model.name} ${model.accountName}`.toLowerCase().includes(query.toLowerCase()));
+  return <Popover.Root open={expanded} onOpenChange={setExpanded}><Popover.Trigger asChild>
+      <Button type="button" variant={expanded ? 'secondary' : 'ghost'} size="sm" className="max-w-64 gap-2 text-xs text-muted-foreground" aria-label={`Choose CLI and model: ${current?.name || agent.model}`}><RuntimeBrandIcon runtimeId={agent.runtimeType} className="h-4 w-4 shrink-0" /><span className="truncate">{current?.name || agent.model}</span><ChevronDown className="h-3 w-3 shrink-0" /></Button>
+    </Popover.Trigger><Popover.Portal><Popover.Content side="top" align="start" sideOffset={12} collisionPadding={16} aria-label="CLI and model settings" className="z-[120] max-h-[min(520px,var(--radix-popover-content-available-height))] w-[min(580px,calc(100vw-32px))] overflow-y-auto rounded-2xl border border-border bg-popover p-4 text-popover-foreground shadow-xl outline-none">
+      <div className="mb-3"><h3 className="text-sm font-semibold">Model & CLI</h3><p className="mt-1 text-xs text-muted-foreground">Configure {agent.name}</p></div>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{RUNTIME_BRANDS.map(provider => <button type="button" key={provider.id} aria-pressed={runtime === provider.id} disabled={pending} onClick={() => { setRuntime(provider.id); setChosen(''); setQuery(''); }} className={`flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium transition-colors ${runtime === provider.id ? 'border-primary/50 bg-primary/5 text-foreground' : 'border-border text-muted-foreground hover:bg-accent'}`}><RuntimeBrandIcon runtimeId={provider.id} className="h-5 w-5 shrink-0" />{({claude_code:'Claude Code',codex:'Codex',opencode:'OpenCode',antigravity:'Antigravity'} as Record<string,string>)[provider.id]}</button>)}</div>
+      <div className="relative mt-3"><Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" /><Input aria-label="Search CLI models" placeholder="Search models or accounts…" className="pl-9" value={query} onChange={event => setQuery(event.target.value)} /></div>
+      <div className="mt-2 max-h-44 overflow-y-auto" role="radiogroup" aria-label="Available CLI models">{options.map(model => <label key={model.catalogId} className={`flex items-center gap-3 rounded-lg px-3 py-2 ${model.available && model.availability === 'available' ? 'cursor-pointer hover:bg-accent/60' : 'opacity-50'} ${chosen === model.catalogId ? 'bg-primary/5' : ''}`}><input type="radio" name="chat-model" checked={chosen === model.catalogId} disabled={pending || !model.available || model.availability !== 'available'} onChange={() => setChosen(model.catalogId)} className="accent-primary" /><span className="min-w-0 flex-1"><span className="block truncate text-xs font-medium">{model.name}</span><span className="block truncate text-[11px] text-muted-foreground">{model.accountName} · {model.available ? model.routeLabel : model.statusBadge}</span></span>{model.catalogId === agent.catalogId && <span className="text-[10px] text-muted-foreground">Configured</span>}</label>)}{!options.length && <p className="p-3 text-xs text-muted-foreground">No matching models. Connect or verify this CLI in Accounts.</p>}</div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3"><p className="max-w-md text-xs leading-5 text-muted-foreground">{independent ? 'A different CLI/account opens an independent agent. Existing sessions stay open; context is not copied.' : 'Applying stops this CLI and restarts it with the selected model. Its session identity and saved history are preserved.'}</p><Button type="button" size="sm" disabled={pending || !selected?.available || selected.availability !== 'available' || selected.catalogId === agent.catalogId || (independent && agents.length >= 30)} onClick={() => { if (selected) { onApply(selected, independent); setExpanded(false); } }}>{independent ? <Plus className="mr-1.5 h-3.5 w-3.5" /> : <RotateCcw className="mr-1.5 h-3.5 w-3.5" />}{independent ? 'Start new agent' : 'Apply & restart'}</Button></div>
+    </Popover.Content></Popover.Portal></Popover.Root>;
+}

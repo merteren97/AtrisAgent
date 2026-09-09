@@ -1,9 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { apiRequest } from '@/lib/api-client';
+import type { TerminalLayout } from '@/components/manual/terminal-layout';
+import type { RuntimeType } from '@atris-agent-code/domain';
 
 export interface ManualAgent {
-  id: string; conversationId: string; name: string; catalogId: string; runtimeType: string;
+  id: string; conversationId: string; name: string; catalogId: string; runtimeType: RuntimeType;
   model: string; accountProfileId: string; providerSessionId: string; cwd: string; createdAt: string;
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
@@ -19,6 +21,8 @@ interface ManualState {
   surfaceByConversation: Record<string, 'chat' | 'code'>;
   layoutByConversation: Record<string, number>;
   orderByConversation: Record<string, string[]>;
+  terminalLayouts: Record<string, TerminalLayout | undefined>;
+  setTerminalLayout: (conversationId: string, layout?: TerminalLayout) => void;
   hiddenAgents: Record<string, boolean>;
   moveAgent: (conversationId: string, source: string, target: string) => void;
   hideAgent: (id: string, hidden: boolean) => void;
@@ -33,6 +37,7 @@ interface ManualState {
   refresh: (workspaceId: string) => Promise<void>;
   create: (workspaceId: string, title: string, id: string) => Promise<ManualConversation>;
   addAgent: (conversationId: string, name: string, catalogId: string, id: string) => Promise<ManualAgent>;
+  updateModel: (agent: ManualAgent, catalogId: string) => Promise<ManualAgent>;
   addAgents: (conversationId: string, agents: Array<{id: string; name: string; catalogId: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
@@ -46,6 +51,8 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, error: null,
   layoutByConversation: {},
   orderByConversation: {}, hiddenAgents: {},
+  terminalLayouts: {},
+  setTerminalLayout: (conversationId, layout) => set(state => ({ terminalLayouts: { ...state.terminalLayouts, [conversationId]: layout } })),
   hideAgent: (id, hidden) => set(state => ({ hiddenAgents: { ...state.hiddenAgents, [id]: hidden } })),
   moveAgent: (conversationId, source, target) => set(state => {
     const agents = Object.values(state.conversations).flat().find(c => c.id === conversationId)?.agents || [];
@@ -54,7 +61,7 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     ids.forEach(id => { if (!order.includes(id)) order.push(id); });
     if (source === target || !order.includes(source) || !order.includes(target)) return {};
     const destination = order.indexOf(target); order.splice(order.indexOf(source), 1); order.splice(destination, 0, source);
-    return { orderByConversation: { ...state.orderByConversation, [conversationId]: order } };
+    return { orderByConversation: { ...state.orderByConversation, [conversationId]: order }, terminalLayouts: { ...state.terminalLayouts, [conversationId]: undefined } };
   }),
   setLayout: (conversationId, panes) => set(state => ({ layoutByConversation: { ...state.layoutByConversation, [conversationId]: [1, 2, 4].includes(panes) ? panes : 1 } })),
   setMode: mode => set({ mode }),
@@ -88,6 +95,15 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     get().selectAgent(conversationId, agent.id);
     return agent;
   },
+  updateModel: async (agent, catalogId) => {
+    const updated = await apiRequest<ManualAgent>(`/manual/agents/${agent.id}/model`, { method: 'PATCH', body: JSON.stringify({ catalogId, expectedCatalogId: agent.catalogId }) });
+    const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === agent.conversationId));
+    if (workspaceId) {
+      fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
+      set(state => ({ conversations: { ...state.conversations, [workspaceId]: state.conversations[workspaceId].map(c => c.id === agent.conversationId ? { ...c, agents: c.agents.map(item => item.id === agent.id ? updated : item) } : c) } }));
+    }
+    return updated;
+  },
   addAgents: async (conversationId, inputs) => {
     const agents = await apiRequest<ManualAgent[]>(`/manual/conversations/${conversationId}/agents`, { method: 'POST', body: JSON.stringify({ agents: inputs }) });
     const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === conversationId));
@@ -101,4 +117,4 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   },
 }), { name: 'atris-manual-navigation', version: 1,
   migrate: migrateManualNavigation,
-  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation, orderByConversation: state.orderByConversation, hiddenAgents: state.hiddenAgents }) }));
+  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation, orderByConversation: state.orderByConversation, hiddenAgents: state.hiddenAgents, terminalLayouts: state.terminalLayouts }) }));

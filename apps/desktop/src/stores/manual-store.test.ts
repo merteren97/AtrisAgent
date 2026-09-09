@@ -3,6 +3,7 @@ import { useManualStore, migrateManualNavigation, type ManualConversation } from
 import { useMissionStore } from './mission-store';
 import { conversationActivity, type AgentActivity } from '@/components/manual/manual-activity';
 import type { ManualAgent } from './manual-store';
+import { automaticLayout, layoutIds, moveInLayout, resizeLayout, reconcileLayout, minimumLayout, layoutRects, dropPlacement } from '@/components/manual/terminal-layout';
 
 const conversation: ManualConversation = { id: 'manual-a', workspaceId: 'project-a', title: 'Manual work', createdAt: '2026-09-08', agents: [] };
 const store = useManualStore;
@@ -61,3 +62,20 @@ assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('co
 assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('working'),c:observed('completed')},now).kind,'working');
 assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('attention'),c:observed('working')},now).kind,'attention');
 console.log('Manual navigation, independent drafts and stale hydration regression tests passed.');
+const initial = automaticLayout(['a','b','c','d'],2)!;
+assert.equal(initial.type,'split');
+if(initial.type === 'split') {
+  const resized = resizeLayout(initial,initial.id,.65);
+  const moved = moveInLayout(resized,'d','a','left');
+  assert.deepEqual(new Set(layoutIds(moved)),new Set(['a','b','c','d']));
+  assert.deepEqual(layoutIds(moveInLayout(initial,'a','d','swap')),['d','b','c','a']);
+  const pruned = reconcileLayout(resized,['a','b','c']);
+  assert.equal(pruned?.type === 'split' && pruned.ratio,.65,'Closing a leaf preserves surviving ratios');
+  const added = reconcileLayout(resized,['a','b','c','d','e']);
+  assert.ok(JSON.stringify(added).includes(initial.id),'New agents preserve the existing geometry');
+  const minimum = minimumLayout(moved), geometry=layoutRects(moved,minimum.width,minimum.height);
+  assert.equal(Object.keys(geometry.panes).length,4);
+  for(const rect of Object.values(geometry.panes)){assert.ok(rect.width>=320);assert.ok(rect.height>=240);}
+  assert.equal(dropPlacement(5,150,500,300),'left');
+  assert.equal(dropPlacement(250,150,500,300),'swap');
+}

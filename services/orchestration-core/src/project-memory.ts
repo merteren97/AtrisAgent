@@ -58,6 +58,7 @@ export interface ProjectMemorySnapshot extends ProjectMemoryOverview {
 }
 
 export interface ManualMemoryInput {
+  manualScope?: { conversationId: string; agentId?: string; sourceId?: string; url?: string };
   type?: MemoryNodeType;
   title: string;
   summary: string;
@@ -594,6 +595,7 @@ export class ProjectMemoryService {
     const provenance: MemoryProvenance = {
       sourceType: 'manual',
       createdBy: 'user',
+      ...(input.manualScope ? { conversationId: input.manualScope.conversationId, manualAgentId: input.manualScope.agentId, sourceId: input.manualScope.sourceId, url: input.manualScope.url } : {}),
     };
     return this.upsertNode({
       id: crypto.randomUUID(),

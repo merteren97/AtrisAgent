@@ -82,6 +82,15 @@ export class ManualConversationStore {
   save(agent: ManualAgent): void {
     this.saveBatch([agent]);
   }
+  updateModel(id: string, expectedCatalogId: string, catalogId: string, model: string, reasoning?: string): ManualAgent {
+    return this.sqlite.transaction(() => {
+      const agent = this.agent(id);
+      if (agent.catalogId !== expectedCatalogId) return fail('This agent model changed elsewhere. Refresh before applying.', 409);
+      const updated = { ...agent, catalogId, model, reasoning };
+      this.sqlite.prepare('UPDATE manual_agent_sessions SET record = ? WHERE id = ?').run(JSON.stringify(updated), id);
+      return updated;
+    })();
+  }
   saveBatch(agents: ManualAgent[]): ManualAgent[] {
     return this.sqlite.transaction(() => {
       const result: ManualAgent[] = [];
@@ -215,5 +224,16 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     res.json({ supported: true, messages: parseManualTranscript(tail.source, agent.providerSessionId), truncated: tail.truncated, bound: true });
   }));
   app.get('/api/manual/agents/:id/activity', route((req, res) => res.json(bridge.activity(store.agent(idParam(req, 'id'))))));
+  app.patch('/api/manual/agents/:id/model', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const catalogId = required(req.body.catalogId, 'model');
+    const expected = required(req.body.expectedCatalogId, 'previous model');
+    const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(catalogId);
+    if (!descriptor || descriptor.availability !== 'available') return fail('Select a verified available model.');
+    const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
+    if (!profile || profile.authStatus !== 'connected') return fail('Connect this model account first.');
+    if (profile.runtimeType !== agent.runtimeType || descriptor.accountProfileId !== agent.accountProfileId) return fail('A different CLI or account requires a new independent agent.', 409);
+    res.json(store.updateModel(agent.id, expected, descriptor.catalogId, descriptor.runtimeModelId, descriptor.defaultReasoning));
+  }));
   return store;
 }

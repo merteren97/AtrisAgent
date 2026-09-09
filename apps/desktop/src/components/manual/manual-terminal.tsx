@@ -13,21 +13,44 @@ const engines = new Map<string, ReturnType<typeof createEngine>>();
 function createEngine(id: string) {
   const container = document.createElement('div');
   container.className = 'h-full w-full';
+  // xterm must measure fonts in a connected, sized element, including background startup.
+  const parking = document.createElement('div');
+  parking.setAttribute('aria-hidden', 'true');
+  Object.assign(parking.style, { position: 'fixed', left: '-10000px', top: '0', width: '960px', height: '600px', visibility: 'hidden', pointerEvents: 'none' });
+  document.body.appendChild(parking); parking.appendChild(container);
   const terminal = new Terminal({ cols: 120, rows: 30, cursorBlink: true, fontSize: 13,
     fontFamily: 'Cascadia Code, Consolas, monospace', scrollback: 5000, allowProposedApi: false });
   const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
   let disposed = false; let after = 0; let status = 'disconnected'; let size = ''; let epoch = 0;
   let error: string | null = null; let timer: ReturnType<typeof setTimeout>;
   let writes = Promise.resolve();
+  let resizing = false; let frame = 0;
   const listeners = new Set<(error: string | null) => void>();
   const update = (value: string | null) => { error = value; listeners.forEach(listener => listener(error)); };
+  const flushResize = async () => {
+    if (resizing || disposed || status !== 'open' || container.parentElement === parking) return;
+    resizing = true;
+    try {
+      while (!disposed && status === 'open') {
+        const next = terminal.cols+':'+terminal.rows;
+        if (next === size) break;
+        const resizeEpoch = epoch;
+        await invoke('manual_terminal_resize', { id, columns: terminal.cols, rows: terminal.rows });
+        if (resizeEpoch !== epoch) break;
+        size = next;
+      }
+    } catch (e) { if (!disposed) update(String(e)); }
+    finally { resizing = false; }
+  };
   const resize = () => {
-    if (disposed || !container.isConnected || !container.clientWidth || !container.clientHeight) return;
-    fit.fit();
-    const next = terminal.cols+':'+terminal.rows;
-    if (next === size || status !== 'open') return;
-    size = next;
-    void invoke('manual_terminal_resize', { id, columns: terminal.cols, rows: terminal.rows }).catch(e => { if (!disposed) update(String(e)); });
+    if (frame || disposed || container.parentElement === parking) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      if (disposed || container.parentElement === parking || !container.clientWidth || !container.clientHeight) return;
+      fit.fit();
+      if (size !== terminal.cols+':'+terminal.rows) terminal.refresh(0, Math.max(0, terminal.rows - 1));
+      void flushResize();
+    });
   };
   const input = terminal.onData(data => {
     if (status !== 'open') return;
@@ -50,9 +73,11 @@ function createEngine(id: string) {
   };
   void poll();
   return { terminal, container, resize,
+    attach(root: HTMLElement) { root.appendChild(container); size = ''; resize(); },
+    park() { parking.style.width = `${container.clientWidth || 960}px`; parking.style.height = `${container.clientHeight || 600}px`; parking.appendChild(container); },
     restart() { epoch += 1; after = 0; status = 'disconnected'; size = ''; terminal.reset(); update(null); },
     subscribe(listener: (error: string | null) => void) { listeners.add(listener); listener(error); return () => { listeners.delete(listener); }; },
-    dispose() { disposed = true; clearTimeout(timer); input.dispose(); terminal.dispose(); listeners.clear(); },
+    dispose() { disposed = true; clearTimeout(timer); cancelAnimationFrame(frame); input.dispose(); terminal.dispose(); parking.remove(); listeners.clear(); },
   };
 }
 
@@ -71,11 +96,11 @@ export function ManualTerminal({ id, generation = 0 }: { id: string; generation?
   useEffect(() => {
     const root = host.current; if (!root) return;
     const engine = ensureManualTerminal(id);
-    root.appendChild(engine.container);
+    engine.attach(root);
     const unsubscribe = engine.subscribe(setError);
     const observer = new ResizeObserver(engine.resize); observer.observe(root); engine.resize();
     return () => {
-      unsubscribe(); observer.disconnect(); engine.container.remove();
+      unsubscribe(); observer.disconnect(); engine.park();
       // Keep parsing native output in Chat, other conversations, and settings.
     };
   }, [id, generation]);

@@ -512,7 +512,7 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
 // boundary for every request.
 installRuntimeShutdownRoute(app, RUNTIME_TOKEN, shutdownCoordinator);
 installAuthRoutes(app, authService);
-installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
+export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 
 function routeParam(value: string | string[]): string {
   return Array.isArray(value) ? value[0] || '' : value;
