@@ -18,6 +18,10 @@ interface ManualState {
   agentByConversation: Record<string, string>;
   surfaceByConversation: Record<string, 'chat' | 'code'>;
   layoutByConversation: Record<string, number>;
+  orderByConversation: Record<string, string[]>;
+  hiddenAgents: Record<string, boolean>;
+  moveAgent: (conversationId: string, source: string, target: string) => void;
+  hideAgent: (id: string, hidden: boolean) => void;
   setLayout: (conversationId: string, panes: number) => void;
   drafts: Record<string, string>;
   error: string | null;
@@ -41,6 +45,17 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   creating: false, setCreating: creating => set({ creating }),
   mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, error: null,
   layoutByConversation: {},
+  orderByConversation: {}, hiddenAgents: {},
+  hideAgent: (id, hidden) => set(state => ({ hiddenAgents: { ...state.hiddenAgents, [id]: hidden } })),
+  moveAgent: (conversationId, source, target) => set(state => {
+    const agents = Object.values(state.conversations).flat().find(c => c.id === conversationId)?.agents || [];
+    const ids = agents.map(a => a.id);
+    const order = [...(state.orderByConversation[conversationId] || []).filter(id => ids.includes(id))];
+    ids.forEach(id => { if (!order.includes(id)) order.push(id); });
+    if (source === target || !order.includes(source) || !order.includes(target)) return {};
+    const destination = order.indexOf(target); order.splice(order.indexOf(source), 1); order.splice(destination, 0, source);
+    return { orderByConversation: { ...state.orderByConversation, [conversationId]: order } };
+  }),
   setLayout: (conversationId, panes) => set(state => ({ layoutByConversation: { ...state.layoutByConversation, [conversationId]: [1, 2, 4].includes(panes) ? panes : 1 } })),
   setMode: mode => set({ mode }),
   select: conversation => set(state => ({ mode: 'manual', activeByWorkspace: { ...state.activeByWorkspace, [conversation.workspaceId]: conversation.id } })),
@@ -86,4 +101,4 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   },
 }), { name: 'atris-manual-navigation', version: 1,
   migrate: migrateManualNavigation,
-  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation }) }));
+  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation, orderByConversation: state.orderByConversation, hiddenAgents: state.hiddenAgents }) }));

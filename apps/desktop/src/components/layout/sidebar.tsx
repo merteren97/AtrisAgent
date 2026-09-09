@@ -42,6 +42,8 @@ import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
 import { useManualStore } from '@/stores/manual-store';
+import { ManualConversationRow } from '@/components/manual/manual-conversation-row';
+import { useManualActivityMonitor } from '@/components/manual/manual-activity';
 import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
 import { ThemeToggle } from '../theme-toggle';
@@ -180,6 +182,7 @@ function SidebarAgentTree({
 
 export function Sidebar() {
   const manual = useManualStore();
+  useManualActivityMonitor();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
@@ -452,7 +455,7 @@ export function Sidebar() {
                     <span className="text-xs font-medium tracking-normal text-sidebar-muted">Manual</span>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
-                  {(manual.conversations[workspace.id] || []).map(conversation => <button key={conversation.id} type="button" aria-current={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'page' : undefined} onClick={() => { manual.select(conversation); setActiveView('chat'); }} className={`mb-0.5 flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left text-xs ${manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'bg-primary/10 text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent'}`}><Bot className="h-3 w-3 shrink-0" /><span className="truncate">{conversation.title}</span><span className="ml-auto text-[10px]">{conversation.agents.length}</span></button>)}
+                  {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
                   <div className="mb-1 flex items-center justify-between px-2">
                     <span className="text-xs font-medium tracking-normal text-sidebar-muted">Orchestrator</span>

@@ -50,6 +50,14 @@ try {
   const external = path.join(temporary,'outside-profile.jsonl'); fs.writeFileSync(external,publicTranscript);
   callHook(agent.providerSessionId,external);
   assert.equal(bridge.read(agent).messages.length,2,'Out-of-profile history paths cannot replace a binding');
+  const activityAt = new Date(Date.now() + 1000).toISOString();
+  fs.appendFileSync(bindingFile, JSON.stringify({sessionId:agent.providerSessionId,transcriptPath:transcript,event:'UserPromptSubmit',at:activityAt})+'\n');
+  assert.deepEqual(bridge.activity(agent), {state:'working',at:activityAt});
+  fs.appendFileSync(bindingFile, JSON.stringify({sessionId:agent.providerSessionId,transcriptPath:external,event:'Stop',at:new Date(Date.now()+2000).toISOString()})+'\n');
+  assert.equal(bridge.activity(agent).state,'working','Foreign transcript cannot finish this agent');
+  fs.appendFileSync(bindingFile, JSON.stringify({sessionId:agent.providerSessionId,transcriptPath:transcript,event:'Stop',at:new Date(Date.now()+3000).toISOString()})+'\n');
+  assert.equal(bridge.activity(agent).state,'completed');
+  assert.equal(bridge.activity({...agent,runtimeType:'antigravity'}).state,'unknown');
 
   // Optional local CLI schema smoke: no model, authentication, network or task is invoked.
   if (process.env.ATRIS_TEST_CODEX_EXECUTABLE) {

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { useManualStore, migrateManualNavigation, type ManualConversation } from './manual-store';
 import { useMissionStore } from './mission-store';
+import { conversationActivity, type AgentActivity } from '@/components/manual/manual-activity';
+import type { ManualAgent } from './manual-store';
 
 const conversation: ManualConversation = { id: 'manual-a', workspaceId: 'project-a', title: 'Manual work', createdAt: '2026-09-08', agents: [] };
 const store = useManualStore;
@@ -41,4 +43,21 @@ release(new Response('[]', {status: 200, headers: {'Content-Type': 'application/
 await stale;
 assert.ok(store.getState().conversations['project-a'].some(c => c.id === 'manual-b'), 'Stale hydration cannot erase a newly created conversation');
 globalThis.fetch = oldFetch;
+const agents = ['a','b','c'].map(id => ({id,conversationId:'manual-a'} as ManualAgent));
+store.setState({conversations:{'project-a':[{...conversation,agents}]}});
+store.getState().moveAgent('manual-a','a','c');
+assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c','a']);
+store.getState().moveAgent('manual-a','a','b');
+assert.deepEqual(store.getState().orderByConversation['manual-a'],['a','b','c']);
+store.getState().hideAgent('a',true);
+assert.equal(store.getState().conversations['project-a'][0].agents.length,3,'Closing a pane preserves agent history');
+const now = Date.parse('2026-09-09T10:10:00Z');
+const observed = (state: string, lifecycle: AgentActivity['lifecycle'] = 'open'): AgentActivity => ({state,lifecycle,checkedAt:now,at:'2026-09-09T10:08:00Z'});
+assert.equal(conversationActivity([],{},now).kind,'empty');
+assert.equal(conversationActivity(agents,{},now).kind,'unknown');
+assert.equal(conversationActivity(agents,{a:observed('unknown','closed'),b:observed('unknown','closed'),c:observed('unknown','exited')},now).kind,'closed');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('completed'),c:observed('unknown')},now).kind,'open','Unknown activity never counts as finished');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('completed'),c:observed('completed')},now).text,'Turns finished 2m ago');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('working'),c:observed('completed')},now).kind,'working');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('attention'),c:observed('working')},now).kind,'attention');
 console.log('Manual navigation, independent drafts and stale hydration regression tests passed.');

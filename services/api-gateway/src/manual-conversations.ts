@@ -214,5 +214,6 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     const tail = readTail(filename);
     res.json({ supported: true, messages: parseManualTranscript(tail.source, agent.providerSessionId), truncated: tail.truncated, bound: true });
   }));
+  app.get('/api/manual/agents/:id/activity', route((req, res) => res.json(bridge.activity(store.agent(idParam(req, 'id'))))));
   return store;
 }

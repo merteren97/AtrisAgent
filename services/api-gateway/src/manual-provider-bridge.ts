@@ -136,6 +136,23 @@ export function parseCodexManualTranscript(source: string, sessionId: string): M
 
 export class ManualProviderBridge {
   constructor(private dataDir: string) {}
+  activity(agent: ManualAgent): { state: string; at?: string } {
+    if (!['claude_code', 'codex'].includes(agent.runtimeType)) return { state: 'unknown' };
+    const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent);
+    const current = bindings.at(-1);
+    if (!current) return { state: 'unknown' };
+    const states: Record<string, string> = { SessionStart: 'ready', UserPromptSubmit: 'working', PostToolUse: 'working', PermissionRequest: 'attention', Stop: 'completed' };
+    let latest: { state: string; at?: string } = { state: 'unknown' };
+    for (const line of readTail(path.join(this.directory(agent), 'bindings.jsonl'), 128 * 1024).source.split('\n')) {
+      try {
+        const event = JSON.parse(line);
+        if (event.sessionId !== current.sessionId || typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at)) || !states[event.event]) continue;
+        if (fs.realpathSync(event.transcriptPath) !== current.transcriptPath) continue;
+        if (!latest.at || Date.parse(event.at) >= Date.parse(latest.at)) latest = { state: states[event.event], at: event.at };
+      } catch { /* Ignore incomplete and foreign hook records. */ }
+    }
+    return latest;
+  }
   private directory(agent: ManualAgent): string { return path.join(this.dataDir, 'manual-sessions', agent.id); }
   private codexRoot(agent: ManualAgent): string { return agent.sharedProfile ? process.env.CODEX_HOME || path.join(os.homedir(), '.codex') : agent.configDir; }
   private hookCommand(agent: ManualAgent): {command: string; commandWindows: string} {
