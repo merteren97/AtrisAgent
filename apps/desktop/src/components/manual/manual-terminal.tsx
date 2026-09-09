@@ -16,7 +16,7 @@ function createEngine(id: string) {
   const terminal = new Terminal({ cols: 120, rows: 30, cursorBlink: true, fontSize: 13,
     fontFamily: 'Cascadia Code, Consolas, monospace', scrollback: 5000, allowProposedApi: false });
   const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
-  let disposed = false; let after = 0; let status = 'disconnected'; let size = '';
+  let disposed = false; let after = 0; let status = 'disconnected'; let size = ''; let epoch = 0;
   let error: string | null = null; let timer: ReturnType<typeof setTimeout>;
   let writes = Promise.resolve();
   const listeners = new Set<(error: string | null) => void>();
@@ -34,14 +34,15 @@ function createEngine(id: string) {
     writes = writes.then(() => disposed ? undefined : invoke<void>('manual_terminal_write', { id, data, paste: false })).catch(e => { if (!disposed) update(String(e)); });
   });
   const poll = async () => {
+    const pollEpoch = epoch;
     try {
       const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after });
-      if (disposed) return;
+      if (disposed || pollEpoch !== epoch) return;
       status = snapshot.status;
       if (snapshot.reset) terminal.reset();
       after = snapshot.sequence;
       if (snapshot.output) await new Promise<void>(resolve => terminal.write(snapshot.output, resolve));
-      if (disposed) return;
+      if (disposed || pollEpoch !== epoch) return;
       update(status === 'open' ? null : 'Agent '+status+'. Use Open agent to reconnect.');
       resize();
     } catch (e) { if (!disposed) update(String(e)); }
@@ -49,15 +50,16 @@ function createEngine(id: string) {
   };
   void poll();
   return { terminal, container, resize,
+    restart() { epoch += 1; after = 0; status = 'disconnected'; size = ''; terminal.reset(); update(null); },
     subscribe(listener: (error: string | null) => void) { listeners.add(listener); listener(error); return () => { listeners.delete(listener); }; },
     dispose() { disposed = true; clearTimeout(timer); input.dispose(); terminal.dispose(); listeners.clear(); },
   };
 }
 
 export function ensureManualTerminal(id: string, restart = false) {
-  if (restart) { engines.get(id)?.dispose(); engines.delete(id); }
   let engine = engines.get(id);
   if (!engine) { engine = createEngine(id); engines.set(id, engine); }
+  else if (restart) engine.restart();
   return engine;
 }
 
@@ -83,7 +85,7 @@ export function ManualTerminal({ id, generation = 0 }: { id: string; generation?
       foreground: effectiveTheme === 'light' ? '#202124' : '#e4e4e7',
     };
   }, [id, generation, effectiveTheme]);
-  return <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-background">
+  return <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
     {error && <p role="status" className="shrink-0 border-b border-border px-3 py-2 text-xs text-muted-foreground">{error}</p>}
     <div ref={host} className="min-h-0 flex-1 p-2" aria-label="Interactive agent terminal" />
   </div>;

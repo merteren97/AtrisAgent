@@ -12,7 +12,8 @@ import { useAccountStore } from '@/stores/account-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { apiRequest } from '@/lib/api-client';
 import { isTauriRuntime } from '@/lib/secure-storage';
-import { ManualTerminal, ensureManualTerminal, type TerminalSnapshot } from './manual-terminal';
+import { TerminalCanvas } from './terminal-canvas';
+import { ensureManualTerminal, type TerminalSnapshot } from './manual-terminal';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode'].includes(kind || '');
@@ -21,14 +22,16 @@ const selectStyle = 'h-9 w-full min-w-0 rounded-md border border-input bg-backgr
 
 export { ConversationChoice } from '@/components/layout/workspace-home';
 
-function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversationId?: string; onClose: () => void; onCreated: (agent: ManualAgent) => Promise<void> }) {
+function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversationId?: string; onClose: () => void; onCreated: (agents: ManualAgent[]) => Promise<void> }) {
   const models = useAccountStore(s => s.discoveredModels);
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
   const [title, setTitle] = useState(''); const [name, setName] = useState('');
   const [runtime, setRuntime] = useState('claude_code'); const [catalogId, setCatalogId] = useState('');
-  const [panes, setPanes] = useState(1);
+  const [count, setCount] = useState(1);
+  const existingCount = useManualStore(s => Object.values(s.conversations).flat().find(c => c.id === conversationId)?.agents.length || 0);
+  const remaining = 30 - existingCount;
   const [pending, setPending] = useState(false); const [error, setError] = useState<string | null>(null);
-  const conversationKey = useRef(crypto.randomUUID()); const agentKey = useRef(crypto.randomUUID());
+  const conversationKey = useRef(crypto.randomUUID()); const agentKeys = useRef(Array.from({ length: 30 }, () => crypto.randomUUID()));
   const createdConversation = useRef<string | undefined>(conversationId);
   const options = useMemo(() => models.filter(m => m.runtimeType === runtime && m.available), [models, runtime]);
   const selected = options.find(m => m.catalogId === catalogId) || options[0];
@@ -40,17 +43,19 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
         const conversation = await useManualStore.getState().create(workspaceId, title.trim(), conversationKey.current);
         createdConversation.current = conversation.id;
       }
-      const agent = await useManualStore.getState().addAgent(createdConversation.current, name.trim() || `${cliName(runtime)} agent`, selected.catalogId, agentKey.current);
-      if (!conversationId) useManualStore.getState().setLayout(createdConversation.current, panes);
+      const agents = await useManualStore.getState().addAgents(createdConversation.current, Array.from({ length: count }, (_, index) => ({
+        id: agentKeys.current[index], catalogId: selected.catalogId,
+        name: count > 1 ? `${name.trim() || cliName(runtime)} ${existingCount + index + 1}` : (name.trim() || `${cliName(runtime)} agent`),
+      })));
       // Creation is durable before launch. A failed launch remains visible and can be retried explicitly.
-      await onCreated(agent);
+      await onCreated(agents);
     } catch (e) { setError(errorText(e)); } finally { setPending(false); }
   };
   return <section aria-label="Manual agent setup" className="min-h-0 flex-1 overflow-y-auto bg-background">
     <div className="mx-auto w-full max-w-4xl px-6 py-6 lg:px-10 lg:py-8">
       <Button variant="ghost" size="sm" className="-ml-3 mb-5 text-muted-foreground" onClick={onClose} disabled={pending}>← Back to workspace</Button>
       <p className="text-xs font-medium text-primary">Manual workspace</p>
-      <h1 className="mt-2 text-3xl font-semibold tracking-tight">{conversationId ? 'Add an independent agent' : 'Choose your AI. Make it your workspace.'}</h1>
+      <h1 className="mt-2 text-2xl font-semibold tracking-tight">{conversationId ? 'Add an independent agent' : 'Start your workspace'}</h1>
       <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">Each agent has its own context and terminal. Switch between Chat and Code, work side by side, and close agents only when you decide.</p>
       <form className="mt-6 space-y-6" onSubmit={e => { e.preventDefault(); void submit(); }}>
         <fieldset><legend className="mb-3 text-sm font-medium">1. Choose an AI provider</legend>
@@ -70,24 +75,23 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
           <h2 className="text-sm font-medium">2. Set up your agent</h2>
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
             {!conversationId && <label className="grid gap-2 text-xs font-medium">Conversation name<Input value={title} onChange={e => setTitle(e.target.value)} maxLength={200} placeholder="e.g. Interface improvements" required /></label>}
-            <label className="grid gap-2 text-xs font-medium">Agent name<Input value={name} onChange={e => setName(e.target.value)} maxLength={200} placeholder={cliName(runtime) + ' agent'} /></label>
+            <label className="grid gap-2 text-xs font-medium">Agent name<Input value={name} onChange={e => setName(e.target.value)} maxLength={180} placeholder={cliName(runtime) + ' agent'} /></label>
             <label className="grid min-w-0 gap-2 text-xs font-medium sm:col-span-2">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => setCatalogId(e.target.value)} disabled={!options.length}>{!options.length && <option value="">No verified model available</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label>
           </div>
           {runtime === 'codex' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Chat uses a session history hook. Review the AtrisAgent hook in the CLI's /hooks screen when prompted.</p>}
           {runtime === 'antigravity' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Antigravity opens in Code using your existing CLI account. Structured Chat history is not available yet. Reopening starts a fresh CLI session.</p>}
           {!options.length && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted/40 p-3"><p className="text-xs leading-5 text-muted-foreground">Connect or verify this provider to load its available models.</p><Button type="button" variant="outline" size="sm" onClick={() => { useSettingsStore.getState().setActiveView('accounts'); onClose(); }}>Open Accounts</Button></div>}
         </div>
-        {!conversationId && <fieldset><legend className="mb-3 text-sm font-medium">3. Choose your terminal layout</legend>
-          <div className="grid grid-cols-3 gap-3">{[1, 2, 4].map(count => <label key={count} className={`relative cursor-pointer rounded-xl border p-3 focus-within:ring-2 focus-within:ring-ring sm:p-4 ${panes === count ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-accent/30'}`}>
-            <input type="radio" name="layout" value={count} checked={panes === count} onChange={() => setPanes(count)} className="sr-only" />
-            <span aria-hidden="true" className={`mb-3 grid h-12 gap-1 ${count > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>{Array.from({ length: count }, (_, index) => <span key={index} className={`rounded border ${panes === count ? 'border-primary/30 bg-primary/10' : 'border-border bg-muted/50'}`} />)}</span>
-            <span className="text-xs font-medium">{count === 1 ? 'Focus' : count + ' panes'}</span>
+        <fieldset disabled={pending}><legend className="mb-3 text-sm font-medium">3. How many agents?</legend>
+          <div className="grid grid-cols-4 gap-3">{[1, 2, 4, 8].map(amount => <label key={amount} className={`relative rounded-xl border p-4 text-center focus-within:ring-2 focus-within:ring-ring ${amount > remaining ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'} ${count === amount ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-accent/30'}`}>
+            <input type="radio" name="agent-count" value={amount} checked={count === amount} disabled={amount > remaining} onChange={() => setCount(amount)} className="sr-only" />
+            <span className="block text-xl font-semibold">{amount}</span><span className="mt-1 block text-xs text-muted-foreground">{amount === 1 ? 'agent' : 'agents'}</span>
           </label>)}</div>
-          <p className="mt-3 text-xs leading-5 text-muted-foreground">Start with one agent. Add more independently whenever you need them; the layout arranges your open terminals.</p>
-        </fieldset>}
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">Opens {count} independent CLI {count === 1 ? 'session' : 'sessions'}. Terminals arrange automatically. Add more later, up to 30 per conversation.</p>
+        </fieldset>
         {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Use the desktop app to launch interactive terminals.</p>}
         {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
-        <div className="sticky bottom-0 z-10 flex items-center justify-end gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm"><Button type="button" variant="ghost" onClick={onClose} disabled={pending}>Cancel</Button><Button type="submit" className="rounded-xl px-6" disabled={pending || !selected || (!conversationId && !title.trim())}>{pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{conversationId ? 'Add agent' : 'Create conversation'}</Button></div>
+        <div className="sticky bottom-0 z-10 flex items-center justify-end gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm"><Button type="button" variant="ghost" onClick={onClose} disabled={pending}>Cancel</Button><Button type="submit" className="rounded-xl px-6" disabled={pending || !selected || count > remaining || (!conversationId && !title.trim())}>{pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{conversationId ? 'Add agent' : 'Create conversation'}</Button></div>
       </form>
     </div>
   </section>;
@@ -99,24 +103,20 @@ export function ManualWorkspace() {
   const conversation = (workspaceId ? conversations[workspaceId] || [] : []).find(c => c.id === activeByWorkspace[workspaceId!]);
   const agent = conversation?.agents.find(a => a.id === agentByConversation[conversation.id]) || conversation?.agents[0];
   const surface = conversation ? surfaceByConversation[conversation.id] || 'chat' : 'chat';
-  const [adding, setAdding] = useState(false); const [closing, setClosing] = useState(false);
+  const [adding, setAdding] = useState(false); const [closingAgent, setClosingAgent] = useState<ManualAgent | null>(null);
   const [pending, setPending] = useState<string | null>(null); const [error, setError] = useState<string | null>(null);
   const [bound, setBound] = useState(false);
   const actionPending = useRef(false);
   const [messages, setMessages] = useState<ManualMessage[]>([]); const [truncated, setTruncated] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [generation, setGeneration] = useState(0);
-  const layouts = useManualStore(s => s.layoutByConversation);
-  const grid = conversation ? layouts[conversation.id] || 1 : 1;
-  const setGrid = (panes: number) => { if (conversation) useManualStore.getState().setLayout(conversation.id, panes); };
-  const [search, setSearch] = useState('');
   const messageEnd = useRef<HTMLDivElement>(null); const scroller = useRef<HTMLDivElement>(null); const following = useRef(true);
   const native = isTauriRuntime();
   const agentId = agent?.id;
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
 
-  useEffect(() => { setMessages([]); setTruncated(false); setBound(false); setError(null); setClosing(false); following.current = true; }, [agentId]);
-  useEffect(() => { setSearch(''); setAdding(false); }, [conversation?.id]);
+  useEffect(() => { setMessages([]); setTruncated(false); setBound(false); setError(null); following.current = true; }, [agentId]);
+  useEffect(() => { setAdding(false); setClosingAgent(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
     let disposed = false; let timer: ReturnType<typeof setTimeout>;
@@ -165,13 +165,23 @@ export function ManualWorkspace() {
     setPending(label); setError(null);
     try { await run(); } catch (e) { setError(errorText(e)); } finally { setPending(null); actionPending.current = false; }
   };
-  const created = async (target: ManualAgent) => {
-    try { await launch(target); } catch (e) { setError(`Agent saved. ${errorText(e)} Use Open agent to retry.`); }
-    setCreating(false); setAdding(false);
+  const created = async (targets: ManualAgent[]) => {
+    setCreating(false); setAdding(false); setError(null);
+    if (!native) return;
+    actionPending.current = true;
+    const failures: string[] = [];
+    try {
+      for (let index = 0; index < targets.length; index += 2) {
+        setPending(`Opening agents ${index + 1}–${Math.min(index + 2, targets.length)} of ${targets.length}`);
+        await Promise.all(targets.slice(index, index + 2).map(async target => {
+          try { await launch(target); } catch (e) { failures.push(`${target.name}: ${errorText(e)}`); }
+        }));
+      }
+    } finally { setPending(null); actionPending.current = false; }
+    if (failures.length) setError(`Agents saved. ${failures.join(' · ')}. Use each terminal's Open action to retry.`);
   };
   const closeDialog = () => { if (creating) useManualStore.getState().setMode('choose'); setCreating(false); setAdding(false); };
-  const visibleAgents = conversation?.agents.filter(a => `${a.name} ${a.model} ${cliName(a.runtimeType)}`.toLowerCase().includes(search.toLowerCase())) || [];
-  const codeAgents = agent ? [agent, ...(conversation?.agents.filter(a => a.id !== agent.id) || [])].slice(0, grid) : [];
+  const interrupt = (target: ManualAgent) => void action('interrupt', () => invoke('manual_terminal_write', { id: target.id, data: target.runtimeType === 'claude_code' ? '\u001b' : '\u0003', paste: false }));
   const live = agent && statuses[agent.id] === 'open';
   const draft = agent ? drafts[agent.id] || '' : '';
   const send = () => agent && action('send', async () => {
@@ -184,25 +194,21 @@ export function ManualWorkspace() {
   if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
 
   return <section className="manual-workspace flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground" aria-label="Manual conversation">
-    <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
-      <div className="flex min-w-0 items-center gap-2"><span className="rounded border border-border px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Manual</span><span className="truncate text-sm font-medium">{conversation?.title || 'Independent agents'}</span></div>
-      <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/40 p-1" aria-label="Conversation view">{(['chat', 'code'] as const).map(view => <Button key={view} variant={surface === view ? 'secondary' : 'ghost'} size="sm" aria-pressed={surface === view} disabled={!conversation} onClick={() => conversation && setSurface(conversation.id, view)}>{view === 'chat' ? <MessageSquare className="mr-1.5 h-3.5 w-3.5" /> : <Code2 className="mr-1.5 h-3.5 w-3.5" />}{view === 'chat' ? 'Chat' : 'Code'}</Button>)}</div>
-    </div>
-    {conversation && <div className="flex shrink-0 items-center gap-3 border-b border-border bg-card/40 px-5 py-3">
-      {conversation.agents.length > 5 && <Input className="w-32 shrink-0" placeholder="Find agent" aria-label="Find agent" value={search} onChange={e => setSearch(e.target.value)} />}
-      <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto" aria-label="Agents">{visibleAgents.map(item => <button key={item.id} aria-pressed={item.id === agentId} onClick={() => selectAgent(conversation.id, item.id)} className={`flex min-w-40 max-w-64 shrink-0 items-center gap-2.5 rounded-xl border px-3.5 py-3 text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${item.id === agentId ? 'border-primary/35 bg-primary/5 text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:bg-muted'}`}><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${statuses[item.id] === 'open' ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} aria-hidden="true" /><span className="min-w-0 text-left"><span className="block truncate font-medium">{item.name}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{cliName(item.runtimeType)} · {statuses[item.id] || 'Not checked'}</span></span></button>)}</div>
-      <Button size="sm" variant="outline" onClick={() => setAdding(true)}><Plus className="mr-1 h-3.5 w-3.5" />Add agent</Button>
-    </div>}
+    <header className="flex min-h-14 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-2">
+      <div className="flex min-w-0 items-center gap-3"><h1 className="truncate text-sm font-medium">{conversation?.title || 'Independent agents'}</h1><span className="text-xs text-muted-foreground">{conversation?.agents.length || 0} agents</span></div>
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1" aria-label="Conversation view">{(['chat', 'code'] as const).map(view => <Button key={view} variant={surface === view ? 'secondary' : 'ghost'} size="sm" aria-pressed={surface === view} disabled={!conversation} onClick={() => conversation && setSurface(conversation.id, view)}>{view === 'chat' ? <MessageSquare className="mr-1.5 h-3.5 w-3.5" /> : <Code2 className="mr-1.5 h-3.5 w-3.5" />}{view === 'chat' ? 'Chat' : 'Code'}</Button>)}</div>
+        {conversation && <Button size="sm" variant="ghost" disabled={Boolean(pending) || conversation.agents.length >= 30} onClick={() => setAdding(true)} title={conversation.agents.length >= 30 ? '30-agent limit reached' : 'Add independent agents'}><Plus className="mr-1 h-3.5 w-3.5" />Add agents</Button>}
+      </div>
+    </header>
+    {pending?.startsWith('Opening') && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs text-muted-foreground">{pending}</p>}
     {error && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error}</span><button aria-label="Dismiss error" onClick={() => setError(null)}><X className="h-4 w-4" /></button></div>}
     {!conversation || !agent ? <div className="flex flex-1 items-center justify-center p-6"><div className="max-w-md text-center"><Bot className="mx-auto mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-lg font-medium">Your agents, your workflow</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">Group independent agents in a conversation. Each agent keeps its own context and stays under your control.</p><Button className="mt-5" disabled={!workspaceId} onClick={() => conversation ? setAdding(true) : setCreating(true)}><Plus className="mr-2 h-4 w-4" />{conversation ? 'Add first agent' : 'New manual conversation'}</Button></div></div> : <>
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
-        <div className="min-w-0"><p className="truncate text-xs font-medium">{agent.name} <span className="font-normal text-muted-foreground">· {cliName(agent.runtimeType)} · {agent.model}</span></p><p className="mt-0.5 truncate text-[10px] text-muted-foreground" title={agent.cwd}>{agent.cwd}</p></div>
-        <div className="flex items-center gap-1">
-          {surface === 'code' && <select className="h-7 rounded border border-input bg-background px-1 text-xs" aria-label="Terminal layout" value={grid} onChange={e => setGrid(Number(e.target.value))}><option value={1}>Focus</option><option value={2}>2 panes</option><option value={4}>4 panes</option></select>}
-          {!live ? <Button size="sm" variant="outline" disabled={!native || Boolean(pending)} onClick={() => void action('open', () => launch(agent))}><RotateCcw className="mr-1 h-3 w-3" />Open agent</Button> : <><Button size="sm" variant="ghost" disabled={Boolean(pending)} onClick={() => void action('interrupt', () => invoke('manual_terminal_write', { id: agent.id, data: agent.runtimeType === 'claude_code' ? '\u001b' : '\u0003', paste: false }))}><Square className="mr-1 h-3 w-3" />Interrupt</Button><Button size="sm" variant="ghost" disabled={Boolean(pending)} onClick={() => setClosing(true)}><X className="mr-1 h-3 w-3" />Close agent</Button></>}
+      {surface === 'code' ? native ? <TerminalCanvas agents={conversation.agents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={setClosingAgent} /> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : <>
+        <div className="flex shrink-0 items-center justify-between gap-3 px-5 py-2">
+          <label className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">Chat with<select aria-label="Chat agent" className="h-8 max-w-64 rounded-md border border-border bg-background px-2 text-xs text-foreground" value={agent.id} onChange={event => selectAgent(conversation.id, event.target.value)}>{conversation.agents.map(item => <option key={item.id} value={item.id}>{item.name} · {item.model}</option>)}</select></label>
+          {!live ? <Button size="sm" variant="ghost" disabled={!native || Boolean(pending)} onClick={() => void action('open', () => launch(agent))}><RotateCcw className="mr-1 h-3 w-3" />Open agent</Button> : <Button size="sm" variant="ghost" disabled={Boolean(pending)} onClick={() => interrupt(agent)}><Square className="mr-1 h-3 w-3" />Interrupt</Button>}
         </div>
-      </div>
-      {surface === 'code' ? native ? <div className={`grid min-h-0 flex-1 gap-2 overflow-auto p-3 ${grid > 1 ? 'grid-cols-1 auto-rows-[minmax(16rem,1fr)] md:grid-cols-2' : 'grid-cols-1 grid-rows-1'}`}>{codeAgents.map(item => <div className="flex min-h-0 min-w-0 flex-col" key={item.id}>{grid > 1 && <button className="mb-1 truncate text-left text-xs text-muted-foreground" onClick={() => selectAgent(conversation.id, item.id)}>{item.name}</button>}<ManualTerminal id={item.id} generation={generation} /></div>)}</div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : <>
         <div ref={scroller} onScroll={() => { const node = scroller.current; if (node) following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100; }} className="min-h-0 flex-1 overflow-y-auto select-text">
           <div className="mx-auto w-full max-w-3xl space-y-7 px-6 py-8">
             {!supportsChat(agent.runtimeType) ? <div className="rounded-lg border border-border p-5"><h3 className="text-sm font-medium">Continue in Code</h3><p className="mt-2 text-sm leading-6 text-muted-foreground">This provider’s structured Chat history is not connected yet. Use its interactive terminal to continue this agent.</p><Button className="mt-3" variant="outline" onClick={() => setSurface(conversation.id, 'code')}>Open Code</Button></div> : <>
@@ -217,6 +223,6 @@ export function ManualWorkspace() {
         {supportsChat(agent.runtimeType) && <form className="shrink-0 border-t border-border px-4 py-3" onSubmit={e => { e.preventDefault(); void send(); }}><div className="mx-auto max-w-3xl"><div className="mb-2 flex items-center justify-between text-[11px] text-muted-foreground"><span>To {agent.name} · {agent.model}</span><button type="button" className="underline underline-offset-2" onClick={() => setSurface(conversation.id, 'code')}>CLI approvals & live output</button></div><div className="rounded-2xl border border-input bg-card p-3 shadow-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-ring/15"><textarea aria-label={`Message ${agent.name}`} value={draft} onChange={e => setDraft(agent.id, e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} placeholder={live ? 'Message this agent…' : 'Open the agent to continue…'} rows={3} maxLength={32000} className="max-h-40 min-h-20 w-full resize-y bg-transparent px-2 py-1 text-sm outline-none" /><div className="flex items-center justify-between px-1"><span className="text-[10px] text-muted-foreground">{live ? 'CLI open · Shift+Enter for a new line' : 'Session disconnected · history preserved'}</span><Button type="submit" size="sm" disabled={!live || !native || Boolean(pending) || !draft.trim()}>{pending === 'send' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">Send</span></Button></div></div></div></form>}
       </>}
     </>}
-    <Dialog open={closing} onOpenChange={setClosing}><DialogContent><DialogHeader><DialogTitle>Close {agent?.name}?</DialogTitle><DialogDescription>This stops this agent and its running commands. Other agents continue. Chat history is kept.</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setClosing(false)}>Keep open</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => agent && void action('close', async () => { await invoke('manual_terminal_close', { id: agent.id }); setStatuses(previous => ({ ...previous, [agent.id]: 'closed' })); setClosing(false); })}>Close agent</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={Boolean(closingAgent)} onOpenChange={open => { if (!open) setClosingAgent(null); }}><DialogContent><DialogHeader><DialogTitle>Close {closingAgent?.name}?</DialogTitle><DialogDescription>This stops only this agent and its running commands. Other agents continue; its history is kept.</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setClosingAgent(null)}>Keep open</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => closingAgent && void action('close', async () => { const id = closingAgent.id; await invoke('manual_terminal_close', { id }); setStatuses(previous => ({ ...previous, [id]: 'closed' })); setClosingAgent(null); })}>Close agent</Button></DialogFooter></DialogContent></Dialog>
   </section>;
 }

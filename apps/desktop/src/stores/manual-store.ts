@@ -29,6 +29,7 @@ interface ManualState {
   refresh: (workspaceId: string) => Promise<void>;
   create: (workspaceId: string, title: string, id: string) => Promise<ManualConversation>;
   addAgent: (conversationId: string, name: string, catalogId: string, id: string) => Promise<ManualAgent>;
+  addAgents: (conversationId: string, agents: Array<{id: string; name: string; catalogId: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
 export function migrateManualNavigation(persisted: unknown) {
@@ -71,6 +72,17 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     }
     get().selectAgent(conversationId, agent.id);
     return agent;
+  },
+  addAgents: async (conversationId, inputs) => {
+    const agents = await apiRequest<ManualAgent[]>(`/manual/conversations/${conversationId}/agents`, { method: 'POST', body: JSON.stringify({ agents: inputs }) });
+    const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === conversationId));
+    if (workspaceId) {
+      fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
+      const ids = new Set(agents.map(agent => agent.id));
+      set(state => ({ conversations: { ...state.conversations, [workspaceId]: state.conversations[workspaceId].map(c => c.id === conversationId ? { ...c, agents: [...c.agents.filter(agent => !ids.has(agent.id)), ...agents] } : c) } }));
+    }
+    if (agents[0]) get().selectAgent(conversationId, agents[0].id);
+    return agents;
   },
 }), { name: 'atris-manual-navigation', version: 1,
   migrate: migrateManualNavigation,

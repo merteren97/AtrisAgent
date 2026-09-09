@@ -775,6 +775,11 @@ async function runTests() {
   {
     const cases = [
       {
+        name: 'fixed user mission route defeats planner override',
+        eventRoute: {modelCatalogId:'planner-other-model',routeSelectionMode:'fixed'}, expectedSource:'mission',expectedMode:'fixed',
+        policy:{modelCatalogId:'catalog-primary',accountProfileId:'profile-primary',reasoningLevel:'medium',fallbackCatalogIds:[],selectionMode:'fixed',source:'mission'},
+      },
+      {
         name: 'explicit chat route',
         eventRoute: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'high', routeSelectionMode: 'fixed' },
         expectedSource: 'explicit', expectedMode: 'fixed', policy: undefined,

@@ -12,6 +12,7 @@ export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
   runtimeType: string; model: string; accountProfileId: string; providerSessionId: string;
   cwd: string; configDir: string; sharedProfile: boolean; createdAt: string;
+  reasoning?: string;
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
 export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean }
@@ -79,7 +80,25 @@ export class ManualConversationStore {
     return row ? JSON.parse(row.record) : fail('Agent not found.', 404);
   }
   save(agent: ManualAgent): void {
-    this.sqlite.prepare('INSERT INTO manual_agent_sessions (id, conversation_id, record) VALUES (?, ?, ?)').run(agent.id, agent.conversationId, JSON.stringify(agent));
+    this.saveBatch([agent]);
+  }
+  saveBatch(agents: ManualAgent[]): ManualAgent[] {
+    return this.sqlite.transaction(() => {
+      const result: ManualAgent[] = [];
+      for (const agent of agents) {
+        const existing = this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE id = ?').get(agent.id) as {record: string} | undefined;
+        if (existing) {
+          const saved = JSON.parse(existing.record) as ManualAgent;
+          if (saved.conversationId !== agent.conversationId) return fail('Agent identity conflict.', 409);
+          result.push(saved); continue;
+        }
+        const count = this.sqlite.prepare('SELECT COUNT(*) AS n FROM manual_agent_sessions WHERE conversation_id = ?').get(agent.conversationId) as {n: number};
+        if (count.n >= 30) return fail('A manual conversation supports up to 30 agents.', 409);
+        this.sqlite.prepare('INSERT INTO manual_agent_sessions (id, conversation_id, record) VALUES (?, ?, ?)').run(agent.id, agent.conversationId, JSON.stringify(agent));
+        result.push(agent);
+      }
+      return result;
+    })();
   }
 }
 
@@ -113,26 +132,36 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   }));
   app.post('/api/manual/conversations/:conversationId/agents', route(async (req, res) => {
     const conversation = store.conversation(idParam(req, 'conversationId'));
-    const id = required(req.body.id, 'agent ID');
-    if (!/^[a-f0-9-]{36}$/i.test(id)) return fail('Invalid agent identity.');
-    try {
-      const existing = store.agent(id);
-      if (existing.conversationId !== conversation.id) return fail('Agent identity conflict.', 409);
-      return res.json(existing);
-    } catch (error: any) { if (error.status !== 404) throw error; }
-    const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(required(req.body.catalogId, 'model'));
-    if (!descriptor || descriptor.availability !== 'available') return fail('Select an available model from Accounts.');
-    const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
-    if (!profile || profile.authStatus !== 'connected') return fail('The selected CLI account is not connected.');
-    if (!['claude_code', 'codex', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
-    const workspace = store.workspace(conversation.workspaceId);
-    const cwd = fs.realpathSync(workspace.path);
-    const agent: ManualAgent = { id, conversationId: conversation.id, name: required(req.body.name, 'agent name'),
-      catalogId: descriptor.catalogId, runtimeType: profile.runtimeType, model: descriptor.runtimeModelId,
-      accountProfileId: profile.id, providerSessionId: randomUUID(), cwd, configDir: profile.configDir,
-      sharedProfile: profile.profileMode === 'shared_cli', createdAt: new Date().toISOString() };
-    store.save(agent);
-    res.json(agent);
+    const batch = Array.isArray(req.body.agents);
+    const inputs = batch ? req.body.agents : [req.body];
+    if (!inputs.length || inputs.length > 30) return fail('Choose between 1 and 30 agents.');
+    const ids = new Set<string>();
+    const agents: ManualAgent[] = [];
+    for (const input of inputs) {
+      if (!input || typeof input !== 'object') return fail('Invalid agent request.');
+      const id = required(input.id, 'agent ID');
+      if (!/^[a-f0-9-]{36}$/i.test(id) || ids.has(id)) return fail('Invalid or duplicate agent identity.');
+      ids.add(id);
+      try {
+        const existing = store.agent(id);
+        if (existing.conversationId !== conversation.id) return fail('Agent identity conflict.', 409);
+        agents.push(existing); continue;
+      } catch (error: any) { if (error.status !== 404) throw error; }
+      const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(required(input.catalogId, 'model'));
+      if (!descriptor || descriptor.availability !== 'available') return fail('Select an available model from Accounts.');
+      const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
+      if (!profile || profile.authStatus !== 'connected') return fail('The selected CLI account is not connected.');
+      if (!['claude_code', 'codex', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
+      const workspace = store.workspace(conversation.workspaceId);
+      const cwd = fs.realpathSync(workspace.path);
+      agents.push({ id, conversationId: conversation.id, name: required(input.name, 'agent name'),
+        catalogId: descriptor.catalogId, runtimeType: profile.runtimeType, model: descriptor.runtimeModelId,
+        reasoning: descriptor.defaultReasoning || (descriptor.supportedReasoning?.includes('medium') ? 'medium' : descriptor.supportedReasoning?.[0]),
+        accountProfileId: profile.id, providerSessionId: randomUUID(), cwd, configDir: profile.configDir,
+        sharedProfile: profile.profileMode === 'shared_cli', createdAt: new Date().toISOString() });
+    }
+    const saved = store.saveBatch(agents);
+    res.json(batch ? saved : saved[0]);
   }));
   app.post('/api/manual/agents/:id/launch', route(async (req, res) => {
     const agent = store.agent(idParam(req, 'id'));
@@ -155,6 +184,11 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     // The active-route sentinel is app metadata, not a CLI model name. Never resume
     // the globally latest conversation: manual agents must remain independent.
     if (agent.runtimeType === 'antigravity' && agent.model === 'antigravity-active-route') args = [];
+    if (agent.runtimeType === 'antigravity' && agent.model !== 'antigravity-active-route') {
+      const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(agent.catalogId);
+      const effort = agent.reasoning || descriptor?.defaultReasoning || (descriptor?.supportedReasoning?.includes('medium') ? 'medium' : descriptor?.supportedReasoning?.[0]);
+      if (effort && ['low', 'medium', 'high'].includes(effort)) args.push('--effort', effort);
+    }
     if (agent.runtimeType === 'codex') {
       const help = await runCommand(installation.path, ['--help'], {timeoutMs: 5000});
       if (!help.stdout.includes('.config.toml')) return fail('Update Codex to a version supporting layered CLI profiles before opening a manual Chat/Code session.');

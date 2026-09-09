@@ -118,6 +118,8 @@ export interface TimelineItem {
 
 export interface StartMissionOptions {
   model?: string;
+  orchestratorModel?: string;
+  orchestratorReasoningLevel?: string;
   reasoningLevel?: string;
   teamTemplate?: string;
   trustMode?: string;
@@ -126,7 +128,7 @@ export interface StartMissionOptions {
   /** Route override scope without changing which role the mission DAG starts with. */
   routeRole?: string;
   /** Normal selection targets Orchestrator; advanced directives can target another role. */
-  routeScope?: 'mission' | 'role';
+  routeScope?: 'mission' | 'role' | 'subagents';
   /** Explicit named profile IDs by fixed role; omitted roles use durable defaults. */
   agentProfileIds?: Partial<Record<AgentRole, string>>;
   command?: string;
@@ -787,6 +789,8 @@ export function buildMissionRequestBody(request: string, workspaceId: string | u
     title: request,
     workspaceId,
     modelCatalogId: options?.model || undefined,
+    orchestratorModelCatalogId: options?.orchestratorModel,
+    orchestratorReasoningLevel: options?.orchestratorReasoningLevel,
     reasoningLevel: options?.reasoningLevel || undefined,
     teamTemplate: options?.teamTemplate,
     trustMode: options?.trustMode,
@@ -990,6 +994,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         routeScope: options?.routeScope,
         command: options?.command,
         modelCatalogId: options?.model,
+        orchestratorModelCatalogId: options?.orchestratorModel,
+        orchestratorReasoningLevel: options?.orchestratorReasoningLevel,
         reasoningLevel: options?.reasoningLevel,
         agentProfileIds: normalizeAgentProfileIds(options?.agentProfileIds),
         clientMessageId,
@@ -1132,6 +1138,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         routeScope: options?.routeScope,
         command: options?.command,
         modelCatalogId: options?.model,
+        orchestratorModelCatalogId: options?.orchestratorModel,
+        orchestratorReasoningLevel: options?.orchestratorReasoningLevel,
         reasoningLevel: options?.reasoningLevel,
         agentProfileIds: normalizeAgentProfileIds(safeOptions?.agentProfileIds),
       },

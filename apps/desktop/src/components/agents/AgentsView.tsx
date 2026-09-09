@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Brain,
   Search,
@@ -172,6 +172,9 @@ function rolesFromDraft(selectedRoles: AgentRole[]): TeamRole[] {
 }
 
 export function AgentsView() {
+  const [managementView, setManagementView] = useState<'profiles' | 'templates' | 'defaults'>('profiles');
+  const scrollRoot = useRef<HTMLDivElement>(null);
+  useEffect(() => { scrollRoot.current?.scrollTo({top:0}); }, [managementView]);
   const [templates, setTemplates] = useState<TeamTemplate[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -396,24 +399,25 @@ export function AgentsView() {
   };
 
   return (
-    <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden bg-background p-4 sm:p-6">
+    <div ref={scrollRoot} className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden bg-background p-4 sm:p-6">
       <div className="mx-auto max-w-6xl space-y-6 pb-10">
         <div className="flex flex-col gap-3 border-b border-border pb-5 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Agents &amp; Profiles</h1>
-            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">Named profiles keep role identity, instructions and safe route preferences together. Fixed roles and account credentials stay managed by the runtime.</p>
+            <h1 className="text-2xl font-semibold tracking-tight">Orchestrator team</h1>
+            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">Shape how your delegated agents work. Choose their model in conversation; keep reusable instructions and advanced defaults here.</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" disabled={isLoading || profileLoading} onClick={() => { void loadTemplates(); void loadProfiles(); }}><RefreshCw className={cn('mr-2 h-4 w-4', (isLoading || profileLoading) && 'animate-spin')} />Refresh</Button>
-            <Button size="sm" onClick={openCreateProfile}><Plus className="mr-2 h-4 w-4" />New profile</Button>
-            <Button size="sm" onClick={openCreate}><Plus className="mr-2 h-4 w-4" />New template</Button>
+            {managementView === 'profiles' && <Button size="sm" onClick={openCreateProfile}><Plus className="mr-2 h-4 w-4" />New profile</Button>}
+            {managementView === 'templates' && <Button size="sm" onClick={openCreate}><Plus className="mr-2 h-4 w-4" />New template</Button>}
           </div>
         </div>
 
         {error && <div className="flex items-start gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div>}
         {profileError && <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />Named profiles are unavailable right now; runtime defaults remain active.</div>}
 
-        <section aria-labelledby="named-profiles-heading" className="space-y-3">
+        <nav aria-label="Team management" className="flex gap-1 border-b border-border pb-3">{([['profiles', 'Agent profiles'], ['templates', 'Team templates'], ['defaults', 'Advanced defaults']] as const).map(([id, label]) => <Button key={id} variant={managementView === id ? 'secondary' : 'ghost'} size="sm" aria-pressed={managementView === id} onClick={() => setManagementView(id)}>{label}</Button>)}</nav>
+        <section hidden={managementView !== 'profiles'} aria-labelledby="named-profiles-heading" className="space-y-3">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
             <div>
               <h2 id="named-profiles-heading" className="text-lg font-semibold tracking-tight">Named profiles</h2>
@@ -424,7 +428,7 @@ export function AgentsView() {
           {profileLoading ? (
             <div className="flex min-h-32 items-center justify-center rounded-xl border border-dashed border-border text-sm text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />Loading named profiles…</div>
           ) : (
-            <div className="grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <div className="grid min-w-0 gap-3 md:grid-cols-2">
               {PROFILE_ROLES.map((role) => {
                 const config = ROLE_UI[role];
                 const Icon = config.icon;
@@ -458,10 +462,9 @@ export function AgentsView() {
                           </div>
                           {profile.capabilities.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{profile.capabilities.slice(0, 6).map((capability) => <Badge key={capability} variant="outline" className="text-[9px]">{capability}</Badge>)}</div>}
                           <div className="mt-2 flex min-w-0 items-start gap-1.5 text-[10px] text-muted-foreground"><Route className="mt-0.5 h-3 w-3 shrink-0" /><span className="break-words">{profileRouteSummary(profile, accounts, discoveredModels)}</span></div>
-                          <div className="mt-2 flex justify-end gap-1.5"><Button variant="outline" size="sm" className="h-7 px-2 text-[10px]" onClick={() => openEditProfile(profile)}><Pencil className="mr-1 h-3 w-3" />Edit</Button><Button variant="ghost" size="sm" className="h-7 px-2 text-[10px] text-rose-400" disabled={busyProfileId === profile.id} onClick={() => setProfileDeleteTarget(profile)}><Trash2 className="mr-1 h-3 w-3" />Delete</Button></div>
                         </div>
                       ))}
-                      {!roleProfiles.length && <div className="rounded-xl border border-dashed border-border/80 px-3 py-4 text-center text-[11px] text-muted-foreground">No named profile. The {profileRoleLabel(role)} default remains active.</div>}
+                      {!roleProfiles.length && <p className="text-xs leading-5 text-muted-foreground">Automatic role defaults. Add a profile when this role needs custom instructions.</p>}
                     </CardContent>
                   </Card>
                 );
@@ -470,11 +473,11 @@ export function AgentsView() {
           )}
         </section>
 
-        <section aria-labelledby="profile-defaults-heading" className="space-y-3">
+        <section hidden={managementView !== 'defaults'} aria-labelledby="profile-defaults-heading" className="space-y-3">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
             <div>
               <h2 id="profile-defaults-heading" className="text-lg font-semibold tracking-tight">Role defaults</h2>
-              <p className="text-sm text-muted-foreground">Bind reusable profiles at global, workspace, or team-template scope. Explicit run selections still take precedence.</p>
+              <p className="text-sm text-muted-foreground">Bind reusable profiles at global, workspace, or team-template scope. Conversation model instructions take precedence over these defaults.</p>
             </div>
             {bindingsLoading && <Badge variant="outline" className="w-fit text-[10px]"><Loader2 className="mr-1 h-3 w-3 animate-spin" />Loading</Badge>}
           </div>
@@ -512,6 +515,7 @@ export function AgentsView() {
           </Card>
         </section>
 
+        <section hidden={managementView !== 'templates'} aria-label="Team templates">
         {isLoading ? (
           <div className="flex min-h-48 items-center justify-center text-sm text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />Loading templates…</div>
         ) : (
@@ -554,6 +558,7 @@ export function AgentsView() {
             {!templates.length && <Card className="border-dashed xl:col-span-2"><CardContent className="flex min-h-40 items-center justify-center text-sm text-muted-foreground">No templates are stored. Create the first team template.</CardContent></Card>}
           </div>
         )}
+        </section>
       </div>
 
       <Dialog open={profileEditorOpen} onOpenChange={setProfileEditorOpen}>

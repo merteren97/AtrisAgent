@@ -109,7 +109,7 @@ function QueuedTurnComposer() {
           <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
             <div className="flex min-w-0 items-center gap-1.5 text-[9px] text-muted-foreground">
               {selectedModelObject ? <RuntimeBrandIcon runtimeId={selectedModelObject.runtimeType} className="h-3 w-3 shrink-0" /> : <Sparkles className="h-3 w-3 shrink-0 text-primary" />}
-              <span className="truncate">{directive.teamWideModel ? `All mission agents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Next Orchestrator model: ${selectedModelObject?.name || 'Auto routing'}`}</span>
+              <span className="truncate">{directive.teamWideModel ? `All subagents: ${directiveModel?.name || selectedModelObject?.name || 'model required'} · Orchestrator unchanged` : `Next Orchestrator model: ${selectedModelObject?.name || 'Auto routing'}`}</span>
               {reasoningLevel && reasoningLevel !== 'none' && selectedModelObject?.supportedReasoning.length ? <span className="shrink-0">· {reasoningLevel}</span> : null}
               {routeResolution.error ? <span className="shrink-0 text-amber-400">· {routeResolution.error}</span> : null}
             </div>

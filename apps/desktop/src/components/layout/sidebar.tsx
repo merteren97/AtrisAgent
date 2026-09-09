@@ -348,7 +348,7 @@ export function Sidebar() {
           type="button"
           aria-label="Search workspaces and missions"
           onClick={() => setCommandPaletteOpen(true)}
-          className={`flex w-full items-center rounded-md border border-sidebar-border/70 bg-sidebar-accent py-1.5 text-xs text-sidebar-muted transition-colors hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-2.5'}`}
+          className={`flex w-full items-center rounded-lg py-2 text-xs text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}`}
         >
           <Search className="h-3.5 w-3.5 shrink-0" />
           {!sidebarCollapsed && <><span className="min-w-0 truncate">Search conversations</span><kbd className="ml-auto shrink-0 whitespace-nowrap rounded border border-sidebar-border bg-sidebar px-1 py-0.5 font-sans text-[10px]">Ctrl K</kbd></>}
@@ -374,7 +374,7 @@ export function Sidebar() {
       <Separator className="bg-sidebar-border" />
 
       <div className={`mb-1 mt-2 flex items-center ${sidebarCollapsed ? 'justify-center' : 'justify-between px-3'}`}>
-        {!sidebarCollapsed && <p className="px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-sidebar-muted">Workspaces</p>}
+        {!sidebarCollapsed && <p className="px-1 text-xs font-medium text-sidebar-muted">Workspaces</p>}
         <Tooltip delayDuration={0}>
           <TooltipTrigger asChild>
             <Button variant="ghost" size="icon" aria-label="Open project" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">

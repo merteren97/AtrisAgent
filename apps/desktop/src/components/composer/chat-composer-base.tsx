@@ -116,7 +116,9 @@ export function ChatComposer() {
     [discoveredModels, directive.modelCatalogId],
   );
   const directiveTargetRole = directive.targetRole || 'Orchestrator';
-  const directiveModelRoleCompatible = !directiveModel || modelSupportsRole(directiveModel, directiveTargetRole);
+  const directiveModelRoleCompatible = !directiveModel || (directive.teamWideModel
+    ? ['Builder', 'Reviewer', 'Researcher', 'QA'].every((role) => modelSupportsRole(directiveModel, role))
+    : modelSupportsRole(directiveModel, directiveTargetRole));
   const directiveReasoningSupported = !directive.reasoningLevel
     || !directiveModel
     || directiveModel.supportedReasoning.length === 0
@@ -290,13 +292,13 @@ export function ChatComposer() {
   return (
     <div className="border-t border-border bg-background">
       <div className="mx-auto max-w-4xl px-4 py-3">
-        {(directive.dynamicAgent || directive.teamWideModel) && (
+        {(directive.dynamicAgent || directive.teamWideModel || routeResolution.error) && (
           <div className={cn(
             'mb-2 flex items-center gap-2 rounded-lg border px-3 py-1.5 text-[10px]',
             directiveReasoningSupported && directiveModelRoleCompatible && !routeResolution.error ? 'border-primary/25 bg-primary/[0.04]' : 'border-amber-500/40 bg-amber-500/[0.04]',
           )}>
             <Sparkles className="h-3 w-3 shrink-0 text-primary" />
-            <span className="font-medium">{directive.teamWideModel ? `All mission agents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Delegate to ${directive.targetRole || 'specialist'}`}</span>
+            <span className="font-medium">{directive.teamWideModel ? `All subagents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Delegate to ${directive.targetRole || 'specialist'}`}</span>
             {!directive.teamWideModel && <span className="truncate text-muted-foreground">{directive.modelName || 'role policy'}{directive.reasoningLevel ? ` · ${titleCase(directive.reasoningLevel)}` : ''}</span>}
             {!directiveModelRoleCompatible && <span className="ml-auto text-amber-400">Incompatible model</span>}
             {routeResolution.error && <span className="ml-auto text-amber-400">{routeResolution.error}</span>}

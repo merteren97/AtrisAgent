@@ -352,6 +352,14 @@ async function runTests() {
       const restartPolicy = await gateway.workspaceManager.resolveRoleExecutionPolicy(createdMissionId, 'builder');
       assert(restartPolicy?.modelCatalogId === 'catalog-shared-model' && restartPolicy.selectionMode === 'fixed',
         'persisted mission-wide Builder routing survives loss of the runtime in-memory preference');
+      await gateway.configureMissionRouting(createdMissionId, {modelCatalogId:'catalog-child-model',routeScope:'subagents',reasoningLevel:'medium'});
+      gateway.runtimeHost.clearMissionRoutingPreference(createdMissionId, false);
+      const childPolicies = await Promise.all(['builder','reviewer','researcher','qa'].map(role => gateway.workspaceManager.resolveRoleExecutionPolicy(createdMissionId, role as any)));
+      assert(childPolicies.every(policy=>policy?.modelCatalogId==='catalog-child-model' && policy.selectionMode==='fixed'),'Named subagent route persists for all four delegated roles');
+      assert((await gateway.workspaceManager.resolveRoleExecutionPolicy(createdMissionId,'orchestrator'))?.modelCatalogId==='catalog-shared-model','Child-only route preserves the orchestrator model');
+      const coordinatorOptions=gateway.supervisorStartOptions({routeScope:'subagents',modelCatalogId:'catalog-child-model',reasoningLevel:'medium',teamTemplateId:'default'});
+      assert(!coordinatorOptions.modelCatalogId && !coordinatorOptions.reasoningLevel && coordinatorOptions.teamTemplateId==='default','Child model does not leak through supervisor startup options');
+      assert(gateway.supervisorStartOptions({routeScope:'subagents',modelCatalogId:'child',orchestratorModelCatalogId:'coordinator'}).modelCatalogId==='coordinator','Primary picker model is retained independently from the child instruction');
     }
 
     // Public mission starts must acknowledge durable acceptance without waiting
