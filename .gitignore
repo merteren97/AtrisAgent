@@ -69,3 +69,9 @@ docs/required-setup-and-secrets.md
 docs/ubuntu-vps-deployment-guide.md
 .docs/
 /docs/
+
+# Playwright & test artifacts
+.playwright/
+.playwright-mcp/
+playwright-report/
+test-results/
