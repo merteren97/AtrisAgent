@@ -200,7 +200,7 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
   async cancel(sessionId: string): Promise<void> {
     this.markSessionCancelled(sessionId);
     const process = this.activeProcesses.get(sessionId);
-    if (process && !process.killed) {
+    if (process) {
       await terminateProcessTree(process);
       this.activeProcesses.delete(sessionId);
     }
@@ -214,9 +214,7 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
   async shutdown(): Promise<void> {
     for (const [sessionId, child] of this.activeProcesses.entries()) {
       this.markSessionCancelled(sessionId);
-      if (!child.killed) {
-        await terminateProcessTree(child, true);
-      }
+      await terminateProcessTree(child, true);
     }
     this.activeProcesses.clear();
     this.activeSessions.clear();

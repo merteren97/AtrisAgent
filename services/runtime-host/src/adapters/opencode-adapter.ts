@@ -117,7 +117,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     this.reusableSessions.delete(providerSessionId);
     if (!remembered) return;
     const server = this.servers.get(remembered.serverKey);
-    if (server) await this.fetchServer(server, `/session/${encodeURIComponent(providerSessionId)}`, { method: 'DELETE' }).catch(() => undefined);
+    if (server) await this.fetchServer(server, `/session/${encodeURIComponent(providerSessionId)}`, { method: 'DELETE' }, 2_000).catch(() => undefined);
   }
 
   constructor(eventBus?: LocalEventBus) {

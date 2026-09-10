@@ -297,10 +297,12 @@ async function runTests() {
     emittedEvents.length = 0;
     (codexAdapter as any).sessionContext.set('cancelled-codex-session', { missionId: 'm-1', taskId: 't-cancelled-codex' });
     (codexAdapter as any).activeProcesses.set('cancelled-codex-session', {
-      killed: false,
-      kill() { this.killed = true; return true; },
+      // A previous signal is not proof of exit; cancellation must still retry.
+      killed: true,
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     await codexAdapter.cancel('cancelled-codex-session');
+    assert(!(codexAdapter as any).activeProcesses.has('cancelled-codex-session'), 'cancellation retries a previously signaled process and releases ownership only after confirmed exit');
     (codexAdapter as any).handleJsonLine('cancelled-codex-session', JSON.stringify({ type: 'turn.completed' }));
     assert(!emittedEvents.some((event) => event.type === 'task_completed' || event.type === 'task_failed'), 'CodexAdapter suppresses buffered terminal events after cancellation');
 
@@ -318,7 +320,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     const antigravityLines = [
       JSON.stringify({ type: 'step_update', step_type: 'thought', text: 'Planning execution strategy' }),
@@ -360,7 +362,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine('test-session-3', JSON.stringify({
       type: 'result',
@@ -421,7 +423,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine('test-session-5', JSON.stringify({
       type: 'step_update',
@@ -446,7 +448,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine('test-session-6', JSON.stringify({
       type: 'step_update',
@@ -477,7 +479,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine('test-session-7', JSON.stringify({
       type: 'step_update',
@@ -509,7 +511,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine('test-session-8', JSON.stringify({
       type: 'step_update',
@@ -541,7 +543,7 @@ async function runTests() {
       exitCode: null,
       signalCode: null,
       killed: false,
-      kill() { this.killed = true; return true; },
+      kill() { Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine('test-session-9', JSON.stringify({
       type: 'step_update',
@@ -567,7 +569,7 @@ async function runTests() {
     (antigravityAdapter as any).sessionContext.set(cancelCleanupSession, { missionId: 'm-7', taskId: 'cancel-cleanup' });
     (antigravityAdapter as any).activeProcesses.set(cancelCleanupSession, {
       killed: false,
-      kill() { cancelCleanupKilled = true; this.killed = true; return true; },
+      kill() { cancelCleanupKilled = true; Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine(cancelCleanupSession, JSON.stringify({
       type: 'step_update',
@@ -593,7 +595,7 @@ async function runTests() {
     (antigravityAdapter as any).sessionContext.set(shutdownCleanupSession, { missionId: 'm-7', taskId: 'shutdown-cleanup' });
     (antigravityAdapter as any).activeProcesses.set(shutdownCleanupSession, {
       killed: false,
-      kill() { shutdownCleanupKilled = true; this.killed = true; return true; },
+      kill() { shutdownCleanupKilled = true; Object.assign(this, { killed: true, signalCode: 'SIGTERM' }); return true; },
     });
     (antigravityAdapter as any).handleStreamLine(shutdownCleanupSession, JSON.stringify({
       type: 'step_update',

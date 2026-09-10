@@ -222,6 +222,37 @@ async function runTests() {
     await cancelHost.stopAll();
   }
 
+  {
+    const host: any = new RuntimeHostV2(undefined, { watchdogInterval: 0 });
+    let locked = true;
+    let workersStopped = false;
+    host.supervisorSessions.set('stop-failure', {
+      providerSessionId: 'owned-session',
+      adapter: { async releaseProviderSession() {}, async shutdown() { if (locked) throw new Error('process still running'); } },
+    });
+    host.activeSessions.set('worker', { missionId: 'stop-failure', session: {} });
+    host.stopSession = async () => { workersStopped = true; host.activeSessions.delete('worker'); };
+    let rejected = false;
+    try { await host.stopMission('stop-failure'); } catch { rejected = true; }
+    assert(rejected && workersStopped && host.supervisorSessions.has('stop-failure'),
+      'supervisor cleanup failure stops deletion, retains ownership for retry, and still stops independent workers');
+    locked = false;
+    await host.stopMission('stop-failure');
+    assert(!host.supervisorSessions.has('stop-failure'), 'successful supervisor cleanup retry releases the retained session');
+    locked = true;
+    let shutdownCalls = 0;
+    host.activeSupervisorTurns.set('active-stop-failure', new Set([{
+      cancel() { host.activeSupervisorTurns.delete('active-stop-failure'); },
+      adapter: { async shutdown() { shutdownCalls++; if (locked) throw new Error('still stopping'); } },
+    }]));
+    try { await host.stopMission('active-stop-failure'); } catch { /* retained outside the completed turn */ }
+    locked = false;
+    await host.stopMission('active-stop-failure');
+    assert(shutdownCalls === 2 && !host.pendingSupervisorShutdowns.has('active-stop-failure'),
+      'failed active supervisor shutdown remains retryable even after its turn completion removes active tracking');
+    await host.stopAll();
+  }
+
   configureRuntimeControlPlaneBridge(undefined);
   console.log(`--- Supervisor Runtime Boundary Tests Complete: ${passed} passed, ${failed} failed ---`);
   if (failed > 0) process.exitCode = 1;

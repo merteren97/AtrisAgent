@@ -418,7 +418,7 @@ export async function runCommand(
     };
 
     const failForOutputLimit = (stream: 'stdout' | 'stderr') => {
-      void terminateProcessTree(child, true);
+      void terminateProcessTree(child, true).catch((error: Error) => console.warn('[RuntimeHost] Command cleanup failed:', error.message));
       finish(() => {
         const failure = Object.assign(
           new Error(`Command ${stream} exceeded the ${maxOutputBytes}-byte capture limit: ${command}`),
@@ -435,7 +435,7 @@ export async function runCommand(
     };
 
     const timer = setTimeout(() => {
-      void terminateProcessTree(child, true);
+      void terminateProcessTree(child, true).catch((error: Error) => console.warn('[RuntimeHost] Command cleanup failed:', error.message));
       finish(() => {
         const failure = Object.assign(new Error(`Command timed out after ${options.timeoutMs ?? 15_000}ms: ${command}`), {
           stdout,

@@ -114,7 +114,9 @@ async function runTests() {
     const profileWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
     {
       sqlite.exec(`CREATE TABLE IF NOT EXISTS worktrees (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-        task_id TEXT NOT NULL, branch_name TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL)`);
+        task_id TEXT NOT NULL, branch_name TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+        isolation_kind TEXT, canonical_container TEXT, target_name TEXT, target_path TEXT, applied_operation_key TEXT, target_descriptor TEXT,
+        created_at TEXT NOT NULL)`);
       const cleanupMission = await attemptManager.createMission({ workspaceId: profileWorkspace.id, title: 'Resumable cleanup fixture' });
       const cleanupTasks = await Promise.all(['first', 'locked'].map((name) => attemptManager.createTask({
         missionId: cleanupMission.id, title: name, worktreeId: path.join(tmpDir, name),
