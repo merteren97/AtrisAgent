@@ -647,9 +647,16 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     const controller = new AbortController();
     const abort = () => controller.abort(init.signal?.reason);
     init.signal?.addEventListener('abort', abort, { once: true });
+    if (init.signal?.aborted) abort();
     const timer = setTimeout(() => controller.abort(new Error(`OpenCode request timed out after ${timeoutMs}ms`)), timeoutMs);
     try {
       return await fetch(`${server.url}${pathname}`, { ...init, headers, signal: controller.signal });
+    } catch (error) {
+      const cause = error instanceof Error ? (error as Error & { cause?: { code?: string; message?: string } }).cause : undefined;
+      const detail = controller.signal.aborted
+        ? String(controller.signal.reason || 'Request aborted')
+        : [error instanceof Error ? error.message : String(error), cause?.code, cause?.message].filter(Boolean).join(': ');
+      throw new Error(redactSecrets(`OpenCode ${init.method || 'GET'} ${pathname.split('?')[0]} failed: ${detail}`), { cause: error });
     } finally {
       clearTimeout(timer);
       init.signal?.removeEventListener('abort', abort);

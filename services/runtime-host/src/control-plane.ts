@@ -156,6 +156,9 @@ export function codexControlPlaneArgs(session?: PreparedControlPlaneSession): st
   return [
     '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.command=${JSON.stringify(process.execPath)}`,
     '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.args=${JSON.stringify([session.bridgeScriptPath])}`,
+    // Codex filters the MCP child's environment independently of its own.
+    // Forward names only: bearer tokens must never appear in argv/config.
+    '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.env_vars=${JSON.stringify(Object.keys(controlPlaneEnv(session)))}`,
     '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.startup_timeout_sec=10`,
   ];
 }
