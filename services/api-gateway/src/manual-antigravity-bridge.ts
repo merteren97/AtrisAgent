@@ -8,6 +8,23 @@ import type { ManualAgent, ManualMessage } from './manual-conversations';
 const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 interface Binding { launchId: string; sessionId?: string }
 
+function userRequestText(content: string): string {
+  // The CLI records a prompt envelope, not just what was typed. Only unwrap a
+  // complete envelope with recognized trailing metadata; never strip arbitrary
+  // XML/Markdown from a user's request or from an assistant's response.
+  const envelope = /^\s*<USER_REQUEST>\s*\n?([\s\S]*)<\/USER_REQUEST>([\s\S]*)$/.exec(content);
+  if (!envelope) return content;
+  const metadata = /\s*<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|USERSETTINGSCHANGE)>[\s\S]*?<\/\1>\s*/y;
+  const suffix = envelope[2];
+  let offset = 0;
+  while (suffix.slice(offset).trim()) {
+    metadata.lastIndex = offset;
+    if (!metadata.exec(suffix)) return content;
+    offset = metadata.lastIndex;
+  }
+  return envelope[1].trim();
+}
+
 export function parseAntigravityTranscript(source: string, sessionId: string): ManualMessage[] {
   const messages = new Map<string, ManualMessage>();
   for (const line of source.split('\n')) {
@@ -18,7 +35,9 @@ export function parseAntigravityTranscript(source: string, sessionId: string): M
       : item.type === 'PLANNER_RESPONSE' && item.source === 'MODEL' ? 'assistant' : null;
     if (!role) continue;
     const id = `${sessionId}:${item.step_index}`;
-    messages.set(id,{id,role,text:item.content});
+    const text = role === 'user' ? userRequestText(item.content) : item.content;
+    if (!text.trim()) { messages.delete(id); continue; }
+    messages.set(id,{id,role,text});
   }
   return [...messages.values()];
 }

@@ -23,6 +23,19 @@ try {
   const messages = parseAntigravityTranscript(rows,session);
   assert.deepEqual(messages.map(message=>message.text),['Merhaba','Hello!']);
   assert.equal(parseAntigravityTranscript(rows+'\n{"partial":',session).length,2);
+  const wrapped = '<USER_REQUEST>\nMerhaba\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-10T08:32:44+03:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting Model Selection to Gemini 3.8 Flash.\n</USER_SETTINGS_CHANGE>';
+  const parseUser = (content: string) => parseAntigravityTranscript(JSON.stringify({step_index:4,type:'USER_INPUT',source:'USER_EXPLICIT',status:'DONE',content}),session);
+  assert.equal(parseUser(wrapped)[0].text,'Merhaba','Provider metadata is not part of the visible user message');
+  assert.equal(parseUser(wrapped.replaceAll('USER_SETTINGS_CHANGE','USERSETTINGSCHANGE'))[0].text,'Merhaba');
+  assert.equal(parseUser(wrapped.replaceAll('\n','\r\n'))[0].text,'Merhaba','Windows transcript line endings are supported');
+  const codeRequest = 'Review this XML:\n```xml\n<ADDITIONAL_METADATA>keep this</ADDITIONAL_METADATA>\n<USER_REQUEST>example</USER_REQUEST>\n```';
+  assert.equal(parseUser(`<USER_REQUEST>\n${codeRequest}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>clock</ADDITIONAL_METADATA>`)[0].text,codeRequest,'Nested tag examples inside the request are preserved');
+  for (const unchanged of [codeRequest,'<USER_REQUEST>unfinished', '<USER_REQUEST>hello</USER_REQUEST>\nUser-authored trailing text', '<USER_REQUEST>hello</USER_REQUEST><UNKNOWN>keep</UNKNOWN>', '<USER_REQUEST>hello</USER_REQUEST><ADDITIONAL_METADATA>unfinished']) {
+    assert.equal(parseUser(unchanged)[0].text,unchanged,'Ordinary content, unknown suffixes and incomplete envelopes are preserved');
+  }
+  assert.equal(parseUser('<USER_REQUEST>\n \n</USER_REQUEST><ADDITIONAL_METADATA>clock</ADDITIONAL_METADATA>').length,0,'Empty requests do not create empty bubbles');
+  const assistantEnvelope = parseAntigravityTranscript(JSON.stringify({step_index:5,type:'PLANNER_RESPONSE',source:'MODEL',status:'DONE',content:wrapped}),session);
+  assert.equal(assistantEnvelope[0].text,wrapped,'Assistant explanations are not normalized as user envelopes');
   const launch = bridge.prepare(first); assert.equal(launch[0],'--log-file');assert.equal(launch.includes('--continue'),false);
   const second = bridge.prepare(other);assert.notEqual(launch[1],second[1]);
   const transcript = path.join(provider,'brain',session,'.system_generated','logs','transcript.jsonl');

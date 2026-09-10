@@ -1,6 +1,6 @@
 import { useEffect, useState, type MouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Square, RotateCcw, Cpu, Minus, X, Maximize, SquarePen } from 'lucide-react';
+import { Square, RotateCcw, Minus, X, Maximize } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useMissionStore } from '@/stores/mission-store';
@@ -30,7 +30,7 @@ function getErrorMessage(error: unknown): string {
 }
 
 export function Titlebar() {
-  const { devMode, toggleDevMode, setActiveView, activeView } = useSettingsStore();
+  const { setActiveView, activeView } = useSettingsStore();
   const [feedback, setFeedback] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<'stop' | 'retry' | null>(null);
   useLanguageStore();
@@ -87,12 +87,6 @@ export function Titlebar() {
     void runWindowAction('move').catch((error) => reportWindowError('move', error));
   };
 
-  const handleDevModeToggle = () => {
-    toggleDevMode();
-    setFeedback(devMode ? 'Developer Mode disabled' : 'Developer Mode enabled');
-    window.setTimeout(() => setFeedback(null), 2_000);
-  };
-
   const runMissionAction = async (action: 'stop' | 'retry') => {
     if (!activeMission || pendingAction) return;
     setPendingAction(action);
@@ -104,15 +98,6 @@ export function Titlebar() {
     } finally {
       setPendingAction(null);
     }
-  };
-
-  const handleNewChat = () => {
-    if (!activeWorkspaceId) return;
-    useManualStore.getState().setMode('choose');
-    clearActiveMission();
-    setComposerInput('');
-    setActiveView('chat');
-    requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea')?.focus());
   };
 
   useEffect(() => {
@@ -159,18 +144,6 @@ export function Titlebar() {
       </div>
 
       <div data-no-drag className="atris-no-drag relative z-10 flex h-full shrink-0 items-center gap-1 bg-background pr-1">
-        <Button
-          variant="ghost"
-          size="icon"
-          className={`h-7 w-7 shrink-0 ${!activeMission && activeWorkspace ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
-          onClick={handleNewChat}
-          disabled={!activeWorkspace}
-          title={activeWorkspace ? `New chat in ${activeWorkspace.name} (Ctrl+N)` : 'Open a project before starting a chat'}
-          aria-label={activeWorkspace ? `New chat in ${activeWorkspace.name}` : 'New chat'}
-        >
-          <SquarePen className="h-3.5 w-3.5" />
-        </Button>
-        {showMissionControls && <div className="mx-0.5 h-5 w-px bg-border" />}
         {showMissionControls && canStop && (
           <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('stop')} disabled={Boolean(pendingAction)} title={canCancelBeforeStart ? 'Cancel' : t('Stop')} aria-label={canCancelBeforeStart ? 'Cancel mission' : 'Stop mission'}>
             <Square className="h-3.5 w-3.5" />
@@ -189,10 +162,7 @@ export function Titlebar() {
             <RotateCcw className="h-3.5 w-3.5" />
           </Button>
         )}
-        <Button variant="ghost" size="sm" className={`h-7 shrink-0 gap-1.5 text-xs ${devMode ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`} onClick={handleDevModeToggle} aria-label={devMode ? 'Disable Developer Mode' : 'Enable Developer Mode'} title={devMode ? 'Disable Developer Mode' : 'Enable Developer Mode'}>
-          <Cpu className="h-3.5 w-3.5" /><span className="hidden xl:inline">{t('Developer Mode')}</span>
-        </Button>
-        <div className="mx-1 h-5 w-px bg-border" />
+        {showMissionControls && (canStop || canRetry) && <div className="mx-1 h-5 w-px bg-border" />}
         <Button
           data-no-drag
           variant="ghost"
