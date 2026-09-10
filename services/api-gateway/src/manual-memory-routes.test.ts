@@ -7,7 +7,7 @@ import { ProjectMemoryService } from '@atris-agent-code/orchestration-core';
 import type { AtrisDatabase } from '@atris-agent-code/database';
 import type { ProjectMemoryRoutesOptions } from './project-memory-routes';
 import { ManualConversationStore, type ManualAgent } from './manual-conversations';
-import { installManualMemoryRoutes } from './manual-memory-routes';
+import { installManualMemoryRoutes, importantManualMemory } from './manual-memory-routes';
 import type { AddressInfo } from 'node:net';
 
 const sqlite=new Database(':memory:');
@@ -45,5 +45,22 @@ try{
   const reloaded=new ProjectMemoryService(db);const snapshot=await reloaded.getSnapshot(list.projectId);
   assert.ok(snapshot.nodes.some(item=>item.id===node.id&&item.provenance?.[0]?.conversationId==='c1'),'Scoped memory survives a new service instance');
   assert.equal(snapshot.nodes.filter(item=>item.provenance?.some(p=>p.conversationId==='c1')).length,2,'Reads do not duplicate notes');
+  assert.equal(importantManualMemory('Merhaba! Please create a portfolio.'),undefined,'Routine chat is not memory');
+  assert.equal(importantManualMemory('Remember this API key: example-test'),undefined,'Credentials are not automatically captured');
+  store.readMessages=()=>({supported:true,bound:true,truncated:false,messages:[
+    {id:'u-auto',role:'user',text:'Bundan sonra bütün ajanların bağlamını bağımsız tut.'},
+    {id:'a-auto',role:'assistant',text:'Decision: All security checks are complete.'},
+    {id:'hello',role:'user',text:'Merhaba!'},
+  ]});
+  const sync=()=>fetch(`${base}/c1/memory/sync`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agentId:'a1',text:'Remember fabricated browser content.'})});
+  const responses=await Promise.all([sync(),sync()]);assert.ok(responses.every(response=>response.status===200));
+  const auto=await(await fetch(`${base}/c1/memory`)).json();
+  assert.equal(auto.nodes.length,3,'Only the verified user constraint is captured once across concurrent sync');
+  const captured=auto.nodes.find((item:any)=>item.tags.includes('automatic'));
+  assert.equal(captured.summary,'Bundan sonra bütün ajanların bağlamını bağımsız tut.');
+  await memory.deleteMemoryNode(captured.id);
+  await sync();
+  assert.equal((await(await fetch(`${base}/c1/memory`)).json()).nodes.length,2,'Explicitly forgotten auto-memory stays deleted');
+  assert.equal((await fetch(`${base}/c2/memory/sync`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agentId:'a1'})})).status,400,'Auto capture cannot cross conversations');
   console.log('Manual memory persistence, provenance, isolation and safe reference tests passed.');
 }finally{server.close();sqlite.close();}

@@ -51,7 +51,16 @@ assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c','a'])
 store.getState().moveAgent('manual-a','a','b');
 assert.deepEqual(store.getState().orderByConversation['manual-a'],['a','b','c']);
 store.getState().hideAgent('a',true);
-assert.equal(store.getState().conversations['project-a'][0].agents.length,3,'Closing a pane preserves agent history');
+assert.equal(store.getState().conversations['project-a'][0].agents.length,3,'Temporary hiding during restart does not delete an agent');
+store.getState().selectAgent('manual-a','a');store.getState().setDraft('a','Discard on explicit close');
+globalThis.fetch = (async () => new Response(null,{status:204})) as typeof fetch;
+await store.getState().removeAgent(agents[0]);
+assert.deepEqual(store.getState().conversations['project-a'][0].agents.map(agent=>agent.id),['b','c']);
+assert.equal(store.getState().agentByConversation['manual-a'],'b');
+assert.equal(store.getState().drafts.a,undefined);
+assert.equal(store.getState().hiddenAgents.a,undefined);
+assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c']);
+globalThis.fetch = oldFetch;
 const now = Date.parse('2026-09-09T10:10:00Z');
 const observed = (state: string, lifecycle: AgentActivity['lifecycle'] = 'open'): AgentActivity => ({state,lifecycle,checkedAt:now,at:'2026-09-09T10:08:00Z'});
 assert.equal(conversationActivity([],{},now).kind,'empty');

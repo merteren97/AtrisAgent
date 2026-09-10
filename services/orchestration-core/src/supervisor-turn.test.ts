@@ -233,6 +233,17 @@ function runTests() {
     unsafeExplicitTargetError = error instanceof Error ? error.message : String(error);
   }
   assert(unsafeExplicitTargetError.includes('missing or unsafe'), 'explicit unsafe new sibling wording fails before Builder dispatch');
+  for (const userMessage of [
+    'AtrisTask projesini incele',
+    'AtrisTask ile alakalı bir proje açmıştık. Tam olarak işlevselliği tamamlandı mı yarım mı kaldı bilmiyorum bir review edilmesi gerekiyor aynı zamanda playwright ile test edilmesini istiyorum. Yapılması gereken herşeyi çıkarıp planlamanı ve düzeltmeleri uygulamanı istiyorum.',
+    'AtrisTask klasörü içinde hataları düzelt',
+  ]) {
+    const existingReview = normalizeSupervisorDecision({ turnId: 'review-existing', action: 'execute', delegations: [
+      { id: 'existing-builder', role: 'builder', objective: 'Review and fix AtrisTask', requiredCapabilities: [] },
+    ] }, { turnId: 'review-existing', userMessage, conversationContext: '', workspaceContext: '' }, { reusePriorResearch: true });
+    assert(Boolean(existingReview.delegations?.some(item => item.role === 'builder')), 'Existing Turkish project review reaches safe target resolution');
+    assert(!existingReview.delegations?.some(item => item.targetDescriptor?.kind === 'new_sibling_project'), 'Review must not invent a new project');
+  }
   let ambiguousTurkishTargetError = '';
   try {
     normalizeSupervisorDecision({

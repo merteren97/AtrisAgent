@@ -66,12 +66,20 @@ try {
     console.log('Installed Codex accepted the generated layered hook profile.');
   }
 
-  const openAgent = {...agent,id:randomUUID(),runtimeType:'opencode'};
+  const openAgent = {...agent,id:randomUUID(),runtimeType:'opencode',model:'test/model',reasoning:'high'};
   const prepared = bridge.prepareOpenCode(openAgent);
+  assert.ok(!prepared.args.includes('--variant'), 'TUI does not support run-only variant flag');
+  assert.ok(bridge.prepareCodex({...agent,reasoning:'high'}).includes('model_reasoning_effort="high"'));
   assert.ok(!('OPENCODE_CONFIG_CONTENT' in prepared.env),'Inherited config values never cross the UI transport');
   const plugin = await import(prepared.env.ATRIS_MANUAL_OPENCODE_PLUGIN);
   const observer = await plugin.AtrisManualSession();
   await observer.event({event:{type:'session.created',properties:{info:{id:'ses_root'}}}});
+  const rootMessage = {message:{} as {variant?:string},parts:[]};
+  await observer['chat.message']({sessionID:'ses_root',model:{providerID:'test',modelID:'model'}},rootMessage);
+  assert.equal(rootMessage.message.variant,'high','Selected reasoning reaches OpenCode message variant');
+  const childMessage = {message:{} as {variant?:string},parts:[]};
+  await observer['chat.message']({sessionID:'ses_child',model:{providerID:'test',modelID:'model'}},childMessage);
+  assert.equal(childMessage.message.variant,undefined,'Independent subagent reasoning is not overwritten');
   await observer.event({event:{type:'message.updated',properties:{info:{id:'msg_one',sessionID:'ses_root',role:'assistant'}}}});
   await observer.event({event:{type:'message.part.updated',properties:{part:{id:'part_one',messageID:'msg_one',sessionID:'ses_root',type:'text',text:'Live response'}}}});
   await observer.event({event:{type:'session.created',properties:{info:{id:'ses_child',parentID:'ses_root'}}}});

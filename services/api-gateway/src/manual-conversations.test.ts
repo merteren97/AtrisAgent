@@ -42,7 +42,7 @@ assert.ok(!JSON.stringify(messages).includes('private'));
 assert.deepEqual(parseManualTranscript(transcript, randomUUID()), [], 'No cross-session attribution');
 
 const profile = { id: 'account', runtimeType: 'claude_code', authStatus: 'connected', configDir: process.cwd(), profileMode: 'shared_cli' };
-const model = { catalogId: 'claude:model', runtimeModelId: 'test-model', accountProfileId: 'account', availability: 'available' };
+const model = { catalogId: 'claude:model', runtimeModelId: 'test-model', accountProfileId: 'account', availability: 'available', supportedReasoning: [] as string[], defaultReasoning: undefined as string | undefined };
 const runtime = {
   getModelCatalogService: () => ({ resolveModelDescriptor: async (id: string) => id === model.catalogId ? model : undefined }),
   getAccountProfileManager: () => ({ getProfileById: async () => profile }),
@@ -84,6 +84,13 @@ try {
   assert.equal((await changed.json()).providerSessionId,agent.providerSessionId,'Same-CLI model updates preserve exact session identity');
   const changedLaunch = await (await post(`/agents/${id}/launch`,{})).json();
   assert.equal(changedLaunch.args[1],'new-model','The changed model reaches real launch arguments');
+  model.supportedReasoning = ['low','high'];
+  const reasoningUpdate = await fetch(`${base}/agents/${id}/model`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({catalogId:model.catalogId,expectedCatalogId:model.catalogId,reasoning:'high'})});
+  assert.equal(reasoningUpdate.status,200);
+  assert.equal((await reasoningUpdate.json()).reasoning,'high');
+  assert.deepEqual((await (await post(`/agents/${id}/launch`,{})).json()).args.slice(-2),['--effort','high']);
+  assert.equal((await fetch(`${base}/agents/${id}/model`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({catalogId:model.catalogId,expectedCatalogId:model.catalogId,reasoning:'unsafe'})})).status,400);
+  model.supportedReasoning = [];
   model.accountProfileId = 'other';
   assert.equal((await patchModel(model.catalogId,model.catalogId)).status,409,'Account changes require independent sessions');
   model.accountProfileId = 'account';
@@ -94,12 +101,14 @@ try {
   assert.equal(agy.status, 200, 'Verified Antigravity models can create independent manual agents');
   const agyAgent = await agy.json();
   const agyLaunch = await (await post(`/agents/${agyAgent.id}/launch`, {})).json();
-  assert.deepEqual(agyLaunch.args, [], 'Active route uses the CLI default without invalid model or global continue flags');
+  assert.equal(agyLaunch.args[0], '--log-file', 'Active route uses a dedicated session log without invalid model or global continue flags');
+  assert.equal(agyLaunch.args.length,2);
   assert.deepEqual(agyLaunch.env, {}, 'Antigravity credentials stay in the native keyring');
   model.runtimeModelId = 'gemini-test';
   const routed = await (await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).json();
   const routedLaunch = await (await post(`/agents/${routed.id}/launch`, {})).json();
-  assert.deepEqual(routedLaunch.args, ['--model', 'gemini-test'], 'Concrete models are routed explicitly');
+  assert.deepEqual(routedLaunch.args.slice(0,2), ['--model', 'gemini-test'], 'Concrete models are routed explicitly');
+  assert.equal(routedLaunch.args[2],'--log-file');
   const group = store.create('project-b', 'Batch startup', randomUUID());
   const batch = Array.from({length:8}, (_, index) => ({...input, id:randomUUID(), name:`Agent ${index+1}`}));
   const batchResponse = await post(`/conversations/${group.id}/agents`, {agents:batch});
@@ -116,10 +125,20 @@ try {
   assert.equal((await post(`/conversations/${group.id}/agents`,{agents:fill})).status,200);
   assert.equal((await post(`/conversations/${group.id}/agents`,{...input,id:randomUUID()})).status,409,'Server enforces 30-agent maximum');
   assert.equal((await post(`/conversations/${group.id}/agents`,{agents:batch})).status,200,'Idempotent retries remain allowed at capacity');
+  assert.equal((await fetch(`${base}/agents/${batchAgents[0].id}`, {method:'DELETE'})).status,204);
+  assert.throws(() => store.agent(batchAgents[0].id), 'Explicitly closed agent is removed, not archived');
+  assert.equal(store.list('project-b').find(c=>c.id===group.id)!.agents.length,29);
+  assert.equal((await fetch(`${base}/agents/${batchAgents[0].id}`, {method:'DELETE'})).status,204,'Repeated agent deletion is idempotent');
+  assert.equal(store.agent(batchAgents[1].id).id,batchAgents[1].id,'Other independent agents remain intact');
   model.availability = 'unknown';
   assert.equal((await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).status, 400);
   profile.authStatus = 'reauth_required';
   assert.equal((await post(`/agents/${id}/launch`, {})).status, 400);
   assert.equal((await post('/agents/missing/launch', {})).status, 404);
+  assert.equal((await fetch(`${base}/conversations/${group.id}`,{method:'DELETE'})).status,204);
+  assert.equal(store.list('project-b').some(c => c.id===group.id),false);
+  assert.throws(() => store.agent(batchAgents[0].id));
+  assert.equal(store.agent(agent.id).id,agent.id,'Deleting one conversation preserves other sessions');
+  assert.equal((await fetch(`${base}/conversations/${group.id}`,{method:'DELETE'})).status,204,'Delete retry is idempotent');
   console.log('Manual conversation persistence, isolation, idempotency, transcript and route tests passed.');
 } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }

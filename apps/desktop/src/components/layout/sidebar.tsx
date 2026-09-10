@@ -42,6 +42,7 @@ import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
 import { useManualStore } from '@/stores/manual-store';
+import { NavigationDeleteDialog, type NavigationDeleteTarget } from './navigation-delete-dialog';
 import { ManualConversationRow } from '@/components/manual/manual-conversation-row';
 import { useManualActivityMonitor } from '@/components/manual/manual-activity';
 import { useAccountStore } from '../../stores/account-store';
@@ -185,6 +186,7 @@ export function Sidebar() {
   useManualActivityMonitor();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
+  const [navigationDelete, setNavigationDelete] = useState<NavigationDeleteTarget | null>(null);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
   const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
@@ -314,13 +316,13 @@ export function Sidebar() {
     ? missions.find((mission) => mission.id === pendingDeleteMission.id) || pendingDeleteMission
     : null;
 
-  const currentWidth = sidebarCollapsed ? 56 : `clamp(208px, 24vw, ${sidebarWidth}px)`;
+  const currentWidth = sidebarCollapsed ? 64 : `clamp(208px, 24vw, ${sidebarWidth}px)`;
 
   return (
     <aside
       aria-label="Project navigation"
-      className="workspace-sidebar relative flex flex-col select-none border-r border-sidebar-border bg-sidebar transition-[width] duration-200 motion-reduce:transition-none"
-      style={{ width: currentWidth, minWidth: sidebarCollapsed ? 56 : 208, flexShrink: 0 }}
+      className={`workspace-sidebar relative flex flex-col select-none border-sidebar-border bg-sidebar transition-[width] duration-200 motion-reduce:transition-none ${sidebarCollapsed ? 'my-2 ml-2 rounded-2xl border shadow-sm' : 'border-r'}`}
+      style={{ width: currentWidth, minWidth: sidebarCollapsed ? 64 : 208, flexShrink: 0 }}
     >
       <div className="absolute bottom-0 right-0 top-0 z-50 w-1 cursor-col-resize transition-colors hover:bg-primary/50" onMouseDown={handleDrag} />
 
@@ -444,6 +446,7 @@ export function Sidebar() {
                   </Tooltip>
                 )}
 
+                {!sidebarCollapsed && <DropdownMenu><DropdownMenuTrigger asChild><button type="button" aria-label={`Workspace actions for ${workspace.name}`} className="mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-0 hover:bg-sidebar focus-visible:opacity-100 group-hover/workspace:opacity-100 data-[state=open]:opacity-100"><MoreHorizontal className="h-4 w-4"/></button></DropdownMenuTrigger><DropdownMenuContent side="right" align="start"><DropdownMenuItem variant="destructive" onSelect={() => setNavigationDelete({kind:'workspace',id:workspace.id,name:workspace.name})}><Trash2 className="h-4 w-4"/>Remove workspace…</DropdownMenuItem></DropdownMenuContent></DropdownMenu>}
                 {!sidebarCollapsed && isActiveWorkspace && (
                   <span className="mr-1 shrink-0 rounded-full bg-sidebar px-1.5 py-0.5 text-[8px] font-medium text-sidebar-muted">{workspaceMissions.length}</span>
                 )}
@@ -455,7 +458,7 @@ export function Sidebar() {
                     <span className="text-xs font-medium tracking-normal text-sidebar-muted">Manual</span>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
-                  {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
+                  {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} onDelete={() => setNavigationDelete({kind:'manual',conversation})} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
                   <div className="mb-1 flex items-center justify-between px-2">
                     <span className="text-xs font-medium tracking-normal text-sidebar-muted">Orchestrator</span>
@@ -510,7 +513,7 @@ export function Sidebar() {
                             <DropdownMenuTrigger asChild>
                               <button
                                 type="button"
-                                 className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-70 transition-all hover:bg-sidebar hover:text-sidebar-foreground hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground data-[state=open]:opacity-100 group-hover/conversation:opacity-100"
+                                 className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-0 transition-all hover:bg-sidebar hover:text-sidebar-foreground hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground data-[state=open]:opacity-100 group-hover/conversation:opacity-100"
                                 aria-label={`Conversation actions for ${mission.title}`}
                                 title="Conversation actions"
                               >
@@ -545,7 +548,8 @@ export function Sidebar() {
                           </ContextMenu>
 
                         {isActiveMission && rootAgents.length > 0 && (
-                          <div className="ml-2 mt-0.5 border-l border-sidebar-border/50 pl-1">
+                          <details className="ml-3 mt-1 rounded-lg border border-sidebar-border/50 bg-sidebar-accent/20 px-2 py-1">
+                            <summary className="cursor-pointer py-1 text-[11px] text-sidebar-muted hover:text-sidebar-foreground">Team · {activeMissionAgents.length} agents</summary>
                             {rootAgents.map((agent) => (
                               <SidebarAgentTree
                                 key={agent.id}
@@ -557,7 +561,7 @@ export function Sidebar() {
                                 onSelect={handleAgentSelect}
                               />
                             ))}
-                          </div>
+                          </details>
                         )}
                       </div>
                     );
@@ -632,6 +636,7 @@ export function Sidebar() {
         )}
       </div>
 
+      {navigationDelete && <NavigationDeleteDialog target={navigationDelete} onClose={() => setNavigationDelete(null)}/>}
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
       <ConversationDeleteDialog mission={dialogMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />

@@ -143,7 +143,7 @@ export function Titlebar() {
       >
         <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
           <h1 data-tauri-drag-region className="pointer-events-none min-w-0 truncate text-sm font-semibold">
-            {viewTitle}
+            {viewTitle.length > 76 ? `${viewTitle.slice(0, 73).trim()}…` : viewTitle}
           </h1>
           {activeView === 'chat' && activeMission ? (
             <Badge data-tauri-drag-region variant={activeMission.status === 'running' ? 'success' : 'secondary'} className="pointer-events-none shrink-0 text-[10px] uppercase">

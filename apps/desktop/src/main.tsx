@@ -6,6 +6,9 @@ import { initializeRuntime } from './lib/runtime-config';
 
 const root = ReactDOM.createRoot(document.getElementById('root')!);
 
+// App context menus keep receiving the event; only the browser fallback is suppressed.
+document.addEventListener('contextmenu', event => event.preventDefault());
+
 function RuntimeLoadingView() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">

@@ -35,7 +35,7 @@ export function MissionStateStrip() {
   return (
     <section className="flex shrink-0 items-center gap-3 border-b border-border/70 bg-card/35 px-3 py-1.5" aria-label="Mission and connection status" role="status">
       <div className="min-w-0 flex-1 truncate text-xs font-medium" title={title}>
-        {title}
+        {activeTasks.length ? `${completedTasks} of ${activeTasks.length} steps complete` : 'Conversation'}
       </div>
       <div className="flex shrink-0 items-center gap-2 text-[10px] text-muted-foreground">
         {attentionLabel && !visibleError ? (
@@ -56,7 +56,6 @@ export function MissionStateStrip() {
             {pendingMissionStart?.reason === 'deadline' ? 'Start uncertain' : serviceOnline ? TRANSPORT_LABEL[transportStatus] : 'Service offline'}
           </span>
         )}
-        <span className="hidden tabular-nums sm:inline">{completedTasks}/{activeTasks.length} tasks</span>
         {missionQueueCount > 0 && <Badge variant="secondary" className="text-[9px]">{missionQueueCount} queued</Badge>}
         <Badge variant={mission?.status === 'failed' || mission?.status === 'blocked' ? 'destructive' : 'outline'} className="text-[9px]">
           {lifecycle.label || missionStatusLabel(mission?.status || 'starting')}

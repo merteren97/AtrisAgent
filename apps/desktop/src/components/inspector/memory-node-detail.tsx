@@ -67,9 +67,9 @@ export function MemoryNodeDetail({ node, compact }: { node: MemoryNode; compact:
   };
 
   return (
-    <div className={cn('min-h-0 border-border bg-card/70', compact ? 'border-t' : 'h-full border-l')}>
+    <div className={cn('min-h-0 min-w-0 border-border bg-card/70', compact ? 'border-t' : 'h-full border-l')}>
       <ScrollArea className="h-full">
-        <div className="space-y-4 p-4">
+        <div className="space-y-5 p-5">
           <div className="flex items-start gap-2">
             <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground">{memoryTypeIcon(node.type)}</div>
             <div className="min-w-0 flex-1">
@@ -103,12 +103,12 @@ export function MemoryNodeDetail({ node, compact }: { node: MemoryNode; compact:
 
           <label className="block space-y-1.5">
             <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Summary</span>
-            <textarea value={editor.summary} onChange={(event) => setEditor((state) => ({ ...state, summary: event.target.value }))} className="min-h-24 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-xs outline-none focus:border-ring" disabled={isRoot} />
+            <textarea value={editor.summary} onChange={(event) => setEditor((state) => ({ ...state, summary: event.target.value }))} className="min-h-36 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-xs outline-none focus:border-ring" disabled={isRoot} />
           </label>
 
           <label className="block space-y-1.5">
             <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Details</span>
-            <textarea value={editor.body} onChange={(event) => setEditor((state) => ({ ...state, body: event.target.value }))} className="min-h-28 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-[11px] leading-relaxed outline-none focus:border-ring" disabled={isRoot} />
+            <textarea value={editor.body} onChange={(event) => setEditor((state) => ({ ...state, body: event.target.value }))} className="min-h-44 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm leading-6 outline-none focus:border-ring" disabled={isRoot} />
           </label>
 
           <div className="grid grid-cols-2 gap-3">
