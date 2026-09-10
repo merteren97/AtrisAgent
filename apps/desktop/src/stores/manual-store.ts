@@ -10,6 +10,7 @@ export interface ManualAgent {
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
 export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean }
+export interface ManualNamingUpdate { conversationId: string; agentId: string; agentName?: string; conversationTitle?: string }
 export type ManualMode = 'choose' | 'manual' | 'orchestrator';
 interface ManualState {
   creating: boolean;
@@ -35,12 +36,13 @@ interface ManualState {
   setSurface: (conversationId: string, surface: 'chat' | 'code') => void;
   setDraft: (id: string, text: string) => void;
   refresh: (workspaceId: string) => Promise<void>;
-  create: (workspaceId: string, title: string, id: string) => Promise<ManualConversation>;
-  addAgent: (conversationId: string, name: string, catalogId: string, id: string, reasoning?: string) => Promise<ManualAgent>;
+  create: (workspaceId: string, title: string | undefined, id: string) => Promise<ManualConversation>;
+  applyNaming: (naming?: ManualNamingUpdate) => void;
+  addAgent: (conversationId: string, name: string | undefined, catalogId: string, id: string, reasoning?: string) => Promise<ManualAgent>;
   remove: (conversation: ManualConversation) => Promise<void>;
   removeAgent: (agent: ManualAgent) => Promise<void>;
   updateModel: (agent: ManualAgent, catalogId: string, reasoning?: string) => Promise<ManualAgent>;
-  addAgents: (conversationId: string, agents: Array<{id: string; name: string; catalogId: string}>) => Promise<ManualAgent[]>;
+  addAgents: (conversationId: string, agents: Array<{id: string; name?: string; catalogId: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
 export function migrateManualNavigation(persisted: unknown) {
@@ -71,6 +73,20 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   selectAgent: (conversationId, id) => set(state => ({ agentByConversation: { ...state.agentByConversation, [conversationId]: id } })),
   setSurface: (conversationId, surface) => set(state => ({ surfaceByConversation: { ...state.surfaceByConversation, [conversationId]: surface } })),
   setDraft: (id, text) => set(state => ({ drafts: { ...state.drafts, [id]: text } })),
+  applyNaming: naming => {
+    if (!naming) return;
+    const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === naming.conversationId && c.agents.some(a => a.id === naming.agentId)));
+    if (!workspaceId) return; // A late poll must not recreate a deleted conversation/agent.
+    const conversation = get().conversations[workspaceId].find(c => c.id === naming.conversationId)!;
+    const changed = (naming.conversationTitle && naming.conversationTitle !== conversation.title)
+      || (naming.agentName && conversation.agents.some(a => a.id === naming.agentId && a.name !== naming.agentName));
+    if (!changed) return;
+    fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
+    set(state => ({ conversations: { ...state.conversations, [workspaceId]: state.conversations[workspaceId].map(c => c.id !== naming.conversationId ? c : {
+      ...c, title: naming.conversationTitle || c.title,
+      agents: c.agents.map(a => a.id === naming.agentId && naming.agentName ? { ...a, name: naming.agentName } : a),
+    }) } }));
+  },
   refresh: async workspaceId => {
     const version = (fetchVersions.get(workspaceId) || 0) + 1; fetchVersions.set(workspaceId, version);
     try {

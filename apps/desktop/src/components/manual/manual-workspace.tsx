@@ -2,10 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Bot, Brain, Code2, MessageSquare, Plus, Send, Square, X, Loader2, RotateCcw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
 import { MarkdownContent } from '@/components/chat/markdown-content';
-import { useManualStore, type ManualAgent, type ManualMessage } from '@/stores/manual-store';
+import { useManualStore, type ManualAgent, type ManualMessage, type ManualNamingUpdate } from '@/stores/manual-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { useSettingsStore } from '@/stores/settings-store';
@@ -29,7 +28,6 @@ export { ConversationChoice } from '@/components/layout/workspace-home';
 function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversationId?: string; onClose: () => void; onCreated: (agents: ManualAgent[]) => Promise<void> }) {
   const models = useAccountStore(s => s.discoveredModels);
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
-  const [title, setTitle] = useState(''); const [name, setName] = useState('');
   const [runtime, setRuntime] = useState('claude_code'); const [catalogId, setCatalogId] = useState('');
   const [count, setCount] = useState(1);
   const existingCount = useManualStore(s => Object.values(s.conversations).flat().find(c => c.id === conversationId)?.agents.length || 0);
@@ -40,16 +38,15 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
   const options = useMemo(() => models.filter(m => m.runtimeType === runtime && m.available), [models, runtime]);
   const selected = options.find(m => m.catalogId === catalogId) || options[0];
   const submit = async () => {
-    if (!workspaceId || !selected || pending || (!conversationId && !title.trim())) return;
+    if (!workspaceId || !selected || pending) return;
     setPending(true); setError(null);
     try {
       if (!createdConversation.current) {
-        const conversation = await useManualStore.getState().create(workspaceId, title.trim(), conversationKey.current);
+        const conversation = await useManualStore.getState().create(workspaceId, undefined, conversationKey.current);
         createdConversation.current = conversation.id;
       }
       const agents = await useManualStore.getState().addAgents(createdConversation.current, Array.from({ length: count }, (_, index) => ({
         id: agentKeys.current[index], catalogId: selected.catalogId,
-        name: count > 1 ? `${name.trim() || cliName(runtime)} ${existingCount + index + 1}` : (name.trim() || `${cliName(runtime)} agent`),
       })));
       // Creation is durable before launch. A failed launch remains visible and can be retried explicitly.
       await onCreated(agents);
@@ -76,12 +73,11 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
           </div>
         </fieldset>
         <div className="rounded-2xl border border-border bg-card p-5 sm:p-6">
-          <h2 className="text-sm font-medium">2. Set up your agent</h2>
+          <h2 className="text-sm font-medium">2. Choose a model</h2>
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
-            {!conversationId && <label className="grid gap-2 text-xs font-medium">Conversation name<Input value={title} onChange={e => setTitle(e.target.value)} maxLength={200} placeholder="e.g. Interface improvements" required /></label>}
-            <label className="grid gap-2 text-xs font-medium">Agent name<Input value={name} onChange={e => setName(e.target.value)} maxLength={180} placeholder={cliName(runtime) + ' agent'} /></label>
             <label className="grid min-w-0 gap-2 text-xs font-medium sm:col-span-2">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => setCatalogId(e.target.value)} disabled={!options.length}>{!options.length && <option value="">No verified model available</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label>
           </div>
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">Conversation and terminal titles are created automatically from your first task, in Chat or Code.</p>
           {runtime === 'codex' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Chat uses a session history hook. Review the AtrisAgent hook in the CLI's /hooks screen when prompted.</p>}
           {runtime === 'antigravity' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Antigravity uses your existing CLI account. Chat reads this agent’s own transcript; approvals and live tool output remain in Code.</p>}
           {!options.length && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted/40 p-3"><p className="text-xs leading-5 text-muted-foreground">Connect or verify this provider to load its available models.</p><Button type="button" variant="outline" size="sm" onClick={() => { useSettingsStore.getState().setActiveView('accounts'); onClose(); }}>Open Accounts</Button></div>}
@@ -95,7 +91,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
         </fieldset>
         {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Use the desktop app to launch interactive terminals.</p>}
         {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
-        <div className="sticky bottom-0 z-10 flex items-center justify-end gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm"><Button type="button" variant="ghost" onClick={onClose} disabled={pending}>Cancel</Button><Button type="submit" className="rounded-xl px-6" disabled={pending || !selected || count > remaining || (!conversationId && !title.trim())}>{pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{conversationId ? 'Add agent' : 'Create conversation'}</Button></div>
+        <div className="sticky bottom-0 z-10 flex items-center justify-end gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm"><Button type="button" variant="ghost" onClick={onClose} disabled={pending}>Cancel</Button><Button type="submit" className="rounded-xl px-6" disabled={pending || !selected || count > remaining}>{pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{conversationId ? 'Add agent' : 'Create conversation'}</Button></div>
       </form>
     </div>
   </section>;
@@ -155,8 +151,8 @@ export function ManualWorkspace() {
     let memorySignature = '';
     const poll = async () => {
       try {
-        const result = await apiRequest<{messages: ManualMessage[]; truncated: boolean; bound: boolean}>(`/manual/agents/${agentId}/messages`);
-        if (!disposed) { setMessages(result.messages); setTruncated(result.truncated); setBound(Boolean(result.bound)); }
+        const result = await apiRequest<{messages: ManualMessage[]; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
+        if (!disposed) { setMessages(result.messages); setTruncated(result.truncated); setBound(Boolean(result.bound)); useManualStore.getState().applyNaming(result.naming); }
         const signature = result.messages.filter(message => message.role === 'user').map(message => message.id+':'+message.text).join('\n');
         if (!disposed && result.bound && signature && signature !== memorySignature && agent?.conversationId) {
           await apiRequest(`/manual/conversations/${agent.conversationId}/memory/sync`, {method:'POST',body:JSON.stringify({agentId})});
@@ -219,7 +215,7 @@ export function ManualWorkspace() {
     if (!agent || !native) return;
     void action('model', async () => {
       if (independent) {
-        const created = await useManualStore.getState().addAgent(agent.conversationId, `${cliName(model.runtimeType)} agent`, model.catalogId, crypto.randomUUID(), reasoning);
+        const created = await useManualStore.getState().addAgent(agent.conversationId, undefined, model.catalogId, crypto.randomUUID(), reasoning);
         await launch(created, !supportsChat(created.runtimeType));
       } else {
         await invoke('manual_terminal_close', { id: agent.id }); lifecycleEpoch.current += 1; markManualClosed(agent.id);
