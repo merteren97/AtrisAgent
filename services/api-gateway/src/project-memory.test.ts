@@ -179,6 +179,20 @@ async function runTests() {
   assert((overview.space?.nodeCount || 0) >= 6, 'Memory Curator creates project, requirement, task, verification and research nodes');
   assert((overview.space?.edgeCount || 0) >= 5, 'Memory Curator links backfilled and live evidence into the project graph');
 
+  const nodesBeforeRepeat = (await service.getSnapshot(project!.id)).nodes.length;
+  await service.ingestEvent({id:'event-research-repeat',type:'task_completed',missionId:'mission-1',taskId:'task-1',agentInstanceId:'researcher-1',result:'Project memory uses an immutable evidence ledger plus graph-linked curated nodes.',timestamp:now});
+  assert((await service.getSnapshot(project!.id)).nodes.length === nodesBeforeRepeat, 'Repeated outcome merges into one durable memory');
+  assert((await service.getOverview(project!.id)).evidenceCount === 5, 'Repeated outcome evidence remains auditable');
+  const beforeRoutine = (await service.getSnapshot(project!.id)).nodes.length;
+  await service.ingestEvent({id:'event-routine',type:'task_completed',missionId:'mission-1',taskId:'task-1',agentInstanceId:'researcher-1',result:'Done',timestamp:now});
+  assert((await service.getSnapshot(project!.id)).nodes.length === beforeRoutine, 'Generic completion does not become a knowledge node');
+
+  const resultNode = (await service.getSnapshot(project!.id)).nodes.find(node => node.type === 'research_finding')!;
+  await service.updateMemoryNode(resultNode.id,{title:'Human corrected title',status:'archived'});
+  await service.ingestEvent({id:'event-research-third',type:'task_completed',missionId:'mission-1',taskId:'task-1',agentInstanceId:'researcher-1',result:'Project memory uses an immutable evidence ledger plus graph-linked curated nodes.',timestamp:now});
+  const preserved = (await service.getSnapshot(project!.id)).nodes.find(node => node.id === resultNode.id)!;
+  assert(preserved.title === 'Human corrected title' && preserved.status === 'archived','Repeat cannot overwrite human edits or revive archived memory');
+  await service.updateMemoryNode(resultNode.id,{status:'active'});
   const historicalRecall = await service.search({
     projectId: project!.id,
     text: 'historical review local first memory boundary',
@@ -198,7 +212,7 @@ async function runTests() {
   await service.detachWorkspace('workspace-1');
   const detached = await service.getOverview(project!.id);
   assert(detached.project.status === 'detached', 'removing the local workspace detaches project identity instead of deleting memory');
-  assert(detached.evidenceCount === 4, 'detached project keeps its evidence ledger');
+  assert(detached.evidenceCount === 7, 'detached project keeps its evidence ledger');
 
   // Re-adding the same path restores the same project identity and all memory.
   await db.insert(schema.workspaces).values({

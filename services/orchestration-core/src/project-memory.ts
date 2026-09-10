@@ -58,6 +58,7 @@ export interface ProjectMemorySnapshot extends ProjectMemoryOverview {
 }
 
 export interface ManualMemoryInput {
+  manualScope?: { conversationId: string; agentId?: string; sourceId?: string; url?: string };
   type?: MemoryNodeType;
   title: string;
   summary: string;
@@ -594,6 +595,7 @@ export class ProjectMemoryService {
     const provenance: MemoryProvenance = {
       sourceType: 'manual',
       createdBy: 'user',
+      ...(input.manualScope ? { conversationId: input.manualScope.conversationId, manualAgentId: input.manualScope.agentId, sourceId: input.manualScope.sourceId, url: input.manualScope.url } : {}),
     };
     return this.upsertNode({
       id: crypto.randomUUID(),
@@ -712,7 +714,11 @@ export class ProjectMemoryService {
       curatedAt: null,
     });
 
-    await this.curateEvent(project, event, task || null, sourceType, content);
+    // The evidence ledger remains complete; routine lifecycle noise is not durable knowledge.
+    const routine = event.type === 'task_created'
+      || (event.type === 'check_completed' && event.passed)
+      || (event.type === 'task_completed' && (!content.trim() || /^(?:done|completed|success|ok)[.!]?$/i.test(content.trim())));
+    if (!routine) await this.curateEvent(project, event, task || null, sourceType, content);
     await this.db.update(memoryEvidence).set({ curatedAt: now }).where(and(
       eq(memoryEvidence.projectId, project.id),
       eq(memoryEvidence.sourceId, event.id),
@@ -871,8 +877,20 @@ export class ProjectMemoryService {
     }
 
     if (!content.trim()) status = 'stale';
+    const repeatedOutcome = ['task_completed', 'task_failed', 'check_completed'].includes(event.type);
+    const nodeId = stableNodeId(event.type, repeatedOutcome
+      ? `${project.id}:${event.missionId}:${eventTaskId(event) || ''}:${sha256(content.trim())}`
+      : event.id);
+    if (repeatedOutcome) {
+      const previous = (await this.db.select().from(memoryNodes).where(eq(memoryNodes.id, nodeId)))[0];
+      if (previous) {
+        // A retry adds evidence, never overwrites a user's edits, pin or archive decision.
+        await this.db.update(memoryNodes).set({provenance:[...(previous.provenance || []),baseProvenance]}).where(eq(memoryNodes.id,nodeId));
+        return;
+      }
+    }
     const node = await this.upsertNode({
-      id: stableNodeId(event.type, event.id),
+      id: nodeId,
       projectId: project.id,
       type,
       title,

@@ -754,6 +754,28 @@ async function runTests() {
       && events.some((event) => event.type === 'review_completed' && event.approved),
     'Valid structured Reviewer envelope passes and remains adapter-compatible as text');
 
+    for (const [finding, accepted] of [
+      ['Sanitized backlog and unassigned string tokens to null to prevent foreign key errors in reorder routes. Sanitized dueDate and storyPoints parsing to prevent InvalidDate and NaN errors on empty/malformed values. Fixed seed script syntax errors by removing TypeScript casts.', true],
+      ['Fixed seed script syntax errors, but tests failed.', false],
+      ['Not fixed syntax errors.', false],
+      ['Fixed syntax errors are still present.', false],
+      ['Sanitized inputs, but unable to prevent foreign key errors.', false],
+      ['Syntax errors should be fixed before release.', false],
+    ] as const) {
+      const sampleManager = new FakeWorkspaceManager('mission-repair-report', 'plan-repair-report');
+      sampleManager.tasks.set('reviewer', task({ id: 'reviewer', missionId: 'mission-repair-report', planId: 'plan-repair-report', role: 'reviewer', status: 'running', assignedAgentId: 'agent-repair' }));
+      const sampleOrchestrator = new OrchestratorV2(
+        { workspacePath: 'test', workspaceManager: sampleManager as unknown as WorkspaceManager },
+        new LocalEventBus(), undefined, sampleManager as unknown as WorkspaceManager,
+      );
+      await sampleOrchestrator.handleTaskCompleted({
+        id: crypto.randomUUID(), type: 'task_completed', missionId: 'mission-repair-report', taskId: 'reviewer', agentInstanceId: 'agent-repair',
+        result: JSON.stringify({ type: 'quality_result', version: 1, role: 'reviewer', verdict: 'pass', summary: 'Build, typecheck and lint pass with 0 errors.', findings: [finding], evidence: ['Targeted checks executed.'] }),
+        timestamp: new Date().toISOString(),
+      });
+      assert(sampleManager.tasks.get('reviewer')?.status === (accepted ? 'done' : 'rejected'), `Completed repairs versus unresolved findings: ${finding}`);
+    }
+
     const contradictoryManager = new FakeWorkspaceManager('mission-contradictory-envelope', 'plan-contradictory-envelope');
     contradictoryManager.tasks.set('reviewer', task({ id: 'reviewer', missionId: 'mission-contradictory-envelope', planId: 'plan-contradictory-envelope', role: 'reviewer', status: 'running', assignedAgentId: 'agent-contradictory' }));
     const contradictoryOrchestrator = new OrchestratorV2(

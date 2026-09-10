@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { useManualStore, migrateManualNavigation, type ManualConversation } from './manual-store';
 import { useMissionStore } from './mission-store';
+import { conversationActivity, type AgentActivity } from '@/components/manual/manual-activity';
+import type { ManualAgent } from './manual-store';
+import { automaticLayout, layoutIds, moveInLayout, resizeLayout, reconcileLayout, minimumLayout, layoutRects, dropPlacement } from '@/components/manual/terminal-layout';
 
 const conversation: ManualConversation = { id: 'manual-a', workspaceId: 'project-a', title: 'Manual work', createdAt: '2026-09-08', agents: [] };
 const store = useManualStore;
@@ -41,4 +44,47 @@ release(new Response('[]', {status: 200, headers: {'Content-Type': 'application/
 await stale;
 assert.ok(store.getState().conversations['project-a'].some(c => c.id === 'manual-b'), 'Stale hydration cannot erase a newly created conversation');
 globalThis.fetch = oldFetch;
+const agents = ['a','b','c'].map(id => ({id,conversationId:'manual-a'} as ManualAgent));
+store.setState({conversations:{'project-a':[{...conversation,agents}]}});
+store.getState().moveAgent('manual-a','a','c');
+assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c','a']);
+store.getState().moveAgent('manual-a','a','b');
+assert.deepEqual(store.getState().orderByConversation['manual-a'],['a','b','c']);
+store.getState().hideAgent('a',true);
+assert.equal(store.getState().conversations['project-a'][0].agents.length,3,'Temporary hiding during restart does not delete an agent');
+store.getState().selectAgent('manual-a','a');store.getState().setDraft('a','Discard on explicit close');
+globalThis.fetch = (async () => new Response(null,{status:204})) as typeof fetch;
+await store.getState().removeAgent(agents[0]);
+assert.deepEqual(store.getState().conversations['project-a'][0].agents.map(agent=>agent.id),['b','c']);
+assert.equal(store.getState().agentByConversation['manual-a'],'b');
+assert.equal(store.getState().drafts.a,undefined);
+assert.equal(store.getState().hiddenAgents.a,undefined);
+assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c']);
+globalThis.fetch = oldFetch;
+const now = Date.parse('2026-09-09T10:10:00Z');
+const observed = (state: string, lifecycle: AgentActivity['lifecycle'] = 'open'): AgentActivity => ({state,lifecycle,checkedAt:now,at:'2026-09-09T10:08:00Z'});
+assert.equal(conversationActivity([],{},now).kind,'empty');
+assert.equal(conversationActivity(agents,{},now).kind,'unknown');
+assert.equal(conversationActivity(agents,{a:observed('unknown','closed'),b:observed('unknown','closed'),c:observed('unknown','exited')},now).kind,'closed');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('completed'),c:observed('unknown')},now).kind,'open','Unknown activity never counts as finished');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('completed'),c:observed('completed')},now).text,'Turns finished 2m ago');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('working'),c:observed('completed')},now).kind,'working');
+assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('attention'),c:observed('working')},now).kind,'attention');
 console.log('Manual navigation, independent drafts and stale hydration regression tests passed.');
+const initial = automaticLayout(['a','b','c','d'],2)!;
+assert.equal(initial.type,'split');
+if(initial.type === 'split') {
+  const resized = resizeLayout(initial,initial.id,.65);
+  const moved = moveInLayout(resized,'d','a','left');
+  assert.deepEqual(new Set(layoutIds(moved)),new Set(['a','b','c','d']));
+  assert.deepEqual(layoutIds(moveInLayout(initial,'a','d','swap')),['d','b','c','a']);
+  const pruned = reconcileLayout(resized,['a','b','c']);
+  assert.equal(pruned?.type === 'split' && pruned.ratio,.65,'Closing a leaf preserves surviving ratios');
+  const added = reconcileLayout(resized,['a','b','c','d','e']);
+  assert.ok(JSON.stringify(added).includes(initial.id),'New agents preserve the existing geometry');
+  const minimum = minimumLayout(moved), geometry=layoutRects(moved,minimum.width,minimum.height);
+  assert.equal(Object.keys(geometry.panes).length,4);
+  for(const rect of Object.values(geometry.panes)){assert.ok(rect.width>=320);assert.ok(rect.height>=240);}
+  assert.equal(dropPlacement(5,150,500,300),'left');
+  assert.equal(dropPlacement(250,150,500,300),'swap');
+}

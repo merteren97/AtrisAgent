@@ -512,7 +512,7 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
 // boundary for every request.
 installRuntimeShutdownRoute(app, RUNTIME_TOKEN, shutdownCoordinator);
 installAuthRoutes(app, authService);
-installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
+export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 
 function routeParam(value: string | string[]): string {
   return Array.isArray(value) ? value[0] || '' : value;
@@ -977,6 +977,8 @@ function normalizeMissionStartOptions(body: Record<string, any>, automationPolic
   return {
     modelCatalogId,
     accountProfileId: typeof body.accountProfileId === 'string' && body.accountProfileId.trim() ? body.accountProfileId.trim() : undefined,
+    orchestratorModelCatalogId: typeof body.orchestratorModelCatalogId === 'string' ? body.orchestratorModelCatalogId.trim() || undefined : undefined,
+    orchestratorReasoningLevel: typeof body.orchestratorReasoningLevel === 'string' ? body.orchestratorReasoningLevel.trim().toLowerCase() : undefined,
     reasoningLevel: typeof body.reasoningLevel === 'string' && body.reasoningLevel.trim() ? body.reasoningLevel.trim().toLowerCase() : undefined,
     fallbackCatalogIds: normalizeFallbackCatalogIds(body.fallbackCatalogIds, modelCatalogId),
     routeSelectionMode: body.routeSelectionMode,
@@ -1126,7 +1128,7 @@ async function startDurableTurn(command: any, turn: any): Promise<void> {
       content: turn.content, delivery: turn.delivery, timestamp: now });
     await configureMissionRouting(command.mission_id, options);
     stage = 'orchestration';
-    const result = await orchestrator.startMission(command.mission_id, turn.content, { ...options, turnId: turn.id, runId });
+    const result = await orchestrator.startMission(command.mission_id, turn.content, { ...supervisorStartOptions(options), turnId: turn.id, runId });
     sqlite.transaction(() => {
       const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, command.mission_id) as { status: string } | undefined;
       const mission = sqlite.prepare('SELECT active_run_id FROM missions WHERE id = ?').get(command.mission_id) as { active_run_id: string | null } | undefined;
@@ -1221,7 +1223,7 @@ async function startMissionWithDurability(missionId: string, content: string, op
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_started', missionId, turnId, runId,
       content, delivery: 'queue', timestamp: now });
     stage = 'orchestration';
-    const result = await orchestrator.startMission(missionId, content, { ...options, turnId, runId });
+    const result = await orchestrator.startMission(missionId, content, { ...supervisorStartOptions(options), turnId, runId });
     sqlite.transaction(() => {
       const run = sqlite.prepare("SELECT status FROM mission_runs WHERE id = ? AND mission_id = ?").get(runId, missionId) as { status: string } | undefined;
       const mission = sqlite.prepare('SELECT active_run_id FROM missions WHERE id = ?').get(missionId) as { active_run_id: string | null } | undefined;
@@ -1550,13 +1552,25 @@ async function cleanupMissionResources(missionId: string): Promise<void> {
   runtimeHost.clearMissionRoutingPreference(missionId, false);
 }
 
+// Routing was persisted before this boundary. Child-only preferences must not
+// also become the supervisor's own model selection.
+export function supervisorStartOptions(options: Record<string, any>): Record<string, any> {
+  if (options.routeScope !== 'subagents') return options;
+  const { modelCatalogId: _model, accountProfileId: _account, reasoningLevel: _reasoning,
+    fallbackCatalogIds: _fallbacks, routeSelectionMode: _mode, orchestratorModelCatalogId, orchestratorReasoningLevel, ...supervisorOptions } = options;
+  return { ...supervisorOptions, modelCatalogId: orchestratorModelCatalogId, reasoningLevel: orchestratorReasoningLevel };
+}
+
 export async function configureMissionRouting(missionId: string, body: Record<string, any>): Promise<void> {
+  if (body.routeScope === 'subagents' && typeof body.orchestratorModelCatalogId === 'string' && body.orchestratorModelCatalogId.trim()) {
+    await configureMissionRouting(missionId, {modelCatalogId:body.orchestratorModelCatalogId,reasoningLevel:body.orchestratorReasoningLevel,routeScope:'role',routeRole:'orchestrator'});
+  }
   const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId ? body.modelCatalogId : undefined;
   const accountProfileId = typeof body.accountProfileId === 'string' && body.accountProfileId ? body.accountProfileId : undefined;
   const targetRole = typeof body.targetRole === 'string' ? body.targetRole.toLowerCase() : undefined;
   const routeRole = typeof body.routeRole === 'string' ? body.routeRole.toLowerCase() : targetRole;
-  const routeScope = body.routeScope === 'mission'
-    ? 'mission'
+  const routeScope = body.routeScope === 'mission' || body.routeScope === 'subagents'
+    ? body.routeScope
     : body.routeScope === 'role'
       ? routeRole
       : modelCatalogId
@@ -1580,6 +1594,8 @@ export async function configureMissionRouting(missionId: string, body: Record<st
   };
   const roles = routeScope === 'mission'
     ? ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'] as const
+    : routeScope === 'subagents'
+      ? ['builder', 'reviewer', 'researcher', 'qa'] as const
     : ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'].includes(String(routeScope))
       ? [routeScope as 'orchestrator' | 'builder' | 'reviewer' | 'researcher' | 'qa']
       : [];

@@ -76,6 +76,8 @@ export interface ProjectMemorySpace {
 }
 
 export interface MemoryProvenance {
+  conversationId?: string | null;
+  manualAgentId?: string | null;
   sourceType: MemorySourceType;
   sourceId?: string | null;
   missionId?: string | null;

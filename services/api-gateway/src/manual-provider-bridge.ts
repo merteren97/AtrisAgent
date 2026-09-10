@@ -56,7 +56,10 @@ export const AtrisManualSession = async () => {
       } catch { /* A failed UI observer must not terminate the user's CLI. */ }
     }, 80);
   };
-  return { event: async ({event}) => {
+  return { "chat.message": async (input, output) => {
+    // Root session and configured model only; never rewrite subagent/model-switch choices.
+    if (manualReasoning && sessionId === input.sessionID && input.model && input.model.providerID+'/'+input.model.modelID === manualModel) output.message.variant = manualReasoning;
+  }, event: async ({event}) => {
     const info = event.properties?.info;
     if (event.type === 'session.created' && info?.id && !info.parentID) { sessionId = info.id; flush(); }
     if (event.type === 'message.updated' && info?.sessionID === sessionId && ['user','assistant'].includes(info.role)) {
@@ -136,6 +139,23 @@ export function parseCodexManualTranscript(source: string, sessionId: string): M
 
 export class ManualProviderBridge {
   constructor(private dataDir: string) {}
+  activity(agent: ManualAgent): { state: string; at?: string } {
+    if (!['claude_code', 'codex'].includes(agent.runtimeType)) return { state: 'unknown' };
+    const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent);
+    const current = bindings.at(-1);
+    if (!current) return { state: 'unknown' };
+    const states: Record<string, string> = { SessionStart: 'ready', UserPromptSubmit: 'working', PostToolUse: 'working', PermissionRequest: 'attention', Stop: 'completed' };
+    let latest: { state: string; at?: string } = { state: 'unknown' };
+    for (const line of readTail(path.join(this.directory(agent), 'bindings.jsonl'), 128 * 1024).source.split('\n')) {
+      try {
+        const event = JSON.parse(line);
+        if (event.sessionId !== current.sessionId || typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at)) || !states[event.event]) continue;
+        if (fs.realpathSync(event.transcriptPath) !== current.transcriptPath) continue;
+        if (!latest.at || Date.parse(event.at) >= Date.parse(latest.at)) latest = { state: states[event.event], at: event.at };
+      } catch { /* Ignore incomplete and foreign hook records. */ }
+    }
+    return latest;
+  }
   private directory(agent: ManualAgent): string { return path.join(this.dataDir, 'manual-sessions', agent.id); }
   private codexRoot(agent: ManualAgent): string { return agent.sharedProfile ? process.env.CODEX_HOME || path.join(os.homedir(), '.codex') : agent.configDir; }
   private hookCommand(agent: ManualAgent): {command: string; commandWindows: string} {
@@ -174,7 +194,7 @@ export class ManualProviderBridge {
     const settings = JSON.stringify({hooks});
     const settingsFile = path.join(this.directory(agent), `claude-settings-${createHash('sha256').update(settings).digest('hex').slice(0,16)}.json`);
     writeManaged(settingsFile, settings);
-    return ['--model', agent.model, ...(bound || hasInitialTranscript ? ['--resume', bound?.sessionId || agent.providerSessionId] : ['--session-id', agent.providerSessionId]), '--settings', settingsFile];
+    return ['--model', agent.model, ...(bound || hasInitialTranscript ? ['--resume', bound?.sessionId || agent.providerSessionId] : ['--session-id', agent.providerSessionId]), '--settings', settingsFile, ...(agent.reasoning ? ['--effort', agent.reasoning] : [])];
   }
   private codexBindings(agent: ManualAgent): {sessionId: string; transcriptPath: string}[] {
     const filename = path.join(this.directory(agent), 'bindings.jsonl');
@@ -201,11 +221,12 @@ export class ManualProviderBridge {
     const config = '# AtrisAgent managed manual session bridge v1\n' + ['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PostToolUse'].map(event => `\n[[hooks.${event}]]\n[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${JSON.stringify(command)}\ncommand_windows = ${JSON.stringify(commandWindows)}\ntimeout = 5\n`).join('');
     writeManaged(path.join(root, `${profile}.config.toml`), config);
     const bound = this.codexBindings(agent).at(-1);
-    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model];
+    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : [])];
   }
   prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});
-    const plugin = path.join(directory, 'manual-plugin.mjs'); writeManaged(plugin, OPENCODE_SOURCE);
+    const pluginSource = OPENCODE_SOURCE + '\nconst manualReasoning = ' + JSON.stringify(agent.reasoning || null) + ';\nconst manualModel = ' + JSON.stringify(agent.model) + ';\n';
+    const plugin = path.join(directory, `manual-plugin-${createHash('sha256').update(pluginSource).digest('hex').slice(0,16)}.mjs`); writeManaged(plugin, pluginSource);
     const history = this.openCodeHistory(agent);
     // Merge inherited configuration inside the native launcher. Never send its possibly-secret contents to the UI.
     return {args: [...(history.sessionId ? ['--session', history.sessionId] : []), '--model', agent.model], env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href}};

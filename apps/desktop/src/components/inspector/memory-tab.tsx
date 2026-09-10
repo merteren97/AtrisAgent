@@ -111,10 +111,11 @@ export function MemoryTab() {
     clearError,
   } = useMemoryStore();
 
-  const [viewMode, setViewMode] = useState<ViewMode>('graph');
+  const [viewMode, setViewMode] = useState<ViewMode>('notes');
+  const [signalOnly, setSignalOnly] = useState(true);
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<MemoryNodeType | 'all'>('all');
-  const [statusFilter, setStatusFilter] = useState<MemoryNodeStatus | 'all'>('all');
+  const [statusFilter, setStatusFilter] = useState<MemoryNodeStatus | 'all'>('active');
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteProjectOpen, setDeleteProjectOpen] = useState(false);
   const [draft, setDraft] = useState<CreateMemoryInput>(emptyDraft);
@@ -157,7 +158,8 @@ export function MemoryTab() {
   const visibleNodes = useMemo(() => {
     if (!snapshot) return [];
     let nodes = snapshot.nodes.filter((node) =>
-      (typeFilter === 'all' || node.type === typeFilter)
+      (!signalOnly || node.pinned || node.provenance.some(source => source.createdBy === 'user') || (!['task', 'turn', 'agent_run', 'session', 'file'].includes(node.type) && node.importance >= 0.65 && !(node.tags.includes('task_failed') && /could not create an isolated worktree|supervisor pre-dispatch decision failed/i.test(node.summary))))
+      && (typeFilter === 'all' || node.type === typeFilter)
       && (statusFilter === 'all' || node.status === statusFilter),
     );
     if (query.trim()) {
@@ -169,7 +171,7 @@ export function MemoryTab() {
       nodes = nodes.filter((node) => expanded.has(node.id));
     }
     return nodes;
-  }, [hitIds, query, snapshot, statusFilter, typeFilter]);
+  }, [hitIds, query, snapshot, statusFilter, typeFilter, signalOnly]);
   const visibleIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
   const visibleEdges = useMemo(
     () => (snapshot?.edges || []).filter((edge) => visibleIds.has(edge.fromNodeId) && visibleIds.has(edge.toNodeId)),
@@ -258,14 +260,15 @@ export function MemoryTab() {
             <button type="button" onClick={() => setViewMode('graph')} className={cn('flex h-6 items-center gap-1 rounded px-2 text-[9px]', viewMode === 'graph' ? 'bg-accent font-medium text-foreground' : 'text-muted-foreground')}><Network className="h-3 w-3" />Graph</button>
             <button type="button" onClick={() => setViewMode('notes')} className={cn('flex h-6 items-center gap-1 rounded px-2 text-[9px]', viewMode === 'notes' ? 'bg-accent font-medium text-foreground' : 'text-muted-foreground')}><ListTree className="h-3 w-3" />Notes</button>
           </div>
-          <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as MemoryNodeType | 'all')} className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-1.5 text-[9px] outline-none">
+          <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as MemoryNodeType | 'all')} className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-1.5 text-xs outline-none">
             <option value="all">All types</option>{FILTER_TYPES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
           </select>
-          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as MemoryNodeStatus | 'all')} className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-1.5 text-[9px] outline-none">
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as MemoryNodeStatus | 'all')} className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-1.5 text-xs outline-none">
             <option value="all">All states</option>{FILTER_STATUSES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
           </select>
         </div>
 
+        <div className="mt-3 flex items-center justify-between gap-3"><Button size="sm" variant={signalOnly ? 'secondary' : 'outline'} aria-pressed={signalOnly} onClick={() => setSignalOnly(!signalOnly)}><Sparkles className="mr-2 h-3.5 w-3.5"/>{signalOnly ? 'Important memory' : 'All records'}</Button><span className="text-xs text-muted-foreground">{visibleNodes.length} visible · existing records retained</span></div>
         {snapshot ? (
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px] text-muted-foreground">
             <span><strong className="text-foreground">{snapshot.space?.nodeCount ?? snapshot.nodes.length}</strong> nodes</span>
@@ -294,7 +297,7 @@ export function MemoryTab() {
               ? 'grid grid-rows-[minmax(0,1fr)_minmax(220px,46%)]'
               : 'flex flex-col',
         )}>
-          <div className="min-h-0 min-w-0 overflow-hidden">
+          <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
             {viewMode === 'graph'
               ? <MemoryGraphView nodes={visibleNodes} edges={visibleEdges} selectedNodeId={selectedNodeId} onSelect={selectNode} />
               : <MemoryNotesView nodes={visibleNodes} selectedNodeId={selectedNodeId} onSelect={selectNode} />}
@@ -302,7 +305,7 @@ export function MemoryTab() {
           {selectedNode ? (
             <div className={cn(
               'min-h-0 overflow-hidden [&>div]:h-full [&>div]:min-h-0',
-              inspectorExpanded ? 'w-[380px] min-w-[340px] max-w-[440px] shrink-0' : 'h-full',
+              inspectorExpanded ? 'w-[44%] min-w-[320px] max-w-[620px] shrink-0' : 'h-full',
             )}>
               <MemoryNodeDetail node={selectedNode} compact={!inspectorExpanded} />
             </div>

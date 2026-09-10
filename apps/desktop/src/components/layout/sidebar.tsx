@@ -22,7 +22,6 @@ import {
   Circle,
   Ban,
   SquarePen,
-  MoreHorizontal,
   Trash2,
   LogOut,
   House,
@@ -30,9 +29,8 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { NavigationDeleteAction } from './navigation-row-actions';
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
@@ -42,11 +40,14 @@ import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
 import { useManualStore } from '@/stores/manual-store';
+import { NavigationDeleteDialog, type NavigationDeleteTarget } from './navigation-delete-dialog';
+import { ManualConversationRow } from '@/components/manual/manual-conversation-row';
+import { useManualActivityMonitor } from '@/components/manual/manual-activity';
 import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
 import { ThemeToggle } from '../theme-toggle';
 import { useAuthSession } from '@/lib/auth-session';
-import { needsMissionAttention } from '@/lib/mission-display';
+import { needsMissionAttention, missionStatusLabel } from '@/lib/mission-display';
 
 interface SidebarItemProps {
   icon: ReactNode;
@@ -180,8 +181,10 @@ function SidebarAgentTree({
 
 export function Sidebar() {
   const manual = useManualStore();
+  useManualActivityMonitor();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
+  const [navigationDelete, setNavigationDelete] = useState<NavigationDeleteTarget | null>(null);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
   const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
@@ -311,17 +314,18 @@ export function Sidebar() {
     ? missions.find((mission) => mission.id === pendingDeleteMission.id) || pendingDeleteMission
     : null;
 
-  const currentWidth = sidebarCollapsed ? 56 : `clamp(208px, 24vw, ${sidebarWidth}px)`;
+  const currentWidth = sidebarCollapsed ? 64 : `clamp(208px, 24vw, ${sidebarWidth}px)`;
 
   return (
     <aside
       aria-label="Project navigation"
-      className="workspace-sidebar relative flex flex-col select-none border-r border-sidebar-border bg-sidebar transition-[width] duration-200 motion-reduce:transition-none"
-      style={{ width: currentWidth, minWidth: sidebarCollapsed ? 56 : 208, flexShrink: 0 }}
+      data-collapsed={sidebarCollapsed}
+      className="workspace-sidebar relative flex flex-col select-none bg-sidebar transition-[width] duration-200 motion-reduce:transition-none"
+      style={{ width: currentWidth, minWidth: sidebarCollapsed ? 64 : 208, flexShrink: 0 }}
     >
       <div className="absolute bottom-0 right-0 top-0 z-50 w-1 cursor-col-resize transition-colors hover:bg-primary/50" onMouseDown={handleDrag} />
 
-      <div data-tauri-drag-region className={`flex items-center border-b border-sidebar-border ${sidebarCollapsed ? 'h-auto flex-col justify-center gap-2 py-2' : 'h-12 justify-between px-3'}`}>
+      <div data-tauri-drag-region className={`flex shrink-0 items-center ${sidebarCollapsed ? 'flex-col justify-center gap-2' : 'justify-between px-3'}`}>
         <div data-tauri-drag-region className="flex items-center gap-2">
           <img
             data-tauri-drag-region
@@ -340,15 +344,15 @@ export function Sidebar() {
         </div>
       </div>
 
-      <div className="space-y-2 px-3 pb-2 pt-4">
-        <Button className={`h-10 w-full gap-2 rounded-lg ${sidebarCollapsed ? 'px-0' : 'justify-start px-3'}`} onClick={() => { clearActiveMission(); manual.setMode('choose'); setActiveView('chat'); }} aria-label="New conversation">
-          <Plus className="h-4 w-4 shrink-0" />{!sidebarCollapsed && <><span>New conversation</span><span className="ml-auto text-[10px] opacity-70">Ctrl N</span></>}
+      <div className="space-y-2 px-3 pb-3 pt-2">
+        <Button variant="ghost" className={`sidebar-new-conversation h-10 w-full gap-2 bg-primary/[0.08] text-sidebar-foreground shadow-none hover:bg-primary/15 ${sidebarCollapsed ? 'px-0' : 'justify-start px-3'}`} onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)} aria-label="New conversation" title="New conversation · Ctrl/Cmd+N">
+          <SquarePen className="h-4 w-4 shrink-0 text-primary" />{!sidebarCollapsed && <><span className="text-xs font-semibold">New conversation</span><kbd className="ml-auto shrink-0 text-[10px] font-normal text-sidebar-muted">⌘/Ctrl N</kbd></>}
         </Button>
         <button
           type="button"
           aria-label="Search workspaces and missions"
           onClick={() => setCommandPaletteOpen(true)}
-          className={`flex w-full items-center rounded-md border border-sidebar-border/70 bg-sidebar-accent py-1.5 text-xs text-sidebar-muted transition-colors hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-2.5'}`}
+          className={`flex w-full items-center rounded-lg py-2 text-xs text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}`}
         >
           <Search className="h-3.5 w-3.5 shrink-0" />
           {!sidebarCollapsed && <><span className="min-w-0 truncate">Search conversations</span><kbd className="ml-auto shrink-0 whitespace-nowrap rounded border border-sidebar-border bg-sidebar px-1 py-0.5 font-sans text-[10px]">Ctrl K</kbd></>}
@@ -371,10 +375,8 @@ export function Sidebar() {
         </div>
       </div>
 
-      <Separator className="bg-sidebar-border" />
-
       <div className={`mb-1 mt-2 flex items-center ${sidebarCollapsed ? 'justify-center' : 'justify-between px-3'}`}>
-        {!sidebarCollapsed && <p className="px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-sidebar-muted">Workspaces</p>}
+        {!sidebarCollapsed && <p className="flex items-center gap-2 px-1 text-[11px] font-semibold tracking-wide text-sidebar-muted">Workspaces <span className="text-[10px] font-normal tabular-nums">{workspaces.length}</span></p>}
         <Tooltip delayDuration={0}>
           <TooltipTrigger asChild>
             <Button variant="ghost" size="icon" aria-label="Open project" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">
@@ -410,18 +412,19 @@ export function Sidebar() {
           const workspaceMissions = isActiveWorkspace ? missions.filter((mission) => mission.workspaceId === workspace.id) : [];
           return (
             <div key={workspace.id} className="mb-2">
-              <div
-                className={`group/workspace flex w-full items-center rounded-md text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'bg-sidebar-accent text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
+              <ContextMenu><ContextMenuTrigger asChild><div
+                className={`navigation-row group/workspace flex w-full items-center rounded-lg text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
                 title={workspace.path}
               >
                 <button
                   type="button"
                   onClick={() => handleWorkspaceSelect(workspace.id)}
                   aria-label={sidebarCollapsed ? workspace.name : undefined}
-                  className={`flex min-w-0 flex-1 items-center ${sidebarCollapsed ? 'justify-center py-1.5' : 'gap-1.5 py-1.5 pl-1.5'}`}
+                  aria-current={isActiveWorkspace ? 'true' : undefined}
+                  className={`flex min-w-0 flex-1 items-center ${sidebarCollapsed ? 'justify-center py-2' : 'gap-2 py-2.5 pl-1.5'}`}
                 >
                   {!sidebarCollapsed && <ChevronRight className={`h-3 w-3 shrink-0 text-sidebar-muted transition-transform ${isActiveWorkspace ? 'rotate-90' : ''}`} />}
-                  <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-sidebar-muted" />
+                  <FolderGit2 className={`h-4 w-4 shrink-0 ${isActiveWorkspace ? 'text-primary' : 'text-sidebar-muted'}`} />
                   {!sidebarCollapsed && <span className="min-w-0 flex-1 truncate text-left">{workspace.name}</span>}
                 </button>
 
@@ -431,7 +434,7 @@ export function Sidebar() {
                       <button
                         type="button"
                         onClick={(event) => { event.stopPropagation(); handleNewChat(workspace.id); }}
-                        className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-0 transition-all hover:bg-sidebar hover:text-primary focus:opacity-100 focus:outline-none group-hover/workspace:opacity-100"
+                        className="mr-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-primary"
                         aria-label={`New chat in ${workspace.name}`}
                       >
                         <SquarePen className="h-3.5 w-3.5" />
@@ -441,22 +444,20 @@ export function Sidebar() {
                   </Tooltip>
                 )}
 
-                {!sidebarCollapsed && isActiveWorkspace && (
-                  <span className="mr-1 shrink-0 rounded-full bg-sidebar px-1.5 py-0.5 text-[8px] font-medium text-sidebar-muted">{workspaceMissions.length}</span>
-                )}
-              </div>
+                {!sidebarCollapsed && <NavigationDeleteAction label={`Remove workspace: ${workspace.name}`} onClick={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })} />}
+              </div></ContextMenuTrigger><ContextMenuContent><ContextMenuItem variant="destructive" onSelect={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })}><Trash2 className="h-3.5 w-3.5" />Remove workspace…</ContextMenuItem></ContextMenuContent></ContextMenu>
 
               {!sidebarCollapsed && isActiveWorkspace && (
-                <div className="ml-3 mt-1 border-l border-sidebar-border/70 pl-2">
-                  <div className="mb-1 flex items-center justify-between px-2">
-                    <span className="text-xs font-medium tracking-normal text-sidebar-muted">Manual</span>
+                <div className="ml-3 mb-3 pl-2">
+                  <div className="mb-1 mt-2 flex h-7 items-center justify-between px-2">
+                    <span className="navigation-section-title">Manual <span className="font-normal tabular-nums">{(manual.conversations[workspace.id] || []).length}</span></span>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
-                  {(manual.conversations[workspace.id] || []).map(conversation => <button key={conversation.id} type="button" aria-current={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'page' : undefined} onClick={() => { manual.select(conversation); setActiveView('chat'); }} className={`mb-0.5 flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left text-xs ${manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id ? 'bg-primary/10 text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent'}`}><Bot className="h-3 w-3 shrink-0" /><span className="truncate">{conversation.title}</span><span className="ml-auto text-[10px]">{conversation.agents.length}</span></button>)}
+                  {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} onDelete={() => setNavigationDelete({kind:'manual',conversation})} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
-                  <div className="mb-1 flex items-center justify-between px-2">
-                    <span className="text-xs font-medium tracking-normal text-sidebar-muted">Orchestrator</span>
-                    {workspaceMissions.length > 0 && <span className="text-[8px] tabular-nums text-sidebar-muted/70">{workspaceMissions.length}</span>}
+                  <div className="mb-1 mt-3 flex h-7 items-center justify-between px-2">
+                    <span className="navigation-section-title">Orchestrator <span className="font-normal tabular-nums">{workspaceMissions.length}</span></span>
+                    <button type="button" aria-label="New orchestrated conversation" className="rounded p-1 text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground" onClick={() => { handleNewChat(workspace.id); manual.setMode('orchestrator'); }}><Plus className="h-3 w-3" /></button>
                   </div>
 
                   {workspaceMissions.length === 0 ? (
@@ -480,52 +481,29 @@ export function Sidebar() {
                          <ContextMenu>
                            <ContextMenuTrigger asChild>
                              <div
-                               className={`flex items-center rounded-md transition-colors ${isActiveMission ? 'bg-primary/[0.07] text-sidebar-foreground' : 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}
+                                data-active={isActiveMission}
+                                className="navigation-row flex items-center rounded-lg text-sidebar-foreground transition-colors hover:bg-sidebar-accent"
                                aria-busy={deletionPending || undefined}
                              >
                           <button
                             type="button"
                             onClick={() => handleMissionSelect(mission.id)}
                              disabled={deletionPending}
-                             className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-[11px] disabled:cursor-wait disabled:opacity-80"
+                              aria-current={isActiveMission ? 'page' : undefined}
+                              className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-xs disabled:cursor-wait disabled:opacity-80"
                              title={`${mission.title} · ${deletionStatusLabel || mission.status}`}
                           >
                             <span className="flex h-4 w-4 shrink-0 items-center justify-center">{missionStateIcon(mission)}</span>
-                            <span className="min-w-0 flex-1 truncate text-left">{mission.title}</span>
-                             {deletionStatusLabel ? (
-                               <span className={`shrink-0 text-[9px] ${mission.deletionState?.status === 'retryable' ? 'text-destructive' : 'text-amber-400'}`}>
-                                 {deletionStatusLabel}
-                               </span>
-                             ) : isActiveMission && missionAgents.length > 0 ? (
-                               <span className="shrink-0 text-[9px] text-sidebar-muted">
-                                 {runningAgents > 0 ? `${runningAgents} active` : `${missionAgents.length} agents`}
-                               </span>
-                             ) : null}
+                            <span className="min-w-0 flex-1 text-left">
+                              <span className="block truncate">{mission.title}</span>
+                              <span className={`mt-0.5 block truncate text-[11px] ${deletionStatusLabel ? 'text-destructive' : 'text-sidebar-muted'}`}>
+                                {deletionStatusLabel || missionStatusLabel(mission.status)}
+                                {!deletionStatusLabel && isActiveMission && missionAgents.length > 0 && ` · ${runningAgents > 0 ? `${runningAgents} active` : `${missionAgents.length} agents`}`}
+                              </span>
+                            </span>
                           </button>
 
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <button
-                                type="button"
-                                 className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-sidebar-muted opacity-70 transition-all hover:bg-sidebar hover:text-sidebar-foreground hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-sidebar data-[state=open]:text-sidebar-foreground data-[state=open]:opacity-100 group-hover/conversation:opacity-100"
-                                aria-label={`Conversation actions for ${mission.title}`}
-                                title="Conversation actions"
-                              >
-                                <MoreHorizontal className="h-3.5 w-3.5" />
-                              </button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent side="right" align="start" className="w-52">
-                              <DropdownMenuItem
-                                variant="destructive"
-                                onSelect={() => {
-                                  setPendingDeleteMission(mission);
-                                }}
-                               >
-                                 <Trash2 className="h-3.5 w-3.5" />
-                                 {deletionActionLabel}
-                              </DropdownMenuItem>
-                           </DropdownMenuContent>
-                         </DropdownMenu>
+                          <NavigationDeleteAction label={`${deletionActionLabel.replace('…', '')}: ${mission.title}`} onClick={() => setPendingDeleteMission(mission)} />
                               </div>
                             </ContextMenuTrigger>
                             <ContextMenuContent className="w-52">
@@ -542,7 +520,8 @@ export function Sidebar() {
                           </ContextMenu>
 
                         {isActiveMission && rootAgents.length > 0 && (
-                          <div className="ml-2 mt-0.5 border-l border-sidebar-border/50 pl-1">
+                          <details className="ml-3 mt-1 rounded-lg border border-sidebar-border/50 bg-sidebar-accent/20 px-2 py-1">
+                            <summary className="cursor-pointer py-1 text-[11px] text-sidebar-muted hover:text-sidebar-foreground">Team · {activeMissionAgents.length} agents</summary>
                             {rootAgents.map((agent) => (
                               <SidebarAgentTree
                                 key={agent.id}
@@ -554,7 +533,7 @@ export function Sidebar() {
                                 onSelect={handleAgentSelect}
                               />
                             ))}
-                          </div>
+                          </details>
                         )}
                       </div>
                     );
@@ -566,14 +545,13 @@ export function Sidebar() {
         })}
       </ScrollArea>
 
-      <Separator className="bg-sidebar-border" />
       <div className="space-y-0.5 px-2 py-2">
         <SidebarItem collapsed={sidebarCollapsed} icon={<UsersRound className="h-3.5 w-3.5 text-violet-400" />} label="Agents" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
         <SidebarItem collapsed={sidebarCollapsed} icon={<KeyRound className="h-3.5 w-3.5 text-amber-500" />} label="Accounts" isActive={activeView === 'accounts'} onClick={() => setActiveView('accounts')} />
         <SidebarItem collapsed={sidebarCollapsed} icon={<Settings className="h-3.5 w-3.5 text-muted-foreground" />} label="Settings" isActive={activeView === 'settings'} onClick={() => setActiveView('settings')} />
       </div>
 
-      <div className={`border-t border-sidebar-border ${sidebarCollapsed ? 'p-2' : 'p-3'} overflow-hidden`}>
+      <div className={`${sidebarCollapsed ? 'flex justify-center p-2' : 'p-3'} shrink-0 overflow-hidden`}>
         {!sidebarCollapsed ? (
           <div className="flex items-center gap-2">
             <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-full border border-sidebar-border bg-sidebar-accent">
@@ -629,6 +607,7 @@ export function Sidebar() {
         )}
       </div>
 
+      {navigationDelete && <NavigationDeleteDialog target={navigationDelete} onClose={() => setNavigationDelete(null)}/>}
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
       <ConversationDeleteDialog mission={dialogMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />

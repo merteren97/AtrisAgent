@@ -1,9 +1,10 @@
 import { CoordinationMCP, getControlPlaneBridgeScriptPath } from '@atris-agent-code/coordination-mcp';
 import { configureRuntimeControlPlaneBridge } from '@atris-agent-code/runtime-host';
-import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, startupRecovery, db } from './index';
+import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, startupRecovery, db, manualConversationStore } from './index';
 import { ControlPlaneGrantRegistry } from './control-plane-grants';
 import { installControlPlaneRoutes } from './control-plane-router';
 import { installProjectMemoryRoutes } from './project-memory-routes';
+import { installManualMemoryRoutes } from './manual-memory-routes';
 import {
   emitRuntimeReady,
   gatewayOrigin,
@@ -34,6 +35,7 @@ installControlPlaneRoutes(app, {
 
 const projectMemory = orchestrator.getProjectMemoryService();
 if (projectMemory) {
+  installManualMemoryRoutes(app, manualConversationStore, { memory: projectMemory, workspaceManager });
   installProjectMemoryRoutes(app, {
     memory: projectMemory,
     workspaceManager,

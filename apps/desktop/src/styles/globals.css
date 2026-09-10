@@ -136,13 +136,29 @@ body {
   container-type: inline-size;
 }
 .workspace-home { container-type: inline-size; }
-.workspace-sidebar { border-right: 0; }
+.workspace-sidebar { border-right: 0; container: workspace-navigation / inline-size; }
+/* Flat navigation chrome; sections are separated by spacing rather than rules. */
+.workspace-sidebar button,
+.workspace-sidebar .navigation-row { border-radius: 0; }
+.workspace-sidebar .navigation-row[data-active="true"] { box-shadow: none; }
+@container workspace-navigation (max-width: 250px) {
+  .sidebar-new-conversation kbd { display: none; }
+}
 .workspace-sidebar > [data-tauri-drag-region] { height: 64px; border-bottom: 0; }
-.workspace-sidebar [class*="text-[8px]"],
-.workspace-sidebar [class*="text-[9px]"] { font-size: 11px; letter-spacing: .025em; }
-.workspace-sidebar [class*="border-l"] { border-left: 0; margin-left: 0; padding-left: 0; }
-.workspace-sidebar [class*="group/workspace"] { min-height: 38px; }
-.workspace-sidebar [class*="group/conversation"] button { min-height: 34px; }
+.workspace-sidebar[data-collapsed="true"] > [data-tauri-drag-region] {
+  height: auto;
+  padding: 20px 0 8px;
+}
+/* Radix's intrinsic table wrapper otherwise lets long titles push actions off-screen. */
+.workspace-sidebar [data-radix-scroll-area-viewport] > div { display: block !important; }
+.navigation-row { position: relative; min-height: 38px; }
+.navigation-row-action { opacity: 0; pointer-events: none; transition: opacity 120ms ease, background-color 120ms ease; }
+.navigation-row:hover > .navigation-row-action,
+.navigation-row:focus-within > .navigation-row-action { opacity: 1; pointer-events: auto; }
+.navigation-row[data-active="true"] { background: var(--color-sidebar-accent); box-shadow: inset 2px 0 var(--color-primary); }
+.navigation-section-title { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; color: var(--color-sidebar-muted); }
+@media (hover: none) { .navigation-row-action { opacity: 1; pointer-events: auto; } }
+@media (prefers-reduced-motion: reduce) { .navigation-row-action { transition: none; } }
 .workspace-sidebar button:focus-visible { outline: 2px solid var(--color-ring); outline-offset: -2px; }
 @media (max-width: 800px) {
   .atris-workspace-shell > main { margin: 4px 4px 4px 0; border-radius: 10px; }

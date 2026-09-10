@@ -7,11 +7,13 @@ import type { Application, Request, Response } from 'express';
 import type { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { runCommand } from '@atris-agent-code/runtime-host';
 import { ManualProviderBridge, readTail } from './manual-provider-bridge';
+import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
   runtimeType: string; model: string; accountProfileId: string; providerSessionId: string;
   cwd: string; configDir: string; sharedProfile: boolean; createdAt: string;
+  reasoning?: string;
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
 export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean }
@@ -20,6 +22,12 @@ const fail = (message: string, status = 400): never => { throw Object.assign(new
 function required(value: unknown, label: string, limit = 200): string {
   if (typeof value !== 'string' || !value.trim() || value.length > limit) return fail(`Invalid ${label}.`);
   return value.trim();
+}
+
+function resolveReasoning(value: unknown, descriptor: { supportedReasoning?: readonly string[]; defaultReasoning?: string }): string | undefined {
+  if (value === undefined) return descriptor.defaultReasoning || descriptor.supportedReasoning?.[0];
+  if (typeof value !== 'string' || !descriptor.supportedReasoning?.includes(value)) return fail('This model does not support the selected reasoning level.');
+  return value;
 }
 
 /** Only the exact provider session may contribute messages. Never infer identity from cwd/latest file. */
@@ -48,14 +56,17 @@ export function parseManualTranscript(source: string, sessionId: string): Manual
 }
 
 export class ManualConversationStore {
-  constructor(private sqlite: Database.Database) {
+  constructor(private sqlite: Database.Database, private dataDir = path.dirname(sqlite.name)) {
     sqlite.exec(`CREATE TABLE IF NOT EXISTS manual_conversations (
       id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
       title TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS manual_agent_sessions (
       id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES manual_conversations(id) ON DELETE CASCADE,
       record TEXT NOT NULL);
-      CREATE INDEX IF NOT EXISTS manual_agents_conversation ON manual_agent_sessions(conversation_id);`);
+      CREATE INDEX IF NOT EXISTS manual_agents_conversation ON manual_agent_sessions(conversation_id);
+      CREATE TABLE IF NOT EXISTS manual_memory_receipts (
+        agent_id TEXT NOT NULL REFERENCES manual_agent_sessions(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL, PRIMARY KEY(agent_id, source_id));`);
   }
   list(workspaceId: string): ManualConversation[] {
     const rows = this.sqlite.prepare('SELECT id, workspace_id AS workspaceId, title, created_at AS createdAt FROM manual_conversations WHERE workspace_id = ? ORDER BY created_at DESC').all(workspaceId) as Omit<ManualConversation, 'agents'>[];
@@ -79,7 +90,58 @@ export class ManualConversationStore {
     return row ? JSON.parse(row.record) : fail('Agent not found.', 404);
   }
   save(agent: ManualAgent): void {
-    this.sqlite.prepare('INSERT INTO manual_agent_sessions (id, conversation_id, record) VALUES (?, ?, ?)').run(agent.id, agent.conversationId, JSON.stringify(agent));
+    this.saveBatch([agent]);
+  }
+  remove(id: string): void {
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id IN (SELECT id FROM manual_agent_sessions WHERE conversation_id = ?)').run(id);
+      this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE conversation_id = ?').run(id);
+      this.sqlite.prepare('DELETE FROM manual_conversations WHERE id = ?').run(id);
+    })();
+  }
+  removeAgent(id: string): void {
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id = ?').run(id);
+      this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE id = ?').run(id);
+    })();
+  }
+  memoryProcessed(agentId: string, sourceId: string): boolean {
+    return Boolean(this.sqlite.prepare('SELECT 1 FROM manual_memory_receipts WHERE agent_id = ? AND source_id = ?').get(agentId, sourceId));
+  }
+  markMemoryProcessed(agentId: string, sourceId: string): void {
+    this.sqlite.prepare('INSERT OR IGNORE INTO manual_memory_receipts VALUES (?, ?)').run(agentId, sourceId);
+  }
+  readMessages(id: string) {
+    const agent = this.agent(id);
+    if (agent.runtimeType === 'antigravity') return {supported:true,...new ManualAntigravityBridge(this.dataDir).read(agent)};
+    return readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
+  }
+  updateModel(id: string, expectedCatalogId: string, catalogId: string, model: string, reasoning?: string): ManualAgent {
+    return this.sqlite.transaction(() => {
+      const agent = this.agent(id);
+      if (agent.catalogId !== expectedCatalogId) return fail('This agent model changed elsewhere. Refresh before applying.', 409);
+      const updated = { ...agent, catalogId, model, reasoning };
+      this.sqlite.prepare('UPDATE manual_agent_sessions SET record = ? WHERE id = ?').run(JSON.stringify(updated), id);
+      return updated;
+    })();
+  }
+  saveBatch(agents: ManualAgent[]): ManualAgent[] {
+    return this.sqlite.transaction(() => {
+      const result: ManualAgent[] = [];
+      for (const agent of agents) {
+        const existing = this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE id = ?').get(agent.id) as {record: string} | undefined;
+        if (existing) {
+          const saved = JSON.parse(existing.record) as ManualAgent;
+          if (saved.conversationId !== agent.conversationId) return fail('Agent identity conflict.', 409);
+          result.push(saved); continue;
+        }
+        const count = this.sqlite.prepare('SELECT COUNT(*) AS n FROM manual_agent_sessions WHERE conversation_id = ?').get(agent.conversationId) as {n: number};
+        if (count.n >= 30) return fail('A manual conversation supports up to 30 agents.', 409);
+        this.sqlite.prepare('INSERT INTO manual_agent_sessions (id, conversation_id, record) VALUES (?, ?, ?)').run(agent.id, agent.conversationId, JSON.stringify(agent));
+        result.push(agent);
+      }
+      return result;
+    })();
   }
 }
 
@@ -98,14 +160,39 @@ function transcriptPath(agent: ManualAgent): string | null {
   return null;
 }
 
+function readAgentMessages(agent: ManualAgent, bridge: ManualProviderBridge) {
+    if (agent.runtimeType === 'codex' || agent.runtimeType === 'opencode') return { supported: true, ...bridge.read(agent) };
+    const bindings = bridge.claudeBindings(agent);
+    if (bindings.length) {
+      let truncated = bindings.length > 8;
+      const messages = bindings.slice(-8).flatMap(binding => { const tail = readTail(binding.transcriptPath); truncated ||= tail.truncated; return parseManualTranscript(tail.source, binding.sessionId).map(message => ({...message, id:`${binding.sessionId}:${message.id}`})); });
+      return {supported:true, messages, truncated, bound:true};
+    }
+    const filename = transcriptPath(agent);
+    if (!filename) return { supported: agent.runtimeType === 'claude_code', messages: [], truncated: false, bound: false };
+    // Bound I/O and parsing even for very long sessions. The UI labels a partial history.
+    const tail = readTail(filename);
+    return { supported: true, messages: parseManualTranscript(tail.source, agent.providerSessionId), truncated: tail.truncated, bound: true };
+}
+
 export function installManualConversations(app: Application, sqlite: Database.Database, runtime: RuntimeHost, dataDir = path.dirname(sqlite.name)): ManualConversationStore {
-  const store = new ManualConversationStore(sqlite);
+  const store = new ManualConversationStore(sqlite, dataDir);
   const bridge = new ManualProviderBridge(dataDir);
   const route = (handler: (req: Request, res: Response) => unknown) => (req: Request, res: Response) => {
     Promise.resolve().then(() => handler(req, res)).catch((error) => res.status(error.status || 500).json({ error: error.message || 'Manual session operation failed.' }));
   };
   const idParam = (req: Request, key: string) => required(req.params[key], key);
   app.get('/api/manual/conversations', route((req, res) => res.json(store.list(required(req.query.workspaceId, 'project')))));
+  app.delete('/api/manual/conversations/:conversationId', route((req, res) => {
+    store.remove(idParam(req, 'conversationId'));
+    res.status(204).end();
+  }));
+  // The desktop closes its native process before removing the app-owned record.
+  // Provider transcripts and curated memory are intentionally not deleted here.
+  app.delete('/api/manual/agents/:agentId', route((req, res) => {
+    store.removeAgent(idParam(req, 'agentId'));
+    res.status(204).end();
+  }));
   app.post('/api/manual/conversations', route((req, res) => {
     const id = required(req.body.id, 'conversation ID');
     if (!/^[a-f0-9-]{36}$/i.test(id)) return fail('Invalid conversation identity.');
@@ -113,26 +200,36 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   }));
   app.post('/api/manual/conversations/:conversationId/agents', route(async (req, res) => {
     const conversation = store.conversation(idParam(req, 'conversationId'));
-    const id = required(req.body.id, 'agent ID');
-    if (!/^[a-f0-9-]{36}$/i.test(id)) return fail('Invalid agent identity.');
-    try {
-      const existing = store.agent(id);
-      if (existing.conversationId !== conversation.id) return fail('Agent identity conflict.', 409);
-      return res.json(existing);
-    } catch (error: any) { if (error.status !== 404) throw error; }
-    const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(required(req.body.catalogId, 'model'));
-    if (!descriptor || descriptor.availability !== 'available') return fail('Select an available model from Accounts.');
-    const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
-    if (!profile || profile.authStatus !== 'connected') return fail('The selected CLI account is not connected.');
-    if (!['claude_code', 'codex', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
-    const workspace = store.workspace(conversation.workspaceId);
-    const cwd = fs.realpathSync(workspace.path);
-    const agent: ManualAgent = { id, conversationId: conversation.id, name: required(req.body.name, 'agent name'),
-      catalogId: descriptor.catalogId, runtimeType: profile.runtimeType, model: descriptor.runtimeModelId,
-      accountProfileId: profile.id, providerSessionId: randomUUID(), cwd, configDir: profile.configDir,
-      sharedProfile: profile.profileMode === 'shared_cli', createdAt: new Date().toISOString() };
-    store.save(agent);
-    res.json(agent);
+    const batch = Array.isArray(req.body.agents);
+    const inputs = batch ? req.body.agents : [req.body];
+    if (!inputs.length || inputs.length > 30) return fail('Choose between 1 and 30 agents.');
+    const ids = new Set<string>();
+    const agents: ManualAgent[] = [];
+    for (const input of inputs) {
+      if (!input || typeof input !== 'object') return fail('Invalid agent request.');
+      const id = required(input.id, 'agent ID');
+      if (!/^[a-f0-9-]{36}$/i.test(id) || ids.has(id)) return fail('Invalid or duplicate agent identity.');
+      ids.add(id);
+      try {
+        const existing = store.agent(id);
+        if (existing.conversationId !== conversation.id) return fail('Agent identity conflict.', 409);
+        agents.push(existing); continue;
+      } catch (error: any) { if (error.status !== 404) throw error; }
+      const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(required(input.catalogId, 'model'));
+      if (!descriptor || descriptor.availability !== 'available') return fail('Select an available model from Accounts.');
+      const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
+      if (!profile || profile.authStatus !== 'connected') return fail('The selected CLI account is not connected.');
+      if (!['claude_code', 'codex', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
+      const workspace = store.workspace(conversation.workspaceId);
+      const cwd = fs.realpathSync(workspace.path);
+      agents.push({ id, conversationId: conversation.id, name: required(input.name, 'agent name'),
+        catalogId: descriptor.catalogId, runtimeType: profile.runtimeType, model: descriptor.runtimeModelId,
+        reasoning: resolveReasoning(input.reasoning, descriptor),
+        accountProfileId: profile.id, providerSessionId: randomUUID(), cwd, configDir: profile.configDir,
+        sharedProfile: profile.profileMode === 'shared_cli', createdAt: new Date().toISOString() });
+    }
+    const saved = store.saveBatch(agents);
+    res.json(batch ? saved : saved[0]);
   }));
   app.post('/api/manual/agents/:id/launch', route(async (req, res) => {
     const agent = store.agent(idParam(req, 'id'));
@@ -155,6 +252,12 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     // The active-route sentinel is app metadata, not a CLI model name. Never resume
     // the globally latest conversation: manual agents must remain independent.
     if (agent.runtimeType === 'antigravity' && agent.model === 'antigravity-active-route') args = [];
+    if (agent.runtimeType === 'antigravity' && agent.model !== 'antigravity-active-route') {
+      const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(agent.catalogId);
+      const effort = agent.reasoning || descriptor?.defaultReasoning || (descriptor?.supportedReasoning?.includes('medium') ? 'medium' : descriptor?.supportedReasoning?.[0]);
+      if (effort && ['low', 'medium', 'high'].includes(effort)) args.push('--effort', effort);
+    }
+    if (agent.runtimeType === 'antigravity') args.push(...new ManualAntigravityBridge(dataDir).prepare(agent));
     if (agent.runtimeType === 'codex') {
       const help = await runCommand(installation.path, ['--help'], {timeoutMs: 5000});
       if (!help.stdout.includes('.config.toml')) return fail('Update Codex to a version supporting layered CLI profiles before opening a manual Chat/Code session.');
@@ -165,20 +268,18 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     }
     res.json({ id: agent.id, executable: installation.path, args, cwd: agent.cwd, env });
   }));
-  app.get('/api/manual/agents/:id/messages', route((req, res) => {
+  app.get('/api/manual/agents/:id/messages', route((req, res) => res.json(store.readMessages(idParam(req, 'id')))));
+  app.get('/api/manual/agents/:id/activity', route((req, res) => res.json(bridge.activity(store.agent(idParam(req, 'id'))))));
+  app.patch('/api/manual/agents/:id/model', route(async (req, res) => {
     const agent = store.agent(idParam(req, 'id'));
-    if (agent.runtimeType === 'codex' || agent.runtimeType === 'opencode') return res.json({ supported: true, ...bridge.read(agent) });
-    const bindings = bridge.claudeBindings(agent);
-    if (bindings.length) {
-      let truncated = bindings.length > 8;
-      const messages = bindings.slice(-8).flatMap(binding => { const tail = readTail(binding.transcriptPath); truncated ||= tail.truncated; return parseManualTranscript(tail.source, binding.sessionId).map(message => ({...message, id:`${binding.sessionId}:${message.id}`})); });
-      return res.json({supported:true, messages, truncated, bound:true});
-    }
-    const filename = transcriptPath(agent);
-    if (!filename) return res.json({ supported: agent.runtimeType === 'claude_code', messages: [], truncated: false, bound: false });
-    // Bound I/O and parsing even for very long sessions. The UI labels a partial history.
-    const tail = readTail(filename);
-    res.json({ supported: true, messages: parseManualTranscript(tail.source, agent.providerSessionId), truncated: tail.truncated, bound: true });
+    const catalogId = required(req.body.catalogId, 'model');
+    const expected = required(req.body.expectedCatalogId, 'previous model');
+    const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(catalogId);
+    if (!descriptor || descriptor.availability !== 'available') return fail('Select a verified available model.');
+    const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
+    if (!profile || profile.authStatus !== 'connected') return fail('Connect this model account first.');
+    if (profile.runtimeType !== agent.runtimeType || descriptor.accountProfileId !== agent.accountProfileId) return fail('A different CLI or account requires a new independent agent.', 409);
+    res.json(store.updateModel(agent.id, expected, descriptor.catalogId, descriptor.runtimeModelId, resolveReasoning(req.body.reasoning, descriptor)));
   }));
   return store;
 }

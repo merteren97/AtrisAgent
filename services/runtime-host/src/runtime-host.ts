@@ -53,7 +53,7 @@ export interface MissionRoutingPreference {
   fallbackCatalogIds?: string[];
   selectionMode?: RouteSelectionMode;
   /** Role whose route is overridden without changing the mission DAG. */
-  scopeRole?: AgentRole | 'mission';
+  scopeRole?: AgentRole | 'mission' | 'subagents';
   /** Backward-compatible direct-agent role used by older callers. */
   targetRole?: AgentRole;
   /** Optional named profile; the persisted core role still controls access. */
@@ -819,6 +819,7 @@ export class RuntimeHost {
     // selection as an Orchestrator override rather than leaking one model across
     // Builder/Reviewer/QA roles.
     const explicitAppliesToRole = explicitRole === 'mission'
+      || (explicitRole === 'subagents' && role !== 'orchestrator')
       || (explicitRole ? explicitRole === role : role === 'orchestrator');
     const hasExplicitPreference = explicitAppliesToRole && Boolean(
       missionPreference?.modelCatalogId
@@ -916,9 +917,13 @@ export class RuntimeHost {
       source: 'explicit',
     } : undefined;
     const profilePreference = this.profileRoutingPreference(agentProfile, profileResolution.source);
-    const effectivePreference = eventPreference
-      || await this.resolveEffectiveRoutingPreference(event.missionId, role)
-      || profilePreference;
+    const missionPolicy = await this.resolveEffectiveRoutingPreference(event.missionId, role);
+    // A user-fixed mission route is authority, not a suggestion to the planner.
+    // Persisted policies retain that authority after followups or host restarts.
+    // Workspace/template preferences still permit explicit per-task selection.
+    const fixedMissionRoute = missionPolicy?.selectionMode === 'fixed'
+      && (missionPolicy.source === 'explicit' || missionPolicy.source === 'mission');
+    const effectivePreference = fixedMissionRoute ? missionPolicy : eventPreference || missionPolicy || profilePreference;
     const workerRequest: WorkerRequest = {
       role,
       capabilities: [...new Set([

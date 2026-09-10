@@ -152,7 +152,7 @@ export function PlanTab() {
           {activeTasks.length === 0 ? (
             <div className="py-10 text-center">
               <p className="text-sm text-muted-foreground">
-                {missionCancelled ? 'Mission cancelled before executable steps were available.' : 'Görev adımları hazırlanıyor...'}
+                {missionCancelled ? 'Mission cancelled before executable steps were available.' : ['failed', 'blocked'].includes(activeMission.status) ? 'Planning stopped before executable steps were created. Review the error in Chat or Diagnostics before retrying.' : activeMission.status === 'completed' ? 'This conversation completed without executable steps.' : 'Preparing task steps…'}
               </p>
             </div>
           ) : viewMode === 'list' ? (

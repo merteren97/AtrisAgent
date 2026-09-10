@@ -10,6 +10,8 @@ export type MemoryNodeType =
   | 'external_source' | 'requirement' | 'user_constraint';
 
 export interface MemoryProvenance {
+  conversationId?: string | null;
+  manualAgentId?: string | null;
   sourceType: string;
   sourceId?: string | null;
   missionId?: string | null;

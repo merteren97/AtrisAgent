@@ -109,8 +109,17 @@ function clearNegatedQualitySignals(text: string): string {
     .replace(/\b(?:blocking|major|critical)\s*[:=-]\s*(?:none|no)\b/gi, ' ');
 }
 
-function hasQualityFailureSignal(text: string): boolean {
-  const evaluableText = clearNegatedQualitySignals(text);
+function hasQualityFailureSignal(text: string, allowResolvedFindings = false): boolean {
+  const evaluableText = clearNegatedQualitySignals(text)
+    // Only explicit structured verdicts may describe completed repairs. Preserve
+    // the rest of each sentence so a later failed check still rejects the pass.
+    .replace(/[^.!?\n]+/g, sentence => {
+      if (!allowResolvedFindings || !/^\s*(?:fixed|resolved|corrected|eliminated|sanitized)\b/i.test(sentence)
+        || /\b(?:not|never|unable|cannot|can't|pending|unresolved|still|should|must|needs?|required)\b/i.test(sentence)) return sentence;
+      return sentence
+        .replace(/\b(?:fixed|resolved|corrected|eliminated)\s+(?:(?:the|a|an|reported|previous|existing|seed|script|syntax|type|runtime|foreign|key|test|build|lint)\s+)*(?:errors?|failures?|defects?|issues?|bugs?)\b/gi, 'resolved finding')
+        .replace(/\bto prevent\s+(?:(?:the|a|an|foreign|key|runtime|syntax|type|validation|InvalidDate|NaN|and)\s+)*(?:errors?|failures?)\b/gi, 'preventive fix');
+    });
   return [
     /\b(?:revision|revisions|change|changes)\s+(?:is\s+|are\s+)?(?:requested|required|needed)\b/i,
     /\brequest(?:ed)?\s+(?:a\s+)?(?:revision|revisions|change|changes)\b/i,
@@ -152,9 +161,9 @@ function inferQualityVerdict(
     // express the quality judgment; scanning evidence creates false failures
     // for an otherwise explicit structured pass.
     const judgment = [envelope.summary, ...(envelope.findings || [])].join('\n');
-    const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(judgment);
+    const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(judgment, true);
     const passed = envelope.verdict === 'pass' && !contradictory;
-    const failureDetails = [envelope.summary, ...(envelope.findings || [])].filter(hasQualityFailureSignal);
+    const failureDetails = [envelope.summary, ...(envelope.findings || [])].filter(text => hasQualityFailureSignal(text, true));
     const resultSummary = contradictory
       ? `Quality approval was not accepted: the agent reported pass but also reported a failed check or unresolved issue. ${failureDetails.join('\n')}\nResolve the reported issue and rerun the quality gate before applying changes.\n\n${detail}`
       : detail;

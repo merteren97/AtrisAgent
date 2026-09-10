@@ -234,7 +234,9 @@ mod tests {
         let executable = std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe").to_string_lossy().to_string();
         let first = "00000000-0000-4000-8000-000000000001";
         let second = "00000000-0000-4000-8000-000000000002";
-        for id in [first, second] {
+        let third = "00000000-0000-4000-8000-000000000003";
+        let fourth = "00000000-0000-4000-8000-000000000004";
+        for id in [first, second, third, fourth] {
             start(manager.clone(), Launch { id: id.into(), executable: executable.clone(),
                 args: vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(), "Write-Output 'native-ready'; $line=[Console]::ReadLine(); Write-Output ('received:'+$line); Start-Sleep -Seconds 30".into()],
                 cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new() }).unwrap();
@@ -259,6 +261,7 @@ mod tests {
             }
         };
         wait_for(first, "native-ready"); wait_for(second, "native-ready");
+        wait_for(third, "native-ready"); wait_for(fourth, "native-ready");
         {
             let slot = manager.slot(first).unwrap().unwrap();
             let mut slot = slot.lock().unwrap();
@@ -279,6 +282,8 @@ mod tests {
         }
         assert_eq!(snapshot(&manager, first.into(), 0, true).unwrap().status, "closed");
         assert_eq!(snapshot(&manager, second.into(), 0, true).unwrap().status, "open");
+        assert_eq!(snapshot(&manager, third.into(), 0, true).unwrap().status, "open");
+        assert_eq!(snapshot(&manager, fourth.into(), 0, true).unwrap().status, "open");
         assert!(manager.has_live_sessions());
         manager.shutdown();
         assert!(!manager.has_live_sessions());

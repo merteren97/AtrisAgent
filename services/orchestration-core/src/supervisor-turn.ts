@@ -24,10 +24,10 @@ function isNewSiblingProjectRequest(message: string): boolean {
     // English requests that explicitly introduce a new child project/folder.
     new RegExp(`\\b(?:brand[- ]new|new)\\s+(?:[^\\n,;]+\\s+)?(?:folder|project|directory)\\b`, 'i'),
     new RegExp(`\\b(?:create|build|make|install|set\\s+up|scaffold)\\s+(?:a[n]?\\s+)?(?:brand[- ]new\\s+|new\\s+)?(?:[^\\n,;]+\\s+)?(?:folder|project|directory)\\b`, 'i'),
-    // Turkish equivalents, including the common postposed form
-    // "AtrisTask klasörü içine kurulacak".
-    new RegExp(`\\b(?:yeni(?:\\s+bir)?\\s+)?[^\\n,;]+\\s+(?:klas(?:ör|or)(?:ü|u)?|proje(?:si|sı)?|dizin(?:i|ı)?)\\b`, 'iu'),
-    new RegExp(`\\b(?:klas(?:ör|or)(?:ü|u)?|proje(?:si|sı)?|dizin(?:i|ı)?)\\s+(?:içine|icine|içerisine|icerisine|içinde|icinde|altına|altina|altında|altinda)\\b`, 'iu'),
+    // Mentioning an existing project is not creation intent. Require a new
+    // object or a nearby creation verb, never a later "fixes uygulanmalı".
+    /(?:^|\s)yeni(?:\s+bir)?\s+(?:[^\n,;.!?]+\s+)?(?:klasör|klasor|proje|dizin)(?:\s|$)/iu,
+    /(?:klasör[üu]?|klasor[üu]?|proje(?:si|sı)?|dizin[iı]?)\s+(?:(?:içine|icine|içerisine|icerisine|içinde|icinde|altına|altina|altında|altinda)\s+)?(?:kur(?:ulacak|uluyor|ulur)?|oluştur(?:ulacak|uluyor|ulur)?|olustur(?:ulacak|uluyor|ulur)?|yerleştir(?:ilecek|iliyor)?|yerlestir(?:ilecek|iliyor)?|yap(?:ılacak|iliyor|ılır)?)(?:\s|$|[.!?])/iu,
   ].some((pattern) => pattern.test(message));
 }
 
