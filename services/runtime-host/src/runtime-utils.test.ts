@@ -249,6 +249,10 @@ async function runTests() {
   }
 
   if (process.platform === 'win32') {
+    // GitHub-hosted Windows runners can spend several seconds cold-starting the
+    // PowerShell -> Node -> cmd bridge. These success-path checks validate argv
+    // integrity and injection isolation; timeout enforcement is covered below.
+    const liveBridgeSuccessTimeoutMs = 30_000;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atris runtime wrapper '));
     const wrapper = path.join(root, 'test wrapper.cmd');
     const printer = path.join(root, 'print-args.cjs');
@@ -266,7 +270,7 @@ async function runTests() {
       'trailing\\',
     ];
     try {
-      const result = await runCommand(`"${wrapper}"`, dangerousArguments, { cwd: root, timeoutMs: 15_000 });
+      const result = await runCommand(`"${wrapper}"`, dangerousArguments, { cwd: root, timeoutMs: liveBridgeSuccessTimeoutMs });
       const received = JSON.parse(result.stdout.trim()) as string[];
       assert(
         JSON.stringify(received) === JSON.stringify(dangerousArguments),
@@ -280,7 +284,7 @@ async function runTests() {
       fs.writeFileSync(powershellPrinter, 'ConvertTo-Json -InputObject ([string[]]$args) -Compress', 'utf8');
       fs.writeFileSync(genericWrapper, '@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -File "%~dp0print-args.ps1" %*\r\n', 'utf8');
       const genericArguments = ['hello world', '--mode', 'safe'];
-      const genericResult = await runCommand(`"${genericWrapper}"`, genericArguments, { cwd: root, timeoutMs: 15_000 });
+      const genericResult = await runCommand(`"${genericWrapper}"`, genericArguments, { cwd: root, timeoutMs: liveBridgeSuccessTimeoutMs });
       const genericReceived = JSON.parse(genericResult.stdout.trim()) as string[];
       assert(
         JSON.stringify(genericReceived) === JSON.stringify(genericArguments),
