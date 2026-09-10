@@ -112,6 +112,41 @@ async function runTests() {
     });
     assert(workspaceBinding.isDefault && workspaceBinding.role === 'builder', 'workspace/team Agent Profile bindings persist fixed role and default state');
     const profileWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
+    {
+      sqlite.exec(`CREATE TABLE IF NOT EXISTS worktrees (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL, branch_name TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+        isolation_kind TEXT, canonical_container TEXT, target_name TEXT, target_path TEXT, applied_operation_key TEXT, target_descriptor TEXT,
+        created_at TEXT NOT NULL)`);
+      const cleanupMission = await attemptManager.createMission({ workspaceId: profileWorkspace.id, title: 'Resumable cleanup fixture' });
+      const cleanupTasks = await Promise.all(['first', 'locked'].map((name) => attemptManager.createTask({
+        missionId: cleanupMission.id, title: name, worktreeId: path.join(tmpDir, name),
+      })));
+      for (const task of cleanupTasks) sqlite.prepare('INSERT INTO worktrees (id, mission_id, task_id, branch_name, path, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(task.id, cleanupMission.id, task.id, task.title, task.worktreeId, new Date().toISOString());
+      const cleanup = (attemptManager as any).worktreeManager as WorktreeManager;
+      const originalRemove = cleanup.removeWorktree;
+      const calls: string[] = [];
+      let locked = true;
+      cleanup.removeWorktree = async (target) => {
+        calls.push(target);
+        if (target === cleanupTasks[1].worktreeId && locked) throw new Error('EBUSY fixture');
+      };
+      try {
+        try { await attemptManager.removeMissionWorktrees(cleanupMission.id); } catch { /* retry below */ }
+        assert((await attemptManager.getTask(cleanupTasks[0].id))?.worktreeId === null
+          && (await attemptManager.getTask(cleanupTasks[1].id))?.worktreeId === cleanupTasks[1].worktreeId,
+          'partial worktree deletion durably checkpoints each completed path and retains the locked path');
+        locked = false;
+        await attemptManager.removeMissionWorktrees(cleanupMission.id);
+        assert(calls.filter((target) => target === cleanupTasks[0].worktreeId).length === 1 && calls.length === 3,
+          'worktree cleanup retry skips paths already completed in an earlier attempt');
+      } finally { cleanup.removeWorktree = originalRemove; }
+
+      const missingManager = new WorktreeManager();
+      (missingManager as any).isGitRepository = async () => { throw new Error('must not probe Git for missing worktrees'); };
+      await missingManager.removeWorktree(path.join(tmpDir, 'already-removed'));
+      assert(true, 'already removed worktrees return without probing or pruning an unrelated repository');
+    }
     const attemptMission = await attemptManager.createMission({ id: 'attempt-mission', workspaceId: profileWorkspace.id, title: 'Parallel research', teamTemplateId: 'profile-team-template' });
     const workspaceResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' });
     assert(workspaceResolution.source === 'workspace' && workspaceResolution.profile.id === workspaceBuilder.id

@@ -68,6 +68,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   private readonly v2WorkspacePath: string;
   private readonly supervisorRouting = new Map<string, MissionRoutingPreference>();
   private readonly activeSupervisorTurns = new Map<string, Set<{ adapter: BaseRuntimeAdapter; cancel: () => void }>>();
+  private readonly pendingSupervisorShutdowns = new Map<string, Set<BaseRuntimeAdapter>>();
   private readonly supervisorRunner: SupervisorTurnRunner;
   private readonly supervisorSessions = new Map<string, SupervisorSession>();
   private readonly supervisorIdleTtlMs: number;
@@ -119,6 +120,10 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     for (const turn of turns) turn.cancel();
     await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
     this.activeSupervisorTurns.clear();
+    for (const adapters of this.pendingSupervisorShutdowns.values()) {
+      await Promise.all([...adapters].map((adapter) => adapter.shutdown()));
+    }
+    this.pendingSupervisorShutdowns.clear();
     await super.stopAll();
   }
 
@@ -131,13 +136,26 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     // A task-only retry does not own the persistent supervisor conversation.
     if (runId) return super.stopMission(missionId, runId);
     const turns = [...(this.activeSupervisorTurns.get(missionId) || [])];
-    if (turns.length > 0) {
-      for (const turn of turns) turn.cancel();
-      await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
-      this.activeSupervisorTurns.delete(missionId);
-    }
-    await this.discardSupervisorSession(missionId);
-    await super.stopMission(missionId);
+    const stopSupervisor = async () => {
+      const adapters = [...new Set([...turns.map((turn) => turn.adapter), ...(this.pendingSupervisorShutdowns.get(missionId) || [])])];
+      if (adapters.length > 0) {
+        for (const turn of turns) turn.cancel();
+        const results = await Promise.allSettled(adapters.map((adapter) => adapter.shutdown()));
+        const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failures.length) {
+          // Turn completion removes activeSupervisorTurns independently. Retain
+          // failed process ownership outside that map until a retry confirms exit.
+          this.pendingSupervisorShutdowns.set(missionId, new Set(adapters.filter((_, index) => results[index].status === 'rejected')));
+          throw new AggregateError(failures.map((result) => result.reason), 'Supervisor process cleanup failed; retry cancellation.');
+        }
+        this.pendingSupervisorShutdowns.delete(missionId);
+        this.activeSupervisorTurns.delete(missionId);
+      }
+      await this.discardSupervisorSession(missionId, true);
+    };
+    const results = await Promise.allSettled([stopSupervisor(), super.stopMission(missionId)]);
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(failures.map((result) => result.reason), failures.map((result) => String(result.reason)).join('; '));
   }
 
   private async resolveSupervisorPreference(missionId: string): Promise<EffectiveRoutingPreference | undefined> {
@@ -166,13 +184,14 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     return this.v2WorkspaceManager?.resolveRoleExecutionPolicy(missionId, 'orchestrator');
   }
 
-  private async discardSupervisorSession(missionId: string): Promise<void> {
+  private async discardSupervisorSession(missionId: string, requireStopped = false): Promise<void> {
     const session = this.supervisorSessions.get(missionId);
     if (!session) return;
-    this.supervisorSessions.delete(missionId);
     if (session.evictionTimer) clearTimeout(session.evictionTimer);
     await session.adapter.releaseProviderSession(session.providerSessionId).catch(() => undefined);
-    await session.adapter.shutdown().catch(() => undefined);
+    if (requireStopped) await session.adapter.shutdown();
+    else await session.adapter.shutdown().catch(() => undefined);
+    if (this.supervisorSessions.get(missionId) === session) this.supervisorSessions.delete(missionId);
   }
 
   private scheduleSupervisorEviction(missionId: string, session: SupervisorSession): void {

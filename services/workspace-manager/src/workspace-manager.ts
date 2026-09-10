@@ -1336,12 +1336,19 @@ export class WorkspaceManager {
     const records = await this.db.select().from(worktrees).where(eq(worktrees.missionId, missionId));
     const missionTasks = await this.listTasks(missionId);
     const paths = new Set([
-      ...records.map((record) => record.path),
+      ...records.filter((record) => record.status !== 'abandoned').map((record) => record.path),
       ...missionTasks.map((task) => task.worktreeId).filter((value): value is string => Boolean(value)),
     ]);
-    for (const worktreePath of paths) await this.worktreeManager.removeWorktree(worktreePath);
-    for (const task of missionTasks.filter((item) => item.worktreeId)) await this.updateTask(task.id, { worktreeId: null });
-    await this.db.update(worktrees).set({ status: 'abandoned' }).where(eq(worktrees.missionId, missionId));
+    for (const worktreePath of paths) {
+      await this.worktreeManager.removeWorktree(worktreePath);
+      // Checkpoint each path so a later locked worktree does not replay earlier
+      // successful filesystem/Git cleanup on the next deletion attempt.
+      for (const task of missionTasks.filter((item) => item.worktreeId === worktreePath)) {
+        await this.updateTask(task.id, { worktreeId: null });
+      }
+      await this.db.update(worktrees).set({ status: 'abandoned' })
+        .where(and(eq(worktrees.missionId, missionId), eq(worktrees.path, worktreePath)));
+    }
   }
 
   removeWorkspaceCheckpoints(workspacePath: string): void {

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Application, NextFunction, Request, Response as ExpressResponse } from 'express';
+import { isLocalDataRequest } from './local-data-access';
 
 const DEFAULT_HUB_BASE_URL = 'https://atrishub.com';
 const DEFAULT_CACHE_TTL_MS = 30_000;
@@ -409,7 +410,7 @@ export class AtrisAuthService {
   };
 }
 
-export function installAuthRoutes(app: Application, service: AtrisAuthService): void {
+export function installAuthRoutes(app: Application, service: AtrisAuthService, runtimeToken?: string): void {
   app.post('/api/auth/login', async (req, res) => {
     try {
       sendProxyBody(res, await service.login(req.body));
@@ -431,5 +432,11 @@ export function installAuthRoutes(app: Application, service: AtrisAuthService): 
     sendProxyBody(res, await service.logout(extractBearerToken(req)));
   });
 
-  app.use('/api', service.requireAuth, service.requirePremium);
+  app.use('/api', (req, res, next) => {
+    if (isLocalDataRequest(req, runtimeToken)) return next();
+    return service.requireAuth(req, res, (error) => {
+      if (error) return next(error);
+      service.requirePremium(req, res, next);
+    });
+  });
 }

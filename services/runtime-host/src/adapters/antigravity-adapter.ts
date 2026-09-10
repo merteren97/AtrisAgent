@@ -996,12 +996,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const terminate = setTimeout(() => {
       const active = this.activeProcesses.get(sessionId);
       if (!active || active.exitCode !== null || active.signalCode !== null) return;
-      void terminateProcessTree(active);
+      void terminateProcessTree(active).catch((error: Error) => console.warn('[Antigravity] Process cleanup remains pending:', error.message));
 
       const forceKill = setTimeout(() => {
         const stillActive = this.activeProcesses.get(sessionId);
         if (!stillActive || stillActive.exitCode !== null || stillActive.signalCode !== null) return;
-        void terminateProcessTree(stillActive, true);
+        void terminateProcessTree(stillActive, true).catch((error: Error) => console.warn('[Antigravity] Process cleanup remains pending:', error.message));
       }, TERMINAL_FORCE_KILL_MS);
       forceKill.unref?.();
     }, TERMINAL_EXIT_GRACE_MS);

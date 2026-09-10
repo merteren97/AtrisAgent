@@ -70,6 +70,10 @@ async function runTests() {
   await terminateProcessTree(signaledChild, true);
   assert(escalationSignals.length === 1, 'keeps repeated termination safe after signal exit is confirmed');
 
+  const cancelled = await spawnHiddenChecked(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  await terminateProcessTree(cancelled);
+  assert(cancelled.exitCode != null || cancelled.signalCode != null, 'cancellation confirms actual child exit before returning to filesystem cleanup');
+
   const quotedOpenCode = '"C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd"';
   assert(
     normalizeExecutablePath(quotedOpenCode) === 'C:\\Users\\ExampleUser\\AppData\\Roaming\\npm\\opencode.cmd',

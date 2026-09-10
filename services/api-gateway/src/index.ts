@@ -481,8 +481,8 @@ app.use(createRuntimeTokenMiddleware(RUNTIME_TOKEN));
 app.use(express.json({ limit: '2mb' }));
 
 // AtrisHub remains the authoritative identity and Premium entitlement service.
-// Auth routes are installed before the business API gate so login/logout can be
-// reached without a local session, while every other /api route is protected.
+// Local settings/history use the desktop runtime token; execution routes still
+// require the authoritative Hub identity and entitlement.
 const authService = new AtrisAuthService();
 const PORT = resolveGatewayPort();
 const server = http.createServer(app);
@@ -511,7 +511,7 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
 // middleware, while the global runtime-token gate remains the first transport
 // boundary for every request.
 installRuntimeShutdownRoute(app, RUNTIME_TOKEN, shutdownCoordinator);
-installAuthRoutes(app, authService);
+installAuthRoutes(app, authService, RUNTIME_TOKEN);
 export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 
 function routeParam(value: string | string[]): string {
@@ -2956,25 +2956,28 @@ function isDeletionFenced(targetType: 'mission' | 'workspace', targetId: string)
   return Boolean(deletionStore.get(targetType, targetId));
 }
 
+function fenceDeletionMission(missionId: string, stoppedAt: string): void {
+  sqlite.transaction(() => {
+    sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE mission_id = ? AND status IN ('pending', 'processing')").run(stoppedAt, missionId);
+    sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('queued', 'pending_priority', 'starting', 'running')").run(stoppedAt, missionId);
+    sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')").run(stoppedAt, missionId);
+    sqlite.prepare("UPDATE missions SET status = 'cancelled', active_run_id = NULL, completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE id = ?").run(stoppedAt, stoppedAt, missionId);
+  })();
+}
+
 const deletionHandlers: DeletionHandlers = {
   stop: async (operation) => {
     const stoppedAt = new Date().toISOString();
     for (const missionId of deletionMissionIds(operation)) {
       const cancelRun = (orchestrator as any).cancelRun;
       if (typeof cancelRun === 'function') cancelRun.call(orchestrator, missionId);
+      fenceDeletionMission(missionId, stoppedAt);
       await runtimeHost.stopMission(missionId);
       await workspaceManager.cancelMissionTasks(missionId);
-      sqlite.transaction(() => {
-        sqlite.prepare("UPDATE mission_commands SET status = 'cancelled', processed_at = ? WHERE mission_id = ? AND status IN ('pending', 'processing')").run(stoppedAt, missionId);
-        sqlite.prepare("UPDATE conversation_turns SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('queued', 'pending_priority', 'starting', 'running')").run(stoppedAt, missionId);
-        sqlite.prepare("UPDATE mission_runs SET status = 'cancelled', completed_at = ? WHERE mission_id = ? AND status IN ('starting', 'running', 'stopping')").run(stoppedAt, missionId);
-        sqlite.prepare("UPDATE missions SET status = 'cancelled', active_run_id = NULL, completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE id = ?").run(stoppedAt, stoppedAt, missionId);
-      })();
     }
   },
   runtime: async (operation) => {
     for (const missionId of deletionMissionIds(operation)) {
-      await runtimeHost.stopMission(missionId).catch(() => undefined);
       runtimeHost.clearMissionRoutingPreference(missionId, false);
     }
   },
@@ -3433,10 +3436,14 @@ function isPostApplyVerificationPending(missionId: string): boolean {
   return Boolean(operation);
 }
 
-async function recoverGatewayStartup(): Promise<void> {
+export async function recoverGatewayStartup(): Promise<void> {
   const recoveredAt = new Date().toISOString();
   deletionStore.recoverInterrupted();
-  for (const operation of deletionStore.listIncomplete()) await executeDeletion(operation);
+  const pendingDeletions = deletionStore.listIncomplete();
+  const deletingMissionIds = new Set(pendingDeletions.flatMap(deletionMissionIds));
+  // Restore durable fences before any command/completion recovery, but keep
+  // potentially large filesystem cleanup outside the sidecar readiness budget.
+  for (const missionId of deletingMissionIds) fenceDeletionMission(missionId, recoveredAt);
   applyVerificationStore.recoverInterrupted();
   await runtimeHost.reconcileStartup(new Date(recoveredAt));
   sqlite.transaction(() => {
@@ -3459,6 +3466,7 @@ async function recoverGatewayStartup(): Promise<void> {
       id: string; mission_id: string; task_id: string; agent_instance_id: string; error: string | null;
     }>;
   for (const attempt of expiredAttempts) {
+    if (deletingMissionIds.has(attempt.mission_id)) continue;
     const failure = {
       id: `restart-${attempt.id}`,
       type: 'task_failed' as const,
@@ -3486,6 +3494,7 @@ async function recoverGatewayStartup(): Promise<void> {
   }
   const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
   for (const row of pending) await drainMissionCommands(row.mission_id);
+  for (const operation of pendingDeletions) scheduleDeletion(operation);
 }
 
 const startupRecovery = recoverGatewayStartup();

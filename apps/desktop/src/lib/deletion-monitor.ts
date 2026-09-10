@@ -26,10 +26,12 @@ export function startConversationDeletionMonitor(intervalMs = 1_500): () => void
     if (disposed) return;
     polling = true;
     try {
-      for (const id of pendingIds()) {
-        if (disposed) break;
-        await useMissionStore.getState().checkMissionDeletion(id, controller.signal).catch(() => undefined);
-      }
+      const remaining = pendingIds();
+      await Promise.all(Array.from({ length: Math.min(4, remaining.length) }, async () => {
+        for (let id = remaining.shift(); id && !disposed; id = remaining.shift()) {
+          await useMissionStore.getState().checkMissionDeletion(id, controller.signal).catch(() => undefined);
+        }
+      }));
     } finally {
       polling = false;
       schedule();

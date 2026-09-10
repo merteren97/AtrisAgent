@@ -86,7 +86,11 @@ async function runTests() {
 
   const api = express();
   api.use(express.json());
-  installAuthRoutes(api, service);
+  installAuthRoutes(api, service, 'local-test-runtime');
+  api.get('/api/team-templates', (_req, res) => res.json([]));
+  api.put('/api/execution-policies/team_template/:id/:role', (_req, res) => res.json({ success: true }));
+  api.delete('/api/missions/:id', (_req, res) => res.status(202).json({ status: 'pending' }));
+  api.get('/api/missions/:id/deletion', (_req, res) => res.json({ status: 'completed' }));
   api.get('/api/protected', (_req, res) => res.json({ ok: true }));
   api.post('/api/mutation', (_req, res) => res.json({ ok: true }));
   api.get('/api/events/stream', (_req, res) => res.status(200).json({ stream: true }));
@@ -171,6 +175,24 @@ async function runTests() {
     assert.equal(service.cacheSize, cacheSizeBeforeIsolation + 2, 'session cache entries are isolated by token hash');
 
     state.outage = true;
+    const callsBeforeLocal = state.calls.length;
+    const localHeaders = { 'X-Atris-Runtime-Token': 'local-test-runtime', Authorization: `Bearer ${invalidToken}` };
+    for (const [method, pathname, expectedStatus] of [
+      ['GET', '/api/team-templates', 200],
+      ['PUT', '/api/execution-policies/team_template/default/builder', 200],
+      ['DELETE', '/api/missions/offline', 202],
+      ['GET', '/api/missions/offline/deletion', 200],
+    ] as const) {
+      response = await request(pathname, { method, headers: localHeaders });
+      assert.equal(response.status, expectedStatus, `${method} ${pathname} works locally even with an expired Hub token`);
+    }
+    assert.equal(state.calls.length, callsBeforeLocal, 'local settings and deletion never contact Hub');
+    response = await request('/api/team-templates', { headers: { 'X-Atris-Runtime-Token': 'wrong' } });
+    assert.equal(response.status, 401, 'an invalid local token cannot authorize configuration access');
+    response = await request('/api/team-templates?runtimeToken=local-test-runtime', { headers: localHeaders });
+    assert.notEqual(response.status, 200, 'query runtime tokens cannot enable local data access');
+    response = await request('/api/mutation', { method: 'POST', headers: localHeaders });
+    assert.equal(response.status, 503, 'a local runtime token does not authorize agent execution during a Hub outage');
     response = await request('/api/mutation', { method: 'POST', ...withBearer(premiumToken) });
     body = await readJson(response);
     assert.equal(response.status, 503, 'mutations fail closed when AtrisHub is unavailable');
