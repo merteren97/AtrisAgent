@@ -227,14 +227,44 @@ async function runTests() {
     assert(codexCommandEvents[0]?.runId === 'codex-run-1' && codexCommandEvents[0]?.attemptId === 'codex-attempt-1', 'Codex preserves run and attempt ids when provided');
     assert(codexMcpEvents[0]?.toolCallId === 'mcp-1' && codexMcpEvents[1]?.toolCallId === 'mcp-1', 'Codex preserves MCP item id across start and completion');
     assert(codexCommandEvents[2]?.toolCallId && codexCommandEvents[3]?.toolCallId && codexCommandEvents[2].toolCallId !== codexCommandEvents[3].toolCallId, 'Codex fallback ids are deterministic event keys and do not fabricate a cross-event match');
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.completed', item: { id: 'mcp-error', type: 'mcp_tool_call', tool: 'search', error: { message: 'fetch failed' } } }));
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.completed', item: { id: 'mcp-app-error', type: 'mcp_tool_call', tool: 'search', result: { isError: true, content: [{ type: 'text', text: 'connection closed' }] } } }));
+    assert(emittedEvents.some((event: any) => event.toolCallId === 'mcp-error' && event.success === false && event.result.includes('fetch failed')), 'Codex preserves error-only MCP failures with correlation');
+    assert(emittedEvents.some((event: any) => event.toolCallId === 'mcp-app-error' && event.success === false && event.result.includes('connection closed')), 'Codex recognizes MCP application errors');
+    const diagnosticCount = emittedEvents.length;
+    (codexAdapter as any).handleDiagnosticLine('test-codex-session', 'Reading additional input from stdin...');
+    assert(emittedEvents.length === diagnosticCount, 'Codex stdin notice does not become an error or worker response');
+    (codexAdapter as any).handleDiagnosticLine('test-codex-session', 'ERROR exec_command failed: blocked by policy');
+    assert(emittedEvents.some((event: any) => event.type === 'agent_error' && event.error.includes('blocked by policy')), 'Codex preserves genuine policy diagnostics');
+    (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Unable to implement: command execution was blocked.' } }));
     (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 80, output_tokens: 20 } }));
+    assert(emittedEvents.some((event: any) => event.type === 'task_completed' && event.result === 'Unable to implement: command execution was blocked.'), 'Codex passes actual worker outcome to orchestration instead of a generic success summary');
+    (codexAdapter as any).handleProcessExit('test-codex-session', 0, null);
     (codexAdapter as any).handleJsonLine('test-codex-session', JSON.stringify({ type: 'turn.failed', error: { message: 'late duplicate' } }));
     assert(emittedEvents.filter((event) => event.type === 'task_completed').length === 1, 'CodexAdapter emits one terminal event when completed and failed signals race');
     const codexUsage = await codexAdapter.getUsage('test-codex-session');
     assert(codexUsage?.inputTokens === 80 && codexUsage.outputTokens === 20 && codexUsage.totalCost === null, 'Codex records official token usage without fabricating cost');
+    (codexAdapter as any).sessionContext.set('codex-no-result', codexContext);
+    (codexAdapter as any).handleProcessExit('codex-no-result', 0, null);
+    assert(emittedEvents.some((event: any) => event.type === 'task_failed' && event.agentInstanceId === 'codex-no-result' && event.error.includes('without a turn.completed')), 'Clean Codex exit without protocol completion cannot mark work completed');
 
     emittedEvents.length = 0;
     const openCodeAdapter = new OpenCodeAdapter(eventBus);
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNREFUSED', message: 'connection refused' } }); };
+      let transportError = '';
+      try {
+        await (openCodeAdapter as any).fetchServer({ url: 'http://127.0.0.1:1', username: 'test', password: 'secret' }, '/session', { method: 'POST' });
+      } catch (error) { transportError = String(error); }
+      assert(transportError.includes('OpenCode POST /session') && transportError.includes('ECONNREFUSED') && !transportError.includes('secret'), 'OpenCode transport failure identifies operation and network cause without credentials');
+      const abortController = new AbortController();
+      abortController.abort(new Error('Already cancelled'));
+      let wasAborted = false;
+      globalThis.fetch = async (_input, init) => { wasAborted = Boolean(init?.signal?.aborted); throw init?.signal?.reason; };
+      try { await (openCodeAdapter as any).fetchServer({ url: 'http://127.0.0.1:1', username: 'test', password: 'secret' }, '/event', { signal: abortController.signal }); } catch { /* expected cancellation */ }
+      assert(wasAborted, 'OpenCode forwards a signal that was already aborted before the request');
+    } finally { globalThis.fetch = originalFetch; }
     (openCodeAdapter as any).sessionContext.set('test-opencode-session', {
       missionId: 'm-1',
       taskId: 't-opencode',

@@ -65,6 +65,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
   private terminalSessions = new Set<string>();
+  private finalMessages = new Map<string, string>();
   private fallbackToolEventSequence = new Map<string, number>();
 
   constructor(eventBus?: LocalEventBus) {
@@ -405,32 +406,25 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       buffer = lines.pop() || '';
       for (const line of lines) this.handleJsonLine(sessionId, line);
     });
+    let stderrBuffer = '';
     child.stderr?.on('data', (chunk: Buffer) => {
-      if (this.isSessionCancelled(sessionId)) return;
-      const error = redactSecrets(chunk.toString('utf8'));
-      if (error.trim()) this.emitEvent({
-        id: crypto.randomUUID(), type: 'agent_error', missionId: options.missionId,
-        taskId: options.taskId, agentInstanceId: sessionId, error,
-        timestamp: new Date().toISOString(),
-      });
+      stderrBuffer += chunk.toString('utf8');
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() || '';
+      for (const line of lines) this.handleDiagnosticLine(sessionId, line);
     });
     child.on('error', (error) => this.emitFailure(sessionId, error.message));
     child.on('close', (code, signal) => {
       if (buffer.trim()) this.handleJsonLine(sessionId, buffer);
+      if (stderrBuffer.trim()) this.handleDiagnosticLine(sessionId, stderrBuffer);
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
       revokeControlPlaneAgent(sessionId);
-      if (!this.isSessionCancelled(sessionId) && !this.terminalSessions.has(sessionId)) {
-        if (code === 0) this.emitCompleted(sessionId, 'Codex process completed.');
-        else this.emitFailure(
-          sessionId,
-          signal ? `Codex terminated by signal ${signal}` : `Codex exited with code ${code}`,
-          code,
-        );
-      }
+      this.handleProcessExit(sessionId, code, signal);
       this.sessionContext.delete(sessionId);
       this.terminalSessions.delete(sessionId);
+      this.finalMessages.delete(sessionId);
       this.fallbackToolEventSequence.delete(sessionId);
       this.clearSessionCancellation(sessionId);
     });
@@ -451,6 +445,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     if (event.type === 'item.completed' || event.type === 'item.started' || event.type === 'item.updated') {
       const item = event.item || {};
       if (item.type === 'agent_message' && item.text) {
+        if (event.type === 'item.completed') this.finalMessages.set(sessionId, redactSecrets(item.text));
         this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: item.text, timestamp });
       } else if (item.type === 'reasoning' && (item.text || item.summary)) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: item.text || item.summary, timestamp });
@@ -470,7 +465,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
         }
         if (event.type === 'item.completed') {
           const correlation = codexCorrelationFields(event, item, this.toolCallIdForEvent(sessionId, event, item));
-          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: name, result: redactSecrets(JSON.stringify(item.result || '')), success: !item.error, ...correlation, timestamp });
+          this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: name, result: redactSecrets(JSON.stringify(item.error ? { error: item.error, result: item.result } : item.result ?? '')), success: !item.error && item.result?.isError !== true, ...correlation, timestamp });
         }
       } else if (item.type === 'file_change') {
         for (const change of item.changes || []) {
@@ -481,11 +476,31 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     }
     if (event.type === 'turn.completed') {
       this.recordProviderUsage(sessionId, event);
-      this.emitCompleted(sessionId, 'Codex turn completed');
+      this.emitCompleted(sessionId, this.finalMessages.get(sessionId) || 'Codex turn completed');
     } else if (event.type === 'turn.failed' || event.type === 'error') {
       this.recordProviderUsage(sessionId, event);
       this.emitFailure(sessionId, event.error?.message || event.message || 'Codex turn failed');
     }
+  }
+
+  private handleProcessExit(sessionId: string, code: number | null, signal: string | null): void {
+    if (code === 0) this.emitFailure(sessionId, 'Codex exited without a turn.completed event; task completion could not be verified.', code);
+    else this.emitFailure(sessionId, signal ? `Codex terminated by signal ${signal}` : `Codex exited with code ${code}`, code);
+  }
+
+  private handleDiagnosticLine(sessionId: string, line: string): void {
+    const context = this.sessionContext.get(sessionId);
+    if (!context || this.isSessionCancelled(sessionId)) return;
+    const message = redactSecrets(line).trim();
+    if (!message) return;
+    // This is a CLI input notice, not a provider failure. Keep it out of the
+    // task transcript as well: text_delta is consumed as worker output.
+    if (/^Reading additional input (?:from|for prompt from) stdin\.{0,3}$/i.test(message)) return;
+    this.emitEvent({
+      id: crypto.randomUUID(), type: 'agent_error', missionId: context.missionId,
+      taskId: context.taskId, agentInstanceId: sessionId, error: message,
+      timestamp: new Date().toISOString(),
+    });
   }
 
   private toolCallIdForEvent(sessionId: string, event: any, item: any): string {

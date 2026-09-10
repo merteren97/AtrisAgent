@@ -8,15 +8,19 @@ import type { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { runCommand } from '@atris-agent-code/runtime-host';
 import { ManualProviderBridge, readTail } from './manual-provider-bridge';
 import { ManualAntigravityBridge } from './manual-antigravity-bridge';
+import { manualContentTitle, manualProviderName } from './manual-titles';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
   runtimeType: string; model: string; accountProfileId: string; providerSessionId: string;
   cwd: string; configDir: string; sharedProfile: boolean; createdAt: string;
   reasoning?: string;
+  autoName?: boolean;
+  nameSourceId?: string;
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
 export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean }
+export interface ManualNamingUpdate { conversationId: string; agentId: string; agentName?: string; conversationTitle?: string }
 
 const fail = (message: string, status = 400): never => { throw Object.assign(new Error(message), { status }); };
 function required(value: unknown, label: string, limit = 200): string {
@@ -66,7 +70,10 @@ export class ManualConversationStore {
       CREATE INDEX IF NOT EXISTS manual_agents_conversation ON manual_agent_sessions(conversation_id);
       CREATE TABLE IF NOT EXISTS manual_memory_receipts (
         agent_id TEXT NOT NULL REFERENCES manual_agent_sessions(id) ON DELETE CASCADE,
-        source_id TEXT NOT NULL, PRIMARY KEY(agent_id, source_id));`);
+         source_id TEXT NOT NULL, PRIMARY KEY(agent_id, source_id));
+       CREATE TABLE IF NOT EXISTS manual_automatic_titles (
+         conversation_id TEXT PRIMARY KEY REFERENCES manual_conversations(id) ON DELETE CASCADE,
+         source_id TEXT);`);
   }
   list(workspaceId: string): ManualConversation[] {
     const rows = this.sqlite.prepare('SELECT id, workspace_id AS workspaceId, title, created_at AS createdAt FROM manual_conversations WHERE workspace_id = ? ORDER BY created_at DESC').all(workspaceId) as Omit<ManualConversation, 'agents'>[];
@@ -78,11 +85,14 @@ export class ManualConversationStore {
   conversation(id: string): { id: string; workspaceId: string } {
     return this.sqlite.prepare('SELECT id, workspace_id AS workspaceId FROM manual_conversations WHERE id = ?').get(id) as {id: string; workspaceId: string} || fail('Conversation not found.', 404);
   }
-  create(workspaceId: string, title: string, id: string = randomUUID()): ManualConversation {
+  create(workspaceId: string, title: string | undefined, id: string = randomUUID()): ManualConversation {
     this.workspace(workspaceId);
     const existing = this.sqlite.prepare('SELECT workspace_id FROM manual_conversations WHERE id = ?').get(id) as {workspace_id: string} | undefined;
     if (existing && existing.workspace_id !== workspaceId) return fail('Conversation identity conflict.', 409);
-    if (!existing) this.sqlite.prepare('INSERT INTO manual_conversations VALUES (?, ?, ?, ?)').run(id, workspaceId, title, new Date().toISOString());
+    if (!existing) this.sqlite.transaction(() => {
+      this.sqlite.prepare('INSERT INTO manual_conversations VALUES (?, ?, ?, ?)').run(id, workspaceId, title ?? 'New conversation', new Date().toISOString());
+      if (title === undefined) this.sqlite.prepare('INSERT INTO manual_automatic_titles (conversation_id) VALUES (?)').run(id);
+    })();
     return this.list(workspaceId).find(c => c.id === id)!;
   }
   agent(id: string): ManualAgent {
@@ -94,6 +104,7 @@ export class ManualConversationStore {
   }
   remove(id: string): void {
     this.sqlite.transaction(() => {
+      this.sqlite.prepare('DELETE FROM manual_automatic_titles WHERE conversation_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id IN (SELECT id FROM manual_agent_sessions WHERE conversation_id = ?)').run(id);
       this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE conversation_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_conversations WHERE id = ?').run(id);
@@ -111,10 +122,41 @@ export class ManualConversationStore {
   markMemoryProcessed(agentId: string, sourceId: string): void {
     this.sqlite.prepare('INSERT OR IGNORE INTO manual_memory_receipts VALUES (?, ?)').run(agentId, sourceId);
   }
-  readMessages(id: string) {
+  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate } {
     const agent = this.agent(id);
-    if (agent.runtimeType === 'antigravity') return {supported:true,...new ManualAntigravityBridge(this.dataDir).read(agent)};
-    return readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
+    const result = agent.runtimeType === 'antigravity'
+      ? {supported:true,...new ManualAntigravityBridge(this.dataDir).read(agent)}
+      : readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
+    return { ...result, naming: this.syncTitles(id, result.bound ? result.messages : []) };
+  }
+  needsTitle(id: string): boolean {
+    const agent = this.agent(id);
+    return Boolean((agent.autoName && !agent.nameSourceId) || this.sqlite.prepare('SELECT 1 FROM manual_automatic_titles WHERE conversation_id = ? AND source_id IS NULL').get(agent.conversationId));
+  }
+  syncTitles(id: string, messages: ManualMessage[]): ManualNamingUpdate {
+    return this.sqlite.transaction(() => {
+      const agent = this.agent(id);
+      const automatic = this.sqlite.prepare('SELECT source_id FROM manual_automatic_titles WHERE conversation_id = ?').get(agent.conversationId) as {source_id: string | null} | undefined;
+      const pending = (agent.autoName && !agent.nameSourceId) || (automatic && !automatic.source_id);
+      const candidate = pending ? messages.filter(message => message.role === 'user').map(message => ({ id: message.id, title: manualContentTitle(message.text) })).find(message => message.title) : undefined;
+      if (candidate?.title) {
+        if (agent.autoName && !agent.nameSourceId) {
+          const names = new Set((this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE conversation_id = ? AND id != ?').all(agent.conversationId, id) as {record: string}[]).map(row => (JSON.parse(row.record) as ManualAgent).name));
+          let name = candidate.title;
+          for (let index = 2; names.has(name); index++) name = `${candidate.title} (${index})`;
+          agent.name = name;
+          agent.nameSourceId = candidate.id;
+          this.sqlite.prepare('UPDATE manual_agent_sessions SET record = ? WHERE id = ?').run(JSON.stringify(agent), id);
+        }
+        if (automatic && !automatic.source_id) {
+          this.sqlite.prepare('UPDATE manual_conversations SET title = ? WHERE id = ?').run(candidate.title, agent.conversationId);
+          this.sqlite.prepare('UPDATE manual_automatic_titles SET source_id = ? WHERE conversation_id = ?').run(`${id}:${candidate.id}`, agent.conversationId);
+          automatic.source_id = candidate.id;
+        }
+      }
+      const title = automatic?.source_id ? (this.sqlite.prepare('SELECT title FROM manual_conversations WHERE id = ?').get(agent.conversationId) as {title: string}).title : undefined;
+      return { conversationId: agent.conversationId, agentId: id, agentName: agent.nameSourceId ? agent.name : undefined, conversationTitle: title };
+    })();
   }
   updateModel(id: string, expectedCatalogId: string, catalogId: string, model: string, reasoning?: string): ManualAgent {
     return this.sqlite.transaction(() => {
@@ -137,6 +179,13 @@ export class ManualConversationStore {
         }
         const count = this.sqlite.prepare('SELECT COUNT(*) AS n FROM manual_agent_sessions WHERE conversation_id = ?').get(agent.conversationId) as {n: number};
         if (count.n >= 30) return fail('A manual conversation supports up to 30 agents.', 409);
+        if (agent.autoName) {
+          const names = new Set((this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE conversation_id = ?').all(agent.conversationId) as {record: string}[]).map(row => (JSON.parse(row.record) as ManualAgent).name));
+          const prefix = manualProviderName(agent.runtimeType);
+          let index = 1;
+          while (names.has(`${prefix} ${index}`)) index++;
+          agent.name = `${prefix} ${index}`;
+        }
         this.sqlite.prepare('INSERT INTO manual_agent_sessions (id, conversation_id, record) VALUES (?, ?, ?)').run(agent.id, agent.conversationId, JSON.stringify(agent));
         result.push(agent);
       }
@@ -196,7 +245,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   app.post('/api/manual/conversations', route((req, res) => {
     const id = required(req.body.id, 'conversation ID');
     if (!/^[a-f0-9-]{36}$/i.test(id)) return fail('Invalid conversation identity.');
-    res.json(store.create(required(req.body.workspaceId, 'project'), required(req.body.title, 'title'), id));
+    res.json(store.create(required(req.body.workspaceId, 'project'), req.body.title === undefined ? undefined : required(req.body.title, 'title'), id));
   }));
   app.post('/api/manual/conversations/:conversationId/agents', route(async (req, res) => {
     const conversation = store.conversation(idParam(req, 'conversationId'));
@@ -222,7 +271,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       if (!['claude_code', 'codex', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('This provider does not expose a supported interactive CLI yet.');
       const workspace = store.workspace(conversation.workspaceId);
       const cwd = fs.realpathSync(workspace.path);
-      agents.push({ id, conversationId: conversation.id, name: required(input.name, 'agent name'),
+      agents.push({ id, conversationId: conversation.id, name: input.name === undefined ? manualProviderName(profile.runtimeType) : required(input.name, 'agent name'), autoName: input.name === undefined,
         catalogId: descriptor.catalogId, runtimeType: profile.runtimeType, model: descriptor.runtimeModelId,
         reasoning: resolveReasoning(input.reasoning, descriptor),
         accountProfileId: profile.id, providerSessionId: randomUUID(), cwd, configDir: profile.configDir,
@@ -269,7 +318,12 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     res.json({ id: agent.id, executable: installation.path, args, cwd: agent.cwd, env });
   }));
   app.get('/api/manual/agents/:id/messages', route((req, res) => res.json(store.readMessages(idParam(req, 'id')))));
-  app.get('/api/manual/agents/:id/activity', route((req, res) => res.json(bridge.activity(store.agent(idParam(req, 'id'))))));
+  app.get('/api/manual/agents/:id/activity', route((req, res) => {
+    const id = idParam(req, 'id');
+    // The shell polls every open terminal, including unselected Code panes.
+    const naming = store.needsTitle(id) ? store.readMessages(id).naming : store.syncTitles(id, []);
+    res.json({ ...bridge.activity(store.agent(id)), naming });
+  }));
   app.patch('/api/manual/agents/:id/model', route(async (req, res) => {
     const agent = store.agent(idParam(req, 'id'));
     const catalogId = required(req.body.catalogId, 'model');

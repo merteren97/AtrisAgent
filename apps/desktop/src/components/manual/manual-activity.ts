@@ -3,7 +3,7 @@ import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { apiRequest } from '@/lib/api-client';
 import { isTauriRuntime } from '@/lib/secure-storage';
-import { useManualStore, type ManualAgent } from '@/stores/manual-store';
+import { useManualStore, type ManualAgent, type ManualNamingUpdate } from '@/stores/manual-store';
 import type { TerminalSnapshot } from './manual-terminal';
 
 export interface AgentActivity { lifecycle: TerminalSnapshot['status']; state: string; at?: string; checkedAt: number }
@@ -43,8 +43,9 @@ export function useManualActivityMonitor() {
           const epoch = useManualActivity.getState().launched[id];
           try {
             const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after: 0, statusOnly: true });
-            const activity = snapshot.status === 'open' ? await apiRequest<{ state: string; at?: string }>(`/manual/agents/${id}/activity`).catch(() => ({ state: 'unknown', at: undefined })) : { state: 'unknown', at: undefined };
+            const activity: { state: string; at?: string; naming?: ManualNamingUpdate } = snapshot.status === 'open' ? await apiRequest<{ state: string; at?: string; naming?: ManualNamingUpdate }>(`/manual/agents/${id}/activity`).catch(() => ({ state: 'unknown', at: undefined })) : { state: 'unknown', at: undefined };
             if (disposed || epoch !== useManualActivity.getState().launched[id]) return;
+            useManualStore.getState().applyNaming(activity.naming);
             const verified = activity.at && Date.parse(activity.at) >= (epoch || 0) && Date.parse(activity.at) <= Date.now() + 5000;
             useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: snapshot.status, state: verified ? activity.state : 'unknown', at: verified ? activity.at : undefined, checkedAt: Date.now() } } }));
           } catch { if (!disposed) useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: 'disconnected', state: 'unknown', checkedAt: Date.now() } } })); }
