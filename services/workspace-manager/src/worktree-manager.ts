@@ -20,12 +20,12 @@ interface NewSiblingOperationMarker {
   published: boolean;
 }
 
-async function git(args: string[], cwd: string): Promise<{ stdout: string; stderr: string }> {
+async function git(args: string[], cwd: string, timeoutMs = GIT_COMMAND_TIMEOUT_MS): Promise<{ stdout: string; stderr: string }> {
   const result = await execFileAsync('git', args, {
     cwd,
     windowsHide: true,
     maxBuffer: 20 * 1024 * 1024,
-    timeout: GIT_COMMAND_TIMEOUT_MS,
+    timeout: timeoutMs,
     killSignal: 'SIGKILL',
   });
   return { stdout: String(result.stdout || ''), stderr: String(result.stderr || '') };
@@ -535,6 +535,9 @@ export class WorktreeManager {
   }
 
   async removeWorktree(worktreePath: string, force: boolean = true, basePath?: string): Promise<void> {
+    // Completed paths are common on durable retry. Do not probe/prune the
+    // gateway's working directory for a resource that is already gone.
+    if (!fs.existsSync(worktreePath)) return;
     const worktreeIsGit = fs.existsSync(worktreePath) && await this.isGitRepository(worktreePath);
     let cwd = basePath || (fs.existsSync(worktreePath) ? worktreePath : process.cwd());
     if (worktreeIsGit) cwd = (await this.resolveGitOwner(worktreePath)) || cwd;
@@ -542,17 +545,17 @@ export class WorktreeManager {
 
     if (isGit) {
       try {
-        await git(['worktree', 'remove', ...(force ? ['--force'] : []), worktreePath], cwd);
+        await git(['worktree', 'remove', ...(force ? ['--force'] : []), worktreePath], cwd, 10_000);
       } catch {
-        if (fs.existsSync(worktreePath)) await fs.promises.rm(worktreePath, { recursive: true, force: true });
+        if (fs.existsSync(worktreePath)) await fs.promises.rm(worktreePath, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
       }
       try {
-        await git(['worktree', 'prune'], cwd);
+        await git(['worktree', 'prune'], cwd, 5_000);
       } catch {
         // Ignore cleanup-only prune failures.
       }
     } else if (fs.existsSync(worktreePath)) {
-      await fs.promises.rm(worktreePath, { recursive: true, force: true });
+      await fs.promises.rm(worktreePath, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
     }
   }
 

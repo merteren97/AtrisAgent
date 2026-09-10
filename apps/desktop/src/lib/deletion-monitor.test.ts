@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { startConversationDeletionMonitor } from './deletion-monitor';
 import { useMissionStore, type Mission } from '@/stores/mission-store';
+import { apiRequest, ApiRequestTimeoutError } from './api-client';
 
 const originalFetch = globalThis.fetch;
 const mission: Mission = { id: 'delete-background', workspaceId: 'workspace', title: 'Disposable test', status: 'cancelled', createdAt: '2026-09-06', deletionState: { status: 'pending', operationId: 'delete-op' } };
@@ -57,4 +58,28 @@ try {
   assert.equal(useMissionStore.getState().deletionTracking['hidden-delete']?.result.status, 'completed', 'hidden deletion completion is retained after a workspace list switch');
   assert.equal(checks, 1, 'hidden deletion is reconciled without requiring a visible mission row');
 } finally { disposeHidden(); globalThis.fetch = originalFetch; }
+// One stalled status read must not hold up another completed conversation.
+let releaseSlow!: () => void;
+const slow = new Promise<void>((resolve) => { releaseSlow = resolve; });
+globalThis.fetch = async (input) => {
+  if (String(input).includes('/slow/')) await slow;
+  return new Response(JSON.stringify({ status: 'completed' }), { headers: { 'content-type': 'application/json' } });
+};
+useMissionStore.setState({ missions: [{ ...mission, id: 'slow' }, { ...mission, id: 'fast' }], deletionTracking: {} });
+const disposeParallel = startConversationDeletionMonitor(5);
+try {
+  const deadline = Date.now() + 1_000;
+  while (useMissionStore.getState().missions.some((item) => item.id === 'fast') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(useMissionStore.getState().missions.map((item) => item.id), ['slow'], 'completed deletion is observed while another status request is blocked');
+} finally { disposeParallel(); releaseSlow(); globalThis.fetch = originalFetch; }
+
+globalThis.fetch = async (_input, init) => new Response(new ReadableStream({
+  start(controller) {
+    init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason), { once: true });
+  },
+}), { headers: { 'content-type': 'application/json' } });
+try {
+  await assert.rejects(apiRequest('/missions/body-timeout/deletion', { timeoutMs: 20 }), ApiRequestTimeoutError,
+    'request deadline covers a stalled JSON body after response headers arrive');
+} finally { globalThis.fetch = originalFetch; }
 console.log('background conversation deletion tests passed');

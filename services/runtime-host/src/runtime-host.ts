@@ -1444,7 +1444,7 @@ export class RuntimeHost {
     const sessionIds = [...this.activeSessions.entries()]
       .filter(([, active]) => active.missionId === missionId && (!runId || active.runId === runId))
       .map(([sessionId]) => sessionId);
-    for (const sessionId of sessionIds) {
+    const stop = async (sessionId: string) => {
       const active = this.activeSessions.get(sessionId);
       if (active && this.eventBus) {
         this.eventBus.emit({
@@ -1459,6 +1459,16 @@ export class RuntimeHost {
         });
       }
       await this.stopSession(sessionId);
+    };
+    const failures: unknown[] = [];
+    const remaining = [...sessionIds];
+    await Promise.all(Array.from({ length: Math.min(4, remaining.length) }, async () => {
+      for (let sessionId = remaining.shift(); sessionId; sessionId = remaining.shift()) {
+        try { await stop(sessionId); } catch (error) { failures.push(error); }
+      }
+    }));
+    if (failures.length) {
+      throw new AggregateError(failures, `Could not stop ${failures.length} mission session(s): ${failures.map(String).join('; ')}`);
     }
     if (!runId) this.clearMissionRoutingPreference(missionId);
   }

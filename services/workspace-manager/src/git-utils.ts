@@ -14,10 +14,13 @@ export async function isGitWorktree(dirPath: string): Promise<boolean> {
     const result = await execFileAsync(
       'git',
       ['rev-parse', '--is-inside-work-tree'],
-      { cwd: dirPath, windowsHide: true, maxBuffer: 1024 * 1024 },
+      { cwd: dirPath, windowsHide: true, maxBuffer: 1024 * 1024, timeout: 5_000, killSignal: 'SIGKILL' },
     );
     return String(result.stdout || '').trim() === 'true';
-  } catch {
+  } catch (error) {
+    if ((error as { killed?: boolean }).killed) {
+      throw new Error('Git repository detection timed out after 5000ms; retry cleanup when the repository is available.', { cause: error });
+    }
     return false;
   }
 }

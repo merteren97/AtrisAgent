@@ -375,7 +375,7 @@ async function requestConversationDeletion(id: string, method: 'GET' | 'DELETE',
   try {
     const response = await apiRequestWithHeaders<ConversationDeletionResponse>(
       `/missions/${encodeURIComponent(id)}${method === 'GET' ? '/deletion' : ''}`,
-      { method, signal },
+      { method, signal, ...(method === 'GET' ? { timeoutMs: 5_000 } : {}) },
     );
     if (signal?.aborted) throw signal.reason;
     return reconcileConversationDeletion(id, deletionResultFromResponse(response.status, response.data));

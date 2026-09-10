@@ -6,6 +6,7 @@ import type { AddressInfo } from 'net';
 import { WebSocket } from 'ws';
 import { eq } from 'drizzle-orm';
 import * as schema from '@atris-agent-code/database';
+import Database from 'better-sqlite3';
 
 async function runTests() {
   console.log('--- Starting API Gateway REST, SSE & WebSocket Tests ---');
@@ -22,7 +23,14 @@ async function runTests() {
     }
   }
 
+  let hubUnavailable = false;
+  let hubCalls = 0;
   const hubServer = http.createServer((req, res) => {
+    hubCalls++;
+    if (hubUnavailable) {
+      res.writeHead(503).end('Test Hub unavailable');
+      return;
+    }
     if (req.url === '/api/auth/me' && req.headers.authorization === 'Bearer integration-premium-token') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
@@ -62,6 +70,11 @@ async function runTests() {
     headers.set('X-Atris-Runtime-Token', 'gateway-runtime-secret');
     return fetch(input, { ...init, headers });
   };
+  const localFetch = (input: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers || {});
+    headers.set('X-Atris-Runtime-Token', 'gateway-runtime-secret');
+    return fetch(input, { ...init, headers });
+  };
 
   let shouldCloseServer = false;
   if (!server.listening) {
@@ -90,6 +103,38 @@ async function runTests() {
   }
 
   try {
+    // An interrupted deletion must fence execution before recovery, while slow
+    // disk cleanup runs after readiness. Exercise actual durable/API state.
+    {
+      const manager = gateway.workspaceManager;
+      const workspace = await manager.createWorkspace({ name: 'Deletion restart fixture', path: process.cwd() });
+      const mission = await manager.createMission({ workspaceId: workspace.id, title: 'Interrupted cleanup', status: 'running' });
+      const now = new Date().toISOString();
+      gateway.db.insert(schema.deletionOperations).values({ id: crypto.randomUUID(), targetType: 'mission', targetId: mission.id,
+        phase: 'worktrees', status: 'running', removeMemory: false, manifest: [], progress: {}, createdAt: now, updatedAt: now }).run();
+      let releaseCleanup!: () => void;
+      const held = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+      const originalRemove = manager.removeMissionWorktrees;
+      let entered = false;
+      manager.removeMissionWorktrees = async (id) => {
+        if (id === mission.id) { entered = true; await held; }
+        else await originalRemove.call(manager, id);
+      };
+      try {
+        const startedAt = performance.now();
+        await gateway.recoverGatewayStartup();
+        assert(performance.now() - startedAt < 1_000 && (await manager.getMission(mission.id))?.status === 'cancelled',
+          'restart restores deletion fences without waiting for blocked filesystem cleanup');
+        await new Promise((resolve) => setImmediate(resolve));
+        const health = await localFetch(`${baseUrl}/health`);
+        assert(entered && health.status === 200, 'local service remains responsive while resumed cleanup is blocked');
+      } finally {
+        releaseCleanup();
+        await waitForDeletion(`/api/missions/${mission.id}/deletion`);
+        manager.removeMissionWorktrees = originalRemove;
+      }
+    }
+
     // Historical auto-apply failures resume publication via the existing Retry
     // endpoint, preserving all completed workers and enforcing target checks.
     {
@@ -255,7 +300,7 @@ async function runTests() {
     // 2b. Agent profile catalog CRUD and scoped binding behavior
     {
       const unauthenticated = await fetch(`${baseUrl}/api/agent-profiles`);
-      assert(unauthenticated.status === 401, 'agent profile catalog requires authenticated Premium access');
+      assert(unauthenticated.status === 401, 'agent profile catalog requires the desktop runtime token');
 
       const createRes = await authorizedFetch(`${baseUrl}/api/agent-profiles`, {
         method: 'POST',
@@ -647,12 +692,14 @@ async function runTests() {
     let teamTemplateId = '';
     {
       const customTemplateName = `Custom Security Team ${Date.now()}`;
-      const listRes = await authorizedFetch(`${baseUrl}/api/team-templates`);
+      hubUnavailable = true;
+      const beforeLocalCalls = hubCalls;
+      const listRes = await localFetch(`${baseUrl}/api/team-templates`);
       const listBody = await listRes.json();
       assert(listRes.status === 200 && Array.isArray(listBody) && listBody.length > 0, 'GET /api/team-templates returns team templates including defaults');
       teamTemplateId = listBody[0]?.id || '';
 
-      const createRes = await authorizedFetch(`${baseUrl}/api/team-templates`, {
+      const createRes = await localFetch(`${baseUrl}/api/team-templates`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -669,7 +716,7 @@ async function runTests() {
         && createBody.workerPools?.find((pool: any) => pool.role === 'reviewer')?.maxParallel === 1,
       'POST /api/team-templates persists normalized global and role worker limits');
 
-      const policyRes = await authorizedFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}/builder`, {
+      const policyRes = await localFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}/builder`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -682,7 +729,7 @@ async function runTests() {
       const policyBody = await policyRes.json();
       assert(policyRes.status === 200 && policyBody.success === true && Array.isArray(policyBody.policies), 'PUT execution policy persists a role-scoped route');
 
-      const policyListRes = await authorizedFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}`);
+      const policyListRes = await localFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}`);
       const policyList = await policyListRes.json();
       const builderPolicy = Array.isArray(policyList) ? policyList.find((policy: any) => policy.role === 'builder') : undefined;
       assert(
@@ -693,6 +740,13 @@ async function runTests() {
         && builderPolicy?.fallbackCatalogIds?.[0] === 'claude_code:test:fallback',
         'GET execution policies restores account, reasoning and ordered fallback fields',
       );
+      const reopened = new Database(path.join(process.env.ATRIS_AGENT_DATA_DIR!, 'atris.db'), { readonly: true });
+      try {
+        const stored = reopened.prepare("SELECT reasoning_level FROM execution_policies WHERE scope_type = 'team_template' AND scope_id = ? AND role = 'builder'").get(teamTemplateId) as { reasoning_level: string };
+        assert(stored?.reasoning_level === 'high', 'offline settings are durable in a separately reopened local database');
+      } finally { reopened.close(); }
+      assert(hubCalls === beforeLocalCalls, 'local template CRUD and routing persistence make zero Hub requests during an outage');
+      hubUnavailable = false;
 
       const mission = await gateway.workspaceManager.createMission({ id: `route-mission-${Date.now()}`, workspaceId: createdWorkspaceId, title: 'Route read model' });
       const task = await gateway.workspaceManager.createTask({ id: `${mission.id}-task`, missionId: mission.id, title: 'Inspect route', assignedRole: 'researcher' });

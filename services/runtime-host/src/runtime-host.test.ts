@@ -1173,6 +1173,30 @@ async function runTests() {
   }
 
   const siblingStagingPath = path.join(os.tmpdir(), 'atris-runtime-target', '.atris-worktrees', 'mission-new', 'task-new');
+  {
+    const host = new RuntimeHostV2(undefined, { watchdogInterval: 0 });
+    const sessions = (host as any).activeSessions as Map<string, any>;
+    for (let index = 0; index < 6; index++) sessions.set(`delete-${index}`, { missionId: 'delete-many', session: {} });
+    let active = 0;
+    let peak = 0;
+    const stopped: string[] = [];
+    (host as any).stopSession = async (id: string) => {
+      peak = Math.max(peak, ++active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active--;
+      stopped.push(id);
+      if (id === 'delete-1') throw new Error('fixture cancellation failed');
+      sessions.delete(id);
+    };
+    let failure = '';
+    try { await host.stopMission('delete-many'); } catch (error) { failure = String(error); }
+    assert(peak === 4 && stopped.length === 6 && active === 0,
+      'mission cancellation runs independent workers concurrently with a bounded limit and waits for all results');
+    assert(failure.includes('fixture cancellation failed') && sessions.has('delete-1'),
+      'failed cancellation stays owned and retryable instead of allowing worktree cleanup');
+    sessions.clear();
+    await host.stopAll();
+  }
   let dispatchedTarget: unknown;
   const targetAwareManager = {
     getTask: async () => ({

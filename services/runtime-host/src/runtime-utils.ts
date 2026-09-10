@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess, type SpawnOptions } from 'child_process';
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from 'child_process';
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -537,26 +537,40 @@ export async function waitForHttp(
 
 export async function terminateProcessTree(child: ChildProcess, force = false): Promise<void> {
   if (child.exitCode != null || child.signalCode != null) return;
-  if (process.platform !== 'win32' && child.pid && detachedProcessGroups.has(child)) {
-    try { process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process group already exited */ }
-    return;
-  }
-  if (process.platform !== 'win32' || !child.pid) {
-    try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process already exited */ }
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/t', ...(force ? ['/f'] : [])], {
-      windowsHide: true,
-      shell: false,
-      stdio: 'ignore',
+  const exited = () => child.exitCode != null || child.signalCode != null;
+  const waitForExit = async (timeoutMs: number): Promise<boolean> => {
+    if (exited()) return true;
+    return new Promise<boolean>((resolve) => {
+      const finish = () => { clearTimeout(timer); child.removeListener('exit', finish); resolve(exited()); };
+      const timer = setTimeout(finish, timeoutMs);
+      child.once('exit', finish);
+      if (exited()) finish();
     });
-    killer.once('error', () => resolve());
-    killer.once('close', () => resolve());
-  });
-  if (child.exitCode === null && child.signalCode === null) {
-    try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* process already exited */ }
+  };
+  if (process.platform === 'win32' && child.pid) {
+    // Windows has no reliable graceful signal for CLI process trees. Kill the
+    // whole owned tree before its root exits and descendants become orphaned.
+    await new Promise<void>((resolve, reject) => {
+      execFile('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], {
+        windowsHide: true, timeout: 5_000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
+      }, (error) => {
+        if (error && !exited()) reject(new Error('Could not terminate the runtime process tree; retry cancellation.', { cause: error }));
+        else resolve();
+      });
+    });
+  } else {
+    const signal = (value: NodeJS.Signals) => {
+      try {
+        if (child.pid && detachedProcessGroups.has(child)) process.kill(-child.pid, value);
+        else child.kill(value);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+    };
+    signal(force ? 'SIGKILL' : 'SIGTERM');
+    if (!force && !(await waitForExit(1_000))) signal('SIGKILL');
   }
+  if (!(await waitForExit(2_000))) throw new Error('Runtime process exit was not confirmed; retry cancellation before cleanup.');
 }
 
 async function findWindowsTerminalExecutable(): Promise<string | undefined> {

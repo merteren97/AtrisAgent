@@ -459,8 +459,10 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     const context = this.sessionContext.get(sessionId);
     if (context) {
       const server = this.getServer(context.serverKey);
-      await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`, { method: 'POST' }).catch(() => undefined);
-      if (server.dedicated) await terminateProcessTree(server.process).catch(() => undefined);
+      const aborted = await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`, { method: 'POST' }, 2_000)
+        .then((response) => response.ok, () => false);
+      if (server.dedicated) await terminateProcessTree(server.process);
+      else if (!aborted) throw new Error('OpenCode did not confirm session cancellation; retry before cleaning its worktree.');
     }
     this.cleanupSession(sessionId);
   }

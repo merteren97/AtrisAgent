@@ -69,8 +69,8 @@ export interface ApiRequestInit extends RequestInit {
   timeoutMs?: number;
 }
 
-async function fetchWithDeadline(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
-  if (timeoutMs <= 0) return fetch(input, init);
+async function fetchWithDeadline<T>(input: RequestInfo | URL, init: RequestInit, timeoutMs: number, consume: (response: Response) => Promise<T>): Promise<T> {
+  if (timeoutMs <= 0) return consume(await fetch(input, init));
 
   const controller = new AbortController();
   let timedOut = false;
@@ -83,7 +83,11 @@ async function fetchWithDeadline(input: RequestInfo | URL, init: RequestInit, ti
   }, timeoutMs);
 
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    const result = await consume(response);
+    if (timedOut) throw new ApiRequestTimeoutError(timeoutMs);
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return result;
   } catch (error) {
     if (timedOut) throw new ApiRequestTimeoutError(timeoutMs);
     throw error;
@@ -99,14 +103,16 @@ export async function apiRequestWithHeaders<T>(pathname: string, init: ApiReques
   if (requestInit.body && !(requestInit.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = getAuthToken();
   if (!skipAuth && token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
-  const response = await fetchWithDeadline(`${getApiBaseUrl()}${pathname.startsWith('/') ? pathname : `/${pathname}`}`, {
+  const { response, payload } = await fetchWithDeadline(`${getApiBaseUrl()}${pathname.startsWith('/') ? pathname : `/${pathname}`}`, {
     ...requestInit,
     headers,
-  }, timeoutMs);
-  const contentType = response.headers.get('content-type') || '';
-  const payload = contentType.includes('application/json')
-    ? await response.json().catch(() => null)
-    : await response.text().catch(() => '');
+  }, timeoutMs, async (response) => {
+    const contentType = response.headers.get('content-type') || '';
+    const payload = contentType.includes('application/json')
+      ? await response.json().catch(() => null)
+      : await response.text().catch(() => '');
+    return { response, payload };
+  });
   if (!response.ok) {
     if (response.status === 401 && !suppressUnauthorized) notifyUnauthorized();
     const message = payload && typeof payload === 'object' && 'error' in payload
@@ -124,7 +130,8 @@ export async function apiRequest<T>(pathname: string, init: ApiRequestInit = {})
 export async function checkApiHealth(): Promise<{ status: string; version?: string; connectedAccounts?: number }> {
   // Health is intentionally public: it reports local process availability,
   // not AtrisHub identity or Premium entitlement.
-  const response = await fetchWithDeadline(`${getApiOrigin()}/health`, { headers: runtimeHeaders() }, HEALTH_REQUEST_TIMEOUT_MS);
-  if (!response.ok) throw new ApiError(`Local service returned ${response.status}`, response.status);
-  return response.json();
+  return fetchWithDeadline(`${getApiOrigin()}/health`, { headers: runtimeHeaders() }, HEALTH_REQUEST_TIMEOUT_MS, async (response) => {
+    if (!response.ok) throw new ApiError(`Local service returned ${response.status}`, response.status);
+    return response.json();
+  });
 }
