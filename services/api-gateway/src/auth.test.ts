@@ -49,6 +49,7 @@ function createHubFetch(state: HubState) {
     if (url.pathname === '/api/auth/login') return jsonResponse(state.loginBody, state.loginStatus);
     if (url.pathname === '/api/auth/logout') return jsonResponse({ message: 'Hub logout complete' });
     if (url.pathname === '/api/apps/agent/access') return jsonResponse({ access: { appId: 'agent', mode: 'PREMIUM', allowed: authorization?.includes('premium-token') === true, announcement: '', version: 1 } });
+    if (url.pathname === '/api/apps/agent/activity') return jsonResponse({ ok: true });
     if (url.pathname === '/api/auth/me') {
       if (state.meFailure === 'not-found') return jsonResponse({ error: 'User not found' }, 404);
       if (state.meFailure === 'server-error') return jsonResponse({ error: 'Hub failure' }, 500);
@@ -251,6 +252,14 @@ async function runTests() {
     body = await readJson(response);
     assert.equal(response.status, 200, 'logout forwards a bearer token to AtrisHub');
     assert.equal(body.forwarded, true, 'successful logout reports that Hub forwarding completed');
+
+    response = await request('/api/auth/activity', { method: 'POST', ...withBearer(premiumToken) });
+    body = await readJson(response);
+    assert.equal(response.status, 200, 'activity forwards bearer token to AtrisHub');
+    assert.equal(body.ok, true, 'successful activity returns Hub response');
+
+    response = await request('/api/auth/activity', { method: 'POST' });
+    assert.equal(response.status, 401, 'activity rejects request without bearer token');
 
     state.outage = true;
     response = await request('/api/auth/logout', { method: 'POST', ...withBearer(premiumToken) });

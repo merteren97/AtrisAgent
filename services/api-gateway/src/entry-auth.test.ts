@@ -8,6 +8,19 @@ async function runTests(): Promise<void> {
   const hubCalls: string[] = [];
   const hubServer = http.createServer((req, res) => {
     hubCalls.push(req.headers.authorization || '');
+    const pathname = req.url ? new URL(req.url, 'http://127.0.0.1').pathname : '';
+    if (pathname === '/api/apps/agent/access' && req.headers.authorization === 'Bearer integration-premium-token') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        access: { appId: 'agent', mode: 'PREMIUM', allowed: true, announcement: '', version: 1 },
+      }));
+      return;
+    }
+    if (pathname === '/api/apps/agent/activity') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
     if (req.headers.authorization === 'Bearer integration-premium-token') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
