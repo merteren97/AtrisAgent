@@ -48,6 +48,7 @@ function createHubFetch(state: HubState) {
 
     if (url.pathname === '/api/auth/login') return jsonResponse(state.loginBody, state.loginStatus);
     if (url.pathname === '/api/auth/logout') return jsonResponse({ message: 'Hub logout complete' });
+    if (url.pathname === '/api/apps/agent/access') return jsonResponse({ access: { appId: 'agent', mode: 'PREMIUM', allowed: authorization?.includes('premium-token') === true, announcement: '', version: 1 } });
     if (url.pathname === '/api/auth/me') {
       if (state.meFailure === 'not-found') return jsonResponse({ error: 'User not found' }, 404);
       if (state.meFailure === 'server-error') return jsonResponse({ error: 'Hub failure' }, 500);

@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ApiError } from '@/lib/api-client';
+import { ApiError, apiRequest } from '@/lib/api-client';
 import {
   clearStoredSession,
   loginWithAtrisAccount,
@@ -9,7 +9,7 @@ import {
   signedOutSession,
   type SessionSnapshot,
 } from '@/lib/auth-client';
-import { hasPremiumAccess } from '@/lib/auth-policy';
+import { hasAgentApplicationAccess } from '@/lib/auth-policy';
 import { registerUnauthorizedHandler } from '@/lib/token-provider';
 
 export type AuthShellState = 'checking' | 'signed-out' | 'offline' | 'premium-required' | 'workspace';
@@ -41,6 +41,27 @@ export function AuthSessionProvider({ children }: { children: ReactNode }) {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!session.token || session.status !== 'authenticated') return;
+    let disposed = false;
+    let busy = false;
+    const token = session.token;
+    const tick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const latest = await apiRequest<Pick<SessionSnapshot, 'user' | 'membership' | 'entitlement' | 'appAccess'>>('/auth/me', { method: 'GET', suppressUnauthorized: true });
+        if (disposed) return;
+        setSession(current => current.token === token ? { ...current, ...latest } : current);
+        if (latest.appAccess?.allowed) await apiRequest('/auth/activity', { method: 'POST', suppressUnauthorized: true });
+      } catch (cause) { if (!disposed) setError(errorMessage(cause, 'Application access could not be refreshed.')); }
+      finally { busy = false; }
+    };
+    void tick();
+    const timer = setInterval(tick, 60000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, [session.token, session.status, session.remembered]);
 
   const checkSession = useCallback(async (showOfflineState = true) => {
     setIsCheckingSession(true);
@@ -128,7 +149,7 @@ export function AuthSessionProvider({ children }: { children: ReactNode }) {
     if (isCheckingSession) return 'checking';
     if (session.status === 'offline') return 'offline';
     if (session.status !== 'authenticated' || !session.user) return 'signed-out';
-    return hasPremiumAccess(session) ? 'workspace' : 'premium-required';
+    return hasAgentApplicationAccess(session) ? 'workspace' : 'premium-required';
   }, [isCheckingSession, session]);
 
   const value = useMemo<AuthSessionContextValue>(() => ({

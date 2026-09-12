@@ -16,6 +16,7 @@ export interface AtrisMembership {
 }
 
 export interface AtrisSession {
+  appAccess?: { appId: string; mode: string; allowed: boolean; announcement: string; version: number };
   user: {
     id: string;
     email?: string;
@@ -201,6 +202,10 @@ export function hasPremiumEntitlement(session: AtrisSession): boolean {
   return status === 'active' && (plan === 'premium' || plan === 'admin');
 }
 
+export function hasAgentAccess(session: AtrisSession): boolean {
+  return session.appAccess?.appId === 'agent' && session.appAccess.allowed === true;
+}
+
 function sendError(res: ExpressResponse, status: number, error: string, code: string): void {
   res.status(status).json({ error, code });
 }
@@ -290,6 +295,12 @@ export class AtrisAuthService {
       if (!response.ok) throw new HubAuthUnavailableError();
 
       const session = normalizePayloadAvatar(parseSession(payload), this.baseUrl) as AtrisSession;
+      const policy = await this.requestHub('/api/apps/agent/access', { method: 'GET', headers: { Authorization: `Bearer ${token}` } });
+      if (policy.response.status === 401 || policy.response.status === 403) { this.cache.delete(tokenHash); throw new HubAuthRejectedError(); }
+      if (!policy.response.ok || !isRecord(policy.payload) || !isRecord(policy.payload.access) ||
+          policy.payload.access.appId !== 'agent' || typeof policy.payload.access.allowed !== 'boolean' ||
+          !['FREE', 'PREVIEW', 'PREMIUM'].includes(String(policy.payload.access.mode))) throw new HubAuthUnavailableError();
+      session.appAccess = policy.payload.access as NonNullable<AtrisSession['appAccess']>;
       const now = this.now();
       this.cache.set(tokenHash, {
         session,
@@ -361,7 +372,7 @@ export class AtrisAuthService {
     try {
       const authenticated = await this.authenticate(token, 'GET');
       if (authenticated.stale) return { allowed: false, status: 503 };
-      const allowed = hasPremiumEntitlement(authenticated.session);
+      const allowed = hasAgentAccess(authenticated.session);
       return { allowed, status: allowed ? 200 : 403 };
     } catch (error) {
       if (error instanceof HubAuthRejectedError) return { allowed: false, status: 401 };
@@ -402,15 +413,24 @@ export class AtrisAuthService {
       sendError(res, 503, 'AtrisAgent could not verify the AtrisHub session. Reconnect to AtrisHub and try again.', 'AUTH_UPSTREAM_UNAVAILABLE');
       return;
     }
-    if (!hasPremiumEntitlement(authenticated.session)) {
+    if (!hasAgentAccess(authenticated.session)) {
       sendError(res, 403, 'Forbidden: Active AtrisAgent premium entitlement required.', 'PREMIUM_REQUIRED');
       return;
     }
     next();
   };
+
+  async activity(token: string): Promise<ProxyResponse> {
+    const result = await this.requestHub('/api/apps/agent/activity', { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+    return { status: result.response.status, body: sanitizePayload(result.payload) };
+  }
 }
 
 export function installAuthRoutes(app: Application, service: AtrisAuthService, runtimeToken?: string): void {
+  app.post('/api/auth/activity', service.requireAuth, async (req, res) => {
+    try { sendProxyBody(res, await service.activity(extractBearerToken(req)!)); }
+    catch { sendError(res, 503, 'Application activity unavailable.', 'AUTH_UPSTREAM_UNAVAILABLE'); }
+  });
   app.post('/api/auth/login', async (req, res) => {
     try {
       sendProxyBody(res, await service.login(req.body));

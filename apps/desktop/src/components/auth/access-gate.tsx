@@ -43,6 +43,7 @@ export function AccessGate({ session, offline = false, error, isLoggingOut, onRe
           <CardDescription className="leading-relaxed">{description}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {session.appAccess?.announcement && <p className="text-sm text-muted-foreground">{session.appAccess.announcement}</p>}
           {error && <p className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive" role="alert">{error}</p>}
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => void onRetry()} variant="default">

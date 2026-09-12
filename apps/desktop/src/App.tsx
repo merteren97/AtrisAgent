@@ -159,6 +159,7 @@ function WorkspaceApp() {
         main={
            <main className="flex min-h-0 min-w-0 flex-1 flex-col">
              <Titlebar />
+             {session.appAccess?.announcement && <p role="status" className="shrink-0 border-b border-border bg-muted/40 px-4 py-2 text-xs">{session.appAccess.announcement}</p>}
              <CommandPalette />
              {activeView === 'chat' && orchestrated && activeMissionId ? (
                <Tabs value={missionSurface} onValueChange={(value) => setMissionSurface(value as 'chat' | 'processes')} className="shrink-0 gap-0 border-b border-border bg-background px-3">

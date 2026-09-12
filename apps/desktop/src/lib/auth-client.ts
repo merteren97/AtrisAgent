@@ -32,6 +32,7 @@ export interface ProductEntitlement {
 }
 
 export interface SessionSnapshot {
+  appAccess?: { appId: string; allowed: boolean; mode: string; announcement: string; version: number };
   status: 'authenticated' | 'signed-out' | 'offline';
   token: string | null;
   user: SessionUser | null;
@@ -41,6 +42,7 @@ export interface SessionSnapshot {
 }
 
 interface AuthResponse {
+  appAccess?: SessionSnapshot['appAccess'];
   token: string;
   user: SessionUser;
   membership?: AtrisMembership;
@@ -48,6 +50,7 @@ interface AuthResponse {
 }
 
 interface MeResponse {
+  appAccess?: SessionSnapshot['appAccess'];
   user: SessionUser;
   membership?: AtrisMembership;
   entitlement?: ProductEntitlement;
@@ -83,6 +86,7 @@ function createSession(response: AuthResponse | MeResponse, token: string, remem
     status: 'authenticated',
     token,
     user: response.user,
+    appAccess: response.appAccess,
     membership: response.membership || membershipFromEntitlement(response.entitlement),
     entitlement,
     remembered,
@@ -162,9 +166,18 @@ export async function loginWithAtrisAccount(email: string, password: string, rem
     body: JSON.stringify({ email, password, remember }),
   });
   if (!response?.token || !response.user) throw new Error('Login response did not include a valid account session.');
-  const session = createSession(response, response.token, remember);
-  await persistSession(session, remember);
-  return session;
+  setAuthToken(response.token);
+  try {
+    const validated = await apiRequest<MeResponse>('/auth/me', { method: 'GET', suppressUnauthorized: true });
+    const session = createSession(validated, response.token, remember);
+    await persistSession(session, remember);
+    return session;
+  } catch (error) {
+    // The token is only provisional until the Hub policy check succeeds. Do
+    // not leave a failed login bearer usable in the in-memory provider.
+    clearAuthToken();
+    throw error;
+  }
 }
 
 export async function refreshSession(token: string, remembered: boolean): Promise<SessionSnapshot> {
