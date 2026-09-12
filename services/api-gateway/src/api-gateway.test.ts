@@ -31,7 +31,8 @@ async function runTests() {
       res.writeHead(503).end('Test Hub unavailable');
       return;
     }
-    if (req.url === '/api/auth/me' && req.headers.authorization === 'Bearer integration-premium-token') {
+    const pathname = req.url ? new URL(req.url, 'http://127.0.0.1').pathname : '';
+    if (pathname === '/api/auth/me' && req.headers.authorization === 'Bearer integration-premium-token') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         user: { id: 'integration-user', email: 'integration@example.test' },
@@ -40,13 +41,44 @@ async function runTests() {
       }));
       return;
     }
-    if (req.url === '/api/auth/me' && req.headers.authorization === 'Bearer integration-free-token') {
+    if (pathname === '/api/auth/me' && req.headers.authorization === 'Bearer integration-free-token') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         user: { id: 'integration-free-user', email: 'free@example.test' },
         membership: { status: 'active', plan: 'Free' },
         entitlement: { product: 'AtrisAgent', status: 'inactive', plan: 'Free' },
       }));
+      return;
+    }
+    if (pathname === '/api/apps/agent/access' && req.headers.authorization === 'Bearer integration-premium-token') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        access: {
+          appId: 'agent',
+          mode: 'PREMIUM',
+          allowed: true,
+          announcement: '',
+          version: 1,
+        },
+      }));
+      return;
+    }
+    if (pathname === '/api/apps/agent/access' && req.headers.authorization === 'Bearer integration-free-token') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        access: {
+          appId: 'agent',
+          mode: 'FREE',
+          allowed: false,
+          announcement: '',
+          version: 1,
+        },
+      }));
+      return;
+    }
+    if (pathname === '/api/apps/agent/activity') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
     res.writeHead(401, { 'content-type': 'application/json' });
