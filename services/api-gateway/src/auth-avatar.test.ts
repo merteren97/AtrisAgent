@@ -27,6 +27,7 @@ assert.equal(
 
 const fetchImpl = async (input: string | URL): Promise<Response> => {
   const path = new URL(String(input)).pathname;
+  if (path === '/api/apps/agent/access') return Response.json({ access: { appId: 'agent', mode: 'PREMIUM', allowed: true, announcement: '', version: 1 } });
   if (path === '/api/auth/login') {
     return Response.json({
       token: 'avatar-login-token',
