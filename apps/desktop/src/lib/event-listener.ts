@@ -4,6 +4,7 @@ import { useAccountStore } from '@/stores/account-store';
 import { getApiOrigin, runtimeHeaders } from '@/lib/api-client';
 import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 import { consumeSseFrames } from '@/lib/sse-parser';
+import { boundStreamContent, compactTimelineMetadata } from '@/lib/timeline-metadata';
 
 let reconnectTimer: number | null = null;
 let streamAbortController: AbortController | null = null;
@@ -12,6 +13,23 @@ let needsReconcile = false;
 let unsubscribeMission: (() => void) | null = null;
 const highestSequenceByMission = new Map<string, number>();
 const refreshedPlanByMission = new Map<string, string>();
+const TEXT_DELTA_BATCH_MS = 16;
+
+type PendingTextDelta = {
+  key: string;
+  eventData: any;
+  content: string;
+  agentRole: string;
+  orchestratorOutput: boolean;
+  eventIds: string[];
+  eventIdsTruncated: boolean;
+  startSequence?: number;
+  endSequence?: number;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const pendingTextDeltas: PendingTextDelta[] = [];
+const MAX_BATCH_EVENT_IDS = 64;
 
 function timestampLabel(value?: string): string {
   const date = value ? new Date(value) : new Date();
@@ -32,6 +50,103 @@ function append(eventData: any, content: string, options: Partial<TimelineItem> 
     agentRole: options.agentRole,
     metadata: { ...eventData, ...options.metadata },
   });
+}
+
+function streamKey(eventData: any, sourceRole: string): string {
+  const agentId = optionalString(eventData.agentInstanceId) || sourceRole;
+  const responseId = optionalString(eventData.turnId)
+    || optionalString(eventData.responseId)
+    || optionalString(eventData.messageId)
+    || optionalString(eventData.taskId)
+    || 'default';
+  return `${eventData.missionId}:${agentId}:${responseId}`;
+}
+
+function projectStreamEventData(eventData: any): any {
+  const projected = { ...eventData };
+  // Keep streamed text in TimelineItem.content only. Holding it in the queued
+  // event object as well doubles the hot-path memory cost.
+  delete projected.content;
+  delete projected.thought;
+  return projected;
+}
+
+function appendBatchEventId(pending: PendingTextDelta, eventData: any): void {
+  const id = optionalString(eventData.id);
+  if (!id || pending.eventIds.includes(id)) return;
+  if (pending.eventIds.length < MAX_BATCH_EVENT_IDS) {
+    pending.eventIds.push(id);
+    return;
+  }
+  // Keep the first IDs and the latest ID. Sequence bounds below cover the
+  // omitted middle when hydration races a still-persisting stream.
+  pending.eventIds[pending.eventIds.length - 1] = id;
+  pending.eventIdsTruncated = true;
+}
+
+function recordSequence(eventData: any): void {
+  if (typeof eventData.sequence === 'number') highestSequenceByMission.set(eventData.missionId, eventData.sequence);
+}
+
+function flushTextDelta(pending: PendingTextDelta): void {
+  clearTimeout(pending.timer);
+  const index = pendingTextDeltas.indexOf(pending);
+  if (index >= 0) pendingTextDeltas.splice(index, 1);
+  const store = useMissionStore.getState();
+  if (!store.activeMissionId || pending.eventData.missionId !== store.activeMissionId) return;
+  append(pending.eventData, pending.content, {
+    type: pending.orchestratorOutput ? 'orchestrator_message' : 'event',
+    agentRole: pending.agentRole,
+    metadata: {
+      streamKey: pending.key,
+      streamEventIds: pending.eventIds,
+      ...(pending.eventIdsTruncated ? { streamEventIdsTruncated: true } : {}),
+      ...(pending.startSequence !== undefined ? { streamStartSequence: pending.startSequence } : {}),
+      ...(pending.endSequence !== undefined ? { streamEndSequence: pending.endSequence, sequence: pending.endSequence } : {}),
+    },
+  });
+  if (pending.eventData.agentInstanceId) {
+    useAgentStore.getState().patchAgent(pending.eventData.agentInstanceId, { lastActivityAt: pending.eventData.timestamp });
+  }
+}
+
+/** Flushes queued stream fragments before an ordered non-text event is applied. */
+export function flushPendingTextDeltas(missionId?: string): void {
+  for (const pending of [...pendingTextDeltas]) {
+    if (!missionId || pending.eventData.missionId === missionId) flushTextDelta(pending);
+  }
+}
+
+function queueTextDelta(eventData: any, content: string, agentRole: string, orchestratorOutput: boolean): void {
+  if (!content) {
+    if (eventData.agentInstanceId) useAgentStore.getState().patchAgent(eventData.agentInstanceId, { lastActivityAt: eventData.timestamp });
+    return;
+  }
+  const key = streamKey(eventData, agentRole);
+  // Only coalesce adjacent fragments. A map keyed by agent would reorder
+  // interleaved streams (A1, B1, A2) when the queues flush.
+  const existing = pendingTextDeltas[pendingTextDeltas.length - 1];
+  if (existing?.key === key) {
+    existing.content = boundStreamContent(existing.content + content);
+    existing.eventData = { ...existing.eventData, ...projectStreamEventData(eventData), id: existing.eventData.id };
+    existing.endSequence = typeof eventData.sequence === 'number' ? eventData.sequence : existing.endSequence;
+    appendBatchEventId(existing, eventData);
+    return;
+  }
+  let pending!: PendingTextDelta;
+  pending = {
+    key,
+    eventData: projectStreamEventData(eventData),
+    content: boundStreamContent(content),
+    agentRole,
+    orchestratorOutput,
+    eventIds: optionalString(eventData.id) ? [eventData.id] : [],
+    eventIdsTruncated: false,
+    startSequence: typeof eventData.sequence === 'number' ? eventData.sequence : undefined,
+    endSequence: typeof eventData.sequence === 'number' ? eventData.sequence : undefined,
+    timer: setTimeout(() => flushTextDelta(pending), TEXT_DELTA_BATCH_MS),
+  };
+  pendingTextDeltas.push(pending);
 }
 
 function shortAgent(agentId?: string): string {
@@ -56,6 +171,7 @@ export function handleIncomingEvent(eventData: any): void {
       return;
     }
   }
+  if (eventData.type !== 'text_delta') flushPendingTextDeltas(eventData.missionId);
   const agents = useAgentStore.getState();
   const isCancelledExecution = (): boolean => {
     const missionCancelled = missions.missions.find((mission) => mission.id === eventData.missionId)?.status === 'cancelled';
@@ -78,7 +194,7 @@ export function handleIncomingEvent(eventData: any): void {
       if (optimistic) {
         useMissionStore.setState((state) => ({ timeline: state.timeline.map((item) => item.type === 'user_message'
           && (item.metadata?.queueId === optimisticId || item.metadata?.clientMessageId === optimisticId)
-          ? { ...item, id: eventData.id, metadata: { ...item.metadata, ...eventData, durable: true, turnId: eventData.turnId } }
+          ? { ...item, id: eventData.id, metadata: { ...item.metadata, ...compactTimelineMetadata(eventData), durable: true, turnId: eventData.turnId } }
           : item) }));
       } else if (!missions.timeline.some((item) => item.id === eventData.id)) append(eventData, content, { type: 'user_message' });
       break;
@@ -300,9 +416,9 @@ export function handleIncomingEvent(eventData: any): void {
       const sourceAgent = agents.agents.find((agent) => agent.id === eventData.agentInstanceId);
       const sourceRole = sourceAgent?.role || eventData.agentRole || eventData.role || 'agent';
       const orchestratorOutput = sourceRole === 'orchestrator' || String(eventData.agentInstanceId || '').startsWith('orchestrator-');
-      append(eventData, eventData.content || '', { type: orchestratorOutput ? 'orchestrator_message' : 'event', agentRole: sourceRole });
-      if (eventData.agentInstanceId) agents.patchAgent(eventData.agentInstanceId, { lastActivityAt: eventData.timestamp });
-      break;
+      queueTextDelta(eventData, String(eventData.content || ''), sourceRole, orchestratorOutput);
+      recordSequence(eventData);
+      return;
     }
 
     case 'agent_tool_call':
@@ -465,7 +581,7 @@ export function handleIncomingEvent(eventData: any): void {
     default:
       append(eventData, `Event: ${eventData.type}`);
   }
-  if (typeof eventData.sequence === 'number') highestSequenceByMission.set(eventData.missionId, eventData.sequence);
+  recordSequence(eventData);
 }
 
 function markTransportGap(): void {
@@ -608,6 +724,7 @@ export function initEventListener(): () => void {
   });
   void connectSse();
   return () => {
+    flushPendingTextDeltas();
     transportActive = false;
     streamAbortController?.abort();
     streamAbortController = null;

@@ -165,7 +165,11 @@ fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool
     };
     let reset = after > replay.sequence || replay.chunks.front().map(|(seq, _)| after.saturating_add(1) < *seq).unwrap_or(false);
     let output = if status_only { String::new() } else { replay.chunks.iter().filter(|(seq, _)| reset || *seq > after).map(|(_, text)| text.as_str()).collect::<String>() };
-    Ok(Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset })
+    let snapshot = Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset };
+    drop(replay);
+    // Snapshot is observational. Status-only polling can race with the full
+    // output poll, so only an explicit close may release the terminal slot.
+    Ok(snapshot)
 }
 #[tauri::command]
 pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String, data: String, paste: bool) -> Result<(), String> {
@@ -207,6 +211,10 @@ pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String
         if let Some(slot) = manager.slot(&id)? {
             let mut slot = slot.lock().map_err(|_| "Agent state is unavailable")?;
             if let Some(terminal) = slot.as_mut() { close(terminal)?; }
+            // The UI removes a closed manual agent immediately. Release the
+            // PTY, replay buffer, and child handles instead of retaining a
+            // closed terminal for the lifetime of the application.
+            *slot = None;
         }
         Ok(())
     }).await.map_err(|e| e.to_string())?

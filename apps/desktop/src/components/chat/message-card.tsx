@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Check, Copy, Loader2, Sparkles, User } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownContent } from './markdown-content';
@@ -18,7 +18,7 @@ interface MessageCardProps {
   deliveryState?: 'queued' | 'starting' | 'cancelled' | 'failed';
 }
 
-export function MessageCard({ role, content, timestamp, deliveryState }: MessageCardProps) {
+export const MessageCard = memo(function MessageCard({ role, content, timestamp, deliveryState }: MessageCardProps) {
   const isUser = role === 'user';
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
   const resetCopyStateTimer = useRef<number | null>(null);
@@ -104,4 +104,6 @@ export function MessageCard({ role, content, timestamp, deliveryState }: Message
       </ContextMenuContent>
     </ContextMenu>
   );
-}
+});
+
+MessageCard.displayName = 'MessageCard';
