@@ -4,6 +4,7 @@ import { ApiError, apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from
 import { useAgentStore } from '@/stores/agent-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useManualStore } from '@/stores/manual-store';
+import { boundStreamContent, compactTimelineMetadata } from '@/lib/timeline-metadata';
 
 export type MissionStatus =
   | 'draft'
@@ -235,6 +236,77 @@ let missionListRequestId = 0;
 const missionStateRequestIds = new Map<string, number>();
 
 const MAX_TERMINAL_DELETION_TRACKING = 64;
+/** Keep durable history on the server while bounding the live desktop projection. */
+export const MAX_TIMELINE_ITEMS = 4_000;
+
+function boundTimeline(items: TimelineItem[]): TimelineItem[] {
+  return items.length > MAX_TIMELINE_ITEMS ? items.slice(-MAX_TIMELINE_ITEMS) : items;
+}
+
+const MAX_MERGED_STREAM_EVENT_IDS = 64;
+
+function metadataNumber(metadata: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = metadata?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function textStreamIdentity(item: TimelineItem): string | undefined {
+  const explicit = metadataString(item.metadata, 'streamKey');
+  if (explicit) return explicit;
+  const agentId = metadataString(item.metadata, 'agentInstanceId');
+  if (!agentId) return undefined;
+  const turnId = metadataString(item.metadata, 'turnId')
+    || metadataString(item.metadata, 'responseId')
+    || metadataString(item.metadata, 'messageId')
+    || metadataString(item.metadata, 'taskId');
+  return `${agentId}:${turnId || 'default'}`;
+}
+
+function adjacentTimelineSequences(previous: TimelineItem, next: TimelineItem): boolean {
+  const previousSequence = metadataNumber(previous.metadata, 'sequence');
+  const nextSequence = metadataNumber(next.metadata, 'sequence');
+  return previousSequence === undefined || nextSequence === undefined || nextSequence === previousSequence + 1;
+}
+
+function mergeStreamMetadata(
+  previous: Record<string, unknown> | undefined,
+  next: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const merged = { ...previous, ...next };
+  const previousIds = Array.isArray(previous?.streamEventIds)
+    ? previous.streamEventIds.filter((value): value is string => typeof value === 'string')
+    : [];
+  const nextIds = Array.isArray(next?.streamEventIds)
+    ? next.streamEventIds.filter((value): value is string => typeof value === 'string')
+    : [];
+  const eventIds = [...new Set([...previousIds, ...nextIds])];
+  if (eventIds.length > 0) {
+    const truncated = Boolean(previous?.streamEventIdsTruncated || next?.streamEventIdsTruncated || eventIds.length > MAX_MERGED_STREAM_EVENT_IDS);
+    merged.streamEventIds = eventIds.length <= MAX_MERGED_STREAM_EVENT_IDS
+      ? eventIds
+      : [...eventIds.slice(0, MAX_MERGED_STREAM_EVENT_IDS / 2), ...eventIds.slice(-MAX_MERGED_STREAM_EVENT_IDS / 2)];
+    if (truncated) merged.streamEventIdsTruncated = true;
+  }
+  const starts = [metadataNumber(previous, 'streamStartSequence'), metadataNumber(next, 'streamStartSequence')].filter((value): value is number => value !== undefined);
+  const ends = [metadataNumber(previous, 'streamEndSequence'), metadataNumber(next, 'streamEndSequence')].filter((value): value is number => value !== undefined);
+  if (starts.length > 0) merged.streamStartSequence = Math.min(...starts);
+  if (ends.length > 0) {
+    merged.streamEndSequence = Math.max(...ends);
+    merged.sequence = merged.streamEndSequence;
+  }
+  return compactTimelineMetadata(merged);
+}
+
+function hasUnpersistedStreamFragment(
+  item: TimelineItem,
+  persistedEventIds: Set<unknown>,
+  persistedMaxSequence: number,
+): boolean {
+  const eventIds = Array.isArray(item.metadata?.streamEventIds) ? item.metadata.streamEventIds : [];
+  if (eventIds.some((id) => typeof id === 'string' && !persistedEventIds.has(id))) return true;
+  const endSequence = metadataNumber(item.metadata, 'streamEndSequence');
+  return endSequence !== undefined && endSequence > persistedMaxSequence;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -609,6 +681,7 @@ function isOrchestratorTextEvent(event: Record<string, any>): boolean {
 
 function timelineFromEvent(event: Record<string, any>): TimelineItem {
   const date = event.timestamp ? new Date(event.timestamp) : new Date();
+  const label = eventLabel(event);
   return {
     id: event.id || crypto.randomUUID(),
     type: event.type === 'user_message'
@@ -616,26 +689,28 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
        : event.type === 'mission_completed' || isOrchestratorTextEvent(event)
         ? 'orchestrator_message'
         : 'event',
-    content: eventLabel(event),
+    content: event.type === 'text_delta' || event.type === 'process_output_delta'
+      ? boundStreamContent(label)
+      : label,
     timestamp: Number.isNaN(date.getTime()) ? nowLabel() : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     eventType: event.type,
     agentRole: event.type === 'user_message'
       ? undefined
       : event.role || event.agentRole
         || (event.type?.includes('verification') || event.type?.includes('check') ? 'qa' : event.type?.includes('review') ? 'reviewer' : undefined),
-    metadata: event,
+    metadata: compactTimelineMetadata(event),
   };
 }
 
 export function restoreMissionTimeline(mission: Mission | undefined, events: Array<Record<string, any>>): TimelineItem[] {
   const restored = reconcileApprovalTimeline(events.map(timelineFromEvent));
-  if (!mission || events.some((event) => event.type === 'user_message')) return restored;
-  return [{
-    id: `request-${mission.id}`,
-    type: 'user_message',
-    content: mission.description || mission.title,
-    timestamp: new Date(mission.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-  }, ...restored];
+  if (!mission || events.some((event) => event.type === 'user_message')) return boundTimeline(restored);
+  return boundTimeline([{
+      id: `request-${mission.id}`,
+      type: 'user_message',
+      content: mission.description || mission.title,
+      timestamp: new Date(mission.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    }, ...restored]);
 }
 
 export type ApprovalDecision = 'approved' | 'rejected';
@@ -902,6 +977,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       // events while it was in flight; replay those too before replacing the
       // agent projection, just as the timeline below retains live-only items.
       const persistedEventIds = new Set(events.map((event) => event.id));
+      const persistedMaxSequence = events.reduce((highest, event) => (
+        typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+          ? Math.max(highest, event.sequence)
+          : highest
+      ), 0);
       const liveAgentEvents = get().timeline.flatMap((item) => {
         const event = item.metadata;
         return event?.missionId === missionId && typeof event.type === 'string'
@@ -925,7 +1005,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         if (current.activeMissionId !== missionId) return { missions };
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
         const liveOnlyItems = current.timeline.filter((item) => (
-          !restoredIds.has(item.id)
+          (!restoredIds.has(item.id) || hasUnpersistedStreamFragment(item, persistedEventIds, persistedMaxSequence))
           && (item.type !== 'user_message'
             || item.metadata?.queued === true
             || item.metadata?.starting === true
@@ -933,13 +1013,41 @@ export const useMissionStore = create<MissionState>((set, get) => ({
             || item.metadata?.cancelled === true
             || typeof item.metadata?.sequence === 'number')
         ));
+        const liveReplacementItems = liveOnlyItems
+          .filter((item) => hasUnpersistedStreamFragment(item, persistedEventIds, persistedMaxSequence));
+        const liveReplacementIds = new Set(liveReplacementItems.map((item) => item.id));
+        const liveReplacementEventIds = new Set<string>();
+        const liveReplacementSequenceRanges: Array<{ eventType: string; start: number; end: number }> = [];
+        for (const item of liveReplacementItems) {
+          for (const eventId of Array.isArray(item.metadata?.streamEventIds) ? item.metadata.streamEventIds : []) {
+            if (typeof eventId === 'string') liveReplacementEventIds.add(eventId);
+          }
+          const start = metadataNumber(item.metadata, 'streamStartSequence');
+          const end = metadataNumber(item.metadata, 'streamEndSequence');
+          if ((item.eventType === 'text_delta' || item.eventType === 'process_output_delta')
+            && start !== undefined && end !== undefined && start <= end) {
+            liveReplacementSequenceRanges.push({ eventType: item.eventType, start, end });
+          }
+        }
         const activePlanId = state.mission?.planId;
         const snapshotTasks = (state.tasks || []).filter((task) => !activePlanId || !task.planId || task.planId === activePlanId);
         const activeTasks = mergeLiveTaskSnapshot(snapshotTasks, current.activeTasks, taskSnapshotAtRequest, activePlanId);
         return {
           missions,
           activeTasks,
-          timeline: reconcileApprovalTimeline([...restoredTimeline, ...liveOnlyItems]),
+          timeline: boundTimeline(reconcileApprovalTimeline([
+            ...restoredTimeline.filter((item) => {
+              if (liveReplacementIds.has(item.id) || liveReplacementEventIds.has(item.id)) return false;
+              const sequence = metadataNumber(item.metadata, 'sequence');
+              return !liveReplacementSequenceRanges.some((range) => (
+                item.eventType === range.eventType
+                  && sequence !== undefined
+                  && sequence >= range.start
+                  && sequence <= range.end
+              ));
+            }),
+            ...liveOnlyItems,
+          ])),
           hydratedMissionId: missionId,
           missionStateLoading: false,
           missionStateError: null,
@@ -988,7 +1096,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       type: 'user_message',
       content: trimmed,
       timestamp: nowLabel(),
-      metadata: {
+      metadata: compactTimelineMetadata({
         targetRole: options?.targetRole,
         routeRole: options?.routeRole,
         routeScope: options?.routeScope,
@@ -999,7 +1107,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         reasoningLevel: options?.reasoningLevel,
         agentProfileIds: normalizeAgentProfileIds(options?.agentProfileIds),
         clientMessageId,
-      },
+      }),
     };
     useAgentStore.getState().setSelectedAgent(null);
     set({
@@ -1063,7 +1171,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           metadata: { pending: true, clientMessageId },
         };
         set((state) => ({
-          timeline: [...state.timeline, pendingCard],
+          timeline: boundTimeline([...state.timeline, pendingCard]),
           loading: false,
           error: null,
           pendingMissionStart: {
@@ -1086,7 +1194,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         agentRole: 'orchestrator',
       };
       set((state) => ({
-        timeline: [...state.timeline, errorCard],
+        timeline: boundTimeline([...state.timeline, errorCard]),
         loading: false,
         error: message,
         pendingMissionStart: null,
@@ -1129,7 +1237,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       type: 'user_message',
       content: trimmed,
       timestamp: nowLabel(),
-      metadata: {
+      metadata: compactTimelineMetadata({
         queued: delivery !== 'stop_and_replan',
         starting: delivery === 'stop_and_replan',
         queueId,
@@ -1142,7 +1250,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         orchestratorReasoningLevel: options?.orchestratorReasoningLevel,
         reasoningLevel: options?.reasoningLevel,
         agentProfileIds: normalizeAgentProfileIds(safeOptions?.agentProfileIds),
-      },
+      }),
     };
     const queuedCard: TimelineItem = {
       id: `queued-event-${queueId}`,
@@ -1156,7 +1264,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     set((state) => ({
       error: null,
       queuedTurns: delivery === 'queue' ? [...state.queuedTurns, { id: queueId, missionId, request: trimmed, options: safeOptions, queuedAt }] : state.queuedTurns,
-      timeline: [...state.timeline, userMessage, queuedCard],
+      timeline: boundTimeline([...state.timeline, userMessage, queuedCard]),
       activeTasks: delivery === 'queue' && CONTINUABLE_CONVERSATION_STATUSES.has(state.missions.find((mission) => mission.id === missionId)?.status || 'draft')
         ? []
         : state.activeTasks,
@@ -1239,6 +1347,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   })),
 
   addTimelineItem: (item) => {
+    item = {
+      ...item,
+      content: item.eventType === 'text_delta' || item.eventType === 'process_output_delta'
+        ? boundStreamContent(item.content)
+        : item.content,
+      metadata: compactTimelineMetadata(item.metadata),
+    };
     set((state) => {
     const eventMissionId = metadataString(item.metadata, 'missionId');
     const mission = state.missions.find((candidate) => candidate.id === (eventMissionId || state.activeMissionId));
@@ -1266,8 +1381,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const queuedTurns = item.eventType === 'turn_queued'
         ? state.queuedTurns
         : state.queuedTurns.filter((turn) => turn.turnId !== turnId && turn.id !== turnId);
-      if (reconciled.some((entry) => entry.id === item.id)) return { ...missionPatch, timeline: reconciled, queuedTurns };
-      return { ...missionPatch, timeline: reconcileApprovalTimeline([...reconciled, item]), queuedTurns };
+      if (reconciled.some((entry) => entry.id === item.id)) return { ...missionPatch, timeline: boundTimeline(reconciled), queuedTurns };
+      return { ...missionPatch, timeline: boundTimeline(reconcileApprovalTimeline([...reconciled, item])), queuedTurns };
     }
     const toolCallId = metadataString(item.metadata, 'toolCallId');
     if (toolCallId && item.eventType === 'tool_call_completed') {
@@ -1275,19 +1390,60 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       if (startedIndex >= 0) {
         const timeline = [...state.timeline];
         timeline[startedIndex] = { ...timeline[startedIndex], content: item.content, timestamp: item.timestamp, eventType: item.eventType, metadata: { ...timeline[startedIndex].metadata, ...item.metadata } };
-        return { ...missionPatch, timeline };
+        return { ...missionPatch, timeline: boundTimeline(timeline) };
+      }
+    }
+    if (item.eventType === 'process_output_delta') {
+      const processIdentity = metadataString(item.metadata, 'processId')
+        || metadataString(item.metadata, 'agentInstanceId')
+        || item.agentRole
+        || 'orchestrator';
+      const previous = state.timeline[state.timeline.length - 1];
+      const previousIdentity = previous
+        ? metadataString(previous.metadata, 'processId')
+          || metadataString(previous.metadata, 'agentInstanceId')
+          || previous.agentRole
+          || 'orchestrator'
+        : undefined;
+      if (previous?.eventType === 'process_output_delta' && previousIdentity === processIdentity && adjacentTimelineSequences(previous, item)) {
+        return {
+          ...missionPatch,
+          timeline: boundTimeline([
+            ...state.timeline.slice(0, -1),
+            {
+              ...previous,
+              content: boundStreamContent(previous.content + item.content),
+              timestamp: item.timestamp,
+              metadata: compactTimelineMetadata({ ...previous.metadata, ...item.metadata }),
+            },
+          ]),
+        };
       }
     }
     if (item.eventType === 'text_delta') {
-      const agentId = metadataString(item.metadata, 'agentInstanceId');
       const previous = state.timeline[state.timeline.length - 1];
-      if (previous?.eventType === 'text_delta' && metadataString(previous.metadata, 'agentInstanceId') === agentId) {
-        return { ...missionPatch, timeline: [...state.timeline.slice(0, -1), { ...previous, content: previous.content + item.content, timestamp: item.timestamp, metadata: { ...previous.metadata, ...item.metadata } }] };
+      const streamIdentity = textStreamIdentity(item);
+      if (previous?.eventType === 'text_delta'
+        && streamIdentity
+        && textStreamIdentity(previous) === streamIdentity
+        && adjacentTimelineSequences(previous, item)) {
+        return {
+          ...missionPatch,
+          timeline: boundTimeline([
+            ...state.timeline.slice(0, -1),
+            {
+              ...previous,
+              content: boundStreamContent(previous.content + item.content),
+              timestamp: item.timestamp,
+              metadata: mergeStreamMetadata(previous.metadata, item.metadata),
+            },
+          ]),
+        };
       }
     }
     return state.timeline.some((entry) => entry.id === item.id)
       ? missionPatch && Object.keys(missionPatch).length > 0 ? missionPatch : state
-      : { ...missionPatch, timeline: reconcileApprovalTimeline([...state.timeline, item]) };
+      : { ...missionPatch, timeline: boundTimeline(reconcileApprovalTimeline([...state.timeline, item])) };
     });
     if (item.eventType?.startsWith('turn_')) {
       const state = get();

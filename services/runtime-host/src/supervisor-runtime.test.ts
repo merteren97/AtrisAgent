@@ -253,6 +253,31 @@ async function runTests() {
     await host.stopAll();
   }
 
+  {
+    const host: any = new RuntimeHostV2(undefined, { watchdogInterval: 0 });
+    const shutdowns: string[] = [];
+    host.supervisorSessions.set('stop-all-failure', {
+      providerSessionId: 'owned-session',
+      adapter: {
+        async releaseProviderSession() { throw new Error('release failed'); },
+        async shutdown() { shutdowns.push('failed'); throw new Error('shutdown failed'); },
+      },
+    });
+    host.supervisorSessions.set('stop-all-independent', {
+      providerSessionId: 'independent-session',
+      adapter: {
+        async releaseProviderSession() {},
+        async shutdown() { shutdowns.push('independent'); },
+      },
+    });
+    let stopAllError: any;
+    try { await host.stopAll(); } catch (error) { stopAllError = error; }
+    assert(stopAllError instanceof AggregateError && stopAllError.errors.length === 2
+      && shutdowns.includes('failed') && shutdowns.includes('independent')
+      && host.supervisorSessions.has('stop-all-failure'),
+      'RuntimeHostV2 reports supervisor cleanup failures after attempting every independent shutdown and retains failed ownership');
+  }
+
   configureRuntimeControlPlaneBridge(undefined);
   console.log(`--- Supervisor Runtime Boundary Tests Complete: ${passed} passed, ${failed} failed ---`);
   if (failed > 0) process.exitCode = 1;

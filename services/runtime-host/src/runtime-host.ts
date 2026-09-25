@@ -1476,8 +1476,26 @@ export class RuntimeHost {
   async stopAll(): Promise<void> {
     if (this.watchdog) clearInterval(this.watchdog);
     this.watchdog = undefined;
-    for (const sessionId of [...this.activeSessions.keys()]) await this.stopSession(sessionId);
-    for (const adapter of this.adapters.values()) await adapter.shutdown();
+    const failures: unknown[] = [];
+    await Promise.all([...this.activeSessions.keys()].map(async (sessionId) => {
+      try {
+        await this.stopSession(sessionId);
+      } catch (error) {
+        // Continue cleaning independent sessions/adapters. A single stuck
+        // provider must not prevent the rest of the runtime from shutting down.
+        failures.push(error);
+      }
+    }));
+    await Promise.all([...this.adapters.values()].map(async (adapter) => {
+      try {
+        await adapter.shutdown();
+      } catch (error) {
+        failures.push(error);
+      }
+    }));
+    if (failures.length) {
+      throw new AggregateError(failures, `Runtime shutdown completed with ${failures.length} cleanup failure(s).`);
+    }
   }
 
   private requireAdapter(id: string): BaseRuntimeAdapter {

@@ -20,15 +20,34 @@ struct Terminal {
     master: Box<dyn MasterPty + Send>, writer: Arc<Mutex<Box<dyn Write + Send>>>, child: Box<dyn Child + Send + Sync>,
     replay: Arc<Mutex<Replay>>, closed: bool,
 }
+#[derive(Default)]
+struct TerminalSlot { terminal: Mutex<Option<Terminal>>, closing: AtomicBool }
 #[derive(Default, Clone)]
-pub struct ManualTerminals { sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Option<Terminal>>>>>>, stopping: Arc<AtomicBool> }
+pub struct ManualTerminals { sessions: Arc<Mutex<HashMap<String, Arc<TerminalSlot>>>>, stopping: Arc<AtomicBool> }
 impl ManualTerminals {
-    fn slot(&self, id: &str) -> Result<Option<Arc<Mutex<Option<Terminal>>>>, String> {
+    fn slot(&self, id: &str) -> Result<Option<Arc<TerminalSlot>>, String> {
         Ok(self.sessions.lock().map_err(|_| "Terminal state is unavailable")?.get(id).cloned())
+    }
+    fn remove_slot(&self, id: &str, slot: &Arc<TerminalSlot>) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().map_err(|_| "Terminal state is unavailable")?;
+        if matches!(sessions.get(id), Some(current) if Arc::ptr_eq(current, slot)) { sessions.remove(id); }
+        Ok(())
+    }
+    fn remove_idle_slot(&self, id: &str) -> Result<(), String> {
+        let Some(slot) = self.slot(id)? else { return Ok(()); };
+        let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+        if slot.closing.load(Ordering::SeqCst)
+            || terminal_slot.as_ref().map(|terminal| !terminal.closed).unwrap_or(false) {
+            return Ok(());
+        }
+        slot.closing.store(true, Ordering::SeqCst);
+        *terminal_slot = None;
+        drop(terminal_slot);
+        self.remove_slot(id, &slot)
     }
     pub fn has_live_sessions(&self) -> bool {
         self.sessions.lock().map(|sessions| sessions.values().any(|slot| {
-            match slot.try_lock() {
+            match slot.terminal.try_lock() {
                 Ok(mut slot) => slot.as_mut().map(|t| !t.closed && matches!(t.child.try_wait(), Ok(None))).unwrap_or(false),
                 Err(_) => true, // Starting/writing: keep the app alive without blocking the window thread.
             }
@@ -37,7 +56,7 @@ impl ManualTerminals {
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let slots = self.sessions.lock().map(|mut sessions| sessions.drain().map(|(_, slot)| slot).collect::<Vec<_>>()).unwrap_or_default();
-        for slot in slots { if let Ok(mut value) = slot.lock() { if let Some(terminal) = value.as_mut() { let _ = close(terminal); } } }
+        for slot in slots { if let Ok(mut value) = slot.terminal.lock() { if let Some(terminal) = value.as_mut() { let _ = close(terminal); } } }
     }
 }
 #[derive(Deserialize)]
@@ -76,9 +95,11 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     if manager.stopping.load(Ordering::SeqCst) { return Err("Application is shutting down".into()); }
     if request.id.len() != 36 || !request.id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return Err("Invalid agent identity".into()); }
     if !Path::new(&request.cwd).is_dir() || !Path::new(&request.executable).is_file() { return Err("The CLI executable or project directory is unavailable".into()); }
-    let slot = manager.sessions.lock().map_err(|_| "Terminal state is unavailable")?.entry(request.id.clone()).or_insert_with(|| Arc::new(Mutex::new(None))).clone();
-    let mut slot = slot.lock().map_err(|_| "Agent state is unavailable")?;
-    if let Some(existing) = slot.as_mut() {
+    let session = manager.sessions.lock().map_err(|_| "Terminal state is unavailable")?.entry(request.id.clone()).or_insert_with(|| Arc::new(TerminalSlot::default())).clone();
+    if session.closing.load(Ordering::SeqCst) { return Err("Agent terminal is closing".into()); }
+    let mut terminal_slot = session.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+    if session.closing.load(Ordering::SeqCst) { return Err("Agent terminal is closing".into()); }
+    if let Some(existing) = terminal_slot.as_mut() {
         if !existing.closed && matches!(existing.child.try_wait(), Ok(None)) { return Ok(()); }
         close(existing)?;
     }
@@ -140,14 +161,26 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     });
     let mut terminal = Terminal { master: pair.master, writer, child, replay, closed: false };
     if manager.stopping.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Application is shutting down".into()); }
-    *slot = Some(terminal);
+    if session.closing.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Agent terminal is closing".into()); }
+    *terminal_slot = Some(terminal);
     Ok(())
+}
+
+fn start_with_cleanup(manager: ManualTerminals, request: Launch) -> Result<(), String> {
+    let id = request.id.clone();
+    match start(manager.clone(), request) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = manager.remove_idle_slot(&id);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn manual_terminal_start(state: State<'_, ManualTerminals>, request: Launch) -> Result<(), String> {
     let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || start(manager, request)).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || start_with_cleanup(manager, request)).await.map_err(|e| e.to_string())?
 }
 #[tauri::command]
 pub async fn manual_terminal_snapshot(state: State<'_, ManualTerminals>, id: String, after: u64, status_only: Option<bool>) -> Result<Snapshot, String> {
@@ -157,15 +190,19 @@ pub async fn manual_terminal_snapshot(state: State<'_, ManualTerminals>, id: Str
 fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool) -> Result<Snapshot, String> {
     let disconnected = || Snapshot { id: id.clone(), status: "disconnected".into(), sequence: 0, output: String::new(), reset: true };
     let Some(slot) = manager.slot(&id)? else { return Ok(disconnected()); };
-    let mut slot = slot.lock().map_err(|_| "Agent state is unavailable")?;
-    let Some(terminal) = slot.as_mut() else { return Ok(disconnected()); };
+    let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+    let Some(terminal) = terminal_slot.as_mut() else { return Ok(disconnected()); };
     let replay = terminal.replay.lock().map_err(|_| "Terminal output is unavailable")?;
     let status = if terminal.closed { "closed" } else {
         match terminal.child.try_wait() { Ok(Some(_)) => "exited", Ok(None) if !replay.ended => "open", _ => "disconnected" }
     };
     let reset = after > replay.sequence || replay.chunks.front().map(|(seq, _)| after.saturating_add(1) < *seq).unwrap_or(false);
     let output = if status_only { String::new() } else { replay.chunks.iter().filter(|(seq, _)| reset || *seq > after).map(|(_, text)| text.as_str()).collect::<String>() };
-    Ok(Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset })
+    let snapshot = Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset };
+    drop(replay);
+    // Snapshot is observational. Status-only polling can race with the full
+    // output poll, so only an explicit close may release the terminal slot.
+    Ok(snapshot)
 }
 #[tauri::command]
 pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String, data: String, paste: bool) -> Result<(), String> {
@@ -174,12 +211,14 @@ pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String
     let manager = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let slot = manager.slot(&id)?.ok_or("Open the agent first")?;
-        let mut slot = slot.lock().map_err(|_| "Agent state is unavailable")?;
-        let terminal = slot.as_mut().ok_or("Open the agent first")?;
+        if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+        let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+        if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+        let terminal = terminal_slot.as_mut().ok_or("Open the agent first")?;
         if terminal.closed || !matches!(terminal.child.try_wait(), Ok(None)) { return Err("Agent is not connected".into()); }
         let writer = terminal.writer.clone();
         // A full PTY input buffer must not prevent Close from reaching the child.
-        drop(slot);
+        drop(terminal_slot);
         let mut writer = writer.lock().map_err(|_| "Terminal input is unavailable")?;
         if paste {
             writer.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
@@ -195,21 +234,34 @@ pub async fn manual_terminal_resize(state: State<'_, ManualTerminals>, id: Strin
     let manager = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
     let slot = manager.slot(&id)?.ok_or("Open the agent first")?;
-    let slot = slot.lock().map_err(|_| "Agent state is unavailable")?;
-    let terminal = slot.as_ref().ok_or("Open the agent first")?;
+    if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+    let terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+    if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+    let terminal = terminal_slot.as_ref().ok_or("Open the agent first")?;
     terminal.master.resize(PtySize { rows: rows.clamp(2, 300), cols: columns.clamp(2, 500), pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?
 }
+
+fn close_session(manager: &ManualTerminals, id: &str) -> Result<(), String> {
+    let Some(slot) = manager.slot(id)? else { return Ok(()); };
+    if slot.closing.swap(true, Ordering::SeqCst) { return Err("Agent terminal is already closing".into()); }
+    let result = (|| {
+        let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+        if let Some(terminal) = terminal_slot.as_mut() { close(terminal)?; }
+        *terminal_slot = None;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        slot.closing.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+    manager.remove_slot(id, &slot)
+}
+
 #[tauri::command]
 pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String) -> Result<(), String> {
     let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Some(slot) = manager.slot(&id)? {
-            let mut slot = slot.lock().map_err(|_| "Agent state is unavailable")?;
-            if let Some(terminal) = slot.as_mut() { close(terminal)?; }
-        }
-        Ok(())
-    }).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || close_session(&manager, &id)).await.map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
@@ -222,6 +274,32 @@ mod tests {
         assert!(replay.bytes <= REPLAY_LIMIT);
         assert_eq!(replay.sequence, 200);
         assert!(replay.chunks.front().unwrap().0 > 1);
+    }
+
+    #[test]
+    fn closing_empty_session_removes_its_registry_entry() {
+        let manager = ManualTerminals::default();
+        let id = "00000000-0000-4000-8000-000000000001";
+        manager.sessions.lock().unwrap().insert(id.into(), Arc::new(TerminalSlot::default()));
+        close_session(&manager, id).unwrap();
+        assert!(manager.slot(id).unwrap().is_none());
+        assert!(manager.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_terminal_start_removes_its_empty_registry_entry() {
+        let manager = ManualTerminals::default();
+        let id = "00000000-0000-4000-8000-000000000002";
+        let error = start_with_cleanup(manager.clone(), Launch {
+            id: id.into(),
+            executable: std::env::current_exe().unwrap().to_string_lossy().to_string(),
+            args: Vec::new(),
+            cwd: std::env::temp_dir().to_string_lossy().to_string(),
+            env: HashMap::from([("UNSUPPORTED".into(), "value".into())]),
+        }).unwrap_err();
+        assert_eq!(error, "Unsupported CLI environment override");
+        assert!(manager.slot(id).unwrap().is_none());
+        assert!(manager.sessions.lock().unwrap().is_empty());
     }
 
     #[cfg(windows)]
@@ -249,7 +327,7 @@ mod tests {
                 // ConPTY inherits the terminal cursor. A real xterm renderer answers this query.
                 if !replied_to_cursor && result.output.contains("\x1b[6n") {
                     let slot = manager.slot(id).unwrap().unwrap();
-                    let mut slot = slot.lock().unwrap();
+                    let mut slot = slot.terminal.lock().unwrap();
                     let terminal = slot.as_mut().unwrap();
                     let mut writer = terminal.writer.lock().unwrap();
                     writer.write_all(b"\x1b[1;1R").unwrap(); writer.flush().unwrap();
@@ -264,7 +342,7 @@ mod tests {
         wait_for(third, "native-ready"); wait_for(fourth, "native-ready");
         {
             let slot = manager.slot(first).unwrap().unwrap();
-            let mut slot = slot.lock().unwrap();
+            let mut slot = slot.terminal.lock().unwrap();
             let terminal = slot.as_mut().unwrap();
             let mut writer = terminal.writer.lock().unwrap();
             writer.write_all(b"isolation-check\r").unwrap(); writer.flush().unwrap();
@@ -275,16 +353,19 @@ mod tests {
         assert!(snapshot(&manager, first.into(), replay.sequence, false).unwrap().output.is_empty());
         {
             let slot = manager.slot(first).unwrap().unwrap();
-            let writer = slot.lock().unwrap().as_ref().unwrap().writer.clone();
+            let writer = slot.terminal.lock().unwrap().as_ref().unwrap().writer.clone();
             let _busy_input = writer.lock().unwrap();
             // Closing cannot depend on the input lock, even when a write is blocked.
-            close(slot.lock().unwrap().as_mut().unwrap()).unwrap();
+            close(slot.terminal.lock().unwrap().as_mut().unwrap()).unwrap();
         }
         assert_eq!(snapshot(&manager, first.into(), 0, true).unwrap().status, "closed");
         assert_eq!(snapshot(&manager, second.into(), 0, true).unwrap().status, "open");
         assert_eq!(snapshot(&manager, third.into(), 0, true).unwrap().status, "open");
         assert_eq!(snapshot(&manager, fourth.into(), 0, true).unwrap().status, "open");
         assert!(manager.has_live_sessions());
+        close_session(&manager, second).unwrap();
+        assert!(manager.slot(second).unwrap().is_none(), "closed terminal session is removed from the registry");
+        assert_eq!(snapshot(&manager, second.into(), 0, true).unwrap().status, "disconnected");
         manager.shutdown();
         assert!(!manager.has_live_sessions());
     }

@@ -109,22 +109,48 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   override async stopAll(): Promise<void> {
     unregisterSupervisorTurnRunner(this.supervisorRunner);
     this.supervisorRouting.clear();
-    const sessions = [...this.supervisorSessions.values()];
-    this.supervisorSessions.clear();
-    for (const session of sessions) {
+    const failures: unknown[] = [];
+    const recordFailure = (error: unknown) => failures.push(error);
+    const sessions = [...this.supervisorSessions.entries()];
+    await Promise.all(sessions.map(async ([missionId, session]) => {
+      let sessionFailed = false;
       if (session.evictionTimer) clearTimeout(session.evictionTimer);
-      await session.adapter.releaseProviderSession(session.providerSessionId).catch(() => undefined);
-      await session.adapter.shutdown().catch(() => undefined);
-    }
-    const turns = [...this.activeSupervisorTurns.values()].flatMap((missionTurns) => [...missionTurns]);
-    for (const turn of turns) turn.cancel();
-    await Promise.all(turns.map((turn) => turn.adapter.shutdown().catch(() => undefined)));
+      try { await session.adapter.releaseProviderSession(session.providerSessionId); } catch (error) { sessionFailed = true; recordFailure(error); }
+      try { await session.adapter.shutdown(); } catch (error) { sessionFailed = true; recordFailure(error); }
+      if (!sessionFailed) this.supervisorSessions.delete(missionId);
+    }));
+    const turns = [...this.activeSupervisorTurns.entries()];
+    for (const [, missionTurns] of turns) for (const turn of missionTurns) turn.cancel();
+    const failedTurnAdapters = new Map<string, Set<BaseRuntimeAdapter>>();
+    await Promise.all(turns.flatMap(([missionId, missionTurns]) => [...new Set([...missionTurns].map((turn) => turn.adapter))].map(async (adapter) => {
+      try {
+        await adapter.shutdown();
+      } catch (error) {
+        recordFailure(error);
+        const retained = failedTurnAdapters.get(missionId) || new Set<BaseRuntimeAdapter>();
+        retained.add(adapter);
+        failedTurnAdapters.set(missionId, retained);
+      }
+    })));
     this.activeSupervisorTurns.clear();
-    for (const adapters of this.pendingSupervisorShutdowns.values()) {
-      await Promise.all([...adapters].map((adapter) => adapter.shutdown()));
+    for (const [missionId, adapters] of failedTurnAdapters) {
+      const retained = this.pendingSupervisorShutdowns.get(missionId) || new Set<BaseRuntimeAdapter>();
+      for (const adapter of adapters) retained.add(adapter);
+      this.pendingSupervisorShutdowns.set(missionId, retained);
     }
-    this.pendingSupervisorShutdowns.clear();
-    await super.stopAll();
+    const pendingShutdowns = [...this.pendingSupervisorShutdowns.entries()];
+    await Promise.all(pendingShutdowns.map(async ([missionId, adapters]) => {
+      const remaining = new Set<BaseRuntimeAdapter>();
+      await Promise.all([...adapters].map(async (adapter) => {
+        try { await adapter.shutdown(); } catch (error) { remaining.add(adapter); recordFailure(error); }
+      }));
+      if (remaining.size > 0) this.pendingSupervisorShutdowns.set(missionId, remaining);
+      else this.pendingSupervisorShutdowns.delete(missionId);
+    }));
+    await super.stopAll().catch(recordFailure);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `Runtime shutdown completed with ${failures.length} cleanup failure(s).`);
+    }
   }
 
   override setEventBus(eventBus: LocalEventBus): void {

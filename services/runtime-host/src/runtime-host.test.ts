@@ -1199,6 +1199,33 @@ async function runTests() {
     sessions.clear();
     await host.stopAll();
   }
+
+  {
+    const host = new RuntimeHost(undefined, { watchdogInterval: 0 });
+    const sessions = (host as any).activeSessions as Map<string, any>;
+    sessions.set('shutdown-session-1', { session: {} });
+    sessions.set('shutdown-session-2', { session: {} });
+    const stopped: string[] = [];
+    (host as any).stopSession = async (id: string) => {
+      stopped.push(id);
+      if (id === 'shutdown-session-1') throw new Error('fixture session cleanup failed');
+      sessions.delete(id);
+    };
+    let adapterShutdowns = 0;
+    host.registerAdapter({
+      id: 'shutdown-adapter-1',
+      async shutdown() { adapterShutdowns += 1; throw new Error('fixture adapter cleanup failed'); },
+    } as any);
+    host.registerAdapter({
+      id: 'shutdown-adapter-2',
+      async shutdown() { adapterShutdowns += 1; },
+    } as any);
+    let shutdownError = '';
+    try { await host.stopAll(); } catch (error) { shutdownError = String(error); }
+    assert(stopped.length === 2 && adapterShutdowns === 2, 'runtime shutdown attempts every session and adapter even when one cleanup fails');
+    assert(shutdownError.includes('cleanup failure'), 'runtime shutdown reports cleanup failures after best-effort teardown');
+  }
+
   let dispatchedTarget: unknown;
   const targetAwareManager = {
     getTask: async () => ({
