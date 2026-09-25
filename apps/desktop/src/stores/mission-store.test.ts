@@ -15,6 +15,7 @@ import {
 } from './mission-store';
 import { projectMissionProcesses } from '@/lib/process-projection';
 import { ApiRequestTimeoutError } from '@/lib/api-client';
+import { MAX_STREAM_CONTENT_LENGTH } from '@/lib/timeline-metadata';
 import { useAgentStore, type AgentInstance } from '@/stores/agent-store';
 
 assert.equal(missionStartDisposition(202, { accepted: true }), 'accepted', '202 mission starts are treated as accepted');
@@ -85,6 +86,11 @@ assert.equal(persistedTimeline.filter((entry) => entry.type === 'user_message').
 assert.equal(persistedTimeline[0]?.id, 'persisted-user');
 const legacyTimeline = restoreMissionTimeline(mission, []);
 assert.equal(legacyTimeline[0]?.content, mission.description, 'legacy missions without a persisted message synthesize the description');
+const oversizedRestoredStreams = restoreMissionTimeline(undefined, [
+  { id: 'large-text-delta', type: 'text_delta', content: 't'.repeat(MAX_STREAM_CONTENT_LENGTH + 10) },
+  { id: 'large-process-output', type: 'process_output_delta', content: 'p'.repeat(MAX_STREAM_CONTENT_LENGTH + 20) },
+]);
+assert.equal(oversizedRestoredStreams.every((entry) => entry.content.length <= MAX_STREAM_CONTENT_LENGTH), true, 'restored stream history obeys the same content bound as live output');
 
 const processAgent: AgentInstance = { id: 'builder-1', missionId: mission.id, role: 'builder', model: 'gpt-test', status: 'running', parentAgentId: null, taskId: 'task-1' };
 const processes = projectMissionProcesses(mission, [processAgent], [{ id: 'task-1', missionId: mission.id, title: 'Implement UI', description: '', status: 'running' }], [
@@ -344,3 +350,106 @@ assert.equal(useMissionStore.getState().activeTasks.find((task) => task.id === '
 assert.equal(useAgentStore.getState().getAgentsByMission('live-race').find((agent) => agent.id === 'live-builder')?.status, 'completed', 'live agent startup/completion survives an older server snapshot');
 globalThis.fetch = originalFetch;
 console.log('live event hydration merge regression tests passed');
+
+const overlapMissionId = 'stream-overlap';
+const persistedStreamEvents = [
+  { id: 'batch-event-1', type: 'text_delta', missionId: overlapMissionId, sequence: 10, agentInstanceId: 'stream-agent', turnId: 'stream-turn', content: 'first ', timestamp: '2026-09-05T12:10:00Z' },
+  { id: 'batch-event-2', type: 'text_delta', missionId: overlapMissionId, sequence: 11, agentInstanceId: 'stream-agent', turnId: 'stream-turn', content: 'second ', timestamp: '2026-09-05T12:10:01Z' },
+];
+globalThis.fetch = (async (input) => {
+  const url = String(input);
+  if (url.endsWith(`/missions/${overlapMissionId}`)) {
+    return new Response(JSON.stringify({ mission: { id: overlapMissionId, workspaceId: 'workspace-stream', title: 'Stream', status: 'running', createdAt: '2026-09-05T12:10:00Z' } }), { headers: { 'content-type': 'application/json' } });
+  }
+  if (url.includes(`/missions/${overlapMissionId}/events?`)) {
+    return new Response(JSON.stringify(persistedStreamEvents), { headers: { 'content-type': 'application/json' } });
+  }
+  throw new Error(`Unexpected request during stream hydration: ${url}`);
+}) as typeof fetch;
+useMissionStore.setState({
+  missions: [{ id: overlapMissionId, workspaceId: 'workspace-stream', title: 'Stream', status: 'running', createdAt: '2026-09-05T12:10:00Z' }],
+  activeMissionId: overlapMissionId,
+  hydratedMissionId: null,
+  activeTasks: [],
+  timeline: [{
+    id: 'batch-event-1',
+    type: 'event',
+    content: 'first second third',
+    timestamp: '12:10',
+    eventType: 'text_delta',
+    metadata: {
+      id: 'batch-event-1',
+      type: 'text_delta',
+      missionId: overlapMissionId,
+      sequence: 12,
+      agentInstanceId: 'stream-agent',
+      turnId: 'stream-turn',
+      streamEventIds: ['batch-event-1', 'batch-event-2', 'batch-event-3'],
+      streamStartSequence: 10,
+      streamEndSequence: 12,
+    },
+  }],
+});
+await useMissionStore.getState().fetchMissionState(overlapMissionId);
+const overlapTimeline = useMissionStore.getState().timeline.filter((entry) => entry.eventType === 'text_delta');
+assert.equal(overlapTimeline.length, 1, 'hydration replaces every persisted fragment represented by a live batch');
+assert.equal(overlapTimeline[0]?.content, 'first second third', 'partial-overlap hydration retains the complete live stream exactly once');
+globalThis.fetch = originalFetch;
+console.log('partial stream hydration overlap regression tests passed');
+
+const truncatedMissionId = 'truncated-stream-overlap';
+const persistedTruncatedEvents = Array.from({ length: 65 }, (_, index) => ({
+  id: `truncated-fragment-${index}`,
+  type: 'text_delta',
+  missionId: truncatedMissionId,
+  sequence: 100 + index,
+  agentInstanceId: 'truncated-stream-agent',
+  turnId: 'truncated-stream-turn',
+  content: `fragment-${index}|`,
+  timestamp: '2026-09-05T12:11:00Z',
+}));
+const truncatedBatchEventIds = [
+  ...Array.from({ length: 32 }, (_, index) => `truncated-fragment-${index}`),
+  ...Array.from({ length: 32 }, (_, index) => `truncated-fragment-${index + 34}`),
+];
+globalThis.fetch = (async (input) => {
+  const url = String(input);
+  if (url.endsWith(`/missions/${truncatedMissionId}`)) {
+    return new Response(JSON.stringify({ mission: { id: truncatedMissionId, workspaceId: 'workspace-stream', title: 'Truncated stream', status: 'running', createdAt: '2026-09-05T12:11:00Z' } }), { headers: { 'content-type': 'application/json' } });
+  }
+  if (url.includes(`/missions/${truncatedMissionId}/events?`)) {
+    return new Response(JSON.stringify(persistedTruncatedEvents), { headers: { 'content-type': 'application/json' } });
+  }
+  throw new Error(`Unexpected request during truncated stream hydration: ${url}`);
+}) as typeof fetch;
+useMissionStore.setState({
+  missions: [{ id: truncatedMissionId, workspaceId: 'workspace-stream', title: 'Truncated stream', status: 'running', createdAt: '2026-09-05T12:11:00Z' }],
+  activeMissionId: truncatedMissionId,
+  hydratedMissionId: null,
+  activeTasks: [],
+  timeline: [{
+    id: 'truncated-fragment-0',
+    type: 'event',
+    content: 'complete 66-fragment stream',
+    timestamp: '12:11',
+    eventType: 'text_delta',
+    metadata: {
+      id: 'truncated-fragment-0',
+      type: 'text_delta',
+      missionId: truncatedMissionId,
+      sequence: 165,
+      agentInstanceId: 'truncated-stream-agent',
+      turnId: 'truncated-stream-turn',
+      streamEventIds: truncatedBatchEventIds,
+      streamEventIdsTruncated: true,
+      streamStartSequence: 100,
+      streamEndSequence: 165,
+    },
+  }],
+});
+await useMissionStore.getState().fetchMissionState(truncatedMissionId);
+const truncatedOverlapTimeline = useMissionStore.getState().timeline.filter((entry) => entry.eventType === 'text_delta');
+assert.equal(truncatedOverlapTimeline.length, 1, 'sequence bounds replace persisted fragments omitted from a truncated batch ID list');
+assert.equal(truncatedOverlapTimeline[0]?.content, 'complete 66-fragment stream');
+globalThis.fetch = originalFetch;
+console.log('truncated stream hydration overlap regression tests passed');

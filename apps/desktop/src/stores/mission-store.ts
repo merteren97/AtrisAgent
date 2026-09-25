@@ -681,6 +681,7 @@ function isOrchestratorTextEvent(event: Record<string, any>): boolean {
 
 function timelineFromEvent(event: Record<string, any>): TimelineItem {
   const date = event.timestamp ? new Date(event.timestamp) : new Date();
+  const label = eventLabel(event);
   return {
     id: event.id || crypto.randomUUID(),
     type: event.type === 'user_message'
@@ -688,7 +689,9 @@ function timelineFromEvent(event: Record<string, any>): TimelineItem {
        : event.type === 'mission_completed' || isOrchestratorTextEvent(event)
         ? 'orchestrator_message'
         : 'event',
-    content: eventLabel(event),
+    content: event.type === 'text_delta' || event.type === 'process_output_delta'
+      ? boundStreamContent(label)
+      : label,
     timestamp: Number.isNaN(date.getTime()) ? nowLabel() : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     eventType: event.type,
     agentRole: event.type === 'user_message'
@@ -1010,9 +1013,22 @@ export const useMissionStore = create<MissionState>((set, get) => ({
             || item.metadata?.cancelled === true
             || typeof item.metadata?.sequence === 'number')
         ));
-        const liveReplacementIds = new Set(liveOnlyItems
-          .filter((item) => hasUnpersistedStreamFragment(item, persistedEventIds, persistedMaxSequence))
-          .map((item) => item.id));
+        const liveReplacementItems = liveOnlyItems
+          .filter((item) => hasUnpersistedStreamFragment(item, persistedEventIds, persistedMaxSequence));
+        const liveReplacementIds = new Set(liveReplacementItems.map((item) => item.id));
+        const liveReplacementEventIds = new Set<string>();
+        const liveReplacementSequenceRanges: Array<{ eventType: string; start: number; end: number }> = [];
+        for (const item of liveReplacementItems) {
+          for (const eventId of Array.isArray(item.metadata?.streamEventIds) ? item.metadata.streamEventIds : []) {
+            if (typeof eventId === 'string') liveReplacementEventIds.add(eventId);
+          }
+          const start = metadataNumber(item.metadata, 'streamStartSequence');
+          const end = metadataNumber(item.metadata, 'streamEndSequence');
+          if ((item.eventType === 'text_delta' || item.eventType === 'process_output_delta')
+            && start !== undefined && end !== undefined && start <= end) {
+            liveReplacementSequenceRanges.push({ eventType: item.eventType, start, end });
+          }
+        }
         const activePlanId = state.mission?.planId;
         const snapshotTasks = (state.tasks || []).filter((task) => !activePlanId || !task.planId || task.planId === activePlanId);
         const activeTasks = mergeLiveTaskSnapshot(snapshotTasks, current.activeTasks, taskSnapshotAtRequest, activePlanId);
@@ -1020,7 +1036,16 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           missions,
           activeTasks,
           timeline: boundTimeline(reconcileApprovalTimeline([
-            ...restoredTimeline.filter((item) => !liveReplacementIds.has(item.id)),
+            ...restoredTimeline.filter((item) => {
+              if (liveReplacementIds.has(item.id) || liveReplacementEventIds.has(item.id)) return false;
+              const sequence = metadataNumber(item.metadata, 'sequence');
+              return !liveReplacementSequenceRanges.some((range) => (
+                item.eventType === range.eventType
+                  && sequence !== undefined
+                  && sequence >= range.start
+                  && sequence <= range.end
+              ));
+            }),
             ...liveOnlyItems,
           ])),
           hydratedMissionId: missionId,
