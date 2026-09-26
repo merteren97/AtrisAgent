@@ -14,6 +14,7 @@ import {
   Package,
   Rocket,
   RotateCcw,
+  Route,
   ShieldAlert,
   X,
   XCircle,
@@ -67,7 +68,7 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
           timestamp={timestamp}
           badge="Orchestrator"
         />
-        <p className="text-sm leading-relaxed text-foreground/80">
+        <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/80">
           {content || asString(metadata.summary) || 'The Orchestrator created an execution plan.'}
         </p>
         {tasks.length > 0 && (
@@ -126,10 +127,12 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
       && !effectiveDecision
       && (!lifecycleStatus || lifecycleStatus === 'pending');
     const isPlanApproval = approvalType === 'plan' || approvalType === 'plan_approval';
+    const isWorkerRouteApproval = approvalType === 'worker_route';
     const decisionLabel = effectiveDecision === 'approved' ? 'Approved' : 'Rejected';
     const title = effectiveDecision
-      ? `${isPlanApproval ? 'Execution plan' : normalizedType} ${effectiveDecision}`
-      : isPlanApproval ? 'Execution plan approval required' : `${normalizedType} approval required`;
+      ? `${isWorkerRouteApproval ? 'Subagent model selection' : isPlanApproval ? 'Execution plan' : normalizedType} ${effectiveDecision}`
+      : isWorkerRouteApproval ? 'Confirm subagent model selection'
+        : isPlanApproval ? 'Execution plan approval required' : `${normalizedType} approval required`;
 
     const handleDecision = async (nextDecision: 'approved' | 'rejected') => {
       if (!approvalId) {
@@ -159,7 +162,7 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
           title={title}
           timestamp={timestamp}
         />
-        <p className="text-sm leading-relaxed text-foreground/80">
+        <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/80">
           {content || asString(metadata.description) || 'The runtime requested permission for a restricted operation.'}
         </p>
         {submitError && !effectiveDecision && (
@@ -180,10 +183,10 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
           ) : isPendingApproval ? (
             <>
               <Button size="sm" disabled={isSubmitting || !approvalId} onClick={() => void handleDecision('approved')}>
-                <Check className="mr-1.5 h-4 w-4" /> Approve
+                <Check className="mr-1.5 h-4 w-4" />{isWorkerRouteApproval ? 'Use proposed models' : 'Approve'}
               </Button>
               <Button size="sm" variant="outline" disabled={isSubmitting || !approvalId} onClick={() => void handleDecision('rejected')}>
-                <X className="mr-1.5 h-4 w-4" /> Reject
+                <X className="mr-1.5 h-4 w-4" />{isWorkerRouteApproval ? 'Stop this run' : 'Reject'}
               </Button>
             </>
           ) : (
@@ -345,6 +348,7 @@ function CardHeader({ icon, iconClass, title, timestamp, badge }: { icon: ReactN
 }
 
 function approvalIcon(approvalType: string): ReactNode {
+  if (approvalType === 'worker_route') return <Route className="h-4 w-4 text-primary" />;
   if (approvalType.includes('db') || approvalType.includes('migration')) return <Database className="h-4 w-4 text-amber-400" />;
   if (approvalType.includes('package') || approvalType.includes('install')) return <Package className="h-4 w-4 text-amber-400" />;
   if (approvalType.includes('file') || approvalType.includes('write')) return <FileEdit className="h-4 w-4 text-amber-400" />;

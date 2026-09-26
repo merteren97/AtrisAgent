@@ -19,6 +19,18 @@ export type TaskStatus =
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
+/** A route chosen for one planned task, before RuntimeHost verifies it live. */
+export interface TaskRoutePreference {
+  modelCatalogId: string;
+  accountProfileId: string;
+  reasoningLevel?: CanonicalReasoning;
+  fallbackCatalogIds: string[];
+  selectionMode: RouteSelectionMode;
+  modelDisplayName: string;
+  routeLabel?: string;
+  reason?: string;
+}
+
 export type BuilderTargetDescriptor =
   | { kind: 'workspace_root' }
   | { kind: 'existing_project'; projectName: string }
@@ -65,6 +77,10 @@ export interface Task {
   assignedRole: AgentRole | null;
   /** Named profile selected for this task; assignedRole remains authoritative. */
   agentProfileId?: string | null;
+  /** Optional task-specific specialist focus when no named profile is selected. */
+  specialty?: string | null;
+  /** Human-approved route intent; RuntimeHost still verifies the live route. */
+  routePreference?: TaskRoutePreference | null;
   requiredCapabilities: string[];
   dependsOn: string[]; // task IDs
   worktreeId: string | null;

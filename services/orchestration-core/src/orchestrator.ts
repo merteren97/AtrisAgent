@@ -15,6 +15,7 @@ import type {
   PostApplyVerificationResult,
   ApplyVerificationOperationResult,
   BuilderTargetDescriptor,
+  TaskRoutePreference,
 } from '@atris-agent-code/domain';
 import { parseBuilderTargetDescriptor } from '@atris-agent-code/domain';
 import { PolicyEngine, resolveAutomationAction } from '@atris-agent-code/policy-engine';
@@ -43,6 +44,9 @@ export interface StructuredTaskPlan {
   dependsOnIndices?: number[];
   dependsOn?: string[];
   targetDescriptor?: BuilderTargetDescriptor;
+  agentProfileId?: string;
+  specialty?: string;
+  routePreference?: TaskRoutePreference;
 }
 
 export interface StructuredPlan {
@@ -69,6 +73,22 @@ export const StructuredPlanJSONSchema = {
           requiredCapabilities: { type: 'array', items: { type: 'string' } },
           dependsOnIndices: { type: 'array', items: { type: 'number' } },
           targetDescriptor: { type: 'object' },
+          agentProfileId: { type: 'string' },
+          specialty: { type: 'string' },
+          routePreference: {
+            type: 'object',
+            properties: {
+              modelCatalogId: { type: 'string' },
+              accountProfileId: { type: 'string' },
+              reasoningLevel: { type: 'string' },
+              fallbackCatalogIds: { type: 'array', items: { type: 'string' } },
+              selectionMode: { type: 'string', enum: ['auto', 'prefer', 'fixed'] },
+              modelDisplayName: { type: 'string' },
+              routeLabel: { type: 'string' },
+              reason: { type: 'string' },
+            },
+            required: ['modelCatalogId', 'accountProfileId', 'fallbackCatalogIds', 'selectionMode', 'modelDisplayName'],
+          },
         },
         required: ['title', 'description', 'role', 'priority', 'requiredCapabilities'],
       },
@@ -163,6 +183,38 @@ function generateRuleBasedPlanTemplates(request: string): Array<{
   ];
 }
 
+function parseTaskRoutePreference(value: unknown): TaskRoutePreference | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const modelCatalogId = typeof record.modelCatalogId === 'string' ? record.modelCatalogId.trim() : '';
+  const accountProfileId = typeof record.accountProfileId === 'string' ? record.accountProfileId.trim() : '';
+  const modelDisplayName = typeof record.modelDisplayName === 'string' ? record.modelDisplayName.trim() : '';
+  const selectionMode = record.selectionMode;
+  if (!modelCatalogId || !accountProfileId || !modelDisplayName
+    || (selectionMode !== 'auto' && selectionMode !== 'prefer' && selectionMode !== 'fixed')) return undefined;
+  const reasoningLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const reasoningLevel = typeof record.reasoningLevel === 'string' && reasoningLevels.includes(record.reasoningLevel)
+    ? record.reasoningLevel as TaskRoutePreference['reasoningLevel']
+    : undefined;
+  const fallbackCatalogIds = Array.isArray(record.fallbackCatalogIds)
+    ? Array.from(new Set(record.fallbackCatalogIds
+        .filter((id): id is string => typeof id === 'string')
+        .map((id) => id.trim())
+        .filter(Boolean)))
+      .slice(0, 4)
+    : [];
+  return {
+    modelCatalogId,
+    accountProfileId,
+    reasoningLevel,
+    fallbackCatalogIds,
+    selectionMode,
+    modelDisplayName: modelDisplayName.slice(0, 160),
+    routeLabel: typeof record.routeLabel === 'string' ? record.routeLabel.trim().slice(0, 160) : undefined,
+    reason: typeof record.reason === 'string' ? record.reason.trim().slice(0, 300) : undefined,
+  };
+}
+
 /**
  * Validate and repair raw plan JSON to guarantee a clean StructuredPlan DAG.
  */
@@ -241,6 +293,9 @@ export function validateAndRepairPlan(rawPlan: any, userRequest: string): Struct
         requiredCapabilities,
         dependsOnIndices,
         targetDescriptor: role === 'builder' ? parseBuilderTargetDescriptor(task?.targetDescriptor) : undefined,
+        agentProfileId: typeof task?.agentProfileId === 'string' && task.agentProfileId.trim() ? task.agentProfileId.trim() : undefined,
+        specialty: typeof task?.specialty === 'string' && task.specialty.trim() ? task.specialty.trim().slice(0, 100) : undefined,
+        routePreference: parseTaskRoutePreference(task?.routePreference),
       };
     });
   }
@@ -378,6 +433,8 @@ export class Orchestrator {
     assignedRole?: string | null;
     agentInstanceId?: string;
     agentProfileId?: string | null;
+    specialty?: string | null;
+    routePreference?: TaskRoutePreference | null;
     targetDescriptor?: BuilderTargetDescriptor;
   }): void {
     const missionId = params.missionId ?? this.config.missionId ?? '';
@@ -390,6 +447,8 @@ export class Orchestrator {
       assignedRole: params.assignedRole ?? null,
       agentInstanceId: params.agentInstanceId,
       agentProfileId: params.agentProfileId || undefined,
+      specialty: params.specialty || undefined,
+      routePreference: params.routePreference || undefined,
       targetDescriptor: params.targetDescriptor,
       timestamp: new Date().toISOString(),
     });
@@ -747,6 +806,7 @@ export class Orchestrator {
       agentProfileIds?: Partial<Record<AgentRole, string>>;
       rawModelPlanOutput?: string;
       researchContextPlanId?: string;
+      preDispatchApproval?: { type: 'worker_route'; description: string };
     }
   ): Promise<{
     missionId: string;
@@ -898,6 +958,10 @@ export class Orchestrator {
     // Build tasks (and candidate worktrees if candidate mode)
     for (let i = 0; i < structuredPlan.tasks.length; i++) {
       const taskSpec = structuredPlan.tasks[i];
+      const requestedProfileId = options?.agentProfileIds?.[taskSpec.role] || taskSpec.agentProfileId;
+      const taskAgentProfileId = requestedProfileId
+        ? (await this.resolveTaskProfileIds(missionId, [taskSpec.role], { [taskSpec.role]: requestedProfileId }))[taskSpec.role]
+        : agentProfileIds[taskSpec.role];
       const isCandidate = currentExecutionMode === 'candidate'
         && taskSpec.role === 'builder'
         && taskSpec.targetDescriptor?.kind !== 'new_sibling_project';
@@ -930,7 +994,9 @@ export class Orchestrator {
             status: 'planned',
             priority: taskSpec.priority,
             assignedRole: taskSpec.role,
-            agentProfileId: agentProfileIds[taskSpec.role],
+            agentProfileId: taskAgentProfileId,
+            specialty: taskSpec.specialty,
+            routePreference: taskSpec.routePreference,
             requiredCapabilities: taskSpec.requiredCapabilities,
             dependsOn: dependsOnTaskIds,
             worktreeId,
@@ -951,7 +1017,9 @@ export class Orchestrator {
             dependsOn: dependsOnTaskIds,
             worktreeId,
             targetDescriptor: taskSpec.targetDescriptor ?? null,
-            agentProfileId: agentProfileIds[taskSpec.role] || null,
+            agentProfileId: taskAgentProfileId || null,
+            specialty: taskSpec.specialty || null,
+            routePreference: taskSpec.routePreference || null,
             createdAt: now,
             updatedAt: now,
             completedAt: null,
@@ -1016,6 +1084,20 @@ export class Orchestrator {
       await this.transitionMissionDiagnostic({ missionId, status: 'failed', reason });
       throw new Error(reason);
     }
+    if (options?.preDispatchApproval) {
+      if (this.workspaceManager) {
+        await this.workspaceManager.updateMission(missionId, { status: 'waiting_for_approval' as MissionStatus });
+      } else {
+        const cached = this.inMemoryMissions.get(missionId);
+        if (cached) this.inMemoryMissions.set(missionId, { ...cached, status: 'waiting_for_approval' as MissionStatus });
+      }
+      await this.emitApprovalRequested({
+        missionId,
+        approvalType: options.preDispatchApproval.type,
+        description: options.preDispatchApproval.description,
+      });
+      return { missionId, planId, tasks: createdTasks, structuredPlan };
+    }
     const autoApproved = planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
       'plan', `Approve execution plan with ${createdTasks.length} tasks for: ${request}`);
 
@@ -1024,7 +1106,15 @@ export class Orchestrator {
       await this.emitApprovalRequested({
         missionId,
         approvalType: 'plan',
-        description: `Plan with ${createdTasks.length} tasks: ${createdTasks.map((t) => t.title).join(', ')}`,
+        description: `Plan with ${createdTasks.length} tasks:\n${createdTasks.map((task) => {
+          const specialist = task.specialty
+            ? `specialist ${task.specialty}`
+            : task.agentProfileId ? `specialist profile ${task.agentProfileId}` : 'default specialist';
+          const route = task.routePreference
+            ? `${task.routePreference.modelDisplayName}${task.routePreference.routeLabel ? ` — ${task.routePreference.routeLabel}` : ''}`
+            : 'scheduler-selected compatible model';
+          return `• ${task.title} — ${task.assignedRole || 'worker'}; ${specialist}; model: ${route}`;
+        }).join('\n')}`,
       });
 
       if (this.workspaceManager) {
@@ -1181,6 +1271,8 @@ export class Orchestrator {
       assignedRole: roleToAssign,
       agentInstanceId,
       agentProfileId: task?.agentProfileId,
+      specialty: task?.specialty,
+      routePreference: task?.routePreference,
       targetDescriptor: task?.targetDescriptor ?? undefined,
     });
 
@@ -1198,6 +1290,8 @@ export class Orchestrator {
       assignedAgentId: agentInstanceId,
       assignedRole: roleToAssign,
       agentProfileId: null,
+      specialty: null,
+      routePreference: null,
       requiredCapabilities: [],
       dependsOn: [],
       worktreeId: null,
@@ -1628,7 +1722,7 @@ export class Orchestrator {
       return;
     }
 
-    if (approvalType === 'plan') {
+    if (approvalType === 'plan' || approvalType === 'worker_route') {
       const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission?.planId);
       const pending = tasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
       const roots = this.dependencyFreeRoots(pending);

@@ -1,3 +1,5 @@
+import type { TaskRoutePreference } from './task';
+
 export type ProjectIdentityStatus = 'active' | 'detached' | 'archived';
 
 export type MemoryNodeType =
@@ -172,7 +174,12 @@ export interface OrchestratorDelegation {
   dependsOnDelegationIds?: string[];
   preferredParallelGroup?: string | null;
   targetDescriptor?: import('./task').BuilderTargetDescriptor;
+  agentProfileId?: string;
+  specialty?: string;
+  routePreference?: TaskRoutePreference;
 }
+
+export type OrchestratorWorkerRole = OrchestratorDelegation['role'];
 
 export interface OrchestratorDecision {
   turnId: string;
@@ -180,6 +187,8 @@ export interface OrchestratorDecision {
   response?: string;
   clarifyingQuestions?: string[];
   delegations?: OrchestratorDelegation[];
+  /** Default model route for generated or role-wide worker lanes. */
+  workerRoutes?: Partial<Record<OrchestratorWorkerRole, TaskRoutePreference>>;
   needsUserApproval?: boolean;
   memoryQueries?: MemoryQuery[];
 }

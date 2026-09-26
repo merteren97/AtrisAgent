@@ -806,7 +806,8 @@ async function bindStoredAgentProfile(input: Record<string, unknown>): Promise<u
   return workspaceManager.bindAgentProfile(input as any);
 }
 
-async function unbindStoredAgentProfile(scopeType: string, scopeId: string, role: AgentRole): Promise<unknown> {
+async function unbindStoredAgentProfile(scopeType: string, scopeId: string, role: AgentRole, profileId?: string): Promise<unknown> {
+  if (profileId) return workspaceManager.unbindAgentProfile({ scopeType: scopeType as any, scopeId, role, profileId });
   return workspaceManager.unbindAgentProfile(scopeType as any, scopeId, role);
 }
 
@@ -2258,9 +2259,16 @@ async function createOrUpdateAgentProfileBinding(res: Response, value: unknown, 
   res.status(200).json(safe);
 }
 
-async function removeAgentProfileBinding(res: Response, scopeType: string, scopeId: string, role: string): Promise<void> {
-  if (!PROFILE_SCOPE_TYPES.has(scopeType) || !isAgentRole(role)) throw profileClientError('Invalid profile binding scope or role.');
+async function removeAgentProfileBinding(res: Response, scopeType: string, scopeId: string, role: string, profileId?: string): Promise<void> {
+  if (!PROFILE_SCOPE_TYPES.has(scopeType) || (!isAgentRole(role) && !profileId)) throw profileClientError('Invalid profile binding scope or role.');
   await validateProfileBindingScope(scopeType, scopeId);
+  if (profileId) {
+    const profile = await workspaceManager.getAgentProfile(profileId);
+    if (!profile || (isAgentRole(role) && profile.role !== role)) throw profileClientError('Profile binding does not match its fixed role.');
+    await unbindStoredAgentProfile(scopeType, scopeId, profile.role, profileId);
+    res.json({ success: true, scopeType, scopeId, profileId, role: profile.role });
+    return;
+  }
   await unbindStoredAgentProfile(scopeType, scopeId, role as AgentRole);
   res.json({ success: true, scopeType, scopeId, role: role.toLowerCase() });
 }
@@ -2294,7 +2302,8 @@ app.delete('/api/agent-profiles/bindings', async (req, res) => {
     const scopeType = String(req.query.scopeType || req.body?.scopeType || '').trim().toLowerCase();
     const scopeId = String(req.query.scopeId || req.body?.scopeId || '').trim();
     const role = String(req.query.role || req.body?.role || '').trim().toLowerCase();
-    await removeAgentProfileBinding(res, scopeType, scopeId, role);
+    const profileId = String(req.query.profileId || req.query.agentProfileId || req.body?.profileId || req.body?.agentProfileId || '').trim() || undefined;
+    await removeAgentProfileBinding(res, scopeType, scopeId, role, profileId);
   } catch (error: any) { const status = profileErrorStatus(error) || 500; res.status(status).json({ code: error?.code, error: error?.message || 'Failed to remove agent profile binding' }); }
 });
 
@@ -2740,12 +2749,16 @@ app.put('/api/execution-policies/:scopeType/:scopeId/:role', async (req, res) =>
     const selectionMode = validSelectionModes.has(String(req.body?.selectionMode))
       ? String(req.body.selectionMode)
       : modelCatalogId ? 'prefer' : 'auto';
+    const accountProfileId = String(req.body?.accountProfileId || '').trim() || undefined;
+    if (selectionMode === 'fixed' && !modelCatalogId && !accountProfileId && fallbackCatalogIds.length === 0) {
+      return void res.status(400).json({ error: 'Fixed routing requires a model, account, or explicit fallback route.' });
+    }
     const reasoning = validReasoning.has(String(req.body?.reasoningLevel)) ? String(req.body.reasoningLevel) : undefined;
     await workspaceManager.upsertRoleExecutionPolicy(scopeType as any, req.params.scopeId, {
       role: role as any,
       selectionMode: selectionMode as any,
       modelCatalogId,
-      accountProfileId: String(req.body?.accountProfileId || '').trim() || undefined,
+      accountProfileId,
       reasoningLevel: reasoning as any,
       fallbackCatalogIds,
     });

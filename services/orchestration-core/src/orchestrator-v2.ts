@@ -11,9 +11,11 @@ import {
   type TaskSelect,
 } from '@atris-agent-code/database';
 import {
+  getSupervisorPlanningResources,
   getSupervisorTurnRunner,
   redactSensitiveValue,
   type LocalEventBus,
+  type SupervisorPlanningResources,
 } from '@atris-agent-code/event-bus';
 import type { AgentEvent, TaskCompleted, TaskFailed } from '@atris-agent-code/event-schema';
 import type {
@@ -24,7 +26,7 @@ import type {
   PostApplyVerificationResult,
 } from '@atris-agent-code/domain';
 import { parseQualityResultEnvelope } from '@atris-agent-code/domain';
-import { resolveAutomationAction, trustProfileForExecutionMode } from '@atris-agent-code/policy-engine';
+import { PolicyEngine, resolveAutomationAction, trustProfileForExecutionMode } from '@atris-agent-code/policy-engine';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator as LegacyOrchestrator } from './orchestrator';
 import type {
@@ -914,6 +916,16 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     options?: StartMissionOptionsV2,
   ): Promise<{ decision: OrchestratorDecision; context: SupervisorTurnContext; hasPriorConversation: boolean; priorResearchBundle: ResearchContextBundle | null }> {
     const loaded = await this.loadConversationContext(missionId);
+    let planningResources: SupervisorPlanningResources;
+    try {
+      planningResources = await getSupervisorPlanningResources(missionId, options?.agentProfileIds);
+    } catch (error) {
+      this.trace('supervisor-planning-resources-unavailable', {
+        missionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      planningResources = { models: [], specialists: [] };
+    }
     const context: SupervisorTurnContext = {
       turnId,
       userMessage: request,
@@ -921,6 +933,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       workspaceContext: loaded.workspaceContext,
       explicitCommand: options?.command,
       explicitTargetRole: options?.targetRole,
+      planningResources,
     };
     const reusableResearchBundle = loaded.priorResearchBundle && isPriorResearchImplementationFollowUp(context)
       ? loaded.priorResearchBundle
@@ -943,7 +956,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           reasoningLevel: options?.reasoningLevel,
           agentProfileId: supervisorProfileId,
         });
-        const parsed = parseSupervisorDecision(raw, turnId);
+        const parsed = parseSupervisorDecision(raw, turnId, planningResources);
         if (parsed) {
           return {
             decision: normalizeSupervisorDecision(parsed, context, { reusePriorResearch: Boolean(reusableResearchBundle) }),
@@ -1025,6 +1038,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!manager) {
       return super.startMission(params.missionId, params.request, {
         command: 'plan',
+        agentProfileIds: params.agentProfileIds,
         rawModelPlanOutput: JSON.stringify({ tasks: decisionToTaskPlan(params.decision) }),
       });
     }
@@ -1053,6 +1067,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     for (let index = 0; index < taskSpecs.length; index += 1) {
       const spec = taskSpecs[index];
+      const requestedProfileId = params.agentProfileIds?.[spec.role] || spec.agentProfileId;
+      const taskAgentProfileId = requestedProfileId
+        ? (await this.resolveTaskProfileIds(params.missionId, [spec.role], { [spec.role]: requestedProfileId }))[spec.role]
+        : agentProfileIds[spec.role];
       const id = crypto.randomUUID();
       idsByIndex.set(index, id);
       const dependencies = (spec.dependsOnIndices || [])
@@ -1067,7 +1085,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         status: 'planned',
         priority: spec.priority,
         assignedRole: spec.role,
-        agentProfileId: agentProfileIds[spec.role],
+        agentProfileId: taskAgentProfileId,
+        specialty: spec.specialty,
+        routePreference: spec.routePreference,
         requiredCapabilities: spec.requiredCapabilities,
         dependsOn: dependencies,
         targetDescriptor: spec.targetDescriptor,
@@ -1200,10 +1220,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     let decision: OrchestratorDecision;
+    let turnContext: SupervisorTurnContext;
     let hasPriorConversation: boolean;
     let priorResearchBundle: ResearchContextBundle | null;
     try {
-      ({ decision, hasPriorConversation, priorResearchBundle } = await this.decideTurn(missionId, turnId, request, options));
+      ({ decision, context: turnContext, hasPriorConversation, priorResearchBundle } = await this.decideTurn(missionId, turnId, request, options));
     } catch (error) {
       if (!this.isRunFenceError(error)) {
         await this.transitionMissionDiagnostic({
@@ -1277,6 +1298,23 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       });
       throw error;
     }
+    if (decision.needsUserApproval && !taskPlan.some((task) => task.routePreference)) {
+      // An approval card must name a real, validated model choice. Otherwise
+      // approving it would silently delegate the decision back to the scheduler.
+      const available = [...new Set((turnContext.planningResources?.models || [])
+        .filter((model) => taskPlan.some((task) => model.supportedRoles.includes(task.role as 'researcher' | 'builder' | 'reviewer' | 'qa')))
+        .map((model) => model.displayName))].slice(0, 5);
+      return this.completeConversationalTurn({
+        missionId,
+        turnId,
+        request,
+        response: available.length
+          ? `Alt ajan için onaylanabilecek belirli bir model önerisi oluşmadı; henüz görev başlatmadım. Kullanılmasını istediğin modeli belirt: ${available.join(', ')}.`
+          : 'Alt ajan için doğrulanmış uygun bir model bulunamadı; henüz görev başlatmadım. Bağlı hesapları ve model kataloğunu kontrol edip tekrar dene.',
+        previousPlanId,
+        hasPriorConversation,
+      });
+    }
     const normalizedPlanId = crypto.randomUUID();
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.trace('plan-normalized', {
@@ -1305,6 +1343,22 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         ...options,
         rawModelPlanOutput,
         researchContextPlanId: priorResearchBundle?.planId,
+        ...(decision.needsUserApproval ? {
+          preDispatchApproval: {
+            type: 'worker_route' as const,
+            description: [
+              decision.response ? `Orchestrator note: ${decision.response}` : 'The Orchestrator found a material trade-off in the available worker model routes.',
+              'Review the proposed delegation before any subagent starts:',
+              ...taskPlan.map((task, index) => {
+                const model = task.routePreference?.modelDisplayName || 'automatic role-compatible route';
+                const route = task.routePreference?.routeLabel ? ` · ${task.routePreference.routeLabel}` : '';
+                const reason = task.routePreference?.reason ? `\n   Why: ${task.routePreference.reason}` : '';
+                return `${index + 1}. ${task.role.toUpperCase()} — ${task.title}\n   Proposed model: ${model}${route}${reason}`;
+              }),
+              'Approving confirms these model choices. If your trust mode also requires plan approval, work will wait for that decision. Rejecting stops this run.',
+            ].join('\n'),
+          },
+        } : {}),
       });
       await this.ensureRunIsCurrent(missionId, options?.runId);
     } catch (error) {
@@ -2090,6 +2144,29 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       idempotencyKey?: string;
     },
   ): Promise<void> {
+    if (approvalType === 'worker_route' && approved) {
+      const mission = await this.v2WorkspaceManager?.getMission(missionId);
+      if (!mission || mission.status !== 'waiting_for_approval' || !mission.planId) {
+        throw new Error('The model selection is no longer awaiting approval. Refresh the conversation.');
+      }
+      const policy = mission.automationPolicy;
+      const planDecision = policy
+        ? resolveAutomationAction(policy.profile, 'plan', policy.overrides)
+        : null;
+      if (planDecision === 'deny') throw new Error('Mission policy denies plan execution.');
+      const planAutoApproved = planDecision
+        ? planDecision === 'auto' || planDecision === 'review'
+        : await new PolicyEngine(mission.executionMode).requestApproval('plan', 'Approve the selected worker plan');
+      if (!planAutoApproved) {
+        const tasks = (await this.v2WorkspaceManager!.listTasks(missionId)).filter((task) => task.planId === mission.planId);
+        await this.emitApprovalRequested({
+          missionId,
+          approvalType: 'plan',
+          description: `Approve execution of ${tasks.length} planned task(s) after reviewing the subagent model selection.\n${tasks.map((task) => `• ${task.title} — ${task.assignedRole || 'worker'}; model: ${task.routePreference?.modelDisplayName || 'compatible model selected at dispatch'}`).join('\n')}`,
+        });
+        return;
+      }
+    }
     if (approvalType === 'plan' && approved) {
       const mission = await this.v2WorkspaceManager?.getMission(missionId);
       if (mission?.planId && this.planActions.get(mission.planId) === 'plan_only') {

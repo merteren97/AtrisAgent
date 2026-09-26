@@ -25,6 +25,11 @@ import {
   Trash2,
   LogOut,
   House,
+  Laptop,
+  Moon,
+  Sun,
+  TerminalSquare,
+  Workflow,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
@@ -32,7 +37,7 @@ import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { NavigationDeleteAction } from './navigation-row-actions';
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
 import { ConversationDeleteDialog } from '../history/ConversationDeleteDialog';
 import { useWorkspaceStore } from '../../stores/workspace-store';
@@ -45,26 +50,33 @@ import { ManualConversationRow } from '@/components/manual/manual-conversation-r
 import { useManualActivityMonitor } from '@/components/manual/manual-activity';
 import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
-import { ThemeToggle } from '../theme-toggle';
+import { useTheme } from 'next-themes';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuthSession } from '@/lib/auth-session';
 import { needsMissionAttention, missionStatusLabel } from '@/lib/mission-display';
+import { COLOR_PALETTES, normalizeColorPalette } from '@/lib/theme-palettes';
 
 interface SidebarItemProps {
   icon: ReactNode;
   label: string;
   badge?: ReactNode;
   isActive?: boolean;
+  expanded?: boolean;
+  controls?: string;
   onClick: () => void;
   collapsed: boolean;
 }
 
-function SidebarItem({ icon, label, badge, isActive, onClick, collapsed }: SidebarItemProps) {
+function SidebarItem({ icon, label, badge, isActive, expanded, controls, onClick, collapsed }: SidebarItemProps) {
   const content = (
     <button
+      type="button"
       onClick={onClick}
       aria-label={collapsed ? label : undefined}
       aria-current={isActive ? 'page' : undefined}
-      className={`group flex min-h-9 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${isActive ? 'bg-sidebar-accent font-medium text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
+      aria-expanded={expanded}
+      aria-controls={controls}
+      className={`group flex min-h-9 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${isActive ? 'text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
     >
       {icon}
       {!collapsed && <span>{label}</span>}
@@ -181,6 +193,7 @@ function SidebarAgentTree({
 
 export function Sidebar() {
   const manual = useManualStore();
+  const { theme, resolvedTheme, setTheme } = useTheme();
   useManualActivityMonitor();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
@@ -201,9 +214,22 @@ export function Sidebar() {
     toggleSidebar,
     sidebarWidth,
     setSidebarWidth,
+    colorPalette,
+    setColorPalette,
     setCommandPaletteOpen,
     openInspector,
   } = useSettingsStore();
+
+  useEffect(() => {
+    if (sidebarCollapsed) return;
+    const dismissOverlay = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || !window.matchMedia('(max-width: 1180px)').matches) return;
+      toggleSidebar();
+      requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('button[aria-label="Workspaces"]')?.focus());
+    };
+    window.addEventListener('keydown', dismissOverlay);
+    return () => window.removeEventListener('keydown', dismissOverlay);
+  }, [sidebarCollapsed, toggleSidebar]);
 
   useEffect(() => {
     if (activeWorkspaceId) void useManualStore.getState().refresh(activeWorkspaceId);
@@ -269,7 +295,9 @@ export function Sidebar() {
 
   const handleWorkspaceSelect = (workspaceId: string) => {
     useManualStore.getState().setCreating(false);
-    handleNewChat(workspaceId);
+    if (workspaceId !== activeWorkspaceId) setActiveWorkspace(workspaceId);
+    manual.setMode('choose');
+    setActiveView('chat');
   };
 
   const handleNewChat = (workspaceId = activeWorkspaceId) => {
@@ -314,69 +342,92 @@ export function Sidebar() {
     ? missions.find((mission) => mission.id === pendingDeleteMission.id) || pendingDeleteMission
     : null;
 
-  const currentWidth = sidebarCollapsed ? 64 : `clamp(208px, 24vw, ${sidebarWidth}px)`;
-
   return (
     <aside
       aria-label="Project navigation"
       data-collapsed={sidebarCollapsed}
-      className="workspace-sidebar relative flex flex-col select-none bg-sidebar transition-[width] duration-200 motion-reduce:transition-none"
-      style={{ width: currentWidth, minWidth: sidebarCollapsed ? 64 : 208, flexShrink: 0 }}
+      className="workspace-sidebar relative z-40 flex shrink-0 select-none bg-sidebar"
+      style={{ '--workspace-pane-width': `${sidebarWidth}px` } as CSSProperties}
     >
-      <div className="absolute bottom-0 right-0 top-0 z-50 w-1 cursor-col-resize transition-colors hover:bg-primary/50" onMouseDown={handleDrag} />
-
-      <div data-tauri-drag-region className={`flex shrink-0 items-center ${sidebarCollapsed ? 'flex-col justify-center gap-2' : 'justify-between px-3'}`}>
-        <div data-tauri-drag-region className="flex items-center gap-2">
-          <img
-            data-tauri-drag-region
-            src="/logo.svg"
-            alt="AtrisAgent"
-            draggable={false}
-            className="h-6 w-6 shrink-0 object-contain"
-          />
-          {!sidebarCollapsed && <span data-tauri-drag-region className="whitespace-nowrap text-sm font-semibold tracking-tight text-sidebar-foreground">AtrisAgent</span>}
+      <div className="workspace-rail flex w-[60px] shrink-0 flex-col items-center border-r border-sidebar-border/40 bg-sidebar-accent/15 px-2 pb-3 pt-2">
+        <nav aria-label="Main navigation" className="flex w-full flex-col gap-1">
+          {sidebarCollapsed && <SidebarItem collapsed icon={<SquarePen className="h-4 w-4" />} label="New conversation" onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)} />}
+          <SidebarItem collapsed icon={<Search className="h-4 w-4" />} label="Search conversations" onClick={() => setCommandPaletteOpen(true)} />
+          <div className="my-1 border-t border-sidebar-border/70" />
+          <SidebarItem collapsed icon={<House className="h-4 w-4" />} label="Home" isActive={activeView === 'chat' && manual.mode === 'choose'} onClick={() => { manual.setMode('choose'); setActiveView('chat'); }} />
+          <SidebarItem collapsed icon={<FolderGit2 className="h-4 w-4" />} label="Projects" isActive={activeView === 'projects'} onClick={() => setActiveView('projects')} />
+          <SidebarItem collapsed icon={<PanelLeftOpen className="h-4 w-4" />} label="Workspaces" expanded={!sidebarCollapsed} controls="workspace-list-pane" onClick={toggleSidebar} />
+          <SidebarItem collapsed icon={<History className="h-4 w-4" />} label="History" onClick={() => setIsHistoryDialogOpen(true)} />
+          <SidebarItem collapsed icon={<BarChart2 className="h-4 w-4" />} label="Insights" isActive={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
+          <SidebarItem collapsed icon={<UsersRound className="h-4 w-4" />} label="Agents" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
+        </nav>
+        <div className="mt-auto flex w-full flex-col gap-1 border-t border-sidebar-border/70 pt-2">
+          <DropdownMenu>
+            <Tooltip delayDuration={0}>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <button type="button" aria-label="Account menu" className="relative mx-auto flex h-10 w-10 items-center justify-center rounded-lg text-sidebar-foreground hover:bg-sidebar-accent">
+                    <span className="flex h-7 w-7 items-center justify-center overflow-hidden rounded-full border border-sidebar-border bg-sidebar-accent">
+                      {session.user?.avatarUrl ? <img src={session.user.avatarUrl} alt="" className="h-full w-full object-cover" /> : <User className="h-4 w-4" />}
+                    </span>
+                    <span className={`absolute bottom-1 right-1 h-2 w-2 rounded-full border border-sidebar ${serviceOnline ? 'bg-emerald-500' : 'bg-destructive'}`} />
+                  </button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="right">Account and appearance</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent side="right" align="end" className="w-56">
+              <DropdownMenuLabel className="min-w-0">
+                <span className="block truncate">{session.user?.name || session.user?.username || 'AtrisHub account'}</span>
+                <span className="block truncate text-xs font-normal text-muted-foreground">{session.user?.email || 'AtrisHub'}</span>
+                <span className="mt-2 flex items-center gap-1.5 text-[11px] font-normal text-muted-foreground"><span className={`h-1.5 w-1.5 rounded-full ${serviceOnline ? 'bg-emerald-500' : 'bg-destructive'}`} />{serviceOnline ? 'Local service ready' : 'Local service offline'}</span>
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => setActiveView('accounts')}><KeyRound />Accounts & models</DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setActiveView('settings')}><Settings />Settings</DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger><Sun />Appearance</DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-48">
+                  <DropdownMenuRadioGroup value={theme || 'system'} onValueChange={setTheme}>
+                    <DropdownMenuRadioItem value="system"><Laptop className="mr-2 h-4 w-4" />System</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="light"><Sun className="mr-2 h-4 w-4" />Light</DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="dark"><Moon className="mr-2 h-4 w-4" />Dark</DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">Color palette</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup value={colorPalette} onValueChange={(value) => setColorPalette(normalizeColorPalette(value))}>
+                    {COLOR_PALETTES.map((palette) => (
+                      <DropdownMenuRadioItem key={palette.id} value={palette.id}>
+                        <span className="mr-2 h-3.5 w-3.5 rounded-full border border-border/60" style={{ backgroundColor: palette[resolvedTheme === 'light' ? 'light' : 'dark'].accent }} />
+                        {palette.label}
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={() => setActiveView('settings')}>All appearance settings…</DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem disabled={isLoggingOut} onSelect={() => void logout()} className="text-destructive focus:text-destructive"><LogOut />{isLoggingOut ? 'Signing out…' : 'Sign out'}</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-        <div className={`flex items-center gap-1 ${sidebarCollapsed ? 'flex-col' : ''}`}>
-          {!sidebarCollapsed && <ThemeToggle compact />}
-          <Button variant="ghost" size="icon" aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} className="h-7 w-7 text-sidebar-muted hover:text-sidebar-foreground" onClick={toggleSidebar}>
-            {sidebarCollapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}
+      </div>
+
+      <div id="workspace-list-pane" className="workspace-pane relative flex min-h-0 min-w-0 flex-1 flex-col bg-sidebar">
+        <div className="absolute -right-[3px] bottom-0 top-0 z-20 w-[6px] cursor-col-resize bg-transparent hover:bg-primary/40" onMouseDown={handleDrag} />
+        <div data-tauri-drag-region className="flex h-14 shrink-0 items-center justify-between border-b border-sidebar-border/40 px-4">
+          <span data-tauri-drag-region className="text-sm font-semibold text-sidebar-foreground">Workspaces</span>
+          <Button size="icon" variant="ghost" className="h-8 w-8 text-sidebar-muted" aria-label="Hide workspaces" onClick={toggleSidebar}><PanelLeftClose className="h-4 w-4" /></Button>
+        </div>
+        <div className="px-3 pb-2">
+          <Button variant="ghost" className="h-9 w-full justify-start gap-2 bg-primary/10 px-3 text-xs font-medium text-sidebar-foreground hover:bg-primary/15" onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)}>
+            <SquarePen className="h-4 w-4 text-primary" />New conversation<kbd className="ml-auto text-[10px] font-normal text-sidebar-muted">Ctrl N</kbd>
           </Button>
         </div>
-      </div>
 
-      <div className="space-y-2 px-3 pb-3 pt-2">
-        <Button variant="ghost" className={`sidebar-new-conversation h-10 w-full gap-2 bg-primary/[0.08] text-sidebar-foreground shadow-none hover:bg-primary/15 ${sidebarCollapsed ? 'px-0' : 'justify-start px-3'}`} onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)} aria-label="New conversation" title="New conversation · Ctrl/Cmd+N">
-          <SquarePen className="h-4 w-4 shrink-0 text-primary" />{!sidebarCollapsed && <><span className="text-xs font-semibold">New conversation</span><kbd className="ml-auto shrink-0 text-[10px] font-normal text-sidebar-muted">⌘/Ctrl N</kbd></>}
-        </Button>
-        <button
-          type="button"
-          aria-label="Search workspaces and missions"
-          onClick={() => setCommandPaletteOpen(true)}
-          className={`flex w-full items-center rounded-lg py-2 text-xs text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground ${sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}`}
-        >
-          <Search className="h-3.5 w-3.5 shrink-0" />
-          {!sidebarCollapsed && <><span className="min-w-0 truncate">Search conversations</span><kbd className="ml-auto shrink-0 whitespace-nowrap rounded border border-sidebar-border bg-sidebar px-1 py-0.5 font-sans text-[10px]">Ctrl K</kbd></>}
-        </button>
-      </div>
-
-      <div className="px-2 pb-2">
-        <div className="space-y-0.5">
-          <SidebarItem
-            collapsed={sidebarCollapsed}
-            icon={<House className="h-4 w-4" />}
-            label="Home"
-            isActive={activeView === 'chat' && manual.mode === 'choose'}
-            onClick={() => { manual.setMode('choose'); setActiveView('chat'); }}
-            badge={attentionCount > 0 ? <Badge variant="secondary" className="ml-auto h-4 min-w-4 px-1 text-[9px]">{attentionCount}</Badge> : undefined}
-          />
-          <SidebarItem collapsed={sidebarCollapsed} icon={<FolderGit2 className="h-3.5 w-3.5 text-primary" />} label="Projects" isActive={activeView === 'projects'} onClick={() => setActiveView('projects')} />
-          <SidebarItem collapsed={sidebarCollapsed} icon={<History className="h-3.5 w-3.5 text-muted-foreground" />} label="History" onClick={() => setIsHistoryDialogOpen(true)} />
-          <SidebarItem collapsed={sidebarCollapsed} icon={<BarChart2 className="h-4 w-4" />} label="Insights" isActive={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
-        </div>
-      </div>
-
-      <div className={`mb-1 mt-2 flex items-center ${sidebarCollapsed ? 'justify-center' : 'justify-between px-3'}`}>
-        {!sidebarCollapsed && <p className="flex items-center gap-2 px-1 text-[11px] font-semibold tracking-wide text-sidebar-muted">Workspaces <span className="text-[10px] font-normal tabular-nums">{workspaces.length}</span></p>}
+      <div className="mb-1 mt-2 flex items-center justify-between px-3">
+        <p className="flex items-center gap-2 px-1 text-[11px] font-semibold tracking-wide text-sidebar-muted">Projects <span className="text-[10px] font-normal tabular-nums">{workspaces.length}</span>{attentionCount > 0 && <Badge variant="secondary" className="h-4 px-1 text-[9px]">{attentionCount} need attention</Badge>}</p>
         <Tooltip delayDuration={0}>
           <TooltipTrigger asChild>
             <Button variant="ghost" size="icon" aria-label="Open project" onClick={() => setIsWorkspaceDialogOpen(true)} className="h-6 w-6 text-sidebar-muted hover:text-sidebar-foreground">
@@ -387,7 +438,7 @@ export function Sidebar() {
         </Tooltip>
       </div>
 
-      <ScrollArea className="flex-1 px-2">
+      <ScrollArea className="min-h-0 flex-1 px-2">
         {workspaceError && (
           <div role="alert" className="mt-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[10px] text-destructive">
             <p>{workspaceError}</p>
@@ -413,7 +464,7 @@ export function Sidebar() {
           return (
             <div key={workspace.id} className="mb-2">
               <ContextMenu><ContextMenuTrigger asChild><div
-                className={`navigation-row group/workspace flex w-full items-center rounded-lg text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
+                className={`navigation-row group/workspace flex w-full items-center rounded-lg text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'bg-primary/[0.06] text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
                 title={workspace.path}
               >
                 <button
@@ -421,7 +472,7 @@ export function Sidebar() {
                   onClick={() => handleWorkspaceSelect(workspace.id)}
                   aria-label={sidebarCollapsed ? workspace.name : undefined}
                   aria-current={isActiveWorkspace ? 'true' : undefined}
-                  className={`flex min-w-0 flex-1 items-center ${sidebarCollapsed ? 'justify-center py-2' : 'gap-2 py-2.5 pl-1.5'}`}
+                   className="flex min-w-0 flex-1 items-center gap-2 py-2.5 pl-1.5"
                 >
                   {!sidebarCollapsed && <ChevronRight className={`h-3 w-3 shrink-0 text-sidebar-muted transition-transform ${isActiveWorkspace ? 'rotate-90' : ''}`} />}
                   <FolderGit2 className={`h-4 w-4 shrink-0 ${isActiveWorkspace ? 'text-primary' : 'text-sidebar-muted'}`} />
@@ -450,20 +501,20 @@ export function Sidebar() {
               {!sidebarCollapsed && isActiveWorkspace && (
                 <div className="ml-3 mb-3 pl-2">
                   <div className="mb-1 mt-2 flex h-7 items-center justify-between px-2">
-                    <span className="navigation-section-title">Manual <span className="font-normal tabular-nums">{(manual.conversations[workspace.id] || []).length}</span></span>
+                     <span className="navigation-section-title"><TerminalSquare className="h-3.5 w-3.5 text-primary" />Manual <span className="font-normal tabular-nums">{(manual.conversations[workspace.id] || []).length}</span></span>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
                   {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} onDelete={() => setNavigationDelete({kind:'manual',conversation})} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
                   <div className="mb-1 mt-3 flex h-7 items-center justify-between px-2">
-                    <span className="navigation-section-title">Orchestrator <span className="font-normal tabular-nums">{workspaceMissions.length}</span></span>
+                     <span className="navigation-section-title"><Workflow className="h-3.5 w-3.5 text-primary" />Orchestrator <span className="font-normal tabular-nums">{workspaceMissions.length}</span></span>
                     <button type="button" aria-label="New orchestrated conversation" className="rounded p-1 text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground" onClick={() => { handleNewChat(workspace.id); manual.setMode('orchestrator'); }}><Plus className="h-3 w-3" /></button>
                   </div>
 
                   {workspaceMissions.length === 0 ? (
                     <button
                       type="button"
-                      onClick={() => handleNewChat(workspace.id)}
+                      onClick={() => { handleNewChat(workspace.id); manual.setMode('orchestrator'); }}
                       className="w-full rounded-md border border-dashed border-sidebar-border/70 px-2 py-2 text-left text-[10px] leading-relaxed text-sidebar-muted transition-colors hover:border-primary/30 hover:text-sidebar-foreground"
                     >
                       Start an orchestrated conversation
@@ -545,66 +596,6 @@ export function Sidebar() {
         })}
       </ScrollArea>
 
-      <div className="space-y-0.5 px-2 py-2">
-        <SidebarItem collapsed={sidebarCollapsed} icon={<UsersRound className="h-3.5 w-3.5 text-violet-400" />} label="Agents" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
-        <SidebarItem collapsed={sidebarCollapsed} icon={<KeyRound className="h-3.5 w-3.5 text-amber-500" />} label="Accounts" isActive={activeView === 'accounts'} onClick={() => setActiveView('accounts')} />
-        <SidebarItem collapsed={sidebarCollapsed} icon={<Settings className="h-3.5 w-3.5 text-muted-foreground" />} label="Settings" isActive={activeView === 'settings'} onClick={() => setActiveView('settings')} />
-      </div>
-
-      <div className={`${sidebarCollapsed ? 'flex justify-center p-2' : 'p-3'} shrink-0 overflow-hidden`}>
-        {!sidebarCollapsed ? (
-          <div className="flex items-center gap-2">
-            <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-full border border-sidebar-border bg-sidebar-accent">
-              {session.user?.avatarUrl ? (
-                <img src={session.user.avatarUrl} alt="" className="h-full w-full object-cover" />
-              ) : (
-                <User className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
-              )}
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-medium text-sidebar-foreground" title={session.user?.email || undefined}>
-                {session.user?.name || session.user?.username || session.user?.email || 'AtrisHub account'}
-              </p>
-              <p className="flex items-center gap-1.5 text-[9px] text-sidebar-muted">
-                <span className={`h-1.5 w-1.5 rounded-full ${serviceOnline ? 'bg-emerald-400' : 'bg-destructive'}`} />
-                {serviceOnline ? 'Local service ready' : 'Local service offline'}
-              </p>
-            </div>
-            <Tooltip delayDuration={0}>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 shrink-0 text-sidebar-muted hover:text-sidebar-foreground"
-                  onClick={() => void logout()}
-                  disabled={isLoggingOut}
-                  aria-label="Sign out of AtrisAgent"
-                >
-                  <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right">{isLoggingOut ? 'Signing out…' : 'Sign out'}</TooltipContent>
-            </Tooltip>
-          </div>
-        ) : (
-          <Tooltip delayDuration={0}>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 text-sidebar-muted hover:text-sidebar-foreground"
-                onClick={() => void logout()}
-                disabled={isLoggingOut}
-                aria-label="Sign out of AtrisAgent"
-              >
-                <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">
-              {isLoggingOut ? 'Signing out…' : `${session.user?.email || 'Account'} · Sign out (${serviceOnline ? 'service ready' : 'service offline'})`}
-            </TooltipContent>
-          </Tooltip>
-        )}
       </div>
 
       {navigationDelete && <NavigationDeleteDialog target={navigationDelete} onClose={() => setNavigationDelete(null)}/>}

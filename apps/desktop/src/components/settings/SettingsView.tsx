@@ -6,9 +6,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
-import { ThemeToggle } from '@/components/theme-toggle';
+import { ThemePaletteSelector } from '@/components/theme-palette-selector';
 import { ExecutionPolicyEditor } from './ExecutionPolicyEditor';
-import { Bell, Braces, Download, KeyRound, Loader2, Minimize2, MonitorCog, Power, RefreshCw, Rocket, ShieldCheck, Terminal } from 'lucide-react';
+import { Bell, Braces, Download, KeyRound, Loader2, Minimize2, MonitorCog, Palette, Power, RefreshCw, Rocket, ShieldCheck, Terminal } from 'lucide-react';
 
 const closeBehaviorOptions: Array<{
   value: CloseBehavior;
@@ -96,10 +96,14 @@ export function SettingsView() {
         </header>
 
         <Card>
+          <CardHeader><CardTitle className="flex items-center gap-2 text-base"><Palette className="h-4 w-4 text-primary" /> Appearance & themes</CardTitle><CardDescription>Choose the atmosphere that works best for your workspace.</CardDescription></CardHeader>
+          <CardContent><ThemePaletteSelector /></CardContent>
+        </Card>
+
+        <Card>
           <CardHeader><CardTitle className="flex items-center gap-2 text-base"><ShieldCheck className="h-4 w-4 text-emerald-400" /> Privacy & local operation</CardTitle><CardDescription>AtrisAgent is local-first. Telemetry remains off unless you explicitly enable it.</CardDescription></CardHeader>
           <CardContent className="space-y-4">
             <SettingRow title="Anonymous diagnostics" description="Allow non-secret crash and performance diagnostics. Prompts, source files and credentials are excluded."><Switch checked={telemetryOptIn} onCheckedChange={setTelemetryOptIn} /></SettingRow>
-            <SettingRow title="Theme" description="Use the system, light or dark appearance."><ThemeToggle /></SettingRow>
             <SettingRow title="Interface language" description="Language affects the desktop UI, not agent prompts or repository files."><select value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'tr')} className="h-9 min-w-28 rounded-md border border-input bg-background px-3 text-sm"><option value="en">English</option><option value="tr">Türkçe</option></select></SettingRow>
           </CardContent>
         </Card>

@@ -155,10 +155,10 @@ function WorkspaceApp() {
     <>
       <OnboardingModal />
       <AppShell
+        titlebar={<Titlebar />}
         sidebar={<Sidebar />}
         main={
            <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-             <Titlebar />
              {session.appAccess?.announcement && <p role="status" className="shrink-0 border-b border-border bg-muted/40 px-4 py-2 text-xs">{session.appAccess.announcement}</p>}
              <CommandPalette />
              {activeView === 'chat' && orchestrated && activeMissionId ? (

@@ -3,8 +3,10 @@ import type {
   OrchestratorDelegation,
   OrchestratorTurnAction,
   BuilderTargetDescriptor,
+  TaskRoutePreference,
 } from '@atris-agent-code/domain';
 import { parseBuilderTargetDescriptor, validateDirectChildProjectName } from '@atris-agent-code/domain';
+import type { SupervisorPlanningModel, SupervisorPlanningResources, SupervisorPlanningSpecialist } from '@atris-agent-code/event-bus';
 import type { StructuredTaskPlan } from './orchestrator';
 
 const ACTIONS = new Set<OrchestratorTurnAction>(['respond', 'clarify', 'delegate', 'execute', 'plan_only']);
@@ -97,6 +99,82 @@ export interface SupervisorTurnContext {
   workspaceContext: string;
   explicitCommand?: string;
   explicitTargetRole?: string;
+  planningResources?: SupervisorPlanningResources;
+}
+
+const EMPTY_PLANNING_RESOURCES: SupervisorPlanningResources = { models: [], specialists: [] };
+
+function routeAllowedBySpecialist(model: SupervisorPlanningModel, specialist?: SupervisorPlanningSpecialist): boolean {
+  const policy = specialist?.allowedRoutePolicy;
+  if (!policy) return true;
+  const allowedCatalogIds = policy.allowedCatalogIds ?? policy.allowedModelCatalogIds;
+  if (Array.isArray(allowedCatalogIds) && !allowedCatalogIds.includes(model.catalogId)) return false;
+  if (Array.isArray(policy.allowedAccountProfileIds) && !policy.allowedAccountProfileIds.includes(model.accountProfileId)) return false;
+  if (Array.isArray(policy.allowedRuntimeTypes) && !policy.allowedRuntimeTypes.includes(model.runtimeId)) return false;
+  return true;
+}
+
+function normalizeRoutePreference(
+  value: unknown,
+  role: OrchestratorDelegation['role'],
+  resources: SupervisorPlanningResources,
+  specialist?: SupervisorPlanningSpecialist,
+): TaskRoutePreference | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const modelCatalogId = typeof record.modelCatalogId === 'string' ? record.modelCatalogId.trim() : '';
+  const model = resources.models.find((candidate) => candidate.catalogId === modelCatalogId
+    && candidate.supportedRoles.includes(role)
+    && routeAllowedBySpecialist(candidate, specialist));
+  if (!model) return undefined;
+  const reasoningLevel = typeof record.reasoningLevel === 'string'
+    && model.supportedReasoning.includes(record.reasoningLevel as SupervisorPlanningModel['supportedReasoning'][number])
+    ? record.reasoningLevel as TaskRoutePreference['reasoningLevel']
+    : model.defaultReasoning;
+  const fallbackCatalogIds = Array.isArray(record.fallbackCatalogIds)
+    ? Array.from(new Set(record.fallbackCatalogIds
+        .filter((id): id is string => typeof id === 'string')
+        .map((id) => id.trim())
+        .filter((id) => id && id !== model.catalogId)
+        .filter((id) => resources.models.some((candidate) => candidate.catalogId === id
+          && candidate.supportedRoles.includes(role)
+          && routeAllowedBySpecialist(candidate, specialist)))))
+      .slice(0, 4)
+    : [];
+  const reason = typeof record.reason === 'string' ? record.reason.trim().slice(0, 300) : '';
+  return {
+    modelCatalogId: model.catalogId,
+    accountProfileId: model.accountProfileId,
+    reasoningLevel,
+    fallbackCatalogIds,
+    selectionMode: 'fixed',
+    modelDisplayName: model.displayName,
+    routeLabel: model.routeLabel,
+    reason: reason || undefined,
+  };
+}
+
+function availableSpecialist(
+  value: unknown,
+  role: OrchestratorDelegation['role'],
+  resources: SupervisorPlanningResources,
+): SupervisorPlanningSpecialist | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  return resources.specialists.find((profile) => profile.id === value.trim() && profile.role === role);
+}
+
+function normalizeWorkerRoutes(
+  value: unknown,
+  resources: SupervisorPlanningResources,
+): OrchestratorDecision['workerRoutes'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const result: NonNullable<OrchestratorDecision['workerRoutes']> = {};
+  for (const role of WORKER_ROLES) {
+    const route = normalizeRoutePreference(record[role], role, resources, resources.defaultSpecialists?.[role]);
+    if (route) result[role] = route;
+  }
+  return Object.keys(result).length ? result : undefined;
 }
 
 export function hasExplicitImplementationIntent(context: Pick<SupervisorTurnContext, 'userMessage' | 'explicitCommand' | 'explicitTargetRole'>): boolean {
@@ -178,7 +256,11 @@ function extractJsonObject(raw: string): Record<string, unknown> | null {
   return null;
 }
 
-function normalizeDelegations(value: unknown, action: OrchestratorTurnAction): OrchestratorDelegation[] {
+function normalizeDelegations(
+  value: unknown,
+  action: OrchestratorTurnAction,
+  resources: SupervisorPlanningResources,
+): OrchestratorDelegation[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
   const roleCounts = new Map<OrchestratorDelegation['role'], number>();
@@ -203,6 +285,13 @@ function normalizeDelegations(value: unknown, action: OrchestratorTurnAction): O
     const dependsOnDelegationIds = Array.isArray(record.dependsOnDelegationIds)
       ? record.dependsOnDelegationIds.map(String).map((item) => item.trim())
       : [];
+    const specialist = resources.requestedProfileIds?.[role]
+      ? resources.defaultSpecialists?.[role]
+      : availableSpecialist(record.agentProfileId, role, resources);
+    const specialty = specialist
+      ? (specialist.specialty || specialist.name).slice(0, 100)
+      : (typeof record.specialty === 'string' ? record.specialty.trim().slice(0, 100) : '') || undefined;
+    const routeSpecialist = specialist || resources.defaultSpecialists?.[role];
     result.push({
       id,
       role,
@@ -211,6 +300,9 @@ function normalizeDelegations(value: unknown, action: OrchestratorTurnAction): O
       dependsOnDelegationIds,
       preferredParallelGroup: typeof record.preferredParallelGroup === 'string' ? record.preferredParallelGroup : undefined,
       targetDescriptor: role === 'builder' ? parseBuilderTargetDescriptor(record.targetDescriptor) : undefined,
+      agentProfileId: resources.requestedProfileIds?.[role] ? undefined : specialist?.id,
+      specialty,
+      routePreference: normalizeRoutePreference(record.routePreference ?? record.route, role, resources, routeSpecialist),
     });
     roleCounts.set(role, currentRoleCount + 1);
   }
@@ -236,7 +328,11 @@ function normalizeDelegations(value: unknown, action: OrchestratorTurnAction): O
   });
 }
 
-export function parseSupervisorDecision(raw: string, turnId: string): OrchestratorDecision | null {
+export function parseSupervisorDecision(
+  raw: string,
+  turnId: string,
+  resources: SupervisorPlanningResources = EMPTY_PLANNING_RESOURCES,
+): OrchestratorDecision | null {
   const parsed = extractJsonObject(raw);
   if (!parsed) return null;
   const action = String(parsed.action || '').toLowerCase() as OrchestratorTurnAction;
@@ -249,12 +345,29 @@ export function parseSupervisorDecision(raw: string, turnId: string): Orchestrat
     action,
     response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined,
     clarifyingQuestions: questions,
-    delegations: normalizeDelegations(parsed.delegations, action),
+    delegations: normalizeDelegations(parsed.delegations, action, resources),
+    workerRoutes: normalizeWorkerRoutes(parsed.workerRoutes, resources),
     needsUserApproval: Boolean(parsed.needsUserApproval),
   };
 }
 
 export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): string {
+  const resources = context.planningResources || EMPTY_PLANNING_RESOURCES;
+  const modelsByRole = Object.fromEntries([...WORKER_ROLES].map((role) => [
+    role,
+    resources.models.filter((model) => model.supportedRoles.includes(role)).map((model) => ({
+      catalogId: model.catalogId,
+      displayName: model.displayName,
+      routeLabel: model.routeLabel,
+      accountProfileId: model.accountProfileId,
+      supportedReasoning: model.supportedReasoning,
+      defaultReasoning: model.defaultReasoning,
+    })),
+  ]));
+  const specialists = resources.specialists.map(({ id, name, role, specialty, description, capabilities, allowedRoutePolicy }) => ({
+    id, name, role, specialty, description, capabilities, allowedRoutePolicy,
+  }));
+  const defaultSpecialists = resources.defaultSpecialists || {};
   return [
     'You are the persistent AtrisAgent Orchestrator for one project conversation.',
     'You retain control of the conversation. Specialist agents are workers you delegate to; they do not replace you as the user-facing agent.',
@@ -276,6 +389,12 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- Split independent research topics into multiple researcher delegations with no dependencies and the same preferredParallelGroup.',
     '- For execute, Builder dependencies should reference only research that is actually required.',
     '- When the user explicitly names a new child project in English or Turkish (for example, "Create AtrisTask under this workspace" or "AtrisTask klasörü içine kurulacak"), preserve that name as the Builder new-sibling target. Ask for a direct-child name when the wording is ambiguous.',
+    '- Assign a named specialist only by choosing an exact id from the available bound specialist list; the fixed role remains unchanged. If no listed specialist fits, provide a concise task specialty instead.',
+    '- Choose task model routes only from the live, role-compatible catalog below. For an explicit model requested by the user, choose its exact catalogId when available. Otherwise select the best route for the task. Never invent catalog IDs or account profiles.',
+    '- Keep model selection dynamic per task: use the task objective, required capabilities, specialist constraints and explicit user model instructions. Do not copy the Orchestrator model to workers unless the user requests that.',
+    '- Ask for a human routing checkpoint only when live compatible choices have a material unresolved trade-off and no route clearly matches the user’s goals. In that case set needsUserApproval=true, choose and explain the best current recommendation in routePreference, and make response state why the user is being asked. Do not ask for approval for routine, clear route choices.',
+    '- Put per-task routing in delegation.routePreference. Put role defaults in workerRoutes; these defaults also route the generated Reviewer and QA tasks. A selected model route is fixed and will be verified again before dispatch.',
+    '- Never imply a route is guaranteed before dispatch. User-fixed routes and role policies take precedence where applicable; an unavailable fixed route must fail closed instead of silently switching models.',
     '- Never invent completed work. If current code/evidence must be inspected, delegate it.',
     '- Keep delegations focused; each objective should be independently understandable.',
     '',
@@ -285,6 +404,7 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '  "response": "user-facing response when action is respond/clarify, otherwise a short intent summary",',
     '  "clarifyingQuestions": ["..."],',
     '  "needsUserApproval": false,',
+    '  "workerRoutes": { "researcher": { "modelCatalogId": "catalog-id", "reasoningLevel": "high", "fallbackCatalogIds": [], "reason": "..." } },',
     '  "delegations": [',
     '    {',
     '      "id": "stable-short-id",',
@@ -293,6 +413,9 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '      "requiredCapabilities": ["..."],',
     '      "dependsOnDelegationIds": ["..."],',
     '      "preferredParallelGroup": "optional-group",',
+    '      "agentProfileId": "optional-id-from-available-specialists",',
+    '      "specialty": "optional task focus when no profile is selected",',
+    '      "routePreference": { "modelCatalogId": "catalog-id", "reasoningLevel": "medium", "fallbackCatalogIds": [], "reason": "..." },',
     '      "targetDescriptor": { "kind": "workspace_root|existing_project|new_sibling_project", "projectName": "direct-child name except for workspace_root" }',
     '    }',
     '  ]',
@@ -301,6 +424,15 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     `Turn id: ${context.turnId}`,
     `Explicit command: ${context.explicitCommand || '(none)'}`,
     `Explicit target role: ${context.explicitTargetRole || '(none)'}`,
+    '',
+    'Live model routes by fixed worker role (an empty list means scheduler-selected route):',
+    JSON.stringify(modelsByRole),
+    '',
+    'Bound specialists available in this workspace or team template:',
+    JSON.stringify(specialists),
+    '',
+    'Effective role-default specialists used when a task does not name one (or an explicit user profile selection):',
+    JSON.stringify(defaultSpecialists),
     '',
     'Workspace context:',
     context.workspaceContext || '(workspace context unavailable)',
@@ -418,12 +550,15 @@ function topologicallyOrderDelegations(delegations: OrchestratorDelegation[]): O
   return orderedInputIndices.map((index) => delegations[index]);
 }
 
-function toStructuredTaskPlan(delegations: OrchestratorDelegation[]): StructuredTaskPlan[] {
+function toStructuredTaskPlan(
+  delegations: OrchestratorDelegation[],
+  workerRoutes: OrchestratorDecision['workerRoutes'] = {},
+): StructuredTaskPlan[] {
   const orderedDelegations = topologicallyOrderDelegations(delegations);
   const idToIndex = new Map(orderedDelegations.map((item, index) => [item.id, index]));
 
   return orderedDelegations.map((item) => ({
-    title: `${item.role.charAt(0).toUpperCase() + item.role.slice(1)}: ${item.objective}`,
+    title: `${item.role.charAt(0).toUpperCase() + item.role.slice(1)}${item.specialty ? ` · ${item.specialty}` : ''}: ${item.objective}`,
     description: item.objective,
     role: item.role,
     priority: item.role === 'builder' || item.role === 'reviewer' || item.role === 'qa' ? 'high' : 'medium',
@@ -440,6 +575,9 @@ function toStructuredTaskPlan(delegations: OrchestratorDelegation[]): Structured
       return index;
     }),
     targetDescriptor: item.role === 'builder' ? item.targetDescriptor : undefined,
+    agentProfileId: item.agentProfileId,
+    specialty: item.specialty,
+    routePreference: item.routePreference || workerRoutes?.[item.role],
   }));
 }
 
@@ -481,6 +619,7 @@ export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTa
         objective: `Review Builder lane "${builder.objective}" against the user request, repository rules, architecture and security constraints.`,
         requiredCapabilities: ['code-review', 'security-review', 'architecture-review'],
         dependsOnDelegationIds: [builder.id],
+        routePreference: decision.workerRoutes?.reviewer,
       });
       delegations.push({
         id: qaId,
@@ -488,9 +627,10 @@ export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTa
         objective: `Validate the reviewed Builder lane "${builder.objective}" with the safest relevant build, tests, lint and static checks.`,
         requiredCapabilities: ['testing', 'build', 'lint', 'validation'],
         dependsOnDelegationIds: [reviewerId],
+        routePreference: decision.workerRoutes?.qa,
       });
     }
   }
 
-  return toStructuredTaskPlan(delegations);
+  return toStructuredTaskPlan(delegations, decision.workerRoutes);
 }

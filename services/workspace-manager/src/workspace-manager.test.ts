@@ -59,7 +59,7 @@ async function runTests() {
       PRAGMA foreign_keys = ON;
       CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, git_initialized INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT, last_team_template_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', team_template_id TEXT NOT NULL DEFAULT '', plan_id TEXT, execution_mode TEXT NOT NULL DEFAULT 'balanced', automation_policy TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
-      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, agent_profile_id TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, target_descriptor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, plan_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'planned', priority TEXT NOT NULL DEFAULT 'medium', assigned_agent_id TEXT, assigned_role TEXT, agent_profile_id TEXT, specialty TEXT, route_preference TEXT, required_capabilities TEXT NOT NULL, depends_on TEXT NOT NULL, worktree_id TEXT, target_descriptor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT);
       CREATE TABLE task_attempts (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE, agent_instance_id TEXT NOT NULL, agent_profile_id TEXT, attempt_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'running', worktree_path TEXT, runtime_session_id TEXT, route_adapter_id TEXT, route_provider TEXT, route_account_profile_id TEXT, route_model_catalog_id TEXT, route_runtime_model_id TEXT, route_reasoning_level TEXT, route_source TEXT, route_selection_mode TEXT, provider_session_id TEXT, heartbeat_at TEXT, lease_expires_at TEXT, retryable INTEGER NOT NULL DEFAULT 0, claimed_at TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result_summary TEXT, review_pack TEXT);
       CREATE UNIQUE INDEX idx_task_attempts_task_number ON task_attempts(task_id, attempt_number);
       CREATE TABLE team_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', max_parallel_agents INTEGER, worker_pools TEXT, is_default INTEGER DEFAULT 0, created_at TEXT NOT NULL);
@@ -110,6 +110,11 @@ async function runTests() {
       profileId: workspaceBuilder.id, isDefault: true,
       override: { allowedRoutePolicy: { allowedCatalogIds: ['catalog-safe'] } },
     });
+    await attemptManager.bindAgentProfile({
+      id: 'binding-workspace-specialist', scopeType: 'workspace', scopeId: 'attempt-workspace',
+      profileId: teamBuilder.id, isDefault: false,
+      override: { allowedRoutePolicy: { allowedCatalogIds: ['catalog-secondary'] } },
+    });
     assert(workspaceBinding.isDefault && workspaceBinding.role === 'builder', 'workspace/team Agent Profile bindings persist fixed role and default state');
     const profileWorkspace = await attemptManager.createWorkspace({ id: 'attempt-workspace', name: 'Attempt test', path: tmpDir });
     {
@@ -148,6 +153,22 @@ async function runTests() {
       assert(true, 'already removed worktrees return without probing or pruning an unrelated repository');
     }
     const attemptMission = await attemptManager.createMission({ id: 'attempt-mission', workspaceId: profileWorkspace.id, title: 'Parallel research', teamTemplateId: 'profile-team-template' });
+    const routedTask = await attemptManager.createTask({
+      missionId: attemptMission.id,
+      title: 'Implement a routed specialist lane',
+      assignedRole: 'builder',
+      agentProfileId: workspaceBuilder.id,
+      specialty: 'React UI',
+      routePreference: {
+        modelCatalogId: 'catalog-safe', accountProfileId: 'account-safe', reasoningLevel: 'high',
+        fallbackCatalogIds: [], selectionMode: 'fixed', modelDisplayName: 'Safe Model', routeLabel: 'Codex · Work',
+      },
+    });
+    const reloadedRoutedTask = await attemptManager.getTask(routedTask.id);
+    assert(reloadedRoutedTask?.specialty === 'React UI'
+      && reloadedRoutedTask.routePreference?.modelCatalogId === 'catalog-safe'
+      && reloadedRoutedTask.routePreference?.selectionMode === 'fixed',
+      'task-specific specialist focus and approved route preference persist through workspace task storage');
     const workspaceResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' });
     assert(workspaceResolution.source === 'workspace' && workspaceResolution.profile.id === workspaceBuilder.id
       && workspaceResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.join(',') === 'catalog-safe',
@@ -155,6 +176,15 @@ async function runTests() {
     const explicitResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder', profileId: globalBuilder.id });
     assert(explicitResolution.source === 'explicit' && explicitResolution.profile.id === globalBuilder.id
       && explicitResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.length === 2, 'explicit named profiles bypass lower-scope bindings without losing their identity');
+    const poolResolution = await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder', profileId: teamBuilder.id });
+    assert(poolResolution.profile.id === teamBuilder.id
+      && poolResolution.profile.allowedRoutePolicy?.allowedCatalogIds?.join(',') === 'catalog-secondary',
+      'an explicitly selected non-default workspace specialist resolves with its scoped route restrictions');
+    const unboundSpecialist = await attemptManager.unbindAgentProfile({
+      scopeType: 'workspace', scopeId: profileWorkspace.id, role: 'builder', profileId: teamBuilder.id,
+    });
+    assert(unboundSpecialist && !(await attemptManager.listAgentProfileBindings({ scopeType: 'workspace', scopeId: profileWorkspace.id })).some((binding) => binding.profileId === teamBuilder.id),
+      'workspace specialist pool can remove one bound profile without clearing the role default');
     await attemptManager.archiveAgentProfile(workspaceBuilder.id);
     let archivedWorkspaceRejected = false;
     try { await attemptManager.resolveAgentProfileForMission({ missionId: attemptMission.id, role: 'builder' }); } catch { archivedWorkspaceRejected = true; }
@@ -259,8 +289,9 @@ async function runTests() {
     assert(claimedAttempts[0].routeSource === 'explicit' && claimedAttempts[0].routeRuntimeModelId === 'gpt-5', 'explicit chat route is persisted on the claimed attempt');
     assert(retryAttempt.routeSource === 'workspace' && retryAttempt.routeAdapterId === 'claude_code', 'a retry receives a distinct policy snapshot in a new attempt');
     const routedTasks = await attemptManager.listTasks(attemptMission.id);
-    assert(routedTasks[0].effectiveRoute?.adapterId === 'claude_code' && routedTasks[0].effectiveRoute?.runtimeModelId === 'claude-sonnet'
-      && !('providerSessionId' in (routedTasks[0].effectiveRoute || {})), 'task read model exposes only the latest effective route snapshot without session secrets');
+    const latestAttemptTask = routedTasks.find((task) => task.id === attemptTasks[0].id);
+    assert(latestAttemptTask?.effectiveRoute?.adapterId === 'claude_code' && latestAttemptTask.effectiveRoute?.runtimeModelId === 'claude-sonnet'
+      && !('providerSessionId' in (latestAttemptTask?.effectiveRoute || {})), 'task read model exposes only the latest effective route snapshot without session secrets');
     sqlite.prepare("INSERT INTO team_templates (id, name, max_parallel_agents, worker_pools, created_at) VALUES (?, ?, ?, ?, ?)")
       .run('limited-team', 'Limited', 99, JSON.stringify([{ role: 'researcher', minInstances: -4, maxInstances: 2, maxParallel: 1 }]), new Date().toISOString());
     await attemptManager.updateMission(attemptMission.id, { teamTemplateId: 'limited-team' });

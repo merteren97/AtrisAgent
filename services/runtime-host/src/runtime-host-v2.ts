@@ -1,8 +1,14 @@
 import {
   LocalEventBus,
   redactSensitiveValue,
+  registerSupervisorPlanningResourcesProvider,
   registerSupervisorTurnRunner,
+  unregisterSupervisorPlanningResourcesProvider,
   unregisterSupervisorTurnRunner,
+  type SupervisorPlanningResources,
+  type SupervisorPlanningResourcesProvider,
+  type SupervisorPlanningRole,
+  type SupervisorRequestedProfiles,
   type SupervisorTurnRuntimeRequest,
   type SupervisorTurnRunner,
   type Unsubscribe,
@@ -13,7 +19,10 @@ import type {
   ModelDescriptor,
   RuntimeType,
   WorkerRequest,
+  AgentRole,
+  AgentProfileScopeType,
 } from '@atris-agent-code/domain';
+import { mergeAgentProfiles } from '@atris-agent-code/domain';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import {
   RuntimeHost as LegacyRuntimeHost,
@@ -29,9 +38,14 @@ import { OpenCodeAdapter } from './adapters/opencode-adapter';
 
 const SUPERVISOR_TIMEOUT_MS = 180_000;
 const ADAPTER_IDS: RuntimeType[] = ['codex', 'claude_code', 'antigravity', 'opencode'];
+const PLANNING_WORKER_ROLES: readonly SupervisorPlanningRole[] = ['researcher', 'builder', 'reviewer', 'qa'];
 const MAX_PROCESS_DELTA_CHARS = 8_000;
 const MAX_PROCESS_RESULT_CHARS = 16_000;
 const DEFAULT_SUPERVISOR_IDLE_TTL_MS = 10 * 60_000;
+
+function isPlanningWorkerRole(role: AgentRole): role is SupervisorPlanningResources['specialists'][number]['role'] {
+  return (PLANNING_WORKER_ROLES as readonly AgentRole[]).includes(role);
+}
 
 interface SupervisorSession {
   adapter: BaseRuntimeAdapter;
@@ -70,6 +84,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   private readonly activeSupervisorTurns = new Map<string, Set<{ adapter: BaseRuntimeAdapter; cancel: () => void }>>();
   private readonly pendingSupervisorShutdowns = new Map<string, Set<BaseRuntimeAdapter>>();
   private readonly supervisorRunner: SupervisorTurnRunner;
+  private readonly supervisorPlanningResourcesProvider: SupervisorPlanningResourcesProvider;
   private readonly supervisorSessions = new Map<string, SupervisorSession>();
   private readonly supervisorIdleTtlMs: number;
   private observationBus?: LocalEventBus;
@@ -85,7 +100,9 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     this.supervisorIdleTtlMs = Math.max(1, config.supervisorSessionIdleTtl ?? DEFAULT_SUPERVISOR_IDLE_TTL_MS);
     this.observationBus = eventBus;
     this.supervisorRunner = (request) => this.runSupervisorTurn(request);
+    this.supervisorPlanningResourcesProvider = (missionId, requestedProfiles) => this.getSupervisorPlanningResources(missionId, requestedProfiles);
     registerSupervisorTurnRunner(this.supervisorRunner);
+    registerSupervisorPlanningResourcesProvider(this.supervisorPlanningResourcesProvider);
   }
 
   override setMissionRoutingPreference(missionId: string, preference: MissionRoutingPreference): void {
@@ -108,6 +125,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
 
   override async stopAll(): Promise<void> {
     unregisterSupervisorTurnRunner(this.supervisorRunner);
+    unregisterSupervisorPlanningResourcesProvider(this.supervisorPlanningResourcesProvider);
     this.supervisorRouting.clear();
     const failures: unknown[] = [];
     const recordFailure = (error: unknown) => failures.push(error);
@@ -245,6 +263,101 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       case 'opencode': return new OpenCodeAdapter(eventBus);
       default: throw new Error(`Unsupported supervisor runtime '${runtimeType}'.`);
     }
+  }
+
+  private async getSupervisorPlanningResources(missionId: string, requestedProfiles?: SupervisorRequestedProfiles): Promise<SupervisorPlanningResources> {
+    const manager = this.v2WorkspaceManager;
+    if (!manager) return { models: [], specialists: [] };
+
+    const mission = await manager.getMission(missionId);
+    const bindingScopes: Array<{ scopeType: AgentProfileScopeType; scopeId: string }> = [];
+    if (mission?.workspaceId) bindingScopes.push({ scopeType: 'workspace', scopeId: mission.workspaceId });
+    if (mission?.teamTemplateId) bindingScopes.push({ scopeType: 'team_template', scopeId: mission.teamTemplateId });
+    bindingScopes.push({ scopeType: 'global', scopeId: 'global' });
+
+    const bindings = (await Promise.all(bindingScopes.map(({ scopeType, scopeId }) =>
+      manager.listAgentProfileBindings({ scopeType, scopeId }),
+    ))).flat().filter((binding) => binding.scopeType !== 'global' || binding.isDefault);
+    const specialistsById = new Map<string, SupervisorPlanningResources['specialists'][number]>();
+    for (const binding of bindings) {
+      if (!isPlanningWorkerRole(binding.role)) continue;
+      const profile = await manager.getAgentProfile(binding.profileId);
+      if (!profile || profile.archivedAt || profile.role !== binding.role) continue;
+      const merged = mergeAgentProfiles(profile, binding.override);
+      if (!specialistsById.has(merged.id)) {
+        specialistsById.set(merged.id, {
+          id: merged.id,
+          name: merged.name,
+          role: binding.role,
+          specialty: merged.specialty,
+          description: merged.description,
+          capabilities: merged.capabilities,
+          allowedRoutePolicy: merged.allowedRoutePolicy,
+        });
+      }
+    }
+    for (const profile of await manager.listAgentProfiles()) {
+      if (!profile.isDefault || !isPlanningWorkerRole(profile.role) || specialistsById.has(profile.id)) continue;
+      specialistsById.set(profile.id, {
+        id: profile.id,
+        name: profile.name,
+        role: profile.role,
+        specialty: profile.specialty,
+        description: profile.description,
+        capabilities: profile.capabilities,
+        allowedRoutePolicy: profile.allowedRoutePolicy,
+      });
+    }
+    const defaultSpecialists: NonNullable<SupervisorPlanningResources['defaultSpecialists']> = {};
+    if (typeof manager.resolveAgentProfileForMission === 'function') {
+      for (const role of PLANNING_WORKER_ROLES) {
+        const resolution = await manager.resolveAgentProfileForMission({ missionId, role, profileId: requestedProfiles?.[role] });
+        const profile = resolution.profile;
+        if (profile.id === role) continue;
+        const specialist: SupervisorPlanningResources['specialists'][number] = {
+          id: profile.id,
+          name: profile.name,
+          role,
+          specialty: profile.specialty,
+          description: profile.description,
+          capabilities: profile.capabilities,
+          allowedRoutePolicy: profile.allowedRoutePolicy,
+        };
+        defaultSpecialists[role] = specialist;
+        specialistsById.set(profile.id, specialist);
+      }
+    }
+
+    const accountProfiles = (await this.getAccountProfileManager().getProfiles())
+      .filter((profile) => profile.authStatus === 'connected');
+    const connectedIds = new Set(accountProfiles.map((profile) => profile.id));
+    const catalog = this.getModelCatalogService();
+    let catalogModels = catalog.getCachedCatalog().filter((model) => connectedIds.has(model.accountProfileId));
+    const cachedProfileIds = new Set(catalogModels.map((model) => model.accountProfileId));
+    if (!catalogModels.length
+      || accountProfiles.some((profile) => !cachedProfileIds.has(profile.id))
+      || catalogModels.some((model) => model.source === 'cached' || model.availability === 'unknown')) {
+      catalogModels = await catalog.discoverLiveModels(accountProfiles);
+    }
+    const models = catalogModels
+      .filter((model) => connectedIds.has(model.accountProfileId)
+        && model.availability === 'available'
+        && model.source !== 'cached'
+        && model.hidden !== true)
+      .map((model) => ({
+        catalogId: model.catalogId,
+        accountProfileId: model.accountProfileId,
+        runtimeId: model.runtimeId,
+        runtimeModelId: model.runtimeModelId,
+        displayName: model.displayName,
+        routeLabel: model.routeLabel,
+        supportedRoles: model.supportedRoles.filter(isPlanningWorkerRole),
+        supportedReasoning: model.supportedReasoning,
+        defaultReasoning: model.defaultReasoning,
+      }))
+      .filter((model) => model.supportedRoles.length > 0);
+
+    return { models, specialists: [...specialistsById.values()], defaultSpecialists, requestedProfileIds: requestedProfiles };
   }
 
   async runSupervisorTurn(request: SupervisorTurnRuntimeRequest): Promise<string> {

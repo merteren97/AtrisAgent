@@ -66,6 +66,115 @@
   --sidebar-muted: 215 12% 62%;
 }
 
+/* Appearance and palette are independent: each palette supplies both surfaces. */
+:root[data-palette="graphite"] {
+  --background: 210 17% 97%; --foreground: 216 21% 16%;
+  --card: 0 0% 100%; --card-foreground: 216 21% 16%;
+  --popover: 0 0% 100%; --popover-foreground: 216 21% 16%;
+  --primary: 212 20% 36%; --primary-foreground: 0 0% 100%;
+  --secondary: 210 14% 93%; --secondary-foreground: 216 19% 20%;
+  --muted: 210 13% 94%; --muted-foreground: 214 10% 40%;
+  --accent: 210 13% 92%; --accent-foreground: 216 19% 20%;
+  --border: 212 12% 82%; --input: 212 12% 82%; --ring: 212 20% 36%;
+  --sidebar: 210 16% 96%; --sidebar-foreground: 216 19% 24%;
+  --sidebar-border: 212 13% 85%; --sidebar-accent: 210 12% 90%;
+  --sidebar-accent-foreground: 216 19% 20%; --sidebar-muted: 214 10% 42%;
+}
+.dark[data-palette="graphite"] {
+  --background: 216 13% 9%; --foreground: 210 17% 89%;
+  --card: 213 12% 13%; --card-foreground: 210 17% 89%;
+  --popover: 213 12% 13%; --popover-foreground: 210 17% 89%;
+  --primary: 208 20% 76%; --primary-foreground: 216 20% 10%;
+  --secondary: 213 11% 19%; --secondary-foreground: 210 15% 86%;
+  --muted: 213 11% 18%; --muted-foreground: 211 11% 68%;
+  --accent: 213 11% 22%; --accent-foreground: 210 17% 89%;
+  --border: 214 11% 27%; --input: 214 11% 27%; --ring: 208 20% 76%;
+  --sidebar: 216 12% 10%; --sidebar-foreground: 210 15% 83%;
+  --sidebar-border: 214 10% 23%; --sidebar-accent: 214 11% 20%;
+  --sidebar-accent-foreground: 210 17% 89%; --sidebar-muted: 211 11% 68%;
+}
+
+:root[data-palette="ocean"] {
+  --background: 200 36% 97%; --foreground: 204 45% 15%;
+  --card: 0 0% 100%; --card-foreground: 204 45% 15%;
+  --popover: 0 0% 100%; --popover-foreground: 204 45% 15%;
+  --primary: 197 90% 31%; --primary-foreground: 0 0% 100%;
+  --secondary: 198 29% 93%; --secondary-foreground: 204 37% 20%;
+  --muted: 199 27% 94%; --muted-foreground: 203 16% 39%;
+  --accent: 198 32% 90%; --accent-foreground: 204 37% 20%;
+  --border: 201 25% 82%; --input: 201 25% 82%; --ring: 197 90% 31%;
+  --sidebar: 200 31% 96%; --sidebar-foreground: 204 37% 22%;
+  --sidebar-border: 201 24% 86%; --sidebar-accent: 198 28% 90%;
+  --sidebar-accent-foreground: 204 37% 20%; --sidebar-muted: 203 16% 41%;
+}
+.dark[data-palette="ocean"] {
+  --background: 206 46% 9%; --foreground: 195 35% 91%;
+  --card: 205 39% 13%; --card-foreground: 195 35% 91%;
+  --popover: 205 39% 13%; --popover-foreground: 195 35% 91%;
+  --primary: 188 66% 63%; --primary-foreground: 207 48% 8%;
+  --secondary: 205 34% 19%; --secondary-foreground: 195 32% 87%;
+  --muted: 205 32% 18%; --muted-foreground: 198 20% 70%;
+  --accent: 204 32% 23%; --accent-foreground: 195 35% 91%;
+  --border: 204 28% 26%; --input: 204 28% 26%; --ring: 188 66% 63%;
+  --sidebar: 207 44% 10%; --sidebar-foreground: 195 30% 84%;
+  --sidebar-border: 205 30% 23%; --sidebar-accent: 205 33% 20%;
+  --sidebar-accent-foreground: 195 35% 91%; --sidebar-muted: 198 19% 69%;
+}
+
+:root[data-palette="forest"] {
+  --background: 145 23% 97%; --foreground: 152 24% 16%;
+  --card: 0 0% 100%; --card-foreground: 152 24% 16%;
+  --popover: 0 0% 100%; --popover-foreground: 152 24% 16%;
+  --primary: 154 58% 30%; --primary-foreground: 0 0% 100%;
+  --secondary: 145 18% 93%; --secondary-foreground: 152 22% 19%;
+  --muted: 145 17% 94%; --muted-foreground: 151 12% 39%;
+  --accent: 145 21% 90%; --accent-foreground: 152 22% 19%;
+  --border: 149 19% 82%; --input: 149 19% 82%; --ring: 154 58% 30%;
+  --sidebar: 145 20% 96%; --sidebar-foreground: 152 22% 22%;
+  --sidebar-border: 149 19% 86%; --sidebar-accent: 145 18% 90%;
+  --sidebar-accent-foreground: 152 22% 19%; --sidebar-muted: 151 12% 41%;
+}
+.dark[data-palette="forest"] {
+  --background: 155 30% 9%; --foreground: 142 27% 91%;
+  --card: 154 25% 13%; --card-foreground: 142 27% 91%;
+  --popover: 154 25% 13%; --popover-foreground: 142 27% 91%;
+  --primary: 153 47% 65%; --primary-foreground: 158 33% 9%;
+  --secondary: 153 22% 19%; --secondary-foreground: 142 24% 87%;
+  --muted: 153 21% 18%; --muted-foreground: 149 16% 69%;
+  --accent: 153 22% 23%; --accent-foreground: 142 27% 91%;
+  --border: 153 21% 26%; --input: 153 21% 26%; --ring: 153 47% 65%;
+  --sidebar: 155 28% 10%; --sidebar-foreground: 142 25% 84%;
+  --sidebar-border: 153 22% 23%; --sidebar-accent: 153 22% 20%;
+  --sidebar-accent-foreground: 142 27% 91%; --sidebar-muted: 149 16% 69%;
+}
+
+:root[data-palette="copper"] {
+  --background: 31 37% 97%; --foreground: 23 25% 17%;
+  --card: 0 0% 100%; --card-foreground: 23 25% 17%;
+  --popover: 0 0% 100%; --popover-foreground: 23 25% 17%;
+  --primary: 21 70% 38%; --primary-foreground: 0 0% 100%;
+  --secondary: 29 29% 93%; --secondary-foreground: 23 23% 21%;
+  --muted: 31 25% 94%; --muted-foreground: 25 15% 39%;
+  --accent: 29 30% 90%; --accent-foreground: 23 23% 21%;
+  --border: 28 24% 82%; --input: 28 24% 82%; --ring: 21 70% 38%;
+  --sidebar: 32 32% 96%; --sidebar-foreground: 23 23% 23%;
+  --sidebar-border: 28 23% 86%; --sidebar-accent: 30 25% 90%;
+  --sidebar-accent-foreground: 23 23% 21%; --sidebar-muted: 25 15% 41%;
+}
+.dark[data-palette="copper"] {
+  --background: 25 24% 10%; --foreground: 33 36% 91%;
+  --card: 25 24% 14%; --card-foreground: 33 36% 91%;
+  --popover: 25 24% 14%; --popover-foreground: 33 36% 91%;
+  --primary: 27 72% 70%; --primary-foreground: 23 33% 10%;
+  --secondary: 25 21% 20%; --secondary-foreground: 33 31% 86%;
+  --muted: 25 20% 19%; --muted-foreground: 31 18% 70%;
+  --accent: 25 22% 24%; --accent-foreground: 33 36% 91%;
+  --border: 26 21% 27%; --input: 26 21% 27%; --ring: 27 72% 70%;
+  --sidebar: 25 25% 11%; --sidebar-foreground: 33 29% 84%;
+  --sidebar-border: 26 20% 24%; --sidebar-accent: 25 21% 21%;
+  --sidebar-accent-foreground: 33 36% 91%; --sidebar-muted: 31 18% 69%;
+}
+
 @theme {
   --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
   
@@ -126,9 +235,9 @@ body {
   width: 100vw;
 }
 
-/* A stable desktop frame: navigation is chrome, the workspace is the canvas. */
-.atris-workspace-shell > main {
-  margin: 8px 8px 8px 0;
+/* Shared window chrome anchors the workspace frame and keeps columns visually distinct. */
+.atris-workspace-body > main {
+  margin: 8px;
   border: 1px solid var(--color-border);
   border-radius: 14px;
   overflow: hidden;
@@ -136,21 +245,29 @@ body {
   container-type: inline-size;
 }
 .workspace-home { container-type: inline-size; }
-.workspace-sidebar { border-right: 0; container: workspace-navigation / inline-size; }
-/* Flat navigation chrome; sections are separated by spacing rather than rules. */
-.workspace-sidebar button,
-.workspace-sidebar .navigation-row { border-radius: 0; }
-.workspace-sidebar .navigation-row[data-active="true"] { box-shadow: none; }
-@container workspace-navigation (max-width: 250px) {
-  .sidebar-new-conversation kbd { display: none; }
+.project-browser { display: grid; min-width: 0; gap: 16px; align-items: start; }
+.project-workspace-row[data-selected="true"] { box-shadow: inset 2px 0 var(--color-primary); }
+@container (min-width: 850px) {
+  .project-browser { grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.1fr); }
 }
-.workspace-sidebar > [data-tauri-drag-region] { height: 64px; border-bottom: 0; }
-.workspace-sidebar[data-collapsed="true"] > [data-tauri-drag-region] {
-  height: auto;
-  padding: 20px 0 8px;
+.workspace-sidebar {
+  width: calc(62px + var(--workspace-pane-width));
+  margin: 8px 0 8px 8px;
+  border: 1px solid var(--color-sidebar-border);
+  border-radius: 14px;
+  transition: width 180ms ease;
 }
+.workspace-sidebar > .workspace-rail { border-radius: 13px 0 0 13px; }
+.workspace-sidebar > .workspace-pane { border-radius: 0 13px 13px 0; }
+.workspace-sidebar[data-collapsed="true"] { width: 62px; }
+.workspace-sidebar[data-collapsed="true"] .workspace-pane { display: none; }
+.workspace-rail nav > button { height: 40px; padding: 0; }
+.workspace-rail nav > button[aria-current="page"] { color: var(--color-sidebar-foreground); }
+.workspace-rail nav > button[aria-current="page"] svg { stroke-width: 2.5; }
+.workspace-rail nav > button svg { width: 18px; height: 18px; }
+.workspace-pane .navigation-row { border-radius: 8px; }
 /* Radix's intrinsic table wrapper otherwise lets long titles push actions off-screen. */
-.workspace-sidebar [data-radix-scroll-area-viewport] > div { display: block !important; }
+.workspace-pane [data-radix-scroll-area-viewport] > div { display: block !important; }
 .navigation-row { position: relative; min-height: 38px; }
 .navigation-row-action { opacity: 0; pointer-events: none; transition: opacity 120ms ease, background-color 120ms ease; }
 .navigation-row:hover > .navigation-row-action,
@@ -159,9 +276,13 @@ body {
 .navigation-section-title { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; color: var(--color-sidebar-muted); }
 @media (hover: none) { .navigation-row-action { opacity: 1; pointer-events: auto; } }
 @media (prefers-reduced-motion: reduce) { .navigation-row-action { transition: none; } }
-.workspace-sidebar button:focus-visible { outline: 2px solid var(--color-ring); outline-offset: -2px; }
+.workspace-sidebar button:focus-visible { outline: 2px solid hsl(var(--sidebar-foreground) / 0.65); outline-offset: -2px; }
+@media (prefers-reduced-motion: reduce) { .workspace-sidebar { transition: none; } }
 @media (max-width: 800px) {
-  .atris-workspace-shell > main { margin: 4px 4px 4px 0; border-radius: 10px; }
+  .atris-workspace-body > main { margin: 4px; border-radius: 10px; }
+  .workspace-sidebar { margin: 4px 0 4px 4px; border-radius: 10px; }
+  .workspace-sidebar > .workspace-rail { border-radius: 9px 0 0 9px; }
+  .workspace-sidebar > .workspace-pane { border-radius: 0 9px 9px 0; }
 }
 
 /* Scrollbar styling */
@@ -175,12 +296,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: hsl(225 15% 22%);
+  background: hsl(var(--sidebar-foreground) / 0.28);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: hsl(225 15% 30%);
+  background: hsl(var(--sidebar-foreground) / 0.42);
 }
 
 /* Native frameless-window regions for Windows/WebView2.

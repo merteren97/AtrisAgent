@@ -2,6 +2,10 @@ use keyring::Entry;
 use serde::Serialize;
 use std::{fs, path::Path, process::Command};
 use tauri::{AppHandle, Manager, State};
+#[cfg(windows)]
+use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+#[cfg(windows)]
+use windows::core::Interface;
 
 use app_lifecycle::{set_close_behavior, CloseBehaviorState};
 use app_updater::{check_for_updates, get_update_runtime_info, install_update};
@@ -346,6 +350,21 @@ pub fn run() {
         .setup(|app| {
             app_lifecycle::setup(app)?;
             app_updater::setup(app)?;
+            // WebView2 owns its Find/Reload/Print/Zoom shortcuts. Keep application
+            // shortcuts (Ctrl+K, Ctrl+N) and text editing inside the web content.
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(|webview| unsafe {
+                    let result = webview.controller().CoreWebView2().and_then(|core| core.Settings()).and_then(|settings| {
+                        settings
+                            .cast::<ICoreWebView2Settings3>()?
+                            .SetAreBrowserAcceleratorKeysEnabled(false)
+                    });
+                    if let Err(error) = result {
+                        eprintln!("[AtrisAgent] Could not disable WebView2 browser shortcuts: {error}");
+                    }
+                })?;
+            }
             let state = app.state::<runtime::RuntimeState>();
             if let Err(error) = state.start(&app.handle()) {
                 state.shutdown();

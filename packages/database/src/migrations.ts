@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 20;
+export const DATABASE_SCHEMA_VERSION = 21;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -533,5 +533,13 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
         AFTER DELETE ON team_templates
         BEGIN DELETE FROM agent_profile_bindings WHERE scope_type = 'team_template' AND scope_id = OLD.id; END;`);
     }
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 21) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'tasks')) {
+      if (!hasColumn(sqlite, 'tasks', 'specialty')) sqlite.exec('ALTER TABLE tasks ADD COLUMN specialty TEXT');
+      if (!hasColumn(sqlite, 'tasks', 'route_preference')) sqlite.exec('ALTER TABLE tasks ADD COLUMN route_preference TEXT');
+    }
+    sqlite.exec('PRAGMA user_version = 21');
   })();
 }

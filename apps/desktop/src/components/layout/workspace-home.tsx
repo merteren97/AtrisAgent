@@ -14,8 +14,8 @@ export function ConversationChoice() {
   const missions = useMissionStore(s => s.missions);
   const availableModels = useAccountStore(s => s.discoveredModels.filter(m => m.available).length);
   const recent = [
-    ...conversations.map(c => ({id:c.id, title:c.title, mode:'Manual', detail:`${c.agents.length} independent agent${c.agents.length === 1 ? '' : 's'}`, date:c.createdAt, open:() => useManualStore.getState().select(c)})),
-    ...missions.filter(m => m.workspaceId === workspaceId).map(m => ({id:m.id, title:m.title, mode:'Orchestrator', detail:m.status.replaceAll('_',' '), date:m.createdAt || '', open:() => useMissionStore.getState().setActiveMission(m.id)})),
+    ...conversations.map(c => ({id:c.id, title:c.title, mode:'Manual', detail:`${c.agents.length} independent agent${c.agents.length === 1 ? '' : 's'}`, date:c.createdAt, open:() => { useManualStore.getState().select(c); useSettingsStore.getState().setActiveView('chat'); }})),
+    ...missions.filter(m => m.workspaceId === workspaceId).map(m => ({id:m.id, title:m.title, mode:'Orchestrator', detail:m.status.replaceAll('_',' '), date:m.createdAt || '', open:() => { useManualStore.getState().setMode('orchestrator'); useMissionStore.getState().setActiveMission(m.id); useSettingsStore.getState().setActiveView('chat'); }})),
   ].sort((a,b) => b.date.localeCompare(a.date)).slice(0,5);
   const startManual = () => { useManualStore.getState().setMode('manual'); useManualStore.getState().setCreating(true); };
   const startOrchestrator = () => { useMissionStore.getState().clearActiveMission(); useManualStore.getState().setMode('orchestrator'); };
@@ -31,20 +31,20 @@ export function ConversationChoice() {
         <Button variant="outline" size="sm" className="hidden shrink-0 sm:inline-flex" onClick={() => useSettingsStore.getState().setActiveView('projects')}><FolderGit2 className="mr-2 h-4 w-4" />Projects</Button>
       </div>
 
-      <div className="mb-4 flex items-center gap-2"><h3 className="text-sm font-semibold">Start working</h3><span className="text-xs text-muted-foreground">Choose how agents work</span></div>
-      <div className="grid gap-4 @min-[620px]:grid-cols-2">
-        <button disabled={!workspace} onClick={startManual} className="workspace-mode-card group flex flex-col rounded-2xl border border-border bg-card p-6 text-left transition-colors hover:border-primary/50 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
-          <div className="mb-5 flex w-full items-center justify-between"><span className="flex h-11 w-11 items-center justify-center rounded-xl bg-primary/10 text-primary"><TerminalSquare className="h-5 w-5" /></span><span className="rounded-full bg-secondary px-2.5 py-1 text-[11px] font-medium text-muted-foreground">You lead</span></div>
-          <h4 className="text-lg font-semibold tracking-tight">Manual workspace</h4>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">Choose a CLI and model. Talk to independent agents or work directly in their terminals.</p>
-          <div className="mt-5 flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground"><span className="flex items-center gap-1.5"><MessageSquare className="h-3.5 w-3.5" />Chat + Code</span><span className="flex items-center gap-1.5"><Bot className="h-3.5 w-3.5" />Independent sessions</span></div>
-          <span className="mt-6 flex w-full items-center justify-between border-t border-border pt-4 text-sm font-medium text-primary">Create manual conversation<ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1 motion-reduce:transform-none" /></span>
-        </button>
-        <button disabled={!workspace} onClick={startOrchestrator} className="workspace-mode-card group flex flex-col rounded-2xl border border-border bg-card p-6 text-left transition-colors hover:border-primary/50 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
-          <div className="mb-5 flex w-full items-center justify-between"><span className="flex h-11 w-11 items-center justify-center rounded-xl bg-secondary text-foreground"><Workflow className="h-5 w-5" /></span><span className="rounded-full bg-secondary px-2.5 py-1 text-[11px] font-medium text-muted-foreground">Agents coordinate</span></div>
-          <h4 className="text-lg font-semibold tracking-tight">Orchestrator</h4>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">Describe a goal. Let the orchestrator plan, delegate and bring the whole workflow together.</p>
-          <div className="mt-5 flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground"><span>One conversation</span><span>Coordinated workflow</span></div>
+       <div className="mb-4 flex items-center gap-2"><h3 className="text-sm font-semibold">Choose a workflow</h3><span className="text-xs text-muted-foreground">Same project, different levels of control</span></div>
+       <div className="grid gap-4 @min-[620px]:grid-cols-2">
+         <button disabled={!workspace} onClick={startManual} className="workspace-mode-card group flex flex-col rounded-xl border border-border bg-card p-5 text-left transition-colors hover:border-primary/50 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+           <div className="mb-5 flex w-full items-center justify-between"><span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary"><TerminalSquare className="h-5 w-5" /></span><span className="text-[11px] font-medium text-primary">You lead</span></div>
+           <h4 className="text-base font-semibold tracking-tight">Manual</h4>
+           <p className="mt-2 text-sm leading-6 text-muted-foreground">Choose a CLI and model. Direct independent agents in Chat or their live terminals.</p>
+           <div className="mt-5 flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground"><span className="flex items-center gap-1.5"><MessageSquare className="h-3.5 w-3.5" />Chat + Code</span><span className="flex items-center gap-1.5"><Bot className="h-3.5 w-3.5" />Independent sessions</span></div>
+           <span className="mt-6 flex w-full items-center justify-between border-t border-border pt-4 text-sm font-medium text-primary">Start manual conversation<ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1 motion-reduce:transform-none" /></span>
+         </button>
+         <button disabled={!workspace} onClick={startOrchestrator} className="workspace-mode-card group flex flex-col rounded-xl border border-border bg-card p-5 text-left transition-colors hover:border-primary/50 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+           <div className="mb-5 flex w-full items-center justify-between"><span className="flex h-9 w-9 items-center justify-center rounded-lg bg-secondary text-foreground"><Workflow className="h-5 w-5" /></span><span className="text-[11px] font-medium text-muted-foreground">Agents coordinate</span></div>
+           <h4 className="text-base font-semibold tracking-tight">Orchestrator</h4>
+           <p className="mt-2 text-sm leading-6 text-muted-foreground">Describe a goal. Follow a coordinated plan, delegation and review in one conversation.</p>
+           <div className="mt-5 flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground"><span className="flex items-center gap-1.5"><Workflow className="h-3.5 w-3.5" />Shared plan</span><span>Approval checkpoints</span></div>
           <span className="mt-6 flex w-full items-center justify-between border-t border-border pt-4 text-sm font-medium">Start orchestrated conversation<ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1 motion-reduce:transform-none" /></span>
         </button>
       </div>

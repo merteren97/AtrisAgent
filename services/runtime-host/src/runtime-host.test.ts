@@ -805,7 +805,7 @@ async function runTests() {
 
   // Effective routes cross the WorkspaceManager boundary before provider execution.
   {
-    const cases = [
+    const cases: Array<{ name: string; eventRoute: Record<string, unknown>; expectedSource: string; expectedMode: string; policy?: any; taskSpecialty?: string; taskRoutePreference?: any }> = [
       {
         name: 'fixed user mission route defeats planner override',
         eventRoute: {modelCatalogId:'planner-other-model',routeSelectionMode:'fixed'}, expectedSource:'mission',expectedMode:'fixed',
@@ -821,6 +821,12 @@ async function runTests() {
         policy: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'medium', fallbackCatalogIds: [], selectionMode: 'prefer', source: 'workspace' },
       },
       {
+        name: 'persisted task model choice outranks workspace role preference', eventRoute: {}, expectedSource: 'explicit', expectedMode: 'fixed',
+        taskSpecialty: 'React interface specialist',
+        taskRoutePreference: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'high', fallbackCatalogIds: [], selectionMode: 'fixed', modelDisplayName: 'GPT Test', routeLabel: 'Codex · Primary', reason: 'Best fit for the requested UI work.' },
+        policy: { modelCatalogId: 'catalog-primary', accountProfileId: 'profile-primary', reasoningLevel: 'medium', fallbackCatalogIds: [], selectionMode: 'prefer', source: 'workspace' },
+      },
+      {
         name: 'scheduler fallback route', eventRoute: {}, expectedSource: 'scheduler', expectedMode: 'auto', policy: undefined,
       },
     ];
@@ -828,7 +834,7 @@ async function runTests() {
       let claimedRoute: any;
       let spawned = false;
       const manager: any = {
-        async getTask() { return { missionId: 'mission-route', assignedRole: 'researcher', description: 'Research route durability', priority: 'medium', requiredCapabilities: [], assignedAgentId: null }; },
+        async getTask() { return { missionId: 'mission-route', assignedRole: 'researcher', description: 'Research route durability', priority: 'medium', requiredCapabilities: [], assignedAgentId: null, routePreference: testCase.taskRoutePreference, specialty: testCase.taskSpecialty }; },
         async getMission() { return { workspaceId: 'workspace-route', automationPolicy: null }; },
         async getWorkspace() { return { path: process.cwd() }; },
         async listTasks() { return []; },
@@ -846,7 +852,7 @@ async function runTests() {
       const adapter: any = {
         id: 'codex', runtimeType: 'codex', name: 'Codex test', setEventBus() {}, configureProfile() {},
         async probeCapabilities() { return {}; },
-        async spawnAgent(options: any) { spawned = true; return { id: `provider-${testCase.expectedSource}`, agentInstanceId: options.sessionId }; },
+        async spawnAgent(options: any) { spawned = true; if (testCase.taskSpecialty) assert(options.prompt.includes(testCase.taskSpecialty), 'task-specific specialty reaches the worker prompt'); return { id: `provider-${testCase.expectedSource}`, agentInstanceId: options.sessionId }; },
         async shutdown() {}, async cancel() {},
       };
       host.registerAdapter(adapter);

@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import { useWorkspaceStore, type Workspace } from '@/stores/workspace-store';
-import { useMissionStore } from '@/stores/mission-store';
+import { useMissionStore, type Mission } from '@/stores/mission-store';
+import { useManualStore } from '@/stores/manual-store';
+import { useSettingsStore } from '@/stores/settings-store';
 import { useMemoryStore, type MemorySnapshot } from '@/stores/memory-store';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import { Separator } from '@/components/ui/separator';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { CreateWorkspaceDialog } from '@/components/workspace/create-workspace-dialog';
 import {
@@ -14,28 +14,16 @@ import {
   AlertCircle,
   Brain,
   Check,
-  CheckCircle2,
-  Eye,
   FolderGit2,
   FolderOpen,
-  GitBranch,
   Loader2,
   ListTodo,
   Plus,
   ShieldCheck,
-  Sparkles,
-  Terminal,
   Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-
-const STATUS_ICONS = {
-  running: <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />,
-  reviewing: <Eye className="h-3.5 w-3.5 text-amber-400" />,
-  planning: <ListTodo className="h-3.5 w-3.5 text-muted-foreground" />,
-  blocked: <AlertCircle className="h-3.5 w-3.5 text-destructive" />,
-  completed: <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />,
-} as const;
+import { missionStatusLabel } from '@/lib/mission-display';
 
 const ACTIVE_MISSION_STATUSES = new Set([
   'planning',
@@ -56,8 +44,8 @@ interface PendingWorkspaceRemoval {
 }
 
 export function ProjectsView() {
-  const { workspaces, activeWorkspaceId, setActiveWorkspace, removeWorkspace, fetchWorkspaces } = useWorkspaceStore();
-  const { missions, fetchMissions } = useMissionStore();
+  const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, removeWorkspace, fetchWorkspaces } = useWorkspaceStore();
+  const { missions, fetchMissions, setActiveMission } = useMissionStore();
   const { loadWorkspaceMemory, fetchProjects: fetchMemoryProjects, mutating: memoryMutating } = useMemoryStore();
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedWsId, setSelectedWsId] = useState<string | null>(null);
@@ -78,6 +66,10 @@ export function ProjectsView() {
   }, [activeWorkspaceId, selectedWsId]);
 
   const selectedWorkspace = workspaces.find((workspace) => workspace.id === (selectedWsId || activeWorkspaceId));
+  const recentSelectedMissions = selectedWorkspace
+    ? missions.filter((mission) => mission.workspaceId === selectedWorkspace.id)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 4)
+    : [];
 
   const flash = (message: string) => {
     setFeedback(message);
@@ -146,18 +138,30 @@ export function ProjectsView() {
     setSelectedWsId(id);
     flash(`"${name}" is now the active workspace.`);
   };
+  const openWorkspace = (id: string) => {
+    setActiveWorkspace(id);
+    useManualStore.getState().setMode('choose');
+    useSettingsStore.getState().setActiveView('chat');
+  };
+  const openMission = (mission: Mission) => {
+    setActiveWorkspace(mission.workspaceId);
+    rememberMission(mission.workspaceId, mission.id);
+    setActiveMission(mission.id);
+    useManualStore.getState().setMode('orchestrator');
+    useSettingsStore.getState().setActiveView('chat');
+  };
 
   return (
-    <div className="flex min-h-0 w-full flex-1 flex-col bg-background">
-      <div className="flex items-center justify-between border-b border-border/80 bg-card/40 px-6 py-4 backdrop-blur-md">
-        <div>
-          <h1 className="flex items-center gap-2 text-xl font-bold tracking-tight text-foreground">
+    <div className="flex min-h-0 min-w-0 w-full flex-1 flex-col bg-background">
+       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-4 sm:px-6">
+         <div className="min-w-0">
+           <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight text-foreground">
             <FolderGit2 className="h-5 w-5 text-primary" />
             Project Workspaces
           </h1>
-          <p className="mt-0.5 text-xs text-muted-foreground">Manage local projects, execution isolation, and persistent project memory</p>
+           <p className="mt-0.5 text-xs text-muted-foreground">Choose a project to continue work or inspect its details.</p>
         </div>
-        <div className="flex items-center gap-3">
+         <div className="flex min-w-0 items-center gap-3">
           {feedback ? (
             <span role="status" aria-live="polite" className="flex max-w-[520px] items-center gap-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-400">
               <Check className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{feedback}</span>
@@ -169,9 +173,10 @@ export function ProjectsView() {
         </div>
       </div>
 
-      <ScrollArea className="flex-1">
-        <div className="mx-auto max-w-7xl space-y-6 p-6">
-          {workspaces.length === 0 ? (
+       <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
+         <div className="mx-auto w-full max-w-7xl p-4 sm:p-6">
+           <div className="project-browser">
+            {workspaces.length === 0 ? (
             <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-card/30 py-20 text-center">
               <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-primary/20 bg-primary/10">
                 <FolderGit2 className="h-8 w-8 text-primary" />
@@ -181,7 +186,7 @@ export function ProjectsView() {
               <Button onClick={() => setIsDialogOpen(true)} size="sm"><Plus className="mr-2 h-4 w-4" />Add Workspace</Button>
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3">
+            <div className="min-w-0 divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
               {workspaces.map((workspace) => {
                 const workspaceMissions = missions.filter((mission) => mission.workspaceId === workspace.id);
                 const recentMissions = [...workspaceMissions]
@@ -189,124 +194,99 @@ export function ProjectsView() {
                   .slice(0, 3);
                 const isSelected = (selectedWsId || activeWorkspaceId) === workspace.id;
                 const isActive = activeWorkspaceId === workspace.id;
-                const workspaceMode = workspace.gitInitialized ? 'Git repository' : 'Managed mirror';
-
-                return (
-                  <Card
-                    key={workspace.id}
-                    className={cn(
-                      'group relative flex cursor-pointer flex-col overflow-hidden border bg-card/60 p-5 backdrop-blur-sm transition-all duration-200 hover:shadow-lg',
-                      isSelected ? 'border-primary ring-1 ring-primary/40 shadow-md' : 'border-border/70 hover:border-primary/40',
-                      isActive && 'bg-primary/[0.03]',
-                    )}
-                    onClick={() => setSelectedWsId(workspace.id)}
-                    onKeyDown={(event) => {
-                      if (event.key !== 'Enter' && event.key !== ' ') return;
-                      event.preventDefault();
-                      setSelectedWsId(workspace.id);
-                    }}
-                    role="button"
-                    tabIndex={0}
-                    aria-pressed={isSelected}
-                    aria-label={`Select workspace ${workspace.name}`}
-                  >
-                    {isActive ? <div className="absolute left-0 right-0 top-0 h-1 bg-primary" /> : null}
-                    <div className="mb-3 flex items-start justify-between">
-                      <div className="flex min-w-0 items-center gap-3">
-                        <div className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition-colors', isActive ? 'border-primary bg-primary text-primary-foreground' : 'border-primary/20 bg-primary/10 text-primary group-hover:bg-primary/20')}>
-                          <FolderGit2 className="h-5 w-5" />
-                        </div>
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <h3 className="truncate text-sm font-bold text-foreground">{workspace.name}</h3>
-                            {isActive ? <Badge className="h-4 border-emerald-500/30 bg-emerald-500/20 px-1.5 text-[9px] font-bold tracking-wider text-emerald-400">ACTIVE</Badge> : null}
-                          </div>
-                          <p className="truncate font-mono text-[11px] text-muted-foreground" title={workspace.path}>{workspace.path}</p>
-                        </div>
-                      </div>
-                      <Badge variant="outline" className="shrink-0 bg-background/50 text-[10px] font-semibold uppercase">{workspaceMissions.length} Missions</Badge>
-                    </div>
-
-                    <div className="mb-3 mt-auto flex flex-wrap items-center gap-2">
-                      <div className="flex items-center gap-1.5 rounded-md border border-border/50 bg-muted/60 px-2 py-0.5 text-[11px] text-foreground"><GitBranch className="h-3 w-3 text-primary" />{workspaceMode}</div>
-                      <div className="flex items-center gap-1.5 rounded-md border border-violet-500/15 bg-violet-500/5 px-2 py-0.5 text-[11px] text-violet-300"><Brain className="h-3 w-3" />Persistent memory</div>
-                    </div>
-
-                    <Separator className="my-2.5 opacity-60" />
-                    <div className="space-y-1.5">
-                      <h4 className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-muted-foreground"><span>Recent Missions</span><span className="text-[9px] opacity-75">{workspaceMissions.length} total</span></h4>
-                      {recentMissions.length === 0 ? <p className="py-1 text-xs italic text-muted-foreground">No missions created yet</p> : recentMissions.map((mission) => (
-                        <div key={mission.id} className="flex items-center gap-2 py-0.5 text-xs">
-                          {STATUS_ICONS[mission.status as keyof typeof STATUS_ICONS] || STATUS_ICONS.running}
-                          <span className="truncate font-medium text-foreground/90">{mission.title}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </Card>
+                 return (
+                   <div
+                     key={workspace.id}
+                     data-selected={isSelected}
+                     className={cn(
+                       'project-workspace-row group flex min-w-0 items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40',
+                       isSelected && 'bg-primary/[0.07]',
+                     )}
+                   >
+                     <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${isActive ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}><FolderGit2 className="h-4 w-4" /></span>
+                      <button type="button" className="min-w-0 flex-1 overflow-hidden text-left focus-visible:rounded focus-visible:outline-2 focus-visible:outline-ring" onClick={() => setSelectedWsId(workspace.id)} aria-pressed={isSelected} aria-label={`Inspect workspace ${workspace.name}`}>
+                        <span className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate text-sm font-medium" title={workspace.name}>{workspace.name}</span>{isActive && <span className="shrink-0 text-[10px] font-medium text-primary">Active</span>}</span>
+                       <span className="mt-0.5 block truncate text-xs text-muted-foreground" title={workspace.path}>{workspace.path}</span>
+                        <span className="mt-1 block truncate text-[11px] text-muted-foreground" title={recentMissions.map(m => m.title).join(' · ')}>{recentMissions.length ? recentMissions.map(m => m.title).join(' · ') : 'No orchestrated conversations yet'}</span>
+                     </button>
+                      <Button variant="ghost" size="sm" className="shrink-0" onClick={() => openWorkspace(workspace.id)} aria-label={`Open ${workspace.name}`}>Open</Button>
+                   </div>
                 );
               })}
             </div>
           )}
 
           {selectedWorkspace ? (
-            <div className="mt-8 animate-in fade-in slide-in-from-bottom-3 duration-200">
-              <Card className="relative overflow-hidden rounded-2xl border-primary/30 bg-card/80 p-6 shadow-xl backdrop-blur-md">
-                <div className="mb-6 flex flex-col justify-between gap-4 border-b border-border/80 pb-4 md:flex-row md:items-center">
-                  <div>
-                    <div className="mb-1 flex items-center gap-3">
-                      <h2 className="text-xl font-bold text-foreground">{selectedWorkspace.name}</h2>
+              <div className="min-w-0">
+                <Card className="relative min-w-0 gap-0 overflow-hidden rounded-xl border-border bg-card p-4 shadow-none sm:p-5">
+                 <div className="mb-5 min-w-0 border-b border-border/80 pb-4">
+                  <div className="min-w-0">
+                    <div className="mb-1 flex min-w-0 flex-wrap items-center gap-2">
+                      <h2 className="min-w-0 break-words text-base font-semibold text-foreground">{selectedWorkspace.name}</h2>
                       {activeWorkspaceId === selectedWorkspace.id ? (
-                        <Badge className="gap-1 border-emerald-500/30 bg-emerald-500/20 text-xs text-emerald-400"><Sparkles className="h-3 w-3" />Active Workspace</Badge>
+                         <Badge variant="secondary" className="text-xs">Active workspace</Badge>
                       ) : <Badge variant="outline" className="text-xs text-muted-foreground">Inactive</Badge>}
                     </div>
-                    <p className="flex items-center gap-2 font-mono text-xs text-muted-foreground"><FolderOpen className="h-4 w-4 shrink-0 text-primary" /><span className="select-all">{selectedWorkspace.path}</span></p>
+                     <p className="flex min-w-0 items-start gap-2 font-mono text-xs text-muted-foreground"><FolderOpen className="h-4 w-4 shrink-0 text-primary" /><span className="min-w-0 select-all break-all">{selectedWorkspace.path}</span></p>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                 </div>
+
+                  <div className="grid min-w-0 gap-5 @min-[550px]:grid-cols-2">
+                   <div>
+                     <h3 className="flex items-center gap-2 text-xs font-semibold text-muted-foreground"><Activity className="h-4 w-4" />Conversations</h3>
+                     <p className="mt-3 text-sm"><strong className="mr-1 tabular-nums">{missions.filter((mission) => mission.workspaceId === selectedWorkspace.id && ACTIVE_MISSION_STATUSES.has(mission.status)).length}</strong><span className="text-muted-foreground">active</span><span className="mx-2 text-border">·</span><strong className="mr-1 tabular-nums">{missions.filter((mission) => mission.workspaceId === selectedWorkspace.id && mission.status === 'completed').length}</strong><span className="text-muted-foreground">completed</span></p>
+                   </div>
+                   <div>
+                     <h3 className="flex items-center gap-2 text-xs font-semibold text-muted-foreground"><ShieldCheck className="h-4 w-4" />Repository & memory</h3>
+                      <p className="mt-3 text-sm">{selectedWorkspace.gitInitialized ? 'Git repository' : 'Managed mirror'} <span className="mx-2 text-border">·</span> Project-scoped memory</p>
+                     <p className="mt-2 max-w-xl text-xs leading-5 text-muted-foreground">Removing a workspace can retain its memory for reattachment when the folder is added again.</p>
+                   </div>
+                  </div>
+                  <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-border/80 pt-4">
                     {activeWorkspaceId !== selectedWorkspace.id ? (
-                      <Button variant="default" size="sm" onClick={() => handleSetActive(selectedWorkspace.id, selectedWorkspace.name)} className="gap-1.5 bg-primary text-primary-foreground shadow-sm"><Check className="h-4 w-4" />Set as Active</Button>
-                    ) : null}
-                    <Button variant="outline" size="sm" className="gap-1.5" onClick={() => window.alert(`Workspace folder: ${selectedWorkspace.path}`)}><Terminal className="h-4 w-4 text-primary" />Show Folder Path</Button>
+                      <Button variant="default" size="sm" onClick={() => handleSetActive(selectedWorkspace.id, selectedWorkspace.name)} className="gap-1.5"><Check className="h-4 w-4" />Set as Active</Button>
+                    ) : <span className="text-xs text-muted-foreground">Workspace is ready for conversations.</span>}
                     <Button
-                      variant="destructive"
+                      variant="ghost"
                       size="sm"
                       onClick={() => void requestRemoval(selectedWorkspace)}
                       disabled={loadingRemovalInfo === selectedWorkspace.id}
-                      className="gap-1.5"
+                      className="gap-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive"
                       title={`Delete workspace ${selectedWorkspace.name}`}
                       aria-label={`Delete workspace ${selectedWorkspace.name}`}
                     >
                       {loadingRemovalInfo === selectedWorkspace.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                      <span className="hidden sm:inline">Delete workspace</span>
+                      Delete workspace
                     </Button>
                   </div>
-                </div>
-
-                <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-                  <div className="space-y-4">
-                    <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-muted-foreground"><Activity className="h-4 w-4 text-primary" />Mission Analytics</h3>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="rounded-xl border border-border/60 bg-muted/40 p-3.5"><div className="text-2xl font-bold text-foreground">{missions.filter((mission) => mission.workspaceId === selectedWorkspace.id && ACTIVE_MISSION_STATUSES.has(mission.status)).length}</div><div className="mt-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Active</div></div>
-                      <div className="rounded-xl border border-border/60 bg-muted/40 p-3.5"><div className="text-2xl font-bold text-emerald-400">{missions.filter((mission) => mission.workspaceId === selectedWorkspace.id && mission.status === 'completed').length}</div><div className="mt-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Completed</div></div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4 md:col-span-2">
-                    <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-muted-foreground"><ShieldCheck className="h-4 w-4 text-primary" />Repository, Isolation & Memory</h3>
-                    <div className="space-y-3 rounded-xl border border-border/80 bg-muted/30 p-4">
-                      <div className="flex items-center justify-between gap-4 text-xs"><span className="font-medium text-muted-foreground">Workspace mode:</span><Badge variant="outline" className="font-mono">{selectedWorkspace.gitInitialized ? 'Git repository' : 'Managed mirror'}</Badge></div>
-                      <div className="flex items-center justify-between gap-4 text-xs"><span className="font-medium text-muted-foreground">Project memory lifecycle:</span><Badge variant="outline" className="border-violet-500/20 bg-violet-500/5 font-mono text-violet-300">Project-scoped</Badge></div>
-                      <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
-                        Removing this workspace no longer implies deleting what AtrisAgent learned. You can retain the memory as a detached backup and reattach it automatically when the same repository or folder is added again.
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </Card>
+               </Card>
             </div>
-          ) : null}
-        </div>
-      </ScrollArea>
+           ) : null}
+           </div>
+           {selectedWorkspace && recentSelectedMissions.length > 0 && (
+             <section aria-label={`Recent conversations in ${selectedWorkspace.name}`} className="mt-5 min-w-0 overflow-hidden rounded-xl border border-border bg-card/40">
+               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/70 px-4 py-3">
+                 <div>
+                   <h3 className="text-sm font-semibold text-foreground">Recent conversations</h3>
+                   <p className="mt-0.5 text-xs text-muted-foreground">Continue work in {selectedWorkspace.name} or review an earlier result.</p>
+                 </div>
+                 <Badge variant="outline" className="text-[10px] text-muted-foreground">{recentSelectedMissions.length} recent</Badge>
+               </div>
+               <div className="divide-y divide-border/60">
+                 {recentSelectedMissions.map((mission) => (
+                   <button key={mission.id} type="button" onClick={() => openMission(mission)} className="flex min-w-0 w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+                     <Activity className="h-4 w-4 shrink-0 text-primary" />
+                     <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground" title={mission.title}>{mission.title}</span>
+                     <span className="hidden shrink-0 text-[11px] tabular-nums text-muted-foreground sm:inline">{new Date(mission.createdAt).toLocaleDateString()}</span>
+                     <Badge variant={mission.status === 'completed' ? 'success' : mission.status === 'failed' ? 'destructive' : 'secondary'} className="shrink-0 text-[10px] capitalize">{missionStatusLabel(mission.status)}</Badge>
+                   </button>
+                 ))}
+               </div>
+             </section>
+           )}
+         </div>
+       </div>
 
       <CreateWorkspaceDialog open={isDialogOpen} onOpenChange={setIsDialogOpen} />
 

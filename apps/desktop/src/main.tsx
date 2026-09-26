@@ -3,7 +3,9 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import './styles/globals.css';
 import { initializeRuntime } from './lib/runtime-config';
+import { useSettingsStore } from './stores/settings-store';
 
+document.documentElement.dataset.palette = useSettingsStore.getState().colorPalette;
 const root = ReactDOM.createRoot(document.getElementById('root')!);
 
 // App context menus keep receiving the event; only the browser fallback is suppressed.

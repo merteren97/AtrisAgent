@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
 import { DEFAULT_TEAM_TEMPLATE_ID, normalizeStoredTeamTemplateId } from '@/lib/team-template-utils';
+import { normalizeColorPalette, type ColorPalette } from '@/lib/theme-palettes';
 
 export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts';
 export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate';
@@ -45,6 +46,7 @@ interface SettingsState {
     packageInstall: boolean | null;
   };
   sidebarCollapsed: boolean;
+  colorPalette: ColorPalette;
   sidebarWidth: number;
   inspectorCollapsed: boolean;
   inspectorWidth: number;
@@ -66,6 +68,7 @@ interface SettingsState {
   setTimelineDetailMode: (mode: TimelineDetailMode) => void;
   setAutomationSettings: (settings: Partial<SettingsState['automationSettings']>) => void;
   toggleSidebar: () => void;
+  setColorPalette: (palette: ColorPalette) => void;
   setSidebarWidth: (width: number) => void;
   toggleInspector: () => void;
   openInspector: (tab?: InspectorTab) => void;
@@ -97,8 +100,9 @@ export const useSettingsStore = create<SettingsState>()(
         gitCommit: null,
         packageInstall: null,
       },
-      sidebarCollapsed: false,
-      sidebarWidth: 256,
+      sidebarCollapsed: true,
+      colorPalette: 'iris',
+      sidebarWidth: 272,
       inspectorCollapsed: true,
       inspectorWidth: 320,
       inspectorExpanded: false,
@@ -126,6 +130,7 @@ export const useSettingsStore = create<SettingsState>()(
       setAutomationSettings: (settings) =>
         set((state) => ({ automationSettings: { ...state.automationSettings, ...settings } })),
       toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
+      setColorPalette: (palette) => set({ colorPalette: normalizeColorPalette(palette) }),
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
       toggleInspector: () => set((state) => ({
         inspectorCollapsed: !state.inspectorCollapsed,
@@ -143,7 +148,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'atris-settings-storage',
-      version: 12,
+      version: 14,
       migrate: (persistedState) => {
         const state = (persistedState || {}) as Partial<SettingsState>;
         const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
@@ -161,6 +166,8 @@ export const useSettingsStore = create<SettingsState>()(
           inspectorTab: validInspectorTabs.includes(state.inspectorTab as InspectorTab) ? state.inspectorTab : 'plan',
           inspectorExpanded: false,
           inspectorCollapsed: true,
+          sidebarCollapsed: state.sidebarCollapsed ?? true,
+          colorPalette: normalizeColorPalette(state.colorPalette),
           automationSettings: { fileWrite: null, gitCommit: null, packageInstall: null },
           // Direct role selection is now an advanced capability; normal missions always
           // enter through the orchestrator and @mentions can still target specialists.

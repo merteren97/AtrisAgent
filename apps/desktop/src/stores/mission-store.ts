@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
+import { AGENT_ROLES, type AgentRole, type TaskRoutePreference } from '@atris-agent-code/domain';
 import { ApiError, apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -86,6 +86,9 @@ export interface TaskItem {
   status: string;
   assignedRole?: string | null;
   assignedAgentId?: string | null;
+  agentProfileId?: string | null;
+  specialty?: string | null;
+  routePreference?: TaskRoutePreference | null;
   worktreeId?: string | null;
   targetDescriptor?:
     | { kind: 'workspace_root' }

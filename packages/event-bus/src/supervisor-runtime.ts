@@ -1,3 +1,14 @@
+export type SupervisorPlanningRole = 'researcher' | 'builder' | 'reviewer' | 'qa';
+export type SupervisorPlanningRuntime = 'codex' | 'claude_code' | 'antigravity' | 'opencode';
+export type SupervisorPlanningReasoning = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export interface SupervisorPlanningRoutePolicy {
+  allowedCatalogIds?: string[];
+  allowedModelCatalogIds?: string[];
+  allowedAccountProfileIds?: string[];
+  allowedRuntimeTypes?: SupervisorPlanningRuntime[];
+}
+
 export interface SupervisorTurnRuntimeRequest {
   missionId: string;
   turnId: string;
@@ -16,9 +27,43 @@ export interface SupervisorTurnRuntimeRequest {
   profile?: Record<string, unknown>;
 }
 
+export interface SupervisorPlanningModel {
+  catalogId: string;
+  accountProfileId: string;
+  runtimeId: SupervisorPlanningRuntime;
+  runtimeModelId: string;
+  displayName: string;
+  routeLabel?: string;
+  supportedRoles: SupervisorPlanningRole[];
+  supportedReasoning: SupervisorPlanningReasoning[];
+  defaultReasoning?: SupervisorPlanningReasoning;
+}
+
+export interface SupervisorPlanningSpecialist {
+  id: string;
+  name: string;
+  role: SupervisorPlanningRole;
+  specialty?: string;
+  description?: string;
+  capabilities: string[];
+  allowedRoutePolicy?: SupervisorPlanningRoutePolicy;
+}
+
+export interface SupervisorPlanningResources {
+  models: SupervisorPlanningModel[];
+  specialists: SupervisorPlanningSpecialist[];
+  /** Effective role profiles after workspace/template precedence and explicit user selection. */
+  defaultSpecialists?: Partial<Record<SupervisorPlanningRole, SupervisorPlanningSpecialist>>;
+  requestedProfileIds?: SupervisorRequestedProfiles;
+}
+
+export type SupervisorRequestedProfiles = Partial<Record<SupervisorPlanningRole, string>>;
+
 export type SupervisorTurnRunner = (request: SupervisorTurnRuntimeRequest) => Promise<string>;
+export type SupervisorPlanningResourcesProvider = (missionId: string, requestedProfiles?: SupervisorRequestedProfiles) => Promise<SupervisorPlanningResources>;
 
 let supervisorTurnRunner: SupervisorTurnRunner | null = null;
+let supervisorPlanningResourcesProvider: SupervisorPlanningResourcesProvider | null = null;
 
 /**
  * Registers the runtime-side one-shot supervisor executor for this local process.
@@ -48,4 +93,17 @@ export async function runSupervisorTurn(request: SupervisorTurnRuntimeRequest): 
   const runner = getSupervisorTurnRunner();
   if (!runner) throw new Error('No supervisor runtime bridge is registered.');
   return runner(request);
+}
+
+export function registerSupervisorPlanningResourcesProvider(provider: SupervisorPlanningResourcesProvider | null): void {
+  supervisorPlanningResourcesProvider = provider;
+}
+
+export function unregisterSupervisorPlanningResourcesProvider(provider: SupervisorPlanningResourcesProvider): void {
+  if (supervisorPlanningResourcesProvider === provider) supervisorPlanningResourcesProvider = null;
+}
+
+export async function getSupervisorPlanningResources(missionId: string, requestedProfiles?: SupervisorRequestedProfiles): Promise<SupervisorPlanningResources> {
+  if (!supervisorPlanningResourcesProvider) return { models: [], specialists: [] };
+  return supervisorPlanningResourcesProvider(missionId, requestedProfiles);
 }

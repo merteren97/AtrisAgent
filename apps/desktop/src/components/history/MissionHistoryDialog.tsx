@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { useMissionStore, type Mission, type MissionStatus } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { ConversationDeleteDialog } from './ConversationDeleteDialog';
@@ -18,7 +17,6 @@ import {
   ListTodo,
   PlayCircle,
   Search,
-  SlidersHorizontal,
   Sparkles,
   X,
   XCircle,
@@ -138,8 +136,8 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[min(780px,calc(100vh-2rem))] w-full max-w-[980px] flex-col gap-0 overflow-hidden p-0 sm:max-w-[980px]">
-        <DialogHeader className="shrink-0 border-b border-border/80 bg-card/70 px-5 py-5 sm:px-6">
+      <DialogContent showCloseButton={false} className="flex h-[min(780px,calc(100vh-2rem))] w-full max-w-[980px] flex-col gap-0 overflow-hidden rounded-2xl border-border/80 p-0 sm:max-w-[980px]">
+        <DialogHeader className="shrink-0 border-b border-border/80 bg-card/70 px-4 py-4 sm:px-6">
           <div className="flex items-start justify-between gap-4">
             <div className="flex min-w-0 items-start gap-3">
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary">
@@ -153,31 +151,19 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
                 </DialogDescription>
               </div>
             </div>
-            <Badge variant="outline" className="shrink-0 gap-1.5 rounded-full bg-background/50 text-[10px] text-muted-foreground">
-              <Sparkles className="h-3 w-3 text-primary" />
-              {missions.length} total
-            </Badge>
+            <DialogClose asChild><Button type="button" variant="ghost" size="icon" className="h-8 w-8 shrink-0 rounded-lg text-muted-foreground" aria-label="Close mission history"><X className="h-4 w-4" /></Button></DialogClose>
           </div>
 
-          <div className="mt-5 grid max-w-xl grid-cols-3 gap-2">
-            <div className="rounded-lg border border-border/70 bg-background/50 px-3 py-2.5">
-              <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">All missions</div>
-              <div className="mt-1 text-lg font-semibold tabular-nums text-foreground">{missions.length}</div>
-            </div>
-            <div className="rounded-lg border border-success/20 bg-success/5 px-3 py-2.5">
-              <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-success/80">Completed</div>
-              <div className="mt-1 text-lg font-semibold tabular-nums text-success">{completedCount}</div>
-            </div>
-            <div className="rounded-lg border border-warning/20 bg-warning/5 px-3 py-2.5">
-              <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-warning/80">Attention</div>
-              <div className="mt-1 text-lg font-semibold tabular-nums text-warning">{attentionCount}</div>
-            </div>
+          <div className="mt-4 flex flex-wrap items-center gap-2 text-xs">
+            <span className="rounded-full border border-border/70 bg-background/50 px-3 py-1.5 text-muted-foreground"><strong className="mr-1 font-semibold tabular-nums text-foreground">{missions.length}</strong>missions</span>
+            <span className="rounded-full border border-success/20 bg-success/5 px-3 py-1.5 text-success"><strong className="mr-1 font-semibold tabular-nums">{completedCount}</strong>completed</span>
+            <span className="rounded-full border border-warning/20 bg-warning/5 px-3 py-1.5 text-warning"><strong className="mr-1 font-semibold tabular-nums">{attentionCount}</strong>need attention</span>
           </div>
         </DialogHeader>
 
         <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-          <section aria-label="Mission archive list" className="flex min-h-0 max-h-[46%] flex-col border-b border-border/80 bg-background/30 lg:max-h-none lg:w-[42%] lg:border-b-0 lg:border-r">
-            <div className="shrink-0 space-y-3 p-4">
+          <section aria-label="Mission archive list" className="flex min-h-0 min-w-0 max-h-[46%] flex-col border-b border-border/80 bg-background/30 lg:max-h-none lg:w-[42%] lg:shrink-0 lg:border-b-0 lg:border-r">
+            <div className="min-w-0 shrink-0 space-y-3 p-4">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
                 <Input
@@ -199,25 +185,23 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
                 ) : null}
               </div>
 
-              <div className="flex items-center gap-1 overflow-x-auto pb-0.5" role="tablist" aria-label="Mission history filters">
-                <SlidersHorizontal className="mr-1 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Mission history filters">
                 {filters.map((item) => (
                   <button
                     key={item.id}
                     type="button"
-                    role="tab"
-                    aria-selected={filter === item.id}
+                    aria-pressed={filter === item.id}
                     onClick={() => setFilter(item.id)}
-                    className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[10px] font-medium transition-colors ${filter === item.id ? 'border-primary/30 bg-primary/10 text-primary' : 'border-border/70 bg-card/40 text-muted-foreground hover:bg-card hover:text-foreground'}`}
+                    className={`flex min-w-0 items-center justify-between gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${filter === item.id ? 'border-primary/40 bg-primary/10 text-primary' : 'border-border/70 bg-card/40 text-muted-foreground hover:bg-card hover:text-foreground'}`}
                   >
-                    {item.label}
-                    <span className="tabular-nums opacity-70">{item.count}</span>
+                    <span className="min-w-0 truncate">{item.label}</span>
+                    <span className="shrink-0 tabular-nums opacity-70">{item.count}</span>
                   </button>
                 ))}
               </div>
             </div>
 
-            <ScrollArea className="min-h-0 flex-1 px-3 pb-4">
+            <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-3 pb-4">
               <div className="space-y-1.5">
                 {filteredMissions.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-border/80 bg-card/30 px-4 py-10 text-center">
@@ -235,19 +219,19 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
                       type="button"
                       onClick={() => setSelectedMissionId(mission.id)}
                       aria-pressed={isSelected}
-                      className={`group flex w-full items-center gap-3 rounded-xl border p-3 text-left transition-all ${isSelected ? 'border-primary/40 bg-primary/[0.08] shadow-sm' : 'border-transparent bg-card/35 hover:border-border/80 hover:bg-card/70'}`}
+                      className={`group flex min-w-0 w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${isSelected ? 'border-primary/40 border-l-2 border-l-primary bg-primary/[0.08]' : 'border-transparent bg-card/35 hover:border-border/80 hover:bg-card/70'}`}
                     >
                       <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${isSelected ? 'border-primary/25 bg-primary/10' : 'border-border/70 bg-background/60'}`}>
                         {getStatusIcon(mission.status, 'h-4 w-4')}
                       </span>
                       <span className="min-w-0 flex-1">
                         <span className="flex items-center gap-2">
-                          <span className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground">{mission.title}</span>
+                          <span className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground" title={mission.title}>{mission.title}</span>
                           {isActive ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="Currently open" /> : null}
                         </span>
                         <span className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground">
                           <FolderGit2 className="h-3 w-3 shrink-0" />
-                          <span className="truncate">{workspaceName}</span>
+                          <span className="min-w-0 flex-1 truncate" title={workspaceName}>{workspaceName}</span>
                           <span className="shrink-0 text-muted-foreground/50">·</span>
                           <span className="shrink-0">{formatDate(mission.createdAt)}</span>
                         </span>
@@ -257,37 +241,36 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
                   );
                 })}
               </div>
-            </ScrollArea>
+            </div>
           </section>
 
-          <section aria-label="Selected mission details" className="min-h-0 flex-1 bg-muted/[0.12]">
+          <section aria-label="Selected mission details" className="min-h-0 min-w-0 flex-1 bg-muted/[0.12]">
             {selectedMission ? (
-              <ScrollArea className="h-full">
-                <div className="p-5 sm:p-7">
-                  <div className="flex flex-wrap items-start justify-between gap-4">
-                    <div className="flex min-w-0 items-start gap-3">
-                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border/80 bg-card shadow-sm">
-                        {getStatusIcon(selectedMission.status, 'h-5 w-5')}
-                      </div>
-                      <div className="min-w-0">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Selected mission</p>
-                        <h2 className="mt-1 break-words text-lg font-semibold tracking-tight text-foreground">{selectedMission.title}</h2>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
-                          <Badge variant={getStatusVariant(selectedMission.status)} className="h-5 gap-1.5 rounded-full px-2 text-[9px] capitalize">
-                            {getStatusIcon(selectedMission.status, 'h-3 w-3')}
-                            {getStatusLabel(selectedMission.status)}
-                          </Badge>
-                          <span>{formatDate(selectedMission.createdAt)}</span>
-                        </div>
-                      </div>
+              <div className="h-full min-w-0 overflow-x-hidden overflow-y-auto">
+                <div className="p-4 sm:p-6">
+                  <div className="flex min-w-0 items-start gap-3">
+                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border/80 bg-card shadow-sm">
+                      {getStatusIcon(selectedMission.status, 'h-5 w-5')}
                     </div>
-                    <div className="flex shrink-0 gap-2">
-                      <Button size="sm" variant="outline" className="gap-1.5 text-destructive hover:text-destructive" onClick={() => setPendingDelete(selectedMission)}><Trash2 className="h-3.5 w-3.5" />Delete…</Button>
-                      <Button size="sm" variant={activeMissionId === selectedMission.id ? 'outline' : 'default'} className="gap-1.5" onClick={() => handleOpenMission(selectedMission.id)}><ArrowUpRight className="h-3.5 w-3.5" />{activeMissionId === selectedMission.id ? 'Open conversation' : 'Open mission'}</Button>
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Selected mission</p>
+                      <h2 className="mt-1 line-clamp-3 break-words text-base font-semibold leading-6 tracking-tight text-foreground" title={selectedMission.title}>{selectedMission.title}</h2>
+                      <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+                        <Badge variant={getStatusVariant(selectedMission.status)} className="h-5 gap-1.5 rounded-full px-2 text-[9px] capitalize">
+                          {getStatusIcon(selectedMission.status, 'h-3 w-3')}
+                          {getStatusLabel(selectedMission.status)}
+                        </Badge>
+                        <span>{formatDate(selectedMission.createdAt)}</span>
+                      </div>
                     </div>
                   </div>
 
-                  <div className="mt-6 grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant={activeMissionId === selectedMission.id ? 'outline' : 'default'} className="gap-1.5" onClick={() => handleOpenMission(selectedMission.id)}><ArrowUpRight className="h-3.5 w-3.5" />{activeMissionId === selectedMission.id ? 'Open conversation' : 'Open mission'}</Button>
+                    <Button size="sm" variant="ghost" className="gap-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => setPendingDelete(selectedMission)}><Trash2 className="h-3.5 w-3.5" />Delete…</Button>
+                  </div>
+
+                  <div className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-3">
                     <div className="rounded-lg border border-border/70 bg-card/60 p-3">
                       <div className="flex items-center gap-1.5 text-[9px] font-semibold uppercase tracking-[0.13em] text-muted-foreground"><FolderGit2 className="h-3 w-3 text-primary" />Workspace</div>
                       <div className="mt-2 truncate text-xs font-medium text-foreground" title={workspaces.find((workspace) => workspace.id === selectedMission.workspaceId)?.name}>{workspaces.find((workspace) => workspace.id === selectedMission.workspaceId)?.name || 'Unknown workspace'}</div>
@@ -326,7 +309,7 @@ export function MissionHistoryDialog({ open, onOpenChange }: MissionHistoryDialo
                     Opening a mission restores its timeline and loads the recorded agent context in the main workspace.
                   </p>
                 </div>
-              </ScrollArea>
+              </div>
             ) : (
               <div className="flex h-full min-h-[260px] flex-col items-center justify-center px-6 text-center">
                 <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-border bg-card text-muted-foreground">

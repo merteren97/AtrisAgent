@@ -111,6 +111,8 @@ cd AtrisAgent
 npm ci
 ```
 
+Use Node.js 22 LTS when installing dependencies and running `tauri:dev` (`.nvmrc` pins the major version). If you switch Node versions after installing, rebuild the native SQLite addon under Node 22 with `npm rebuild better-sqlite3`, or run `npm ci` again. The pinned `better-sqlite3` version cannot build against Node 26.
+
 Optional local configuration can be copied from `.env.example`. Never commit real credentials, private keys, or production secrets.
 
 ```bash
