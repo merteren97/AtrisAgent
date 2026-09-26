@@ -16,6 +16,7 @@ import type {
   AgentProfileRoutePolicy,
   AgentProfileBindingOverride,
   AgentProfileScopeType,
+  TaskRoutePreference,
 } from '@atris-agent-code/domain';
 
 export const workspaces = sqliteTable('workspaces', {
@@ -122,6 +123,8 @@ export const tasks = sqliteTable('tasks', {
   assignedRole: text('assigned_role').$type<AgentRole>(),
   /** Canonical named profile identity; assignedRole remains authoritative. */
   agentProfileId: text('agent_profile_id'),
+  specialty: text('specialty'),
+  routePreference: text('route_preference', { mode: 'json' }).$type<TaskRoutePreference>(),
   requiredCapabilities: text('required_capabilities', { mode: 'json' }).$type<string[]>().notNull(),
   dependsOn: text('depends_on', { mode: 'json' }).$type<string[]>().notNull(),
   worktreeId: text('worktree_id'),

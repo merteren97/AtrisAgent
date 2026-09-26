@@ -98,6 +98,56 @@ async function runTests() {
     };
   };
 
+  {
+    let refreshed = false;
+    const workspaceProfile: any = {
+      id: 'workspace-frontend', name: 'Frontend Specialist', role: 'builder', instructions: '',
+      capabilities: ['implementation'], specialty: 'React UI', isDefault: false, archivedAt: null,
+      createdAt: '', updatedAt: '',
+    };
+    const manager: any = {
+      async getMission() { return { workspaceId: 'workspace-1', teamTemplateId: 'team-1' }; },
+      async listAgentProfileBindings({ scopeType }: any) {
+        return scopeType === 'workspace' ? [{
+          id: 'workspace-specialist', scopeType: 'workspace', scopeId: 'workspace-1', role: 'builder',
+          profileId: workspaceProfile.id, isDefault: false,
+          override: { allowedRoutePolicy: { allowedCatalogIds: ['builder-live'] } },
+        }] : [];
+      },
+      async getAgentProfile(id: string) { return id === workspaceProfile.id ? workspaceProfile : null; },
+      async listAgentProfiles() { return []; },
+      async resolveAgentProfileForMission({ role }: any) {
+        return { profile: role === 'builder' ? { ...workspaceProfile, allowedRoutePolicy: { allowedCatalogIds: ['builder-live'] } } : { id: role, name: role, role, instructions: '', capabilities: [] }, source: 'workspace' };
+      },
+      async resolveRoleExecutionPolicy() { return undefined; },
+      async getLatestSupervisorSessionMetadata() { return undefined; },
+      async saveSupervisorSessionMetadata() {},
+    };
+    const host: any = new RuntimeHostV2(undefined, { workspaceManager: manager, watchdogInterval: 0 });
+    host.getAccountProfileManager().getProfiles = async () => [{
+      id: 'account-1', provider: 'openai', runtimeType: 'codex', profileName: 'Work', authStatus: 'connected',
+    }];
+    const liveBuilderModel = {
+      catalogId: 'builder-live', accountProfileId: 'account-1', runtimeId: 'codex', providerId: 'openai',
+      runtimeModelId: 'builder-model', displayName: 'Builder Live', supportedRoles: ['builder'],
+      supportedReasoning: ['high'], defaultReasoning: 'high', inputModalities: ['text'], availability: 'available', source: 'discovered',
+    };
+    host.getModelCatalogService().getCachedCatalog = () => [{
+      ...liveBuilderModel, source: 'cached', availability: 'unknown',
+    }];
+    host.getModelCatalogService().discoverLiveModels = async () => { refreshed = true; return [liveBuilderModel]; };
+    const resources = await host.getSupervisorPlanningResources('mission-1');
+    assert(refreshed && resources.models.some((model: any) => model.catalogId === 'builder-live'), 'supervisor planning refreshes unverified account routes before offering choices');
+    assert(resources.specialists.length === 1
+      && resources.specialists[0].id === 'workspace-frontend'
+      && resources.specialists[0].allowedRoutePolicy?.allowedCatalogIds?.join(',') === 'builder-live',
+      'workspace-bound non-default specialists and their narrowed model allowlists reach planning');
+    assert(resources.defaultSpecialists?.builder?.id === 'workspace-frontend'
+      && resources.defaultSpecialists.builder.allowedRoutePolicy?.allowedCatalogIds?.[0] === 'builder-live',
+      'effective role-default profile constraints are included for generated quality and worker routes');
+    await host.stopAll();
+  }
+
   // A healthy OpenCode adapter/provider session is reused, with the explicit route persisted on every turn.
   {
     const manager = makeManager();

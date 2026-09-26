@@ -1,4 +1,5 @@
-import { decisionToTaskPlan, inferExplicitBuilderTarget, isPriorResearchImplementationFollowUp, normalizeSupervisorDecision, parseSupervisorDecision } from './supervisor-turn';
+import { buildSupervisorDecisionPrompt, decisionToTaskPlan, inferExplicitBuilderTarget, isPriorResearchImplementationFollowUp, normalizeSupervisorDecision, parseSupervisorDecision } from './supervisor-turn';
+import type { SupervisorPlanningResources } from '@atris-agent-code/event-bus';
 
 function runTests() {
   let passed = 0;
@@ -35,6 +36,49 @@ function runTests() {
   const rootDelegations = (decision?.delegations || []).filter((item) => !(item.dependsOnDelegationIds || []).length);
   assert(rootDelegations.length === 4, 'global initial parallel fan-out is capped at four');
   assert((decision?.delegations || []).some((item) => (item.dependsOnDelegationIds || []).length > 0), 'overflow independent work is deferred behind a capacity gate');
+
+  const planningResources: SupervisorPlanningResources = {
+    models: [
+      { catalogId: 'builder-model', accountProfileId: 'account-builder', runtimeId: 'codex', runtimeModelId: 'builder-runtime', displayName: 'Builder Model', routeLabel: 'Codex · Work', supportedRoles: ['builder'], supportedReasoning: ['high'], defaultReasoning: 'high' },
+      { catalogId: 'review-model', accountProfileId: 'account-review', runtimeId: 'claude_code', runtimeModelId: 'review-runtime', displayName: 'Review Model', routeLabel: 'Claude · Review', supportedRoles: ['reviewer'], supportedReasoning: ['medium'], defaultReasoning: 'medium' },
+      { catalogId: 'qa-model', accountProfileId: 'account-qa', runtimeId: 'opencode', runtimeModelId: 'qa-runtime', displayName: 'QA Model', routeLabel: 'OpenCode · QA', supportedRoles: ['qa'], supportedReasoning: ['low'], defaultReasoning: 'low' },
+    ],
+    specialists: [{ id: 'frontend-builder', name: 'Frontend Specialist', role: 'builder', specialty: 'React UI', description: 'Frontend implementation', capabilities: ['implementation'], allowedRoutePolicy: { allowedCatalogIds: ['builder-model'] } }],
+    defaultSpecialists: { builder: { id: 'frontend-builder', name: 'Frontend Specialist', role: 'builder', specialty: 'React UI', capabilities: ['implementation'], allowedRoutePolicy: { allowedCatalogIds: ['builder-model'] } } },
+  };
+  const routedDecision = parseSupervisorDecision(JSON.stringify({
+    action: 'execute',
+    workerRoutes: {
+      builder: { modelCatalogId: 'qa-model' },
+      reviewer: { modelCatalogId: 'review-model', reasoningLevel: 'medium' },
+      qa: { modelCatalogId: 'qa-model', reasoningLevel: 'low' },
+      researcher: { modelCatalogId: 'qa-model' },
+    },
+    delegations: [{
+      id: 'build-ui', role: 'builder', objective: 'Implement the approved interface', requiredCapabilities: ['implementation'],
+      agentProfileId: 'frontend-builder',
+      routePreference: { modelCatalogId: 'builder-model', accountProfileId: 'untrusted-account', reasoningLevel: 'max', fallbackCatalogIds: ['qa-model'], reason: 'Match the frontend stack.' },
+    }],
+  }), 'turn-routed', planningResources);
+  const routedPlan = routedDecision ? decisionToTaskPlan(routedDecision) : [];
+  assert(routedDecision?.workerRoutes?.reviewer?.modelCatalogId === 'review-model'
+    && routedDecision.workerRoutes.qa?.modelCatalogId === 'qa-model'
+    && !routedDecision.workerRoutes.builder
+    && !routedDecision.workerRoutes.researcher,
+    'role-wide model routes are checked against the connected role-compatible catalog');
+  assert(routedPlan[0]?.agentProfileId === 'frontend-builder'
+    && routedPlan[0]?.specialty === 'React UI'
+    && routedPlan[0]?.routePreference?.accountProfileId === 'account-builder'
+    && routedPlan[0]?.routePreference?.reasoningLevel === 'high'
+    && routedPlan[0]?.routePreference?.fallbackCatalogIds.length === 0,
+    'task routing derives account identity, reasoning and fallback routes from trusted descriptors and profile constraints');
+  assert(routedPlan[1]?.routePreference?.modelCatalogId === 'review-model'
+    && routedPlan[2]?.routePreference?.modelCatalogId === 'qa-model',
+    'generated Reviewer and QA tasks receive the manager-selected role routes');
+  const routePrompt = buildSupervisorDecisionPrompt({
+    turnId: 'turn-route-prompt', userMessage: 'Use the frontend expert', conversationContext: '', workspaceContext: '', planningResources,
+  });
+  assert(routePrompt.includes('builder-model') && routePrompt.includes('frontend-builder'), 'supervisor prompt receives live routes and workspace-bound specialist choices');
 
   const malformedDecision = parseSupervisorDecision(JSON.stringify({
     action: 'execute',

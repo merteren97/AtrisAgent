@@ -73,6 +73,8 @@ export interface TaskCreated extends BaseEvent {
   profileId?: string;
   /** Canonical named profile identity; profileId is a compatibility alias. */
   agentProfileId?: string;
+  /** Validated route preference persisted with the task plan. */
+  routePreference?: unknown;
   /** Optional inline profile metadata for trusted producers. */
   profile?: Record<string, unknown>;
   agentProfile?: Record<string, unknown>;

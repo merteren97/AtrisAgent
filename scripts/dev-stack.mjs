@@ -2,8 +2,17 @@ import { spawn, spawnSync } from 'node:child_process';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { checkDevRuntime } from './check-dev-runtime.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const runtime = checkDevRuntime();
+if (!runtime.node.ok || !runtime.sqlite.ok) {
+  if (!runtime.node.ok) console.error(`[dev-stack] ${runtime.node.detail}`);
+  if (!runtime.sqlite.ok) console.error(`[dev-stack] better-sqlite3: ${runtime.sqlite.detail}`);
+  console.error('[dev-stack] Use Node.js 22 LTS, then run npm rebuild better-sqlite3 (or npm ci) in the project root.');
+  process.exit(1);
+}
+
 const children = [];
 let stopping = false;
 

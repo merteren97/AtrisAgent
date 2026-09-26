@@ -123,6 +123,8 @@ function task(params: {
     priority: 'medium',
     assignedAgentId: params.assignedAgentId ?? null,
     agentProfileId: params.agentProfileId ?? null,
+    specialty: null,
+    routePreference: null,
     assignedRole: params.role,
     requiredCapabilities: [],
     dependsOn: params.dependsOn || [],

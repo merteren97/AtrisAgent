@@ -11,9 +11,11 @@ import {
   type TaskSelect,
 } from '@atris-agent-code/database';
 import {
+  getSupervisorPlanningResources,
   getSupervisorTurnRunner,
   redactSensitiveValue,
   type LocalEventBus,
+  type SupervisorPlanningResources,
 } from '@atris-agent-code/event-bus';
 import type { AgentEvent, TaskCompleted, TaskFailed } from '@atris-agent-code/event-schema';
 import type {
@@ -914,6 +916,16 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     options?: StartMissionOptionsV2,
   ): Promise<{ decision: OrchestratorDecision; context: SupervisorTurnContext; hasPriorConversation: boolean; priorResearchBundle: ResearchContextBundle | null }> {
     const loaded = await this.loadConversationContext(missionId);
+    let planningResources: SupervisorPlanningResources;
+    try {
+      planningResources = await getSupervisorPlanningResources(missionId, options?.agentProfileIds);
+    } catch (error) {
+      this.trace('supervisor-planning-resources-unavailable', {
+        missionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      planningResources = { models: [], specialists: [] };
+    }
     const context: SupervisorTurnContext = {
       turnId,
       userMessage: request,
@@ -921,6 +933,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       workspaceContext: loaded.workspaceContext,
       explicitCommand: options?.command,
       explicitTargetRole: options?.targetRole,
+      planningResources,
     };
     const reusableResearchBundle = loaded.priorResearchBundle && isPriorResearchImplementationFollowUp(context)
       ? loaded.priorResearchBundle
@@ -943,7 +956,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           reasoningLevel: options?.reasoningLevel,
           agentProfileId: supervisorProfileId,
         });
-        const parsed = parseSupervisorDecision(raw, turnId);
+        const parsed = parseSupervisorDecision(raw, turnId, planningResources);
         if (parsed) {
           return {
             decision: normalizeSupervisorDecision(parsed, context, { reusePriorResearch: Boolean(reusableResearchBundle) }),
@@ -1025,6 +1038,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (!manager) {
       return super.startMission(params.missionId, params.request, {
         command: 'plan',
+        agentProfileIds: params.agentProfileIds,
         rawModelPlanOutput: JSON.stringify({ tasks: decisionToTaskPlan(params.decision) }),
       });
     }
@@ -1053,6 +1067,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     for (let index = 0; index < taskSpecs.length; index += 1) {
       const spec = taskSpecs[index];
+      const requestedProfileId = params.agentProfileIds?.[spec.role] || spec.agentProfileId;
+      const taskAgentProfileId = requestedProfileId
+        ? (await this.resolveTaskProfileIds(params.missionId, [spec.role], { [spec.role]: requestedProfileId }))[spec.role]
+        : agentProfileIds[spec.role];
       const id = crypto.randomUUID();
       idsByIndex.set(index, id);
       const dependencies = (spec.dependsOnIndices || [])
@@ -1067,7 +1085,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         status: 'planned',
         priority: spec.priority,
         assignedRole: spec.role,
-        agentProfileId: agentProfileIds[spec.role],
+        agentProfileId: taskAgentProfileId,
+        specialty: spec.specialty,
+        routePreference: spec.routePreference,
         requiredCapabilities: spec.requiredCapabilities,
         dependsOn: dependencies,
         targetDescriptor: spec.targetDescriptor,

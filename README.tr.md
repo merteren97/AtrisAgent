@@ -111,6 +111,8 @@ cd AtrisAgent
 npm ci
 ```
 
+Bağımlılıkları kurarken ve `tauri:dev` çalıştırırken Node.js 22 LTS kullanın (`.nvmrc` ana sürümü sabitler). Kurulumdan sonra Node sürümünü değiştirdiyseniz Node 22 altında `npm rebuild better-sqlite3` çalıştırın veya `npm ci` ile yeniden kurun. Sabitlenen `better-sqlite3` sürümü Node 26 ile derlenemez.
+
 İsteğe bağlı yerel yapılandırma `.env.example` dosyasından oluşturulabilir. Gerçek credential, private key veya production secret değerlerini commit etmeyin.
 
 ```bash

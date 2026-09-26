@@ -23,6 +23,7 @@ import type {
   CanonicalReasoning,
   RouteSelectionMode,
   EffectiveRoutingPreference,
+  TaskRoutePreference,
 } from '@atris-agent-code/domain';
 import {
   defaultAgentProfile,
@@ -117,6 +118,28 @@ interface TaskExecutionAccess {
 function isUnverifiedCatalogRoute(model?: ModelDescriptor): boolean {
   if (!model || model.runtimeModelId === 'antigravity-active-route') return false;
   return model.source === 'cached' || model.availability === 'unknown';
+}
+
+function taskRoutePreferenceFrom(value: unknown): EffectiveRoutingPreference | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Partial<TaskRoutePreference>;
+  const modelCatalogId = typeof record.modelCatalogId === 'string' ? record.modelCatalogId.trim() : '';
+  const accountProfileId = typeof record.accountProfileId === 'string' ? record.accountProfileId.trim() : '';
+  if (!modelCatalogId || !accountProfileId) return undefined;
+  const selectionMode: RouteSelectionMode = record.selectionMode === 'auto' || record.selectionMode === 'prefer' || record.selectionMode === 'fixed'
+    ? record.selectionMode
+    : 'fixed';
+  const reasoningLevels: CanonicalReasoning[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  return {
+    modelCatalogId,
+    accountProfileId,
+    reasoningLevel: reasoningLevels.includes(record.reasoningLevel as CanonicalReasoning) ? record.reasoningLevel : undefined,
+    fallbackCatalogIds: Array.isArray(record.fallbackCatalogIds)
+      ? Array.from(new Set(record.fallbackCatalogIds.filter((id): id is string => typeof id === 'string').map((id) => id.trim()).filter(Boolean))).slice(0, 4)
+      : [],
+    selectionMode,
+    source: 'explicit',
+  };
 }
 
 type RuntimeMissionPolicy = {
@@ -916,6 +939,8 @@ export class RuntimeHost {
       selectionMode: event.routeSelectionMode || (event.modelCatalogId ? 'fixed' : 'prefer'),
       source: 'explicit',
     } : undefined;
+    const taskRoutePreference = taskRoutePreferenceFrom(taskRecord?.routePreference)
+      || taskRoutePreferenceFrom(eventRecord.routePreference);
     const profilePreference = this.profileRoutingPreference(agentProfile, profileResolution.source);
     const missionPolicy = await this.resolveEffectiveRoutingPreference(event.missionId, role);
     // A user-fixed mission route is authority, not a suggestion to the planner.
@@ -923,7 +948,7 @@ export class RuntimeHost {
     // Workspace/template preferences still permit explicit per-task selection.
     const fixedMissionRoute = missionPolicy?.selectionMode === 'fixed'
       && (missionPolicy.source === 'explicit' || missionPolicy.source === 'mission');
-    const effectivePreference = fixedMissionRoute ? missionPolicy : eventPreference || missionPolicy || profilePreference;
+    const effectivePreference = fixedMissionRoute ? missionPolicy : taskRoutePreference || eventPreference || missionPolicy || profilePreference;
     const workerRequest: WorkerRequest = {
       role,
       capabilities: [...new Set([
@@ -1016,6 +1041,7 @@ export class RuntimeHost {
         ? `Agent profile: ${agentProfile.name}${agentProfile.specialty ? ` (${agentProfile.specialty})` : ''}`
         : undefined,
       task?.description ? `Instructions:\n${task.description}` : undefined,
+      task?.specialty ? `Task specialty: ${task.specialty}` : undefined,
       agentProfile.instructions ? `Profile instructions:\n${agentProfile.instructions}` : undefined,
       execution.promptContext,
       role === 'builder'

@@ -67,7 +67,7 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
           timestamp={timestamp}
           badge="Orchestrator"
         />
-        <p className="text-sm leading-relaxed text-foreground/80">
+        <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/80">
           {content || asString(metadata.summary) || 'The Orchestrator created an execution plan.'}
         </p>
         {tasks.length > 0 && (
@@ -159,7 +159,7 @@ export function EventCard({ eventType, content, timestamp, agentRole, metadata =
           title={title}
           timestamp={timestamp}
         />
-        <p className="text-sm leading-relaxed text-foreground/80">
+        <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/80">
           {content || asString(metadata.description) || 'The runtime requested permission for a restricted operation.'}
         </p>
         {submitError && !effectiveDecision && (

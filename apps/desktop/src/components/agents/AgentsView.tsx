@@ -204,25 +204,31 @@ export function AgentsView() {
   const [bindingScope, setBindingScope] = useState<ProfileBindingScope>('global');
   const [bindingScopeId, setBindingScopeId] = useState('global');
   const [bindings, setBindings] = useState<Partial<Record<AgentRole, string>>>({});
+  const [bindingProfileIds, setBindingProfileIds] = useState<Partial<Record<AgentRole, string[]>>>({});
   const [bindingsLoading, setBindingsLoading] = useState(false);
   const [bindingBusyRole, setBindingBusyRole] = useState<AgentRole | null>(null);
 
   const loadBindings = async (scope: ProfileBindingScope, scopeId: string) => {
-    if (!scopeId) { setBindings({}); return; }
+    if (!scopeId) { setBindings({}); setBindingProfileIds({}); return; }
     setBindingsLoading(true);
     try {
       const rows = await apiRequest<unknown>(`/agent-profiles/bindings?scopeType=${encodeURIComponent(scope)}&scopeId=${encodeURIComponent(scopeId)}`);
       const next: Partial<Record<AgentRole, string>> = {};
+      const boundIds: Partial<Record<AgentRole, string[]>> = {};
       if (Array.isArray(rows)) rows.forEach((row) => {
         if (!row || typeof row !== 'object') return;
         const record = row as Record<string, unknown>;
         const role = typeof record.role === 'string' ? record.role.toLowerCase() as AgentRole : null;
         const profileId = typeof record.profileId === 'string' ? record.profileId : typeof record.agentProfileId === 'string' ? record.agentProfileId : '';
-        if (role && PROFILE_ROLES.includes(role) && profileId && record.isDefault === true) next[role] = profileId;
+        if (!role || !PROFILE_ROLES.includes(role) || !profileId) return;
+        boundIds[role] = [...(boundIds[role] || []), profileId];
+        if (record.isDefault === true) next[role] = profileId;
       });
       setBindings(next);
+      setBindingProfileIds(boundIds);
     } catch {
       setBindings({});
+      setBindingProfileIds({});
     } finally { setBindingsLoading(false); }
   };
 
@@ -238,12 +244,30 @@ export function AgentsView() {
     try {
       if (profileId) {
         await apiRequest('/agent-profiles/bindings', { method: 'PUT', body: JSON.stringify({ scopeType: bindingScope, scopeId: bindingScopeId, role, profileId, isDefault: true }) });
-      } else {
-        await apiRequest(`/agent-profiles/bindings?scopeType=${encodeURIComponent(bindingScope)}&scopeId=${encodeURIComponent(bindingScopeId)}&role=${encodeURIComponent(role)}`, { method: 'DELETE' });
+      } else if (bindings[role]) {
+        // Keep the profile eligible for prompt-based specialist selection while
+        // clearing only its default status for this scope.
+        await apiRequest('/agent-profiles/bindings', { method: 'PUT', body: JSON.stringify({ scopeType: bindingScope, scopeId: bindingScopeId, role, profileId: bindings[role], isDefault: false }) });
       }
       setBindings((current) => ({ ...current, [role]: profileId || undefined }));
+      if (profileId) setBindingProfileIds((current) => ({ ...current, [role]: Array.from(new Set([...(current[role] || []), profileId])) }));
     } catch (cause: any) {
       setProfileError(cause?.message || 'Profile default could not be saved.');
+    } finally { setBindingBusyRole(null); }
+  };
+
+  const toggleWorkspaceSpecialist = async (profile: DesktopAgentProfile, enabled: boolean) => {
+    if (bindingScope !== 'workspace' || !bindingScopeId) return;
+    setBindingBusyRole(profile.role);
+    try {
+      if (enabled) {
+        await apiRequest('/agent-profiles/bindings', { method: 'PUT', body: JSON.stringify({ scopeType: 'workspace', scopeId: bindingScopeId, role: profile.role, profileId: profile.id, isDefault: false }) });
+      } else {
+        await apiRequest(`/agent-profiles/bindings?scopeType=workspace&scopeId=${encodeURIComponent(bindingScopeId)}&profileId=${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
+      }
+      await loadBindings('workspace', bindingScopeId);
+    } catch (cause: any) {
+      setProfileError(cause?.message || 'Workspace specialist pool could not be updated.');
     } finally { setBindingBusyRole(null); }
   };
 
@@ -511,6 +535,34 @@ export function AgentsView() {
                   </div>;
                 })}
               </div>
+              {bindingScope === 'workspace' && bindingScopeId && (
+                <div className="space-y-3 border-t border-border/70 pt-4">
+                  <div>
+                    <h3 className="text-sm font-medium">Workspace specialist pool</h3>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Selected profiles may be assigned to matching tasks from the user's prompt. Role defaults remain the fallback when no specialist fits.</p>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    {PROFILE_ROLES.filter((role) => role !== 'orchestrator').map((role) => {
+                      const roleProfiles = profilesByRole.get(role) || [];
+                      return <div key={`specialist-pool-${role}`} className="space-y-1.5 rounded-xl border border-border/70 bg-muted/20 p-3">
+                        <div className="text-xs font-medium">{profileRoleLabel(role)}</div>
+                        {roleProfiles.length ? roleProfiles.map((profile) => (
+                          <label key={profile.id} className="flex cursor-pointer items-start gap-2 rounded-md px-1 py-1.5 text-xs hover:bg-muted/40">
+                            <input
+                              type="checkbox"
+                              className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                              checked={(bindingProfileIds[role] || []).includes(profile.id)}
+                              disabled={bindingBusyRole === role}
+                              onChange={(event) => void toggleWorkspaceSpecialist(profile, event.target.checked)}
+                            />
+                            <span className="min-w-0"><span className="block font-medium text-foreground">{profile.name}</span><span className="block break-words text-[10px] text-muted-foreground">{profile.specialty || profile.description || 'Available when a task matches this profile.'}</span></span>
+                          </label>
+                        )) : <p className="text-[10px] text-muted-foreground">Create a {profileRoleLabel(role).toLowerCase()} profile to add it to the pool.</p>}
+                      </div>;
+                    })}
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         </section>

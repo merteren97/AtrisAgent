@@ -204,6 +204,11 @@ export function PlanTab() {
                           {task.description}
                         </p>
                       )}
+                      {expandedTasks[task.id] && task.routePreference?.reason && (
+                        <p className="break-words pl-5 text-[11px] leading-relaxed text-muted-foreground">
+                          Route choice: {task.routePreference.reason}
+                        </p>
+                      )}
                       {task.assignedRole && (
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5 pl-5">
                           <span className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
@@ -212,6 +217,20 @@ export function PlanTab() {
                           {targetLabel(task) && (
                             <span className="max-w-full truncate rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
                               {targetLabel(task)}
+                            </span>
+                          )}
+                          {task.specialty && (
+                            <span className="max-w-full truncate rounded border border-primary/20 bg-primary/5 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                              Specialist: {task.specialty}
+                            </span>
+                          )}
+                          {(task.assignedRole || task.routePreference || task.effectiveRoute?.runtimeModelId) && (
+                            <span
+                              className="max-w-full truncate rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                              title={task.effectiveRoute?.runtimeModelId || task.routePreference?.routeLabel || undefined}
+                            >
+                              Model: {task.effectiveRoute?.runtimeModelId || task.routePreference?.modelDisplayName || 'Automatic scheduler'}
+                              {!task.effectiveRoute?.runtimeModelId && task.routePreference?.routeLabel ? ` · ${task.routePreference.routeLabel}` : ''}
                             </span>
                           )}
                           {displayStatus === 'preparing' && (

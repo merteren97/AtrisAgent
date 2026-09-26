@@ -3,6 +3,7 @@ import { Dialog, DialogContent } from '@/components/ui/dialog';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useMissionStore } from '@/stores/mission-store';
+import { useManualStore } from '@/stores/manual-store';
 import { Search, FolderGit2, Activity, Settings, Bot, Folder, File } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
@@ -51,7 +52,7 @@ export function CommandPalette() {
       title: `Switch to ${ws.name}`,
       icon: Folder,
       type: 'Workspace',
-      onSelect: () => setActiveWorkspace(ws.id)
+       onSelect: () => { setActiveWorkspace(ws.id); useManualStore.getState().setMode('choose'); setActiveView('chat'); }
     })),
     // Missions
     ...missions.map(m => ({
@@ -59,7 +60,7 @@ export function CommandPalette() {
       title: `Mission: ${m.title}`,
       icon: File,
       type: 'Mission',
-      onSelect: () => setActiveMission(m.id)
+       onSelect: () => { setActiveWorkspace(m.workspaceId); useManualStore.getState().setMode('orchestrator'); setActiveMission(m.id); setActiveView('chat'); }
     }))
   ].filter(item => item.title.toLowerCase().includes(query.toLowerCase()));
 

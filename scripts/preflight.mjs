@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { checkDevRuntime } from './check-dev-runtime.mjs';
 
 const checks = [];
 function command(name, args = ['--version'], required = false, executable = name) {
@@ -11,8 +12,9 @@ function command(name, args = ['--version'], required = false, executable = name
   checks.push({ name, ok, required, detail: ok ? output || 'available' : result.error?.message || `exit ${result.status}` });
 }
 
-const major = Number(process.versions.node.split('.')[0]);
-checks.push({ name: 'Node.js 22+', ok: major >= 22, required: true, detail: process.version });
+const runtime = checkDevRuntime();
+checks.push({ name: 'Node.js 22 LTS', ok: runtime.node.ok, required: true, detail: runtime.node.detail });
+checks.push({ name: 'better-sqlite3 addon', ok: runtime.sqlite.ok, required: true, detail: runtime.sqlite.detail });
 checks.push({ name: 'package-lock.json', ok: fs.existsSync(path.resolve('package-lock.json')), required: true, detail: 'lockfile' });
 checks.push({
   name: 'dependencies installed',

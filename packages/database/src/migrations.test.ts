@@ -57,6 +57,7 @@ assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('a
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_instances') WHERE name = 'profile_id'").get() as { count: number }).count, 1);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_instances') WHERE name = 'agent_profile_id'").get() as { count: number }).count, 1);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('tasks') WHERE name = 'agent_profile_id'").get() as { count: number }).count, 1);
+assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('tasks') WHERE name IN ('specialty', 'route_preference')").get() as { count: number }).count, 2);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('task_attempts') WHERE name = 'agent_profile_id'").get() as { count: number }).count, 1);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('agent_profiles', 'agent_profile_bindings')").get() as { count: number }).count, 2);
 assert.equal((sqlite.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('agent_profiles') WHERE name IN ('id', 'name', 'role', 'instructions', 'capabilities', 'specialty', 'description', 'route_policy', 'allowed_route_policy', 'is_default', 'archived_at', 'created_at', 'updated_at')").get() as { count: number }).count, 13);

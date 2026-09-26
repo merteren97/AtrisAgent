@@ -52,6 +52,7 @@ import type {
   AgentProfileRecord,
   AgentProfileBindingOverride,
   AgentProfileBindingRecord,
+  TaskRoutePreference,
   AgentProfileCreateInput,
   AgentProfileUpdateInput,
   AgentProfileResolution,
@@ -98,6 +99,8 @@ export interface CreateTaskInput {
   assignedRole?: AgentRole | null;
   /** Canonical named profile selected for the task. */
   agentProfileId?: string | null;
+  specialty?: string | null;
+  routePreference?: TaskRoutePreference | null;
   requiredCapabilities?: string[];
   dependsOn?: string[];
   worktreeId?: string | null;
@@ -740,8 +743,10 @@ export class WorkspaceManager {
     const resolveBinding = async (scopeType: AgentProfileScopeType, scopeId: string | undefined, requestedId?: string): Promise<AgentProfileResolution | undefined> => {
       if (!scopeId) return undefined;
       const bindings = await this.listAgentProfileBindings({ scopeType, scopeId, role, includeArchivedProfiles: true });
-      const binding = bindings.find((candidate) => candidate.isDefault);
-      if (!binding || (requestedId && binding.profileId !== requestedId)) return undefined;
+      const binding = requestedId
+        ? bindings.find((candidate) => candidate.profileId === requestedId)
+        : bindings.find((candidate) => candidate.isDefault);
+      if (!binding) return undefined;
       const bound = await this.getAgentProfile(binding.profileId, { includeArchived: true });
       if (!bound) throw new Error(`Agent profile binding '${binding.id}' references a missing profile.`);
       if (bound.archivedAt !== null) throw new Error(`Agent profile binding '${binding.id}' references an archived profile.`);
@@ -1025,6 +1030,8 @@ export class WorkspaceManager {
       dependsOn: input.dependsOn ?? [],
       worktreeId: input.worktreeId ?? null,
       targetDescriptor: input.targetDescriptor ?? null,
+      specialty: input.specialty ?? null,
+      routePreference: input.routePreference ?? null,
       createdAt: now,
       updatedAt: now,
     };

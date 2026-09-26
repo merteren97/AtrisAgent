@@ -76,6 +76,8 @@ class FakeWorkspaceManager {
       worktreeId: input.worktreeId || null,
       targetDescriptor: input.targetDescriptor || null,
       agentProfileId: input.agentProfileId || null,
+      specialty: input.specialty || null,
+      routePreference: input.routePreference || null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,
