@@ -5,7 +5,19 @@ import path from 'node:path';
 import { checkDevRuntime } from './check-dev-runtime.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const runtime = checkDevRuntime();
+let runtime = checkDevRuntime();
+if (runtime.node.ok && !runtime.sqlite.ok) {
+  console.warn('[dev-stack] better-sqlite3 does not match Node.js 22. Rebuilding the local native addon...');
+  const env = {
+    ...process.env,
+    PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH || ''}`,
+  };
+  const npmExecPath = process.env.npm_execpath;
+  const rebuild = npmExecPath && /\.(?:c|m)?js$/i.test(npmExecPath)
+    ? spawnSync(process.execPath, [npmExecPath, 'rebuild', 'better-sqlite3'], { cwd: root, env, stdio: 'inherit', windowsHide: true })
+    : spawnSync('npm', ['rebuild', 'better-sqlite3'], { cwd: root, env, stdio: 'inherit', windowsHide: true, shell: process.platform === 'win32' });
+  if (rebuild.status === 0) runtime = checkDevRuntime();
+}
 if (!runtime.node.ok || !runtime.sqlite.ok) {
   if (!runtime.node.ok) console.error(`[dev-stack] ${runtime.node.detail}`);
   if (!runtime.sqlite.ok) console.error(`[dev-stack] better-sqlite3: ${runtime.sqlite.detail}`);

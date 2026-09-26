@@ -2749,12 +2749,16 @@ app.put('/api/execution-policies/:scopeType/:scopeId/:role', async (req, res) =>
     const selectionMode = validSelectionModes.has(String(req.body?.selectionMode))
       ? String(req.body.selectionMode)
       : modelCatalogId ? 'prefer' : 'auto';
+    const accountProfileId = String(req.body?.accountProfileId || '').trim() || undefined;
+    if (selectionMode === 'fixed' && !modelCatalogId && !accountProfileId && fallbackCatalogIds.length === 0) {
+      return void res.status(400).json({ error: 'Fixed routing requires a model, account, or explicit fallback route.' });
+    }
     const reasoning = validReasoning.has(String(req.body?.reasoningLevel)) ? String(req.body.reasoningLevel) : undefined;
     await workspaceManager.upsertRoleExecutionPolicy(scopeType as any, req.params.scopeId, {
       role: role as any,
       selectionMode: selectionMode as any,
       modelCatalogId,
-      accountProfileId: String(req.body?.accountProfileId || '').trim() || undefined,
+      accountProfileId,
       reasoningLevel: reasoning as any,
       fallbackCatalogIds,
     });

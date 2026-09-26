@@ -1,4 +1,4 @@
-import { LocalEventBus, registerSupervisorTurnRunner } from '@atris-agent-code/event-bus';
+import { LocalEventBus, registerSupervisorPlanningResourcesProvider, registerSupervisorTurnRunner } from '@atris-agent-code/event-bus';
 import type { MissionSelect, TaskSelect } from '@atris-agent-code/database';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { OrchestratorV2 } from './orchestrator-v2';
@@ -354,6 +354,137 @@ async function runTests() {
     assert((orchestrator as unknown as { planActions: Map<string, string> }).planActions.get(result.planId) === 'execute',
       'approved plan-only execution keeps execute semantics for terminal reconciliation');
   }
+
+  // A supervisor-requested route review persists the plan and pauses before
+  // any worker dispatch, even when the mission's automation profile is Auto.
+  registerSupervisorPlanningResourcesProvider(async () => ({
+    models: [{ catalogId: 'test-model', accountProfileId: 'connected-account', runtimeId: 'codex', runtimeModelId: 'test-model', displayName: 'Test Model', supportedRoles: ['researcher', 'builder'], supportedReasoning: ['high'], defaultReasoning: 'high' }],
+    specialists: [],
+  }));
+  {
+    const missionId = 'conversation-worker-route-approval';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Research model route options.', status: 'completed' });
+    manager.mission = {
+      ...manager.mission,
+      automationPolicy: { profile: 'auto', strategy: 'standard', overrides: {} },
+    };
+    const eventBus = new LocalEventBus();
+    const events: any[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'delegate',
+      needsUserApproval: true,
+      response: 'Two compatible research routes have different strengths for this task.',
+      delegations: [{ id: 'research-route', role: 'researcher', objective: 'Compare the available research routes.', requiredCapabilities: ['research'], routePreference: { modelCatalogId: 'test-model', reason: 'Fits the research task.' } }],
+    }));
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+
+    const result = await orchestrator.startMission(missionId, 'Research the available model trade-offs.');
+    const approval = events.find((event) => event.type === 'approval_requested' && event.approvalType === 'worker_route');
+    const taskCreatedBeforeApproval = events.filter((event) => event.type === 'task_created').length;
+    assert(Boolean(approval) && String(approval?.description).includes('Proposed model: Test Model'),
+      'uncertain model selection creates an approval card with an explicit routing summary');
+    assert(manager.mission.status === 'waiting_for_approval' && taskCreatedBeforeApproval === 0,
+      'worker-route approval pauses dispatch even in autonomous mode');
+
+    await orchestrator.handleApprovalDecision(missionId, 'worker_route', true);
+    assert(manager.mission.status === 'running' && events.filter((event) => event.type === 'task_created').length === 1,
+      'approving the proposed worker routes resumes root task dispatch');
+    assert(result.tasks.length === 1, 'approval gate preserves the planned delegation');
+  }
+
+  // Confirming a model must not consume a separate Review Driven plan gate.
+  {
+    const missionId = 'conversation-worker-route-then-plan';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Inspect the route before execution.', status: 'completed' });
+    manager.mission = { ...manager.mission, automationPolicy: { profile: 'ask', strategy: 'standard', overrides: {} } };
+    const eventBus = new LocalEventBus();
+    const approvals: string[] = [];
+    let dispatched = 0;
+    eventBus.on('approval_requested', (event) => { approvals.push(event.approvalType); });
+    eventBus.on('task_created', () => { dispatched += 1; });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'execute',
+      needsUserApproval: true,
+      response: 'The available worker routes require a choice.',
+      delegations: [{ id: 'builder-route', role: 'builder', objective: 'Implement the feature.', requiredCapabilities: ['implementation'], routePreference: { modelCatalogId: 'test-model', reason: 'Fits this implementation task.' } }],
+    }));
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+    await orchestrator.startMission(missionId, 'Implement the feature.');
+    assert(approvals.join(',') === 'worker_route' && dispatched === 0,
+      'uncertain execution asks for the worker route before any Builder begins');
+    await orchestrator.handleApprovalDecision(missionId, 'worker_route', true);
+    assert(approvals.join(',') === 'worker_route,plan' && manager.mission.status === 'waiting_for_approval' && dispatched === 0,
+      'accepting the model choice preserves Review Driven plan approval');
+    await orchestrator.handleApprovalDecision(missionId, 'plan', true);
+    assert(manager.mission.status === 'running' && dispatched === 1,
+      'only the second approval launches the Builder');
+  }
+
+  // Human routing review must not override a hard execution-policy denial.
+  {
+    const missionId = 'conversation-worker-route-policy-deny';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Review route policy.', status: 'completed' });
+    manager.mission = {
+      ...manager.mission,
+      automationPolicy: { profile: 'auto', strategy: 'standard', overrides: { plan: 'deny' } },
+    };
+    const eventBus = new LocalEventBus();
+    const events: any[] = [];
+    eventBus.on('*', (event) => { events.push(event); });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'delegate',
+      needsUserApproval: true,
+      response: 'Review this worker route.',
+      delegations: [{ id: 'research-denied', role: 'researcher', objective: 'Inspect the route.', requiredCapabilities: ['research'], routePreference: { modelCatalogId: 'test-model', reason: 'Available for this role.' } }],
+    }));
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus,
+      undefined,
+      manager as unknown as WorkspaceManager,
+    );
+    let denied = false;
+    try {
+      await orchestrator.startMission(missionId, 'Review the route policy.');
+    } catch {
+      denied = true;
+    }
+    assert(denied && manager.mission.status === 'failed'
+      && !events.some((event) => event.type === 'approval_requested' && event.approvalType === 'worker_route'),
+    'worker-route approval cannot bypass a denied execution policy');
+  }
+  {
+    const missionId = 'conversation-worker-route-without-model';
+    const manager = new FakeWorkspaceManager({ missionId, description: 'Research model choices.', status: 'completed' });
+    const eventBus = new LocalEventBus();
+    let approvalCount = 0;
+    let dispatched = 0;
+    eventBus.on('approval_requested', () => { approvalCount += 1; });
+    eventBus.on('task_created', () => { dispatched += 1; });
+    registerSupervisorTurnRunner(async () => JSON.stringify({
+      action: 'delegate', needsUserApproval: true,
+      delegations: [{ id: 'unspecified-route', role: 'researcher', objective: 'Research the alternatives.', requiredCapabilities: ['research'] }],
+    }));
+    const orchestrator = new OrchestratorV2(
+      { workspacePath: 'C:/Projects/AtrisTracker', workspaceManager: manager as unknown as WorkspaceManager },
+      eventBus, undefined, manager as unknown as WorkspaceManager,
+    );
+    const result = await orchestrator.startMission(missionId, 'Research the alternatives.');
+    assert(result.tasks.length === 0 && approvalCount === 0 && dispatched === 0 && manager.mission.status === 'completed',
+      'an uncertain selection without an actual model asks for clarification instead of approving an automatic route');
+  }
+  registerSupervisorPlanningResourcesProvider(null);
 
   // An explicitly auto-approved plan-only Builder lane may continue into the
   // normal scheduler path instead of stopping at a completed preview.

@@ -349,12 +349,9 @@ export function Sidebar() {
       className="workspace-sidebar relative z-40 flex shrink-0 select-none bg-sidebar"
       style={{ '--workspace-pane-width': `${sidebarWidth}px` } as CSSProperties}
     >
-      <div className="workspace-rail flex w-[60px] shrink-0 flex-col items-center border-r border-sidebar-border/70 px-2 pb-3">
-        <div data-tauri-drag-region className="flex h-14 w-full shrink-0 items-center justify-center">
-          <img src="/logo.svg" alt="AtrisAgent" draggable={false} className="pointer-events-none h-6 w-6 object-contain" />
-        </div>
+      <div className="workspace-rail flex w-[60px] shrink-0 flex-col items-center border-r border-sidebar-border/40 bg-sidebar-accent/15 px-2 pb-3 pt-2">
         <nav aria-label="Main navigation" className="flex w-full flex-col gap-1">
-          <SidebarItem collapsed icon={<SquarePen className="h-4 w-4" />} label="New conversation" onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)} />
+          {sidebarCollapsed && <SidebarItem collapsed icon={<SquarePen className="h-4 w-4" />} label="New conversation" onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)} />}
           <SidebarItem collapsed icon={<Search className="h-4 w-4" />} label="Search conversations" onClick={() => setCommandPaletteOpen(true)} />
           <div className="my-1 border-t border-sidebar-border/70" />
           <SidebarItem collapsed icon={<House className="h-4 w-4" />} label="Home" isActive={activeView === 'chat' && manual.mode === 'choose'} onClick={() => { manual.setMode('choose'); setActiveView('chat'); }} />
@@ -417,9 +414,9 @@ export function Sidebar() {
         </div>
       </div>
 
-      <div id="workspace-list-pane" className="workspace-pane relative flex min-h-0 min-w-0 flex-1 flex-col border-r border-sidebar-border/70 bg-sidebar">
-        <div className="absolute bottom-0 right-0 top-0 z-10 w-1 cursor-col-resize hover:bg-primary/40" onMouseDown={handleDrag} />
-        <div data-tauri-drag-region className="flex h-14 shrink-0 items-center justify-between px-4">
+      <div id="workspace-list-pane" className="workspace-pane relative flex min-h-0 min-w-0 flex-1 flex-col bg-sidebar">
+        <div className="absolute -right-[3px] bottom-0 top-0 z-20 w-[6px] cursor-col-resize bg-transparent hover:bg-primary/40" onMouseDown={handleDrag} />
+        <div data-tauri-drag-region className="flex h-14 shrink-0 items-center justify-between border-b border-sidebar-border/40 px-4">
           <span data-tauri-drag-region className="text-sm font-semibold text-sidebar-foreground">Workspaces</span>
           <Button size="icon" variant="ghost" className="h-8 w-8 text-sidebar-muted" aria-label="Hide workspaces" onClick={toggleSidebar}><PanelLeftClose className="h-4 w-4" /></Button>
         </div>
@@ -467,7 +464,7 @@ export function Sidebar() {
           return (
             <div key={workspace.id} className="mb-2">
               <ContextMenu><ContextMenuTrigger asChild><div
-                className={`navigation-row group/workspace flex w-full items-center rounded-lg text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
+                className={`navigation-row group/workspace flex w-full items-center rounded-lg text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'bg-primary/[0.06] text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
                 title={workspace.path}
               >
                 <button
@@ -599,10 +596,6 @@ export function Sidebar() {
         })}
       </ScrollArea>
 
-       <div className="shrink-0 border-t border-sidebar-border/70 px-4 py-3 text-[11px] text-sidebar-muted">
-         <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${serviceOnline ? 'bg-emerald-500' : 'bg-destructive'}`} />
-         {serviceOnline ? 'Local service ready' : 'Local service offline'}
-       </div>
       </div>
 
       {navigationDelete && <NavigationDeleteDialog target={navigationDelete} onClose={() => setNavigationDelete(null)}/>}

@@ -9,7 +9,7 @@ import type {
   TeamRole,
   TeamTemplate,
 } from '@atris-agent-code/domain';
-import { AlertCircle, CheckCircle2, Loader2, Plus, RefreshCw, Route, Save, X } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronDown, Loader2, Plus, RefreshCw, Route, Save, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -150,15 +150,23 @@ export function ExecutionPolicyEditor() {
     });
   };
 
-  const save = async () => {
+  const save = async (nextDraft: PolicyDraft = draft) => {
     if (!selectedTemplate) return;
+    const invalidFixedRole = selectedTemplate.roles.find((item) => {
+      const policy = nextDraft[item.role] || policyFromTemplateRole(item);
+      return policy.selectionMode === 'fixed' && !policy.modelCatalogId && !policy.accountProfileId && !policy.fallbackCatalogIds?.length;
+    });
+    if (invalidFixedRole) {
+      setError(`${roleLabel(invalidFixedRole.role)} is Fixed but has no model, account, or fallback. Configure a route before saving.`);
+      return;
+    }
     setSaving(true);
     setSaved(false);
     setError(null);
     try {
       let persisted: RoleExecutionPolicy[] = [];
       for (const roleDefinition of selectedTemplate.roles) {
-        const policy = normalizePolicy(draft[roleDefinition.role] || policyFromTemplateRole(roleDefinition));
+        const policy = normalizePolicy(nextDraft[roleDefinition.role] || policyFromTemplateRole(roleDefinition));
         const response = await apiRequest<SavePolicyResponse>(
           `/execution-policies/team_template/${encodeURIComponent(selectedTemplate.id)}/${encodeURIComponent(roleDefinition.role)}`,
           {
@@ -183,6 +191,21 @@ export function ExecutionPolicyEditor() {
     }
   };
 
+  const setAllSubagentsToAuto = () => {
+    if (!selectedTemplate || saving) return;
+    const nextDraft: PolicyDraft = { ...draft };
+    for (const roleDefinition of selectedTemplate.roles) {
+      if (roleDefinition.role === 'orchestrator') continue;
+      nextDraft[roleDefinition.role] = normalizePolicy({
+        role: roleDefinition.role,
+        selectionMode: 'auto',
+        fallbackCatalogIds: [],
+      });
+    }
+    setDraft(nextDraft);
+    void save(nextDraft);
+  };
+
   const refreshCatalog = async () => {
     if (catalogRefresh.status === 'refreshing') return;
     setCatalogRefresh({ status: 'refreshing' });
@@ -203,7 +226,7 @@ export function ExecutionPolicyEditor() {
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <CardTitle className="flex items-center gap-2 text-base"><Route className="h-4 w-4 text-primary" /> Team execution routing</CardTitle>
-            <CardDescription className="mt-1 max-w-2xl">Configure account-scoped model, reasoning and ordered fallbacks independently for each team role. Explicit fallback models may use another connected account/runtime; unlisted routes remain blocked in Fixed mode.</CardDescription>
+            <CardDescription className="mt-1 max-w-2xl">Use task-based automatic routing for subagents, or open a role to pin a model, reasoning level and ordered fallbacks. Fixed routes never silently switch to unlisted models.</CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select aria-label="Team template for execution policy" value={templateId} onChange={(event) => setTemplateId(event.target.value)} className="h-9 min-w-48 rounded-md border border-input bg-background px-3 text-xs">
@@ -212,6 +235,10 @@ export function ExecutionPolicyEditor() {
             <Button variant="outline" size="sm" onClick={() => void refreshCatalog()} disabled={catalogRefresh.status === 'refreshing'} aria-busy={catalogRefresh.status === 'refreshing'}>
               {catalogRefresh.status === 'refreshing' ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-2 h-3.5 w-3.5" />}
               {catalogRefresh.status === 'refreshing' ? 'Refreshing…' : 'Refresh catalog'}
+            </Button>
+            <Button variant="outline" size="sm" onClick={setAllSubagentsToAuto} disabled={!selectedTemplate || loading || saving}>
+              {saving ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Route className="mr-2 h-3.5 w-3.5" />}
+              Set & save subagents to Auto
             </Button>
             <Button size="sm" onClick={() => void save()} disabled={!selectedTemplate || loading || saving}><Save className="mr-2 h-3.5 w-3.5" />{saving ? 'Saving…' : 'Save policy'}</Button>
           </div>
@@ -264,8 +291,8 @@ function RolePolicyCard({ roleDefinition, policy, accounts, models, onChange }: 
   const selectedAccount = accounts.find((account) => account.id === policy.accountProfileId);
   const initialRuntime = selectedModel?.runtimeType || selectedAccount?.runtimeType || 'all';
   const [runtimeFilter, setRuntimeFilter] = useState<RuntimeFilter>(initialRuntime);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const mode = policy.selectionMode || 'auto';
-  const routeControlsDisabled = mode === 'auto';
 
   const accountOptions = accounts.filter((account) => {
     if (runtimeFilter !== 'all' && account.runtimeType !== runtimeFilter) return false;
@@ -290,9 +317,11 @@ function RolePolicyCard({ roleDefinition, policy, accounts, models, onChange }: 
   const setMode = (selectionMode: RouteSelectionMode) => {
     if (selectionMode === 'auto') {
       onChange({ selectionMode, accountProfileId: undefined, modelCatalogId: undefined, reasoningLevel: undefined, fallbackCatalogIds: [] });
+      setDetailsOpen(false);
       return;
     }
     onChange({ selectionMode });
+    setDetailsOpen(true);
   };
 
   const changeRuntimeFilter = (value: string) => {
@@ -304,30 +333,40 @@ function RolePolicyCard({ roleDefinition, policy, accounts, models, onChange }: 
   };
 
   return (
-    <div className="rounded-xl border border-border/70 bg-card/40 p-4">
-      <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+    <div className="rounded-xl border border-border/70 bg-card/40 p-3 sm:p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             {displayedRuntime ? <RuntimeBrandIcon runtimeId={displayedRuntime} className="h-4 w-4 text-primary" /> : <Route className="h-4 w-4 text-muted-foreground" />}
             <span className="text-sm font-semibold">{roleLabel(roleDefinition.role)}</span>
             <Badge variant="outline" className="text-[9px]">{roleDefinition.accessLevel.replaceAll('_', ' ')}</Badge>
           </div>
-          <p className="mt-1 text-[11px] text-muted-foreground">{MODES.find((item) => item.id === mode)?.description}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{MODES.find((item) => item.id === mode)?.description}</p>
         </div>
-        <div className="flex rounded-lg border border-border bg-background p-1">
-          {MODES.map((item) => <button key={item.id} type="button" onClick={() => setMode(item.id)} className={`rounded-md px-3 py-1 text-[10px] font-medium transition-colors ${mode === item.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>{item.label}</button>)}
+        <div className="flex shrink-0 self-start rounded-lg border border-border bg-background p-1" role="group" aria-label={`${roleLabel(roleDefinition.role)} routing mode`}>
+          {MODES.map((item) => <button key={item.id} type="button" aria-pressed={mode === item.id} onClick={() => setMode(item.id)} className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${mode === item.id ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>{item.label}</button>)}
         </div>
       </div>
 
-      <div className={`grid gap-3 md:grid-cols-2 xl:grid-cols-4 ${routeControlsDisabled ? 'opacity-55' : ''}`}>
+      {mode !== 'auto' && (
+        <button type="button" aria-expanded={detailsOpen} aria-controls={detailsOpen ? `route-details-${roleDefinition.role}` : undefined} onClick={() => setDetailsOpen(!detailsOpen)} className="mt-3 flex w-full items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/40 px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          <span className="min-w-0 truncate">{selectedModel?.name || selectedAccount?.profileName || 'Choose a model or connected account'}{fallbackIds.length ? ` · ${fallbackIds.length} fallback${fallbackIds.length === 1 ? '' : 's'}` : ''}</span>
+          <span className="flex shrink-0 items-center gap-1 text-foreground">{detailsOpen ? 'Hide settings' : 'Configure route'}<ChevronDown className={`h-3.5 w-3.5 transition-transform ${detailsOpen ? 'rotate-180' : ''}`} /></span>
+        </button>
+      )}
+      {mode === 'fixed' && !policy.modelCatalogId && !policy.accountProfileId && !fallbackIds.length && (
+        <p role="alert" className="mt-2 text-xs text-amber-400">Choose a model or account before saving a Fixed route.</p>
+      )}
+
+      {mode !== 'auto' && detailsOpen && <div id={`route-details-${roleDefinition.role}`} className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Field label="Primary runtime filter">
-          <select disabled={routeControlsDisabled} value={runtimeFilter} onChange={(event) => changeRuntimeFilter(event.target.value)} className={SELECT_CLASS}>
+          <select value={runtimeFilter} onChange={(event) => changeRuntimeFilter(event.target.value)} className={SELECT_CLASS}>
             <option value="all">All connected runtimes</option>
             {RUNTIME_BRANDS.map((runtime) => <option key={runtime.id} value={runtime.id}>{runtime.label}</option>)}
           </select>
         </Field>
         <Field label="Primary account">
-          <select disabled={routeControlsDisabled} value={policy.accountProfileId || ''} onChange={(event) => {
+          <select value={policy.accountProfileId || ''} onChange={(event) => {
             const account = accounts.find((item) => item.id === event.target.value);
             if (account) setRuntimeFilter(account.runtimeType);
             onChange({ accountProfileId: account?.id, modelCatalogId: undefined, reasoningLevel: undefined, fallbackCatalogIds: [] });
@@ -337,7 +376,7 @@ function RolePolicyCard({ roleDefinition, policy, accounts, models, onChange }: 
           </select>
         </Field>
         <Field label="Primary model">
-          <select disabled={routeControlsDisabled} value={policy.modelCatalogId || ''} onChange={(event) => {
+          <select value={policy.modelCatalogId || ''} onChange={(event) => {
             const model = models.find((item) => item.catalogId === event.target.value);
             if (model) setRuntimeFilter(model.runtimeType);
             onChange({ modelCatalogId: model?.catalogId, accountProfileId: model?.accountProfileId || policy.accountProfileId, reasoningLevel: model?.defaultReasoning || policy.reasoningLevel, fallbackCatalogIds: fallbackIds.filter((id) => id !== model?.catalogId) });
@@ -347,26 +386,26 @@ function RolePolicyCard({ roleDefinition, policy, accounts, models, onChange }: 
           </select>
         </Field>
         <Field label="Reasoning">
-          <select disabled={routeControlsDisabled} value={policy.reasoningLevel || ''} onChange={(event) => onChange({ reasoningLevel: event.target.value ? event.target.value as CanonicalReasoning : undefined })} className={SELECT_CLASS}>
+          <select value={policy.reasoningLevel || ''} onChange={(event) => onChange({ reasoningLevel: event.target.value ? event.target.value as CanonicalReasoning : undefined })} className={SELECT_CLASS}>
             <option value="">Role/model default</option>
             {reasoningOptions.map((level) => <option key={level} value={level}>{titleReasoning(level)}</option>)}
           </select>
         </Field>
-      </div>
+      </div>}
 
-      <div className={`mt-4 rounded-lg border border-border/60 bg-background/50 p-3 ${routeControlsDisabled ? 'opacity-55' : ''}`}>
+      {mode !== 'auto' && detailsOpen && <div className="mt-4 rounded-lg border border-border/60 bg-background/50 p-3">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div><div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Ordered fallback routes</div><div className="mt-0.5 text-[10px] text-muted-foreground">{mode === 'fixed' ? 'Only the primary route and these exact fallbacks may run; fallbacks may cross account/runtime boundaries.' : mode === 'prefer' ? 'These explicit fallbacks are preferred before the scheduler broadens to other compatible routes.' : 'Auto mode delegates the complete route decision to the scheduler.'}</div></div>
-          <select disabled={routeControlsDisabled} value="" onChange={(event) => { if (event.target.value) onChange({ fallbackCatalogIds: [...fallbackIds, event.target.value] }); }} className="h-8 min-w-52 rounded-md border border-input bg-background px-2 text-[10px]">
+          <select aria-label={`${roleLabel(roleDefinition.role)} fallback model`} value="" onChange={(event) => { if (event.target.value) onChange({ fallbackCatalogIds: [...fallbackIds, event.target.value] }); }} className="h-8 min-w-52 rounded-md border border-input bg-background px-2 text-xs">
             <option value="">+ Add fallback route</option>
             {availableFallbacks.map((model) => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName} · {model.runtimeType}</option>)}
           </select>
         </div>
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {fallbackModels.map((model, index) => <Badge key={model.catalogId} variant="secondary" className="gap-1 py-1 text-[9px]"><span>{index + 1}.</span><RuntimeBrandIcon runtimeId={model.runtimeType} className="h-3 w-3" />{model.name}<span className="text-muted-foreground">· {model.accountName}</span><button type="button" disabled={routeControlsDisabled} onClick={() => onChange({ fallbackCatalogIds: fallbackIds.filter((id) => id !== model.catalogId) })} aria-label={`Remove ${model.name} fallback`}><X className="h-3 w-3" /></button></Badge>)}
+          {fallbackModels.map((model, index) => <Badge key={model.catalogId} variant="secondary" className="gap-1 py-1 text-[10px]"><span>{index + 1}.</span><RuntimeBrandIcon runtimeId={model.runtimeType} className="h-3 w-3" />{model.name}<span className="text-muted-foreground">· {model.accountName}</span><button type="button" onClick={() => onChange({ fallbackCatalogIds: fallbackIds.filter((id) => id !== model.catalogId) })} aria-label={`Remove ${model.name} fallback`}><X className="h-3 w-3" /></button></Badge>)}
           {!fallbackModels.length && <span className="flex items-center gap-1 text-[10px] text-muted-foreground"><Plus className="h-3 w-3" />No explicit fallbacks</span>}
         </div>
-      </div>
+      </div>}
     </div>
   );
 }

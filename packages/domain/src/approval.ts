@@ -16,7 +16,8 @@ export type ApprovalType =
   | 'pull_request'
   | 'database_migration'
   | 'command_execution'
-  | 'candidate_selection';
+  | 'candidate_selection'
+  | 'worker_route';
 
 export interface Approval {
   id: string;

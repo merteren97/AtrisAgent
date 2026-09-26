@@ -806,6 +806,7 @@ export class Orchestrator {
       agentProfileIds?: Partial<Record<AgentRole, string>>;
       rawModelPlanOutput?: string;
       researchContextPlanId?: string;
+      preDispatchApproval?: { type: 'worker_route'; description: string };
     }
   ): Promise<{
     missionId: string;
@@ -1082,6 +1083,20 @@ export class Orchestrator {
       const reason = 'Mission policy denies plan execution.';
       await this.transitionMissionDiagnostic({ missionId, status: 'failed', reason });
       throw new Error(reason);
+    }
+    if (options?.preDispatchApproval) {
+      if (this.workspaceManager) {
+        await this.workspaceManager.updateMission(missionId, { status: 'waiting_for_approval' as MissionStatus });
+      } else {
+        const cached = this.inMemoryMissions.get(missionId);
+        if (cached) this.inMemoryMissions.set(missionId, { ...cached, status: 'waiting_for_approval' as MissionStatus });
+      }
+      await this.emitApprovalRequested({
+        missionId,
+        approvalType: options.preDispatchApproval.type,
+        description: options.preDispatchApproval.description,
+      });
+      return { missionId, planId, tasks: createdTasks, structuredPlan };
     }
     const autoApproved = planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
       'plan', `Approve execution plan with ${createdTasks.length} tasks for: ${request}`);
@@ -1707,7 +1722,7 @@ export class Orchestrator {
       return;
     }
 
-    if (approvalType === 'plan') {
+    if (approvalType === 'plan' || approvalType === 'worker_route') {
       const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(missionId), mission?.planId);
       const pending = tasks.filter((task) => task.status === 'planned' || task.status === 'ready' || task.status === 'blocked');
       const roots = this.dependencyFreeRoots(pending);

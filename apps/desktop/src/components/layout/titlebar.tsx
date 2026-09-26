@@ -119,13 +119,14 @@ export function Titlebar() {
   }, [activeWorkspaceId, clearActiveMission, setActiveView, setComposerInput]);
 
   return (
-    <header className="relative z-30 flex h-12 shrink-0 items-center border-b border-border bg-background select-none">
+    <header className="relative z-[60] flex h-12 shrink-0 items-center border-b border-border bg-background select-none">
       <div
         id="atris-titlebar-drag-region"
         data-tauri-drag-region
-        className="atris-drag-region flex h-full min-w-0 flex-1 items-center gap-2.5 overflow-hidden px-4"
+        className="atris-drag-region flex h-full min-w-0 flex-1 items-center gap-3 overflow-hidden px-4"
         onMouseDown={handleDragFallback}
       >
+        <img data-tauri-drag-region src="/logo.svg" alt="AtrisAgent" draggable={false} className="pointer-events-none h-5 w-5 shrink-0 object-contain" />
         <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
           <h1 data-tauri-drag-region className="pointer-events-none min-w-0 truncate text-sm font-semibold">
             {viewTitle.length > 76 ? `${viewTitle.slice(0, 73).trim()}…` : viewTitle}
@@ -143,7 +144,7 @@ export function Titlebar() {
         {feedback && <span data-tauri-drag-region className="pointer-events-none max-w-[260px] shrink truncate text-xs text-destructive">{feedback}</span>}
       </div>
 
-      <div data-no-drag className="atris-no-drag relative z-10 flex h-full shrink-0 items-center gap-1 bg-background pr-1">
+      <div data-no-drag className="atris-no-drag relative z-10 flex h-full shrink-0 items-center gap-1 bg-background px-1">
         {showMissionControls && canStop && (
           <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => void runMissionAction('stop')} disabled={Boolean(pendingAction)} title={canCancelBeforeStart ? 'Cancel' : t('Stop')} aria-label={canCancelBeforeStart ? 'Cancel mission' : 'Stop mission'}>
             <Square className="h-3.5 w-3.5" />
@@ -167,7 +168,7 @@ export function Titlebar() {
           data-no-drag
           variant="ghost"
           size="icon"
-          className="h-9 w-10 shrink-0 rounded-none"
+          className="h-9 w-10 shrink-0 rounded-md"
           onClick={() => void runWindowAction('minimize').catch((error) => reportWindowError('minimize', error))}
           aria-label="Minimize window"
           title="Minimize"
@@ -178,7 +179,7 @@ export function Titlebar() {
           data-no-drag
           variant="ghost"
           size="icon"
-          className="h-9 w-10 shrink-0 rounded-none"
+          className="h-9 w-10 shrink-0 rounded-md"
           onClick={() => void runWindowAction('maximize').catch((error) => reportWindowError('maximize', error))}
           aria-label="Maximize or restore window"
           title="Maximize or restore"
@@ -189,7 +190,7 @@ export function Titlebar() {
           data-no-drag
           variant="ghost"
           size="icon"
-          className="h-9 w-10 shrink-0 rounded-none hover:bg-destructive hover:text-destructive-foreground"
+          className="h-9 w-10 shrink-0 rounded-md hover:bg-destructive hover:text-destructive-foreground"
           onClick={() => void runWindowAction('close').catch((error) => reportWindowError('close', error))}
           aria-label="Close window"
           title="Close AtrisAgent"

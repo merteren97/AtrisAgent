@@ -384,11 +384,11 @@ export function ChatComposer() {
                     <ChevronDown className="h-3 w-3 shrink-0" />
                   </Button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" sideOffset={8} className="w-[500px] overflow-hidden p-0" onCloseAutoFocus={(event) => event.preventDefault()}>
+                <DropdownMenuContent align="end" sideOffset={8} className="w-[min(500px,calc(100vw-1.5rem))] overflow-hidden p-0" onCloseAutoFocus={(event) => event.preventDefault()}>
                   <div className="flex items-center justify-between border-b border-border bg-muted/20 px-3 py-2.5">
                     <div>
                       <div className="flex items-center gap-1.5 text-xs font-semibold"><Settings2 className="h-3.5 w-3.5 text-primary" />Run settings</div>
-                      <p className="mt-0.5 text-[9px] text-muted-foreground">{directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : 'This picker overrides Orchestrator only. Child roles keep their role policies.'}</p>
+                      <p className="mt-0.5 text-[9px] text-muted-foreground">{directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : 'This picker selects the Orchestrator model. Child models are matched to each task unless a role is Fixed.'}</p>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" disabled={modelCatalogLoading} onClick={(event) => { event.preventDefault(); void refreshModels().catch(() => undefined); }}>
@@ -408,7 +408,7 @@ export function ChatComposer() {
                       )}
                     >
                       <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10"><Sparkles className="h-4 w-4 text-primary" /></span>
-                      <span className="min-w-0 flex-1"><span className="block text-xs font-semibold">Auto routing</span><span className="block text-[9px] text-muted-foreground">Atris chooses the best connected route for the orchestrator and each child agent.</span></span>
+                      <span className="min-w-0 flex-1"><span className="block text-xs font-semibold">Auto routing</span><span className="block text-[9px] text-muted-foreground">Orchestrator stays automatic; child models are matched to each task and role. Fixed role policies remain in effect.</span></span>
                       {!selectedModel && <CheckCircle2 className="h-4 w-4 text-primary" />}
                     </button>
 
@@ -467,7 +467,7 @@ export function ChatComposer() {
                         </div>
                       </div>
                     )}
-                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child role directives preserved` : 'Auto routing uses role policies.'}</div>
+                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child models match each task unless a role is Fixed` : 'Task-based worker routing follows role policies and live model compatibility.'}</div>
                   </div>
                 </DropdownMenuContent>
               </DropdownMenu>

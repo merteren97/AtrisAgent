@@ -761,6 +761,13 @@ async function runTests() {
       const policyBody = await policyRes.json();
       assert(policyRes.status === 200 && policyBody.success === true && Array.isArray(policyBody.policies), 'PUT execution policy persists a role-scoped route');
 
+      const emptyFixedRes = await localFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}/builder`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selectionMode: 'fixed' }),
+      });
+      assert(emptyFixedRes.status === 400, 'a Fixed policy without an account, model or fallback cannot silently use automatic routing');
+
       const policyListRes = await localFetch(`${baseUrl}/api/execution-policies/team_template/${encodeURIComponent(teamTemplateId)}`);
       const policyList = await policyListRes.json();
       const builderPolicy = Array.isArray(policyList) ? policyList.find((policy: any) => policy.role === 'builder') : undefined;

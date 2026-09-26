@@ -25,5 +25,8 @@
     "dev:all": "node scripts/dev-stack.mjs",
     "clean": "node scripts/clean-generated.mjs",
     "preflight": "node scripts/preflight.mjs"
+  },
+  "devDependencies": {
+    "node": "^22.23.3"
   }
 }

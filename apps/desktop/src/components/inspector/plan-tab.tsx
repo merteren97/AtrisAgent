@@ -206,7 +206,7 @@ export function PlanTab() {
                       )}
                       {expandedTasks[task.id] && task.routePreference?.reason && (
                         <p className="break-words pl-5 text-[11px] leading-relaxed text-muted-foreground">
-                          Route choice: {task.routePreference.reason}
+                          Why this route: {task.routePreference.reason}
                         </p>
                       )}
                       {task.assignedRole && (
@@ -229,10 +229,20 @@ export function PlanTab() {
                               className="max-w-full truncate rounded border border-border bg-background px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
                               title={task.effectiveRoute?.runtimeModelId || task.routePreference?.routeLabel || undefined}
                             >
-                              Model: {task.effectiveRoute?.runtimeModelId || task.routePreference?.modelDisplayName || 'Automatic scheduler'}
+                              {task.effectiveRoute?.runtimeModelId
+                                ? `Ran with: ${task.effectiveRoute.runtimeModelId}`
+                                : `Planned: ${task.routePreference?.modelDisplayName || 'Automatic compatible route'}`}
                               {!task.effectiveRoute?.runtimeModelId && task.routePreference?.routeLabel ? ` · ${task.routePreference.routeLabel}` : ''}
                             </span>
                           )}
+                          <span className="max-w-full truncate rounded border border-border/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            {task.routePreference
+                              && !['mission', 'workspace', 'team_template'].includes(String(task.effectiveRoute?.source))
+                              ? 'Orchestrator task match'
+                              : task.effectiveRoute
+                                ? `${task.effectiveRoute.source?.replaceAll('_', ' ') || 'runtime'} policy · ${task.effectiveRoute.selectionMode || 'auto'}`
+                                : 'Scheduler will choose from live compatible models'}
+                          </span>
                           {displayStatus === 'preparing' && (
                             <span className="text-[10px] text-muted-foreground">
                               {task.targetDescriptor?.kind === 'new_sibling_project'

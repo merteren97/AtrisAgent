@@ -235,9 +235,9 @@ body {
   width: 100vw;
 }
 
-/* A stable desktop frame: navigation is chrome, the workspace is the canvas. */
-.atris-workspace-shell > main {
-  margin: 8px 8px 8px 0;
+/* Shared window chrome anchors the workspace frame and keeps columns visually distinct. */
+.atris-workspace-body > main {
+  margin: 8px;
   border: 1px solid var(--color-border);
   border-radius: 14px;
   overflow: hidden;
@@ -245,25 +245,27 @@ body {
   container-type: inline-size;
 }
 .workspace-home { container-type: inline-size; }
-.workspace-sidebar { width: calc(60px + var(--workspace-pane-width)); transition: width 180ms ease; }
-.workspace-sidebar[data-collapsed="true"] { width: 60px; }
+.project-browser { display: grid; min-width: 0; gap: 16px; align-items: start; }
+.project-workspace-row[data-selected="true"] { box-shadow: inset 2px 0 var(--color-primary); }
+@container (min-width: 850px) {
+  .project-browser { grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.1fr); }
+}
+.workspace-sidebar {
+  width: calc(62px + var(--workspace-pane-width));
+  margin: 8px 0 8px 8px;
+  border: 1px solid var(--color-sidebar-border);
+  border-radius: 14px;
+  transition: width 180ms ease;
+}
+.workspace-sidebar > .workspace-rail { border-radius: 13px 0 0 13px; }
+.workspace-sidebar > .workspace-pane { border-radius: 0 13px 13px 0; }
+.workspace-sidebar[data-collapsed="true"] { width: 62px; }
 .workspace-sidebar[data-collapsed="true"] .workspace-pane { display: none; }
 .workspace-rail nav > button { height: 40px; padding: 0; }
 .workspace-rail nav > button[aria-current="page"] { color: var(--color-sidebar-foreground); }
 .workspace-rail nav > button[aria-current="page"] svg { stroke-width: 2.5; }
 .workspace-rail nav > button svg { width: 18px; height: 18px; }
 .workspace-pane .navigation-row { border-radius: 8px; }
-@media (max-width: 1180px) {
-  .workspace-sidebar { width: 60px; }
-  .workspace-sidebar:not([data-collapsed="true"]) .workspace-pane {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 60px;
-    width: var(--workspace-pane-width);
-    box-shadow: 8px 8px 28px hsl(225 15% 4% / 0.22);
-  }
-}
 /* Radix's intrinsic table wrapper otherwise lets long titles push actions off-screen. */
 .workspace-pane [data-radix-scroll-area-viewport] > div { display: block !important; }
 .navigation-row { position: relative; min-height: 38px; }
@@ -277,7 +279,10 @@ body {
 .workspace-sidebar button:focus-visible { outline: 2px solid hsl(var(--sidebar-foreground) / 0.65); outline-offset: -2px; }
 @media (prefers-reduced-motion: reduce) { .workspace-sidebar { transition: none; } }
 @media (max-width: 800px) {
-  .atris-workspace-shell > main { margin: 4px 4px 4px 0; border-radius: 10px; }
+  .atris-workspace-body > main { margin: 4px; border-radius: 10px; }
+  .workspace-sidebar { margin: 4px 0 4px 4px; border-radius: 10px; }
+  .workspace-sidebar > .workspace-rail { border-radius: 9px 0 0 9px; }
+  .workspace-sidebar > .workspace-pane { border-radius: 0 9px 9px 0; }
 }
 
 /* Scrollbar styling */
