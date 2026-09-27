@@ -9,6 +9,12 @@
     "ref": "v22.23.1",
     "blob": "a640a1f4708257449c53645022c8762488d7261f"
   },
+  "node-v22.23.3-LICENSE": {
+    "source": "https://github.com/nodejs/node/blob/v22.23.3/LICENSE",
+    "ref": "v22.23.3",
+    "blob": "a640a1f4708257449c53645022c8762488d7261f",
+    "localFile": "node-v22.23.1-LICENSE"
+  },
   "drizzle-orm-0.45.2-LICENSE": {
     "source": "https://github.com/drizzle-team/drizzle-orm/blob/0.45.2/LICENSE",
     "ref": "0.45.2",
