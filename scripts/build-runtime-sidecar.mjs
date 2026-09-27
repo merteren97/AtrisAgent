@@ -124,10 +124,15 @@ async function gitBlobSha1(filePath) {
 }
 
 async function trackedLicense(fileName, label) {
-  const source = join(RUNTIME_LICENSES_DIR, fileName);
-  await assertFile(source, label);
   const sources = JSON.parse(await readFile(join(RUNTIME_LICENSES_DIR, 'SOURCES.json'), 'utf8'));
-  const expected = sources[fileName]?.blob;
+  const sourceEntry = sources[fileName];
+  const localFileName = sourceEntry?.localFile ?? fileName;
+  if (localFileName !== basename(localFileName) || localFileName === '.' || localFileName === '..') {
+    throw new Error(`${label} local file must be a file inside ${RUNTIME_LICENSES_DIR}.`);
+  }
+  const source = join(RUNTIME_LICENSES_DIR, localFileName);
+  await assertFile(source, label);
+  const expected = sourceEntry?.blob;
   const actual = await gitBlobSha1(source);
   if (!expected || expected !== actual) {
     throw new Error(`${label} hash mismatch (expected ${expected ?? '(missing)'}, got ${actual}).`);
