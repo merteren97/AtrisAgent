@@ -22,7 +22,6 @@ import {
   Circle,
   Ban,
   SquarePen,
-  Trash2,
   LogOut,
   House,
   Laptop,
@@ -35,8 +34,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { NavigationDeleteAction } from './navigation-row-actions';
-import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
+import { NavigationRowActions } from './navigation-row-actions';
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
 import { ConversationDeleteDialog } from '../history/ConversationDeleteDialog';
@@ -46,6 +44,7 @@ import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
 import { useManualStore } from '@/stores/manual-store';
 import { NavigationDeleteDialog, type NavigationDeleteTarget } from './navigation-delete-dialog';
+import { ConversationRenameDialog, type ConversationRenameTarget } from './conversation-rename-dialog';
 import { ManualConversationRow } from '@/components/manual/manual-conversation-row';
 import { useManualActivityMonitor } from '@/components/manual/manual-activity';
 import { useAccountStore } from '../../stores/account-store';
@@ -198,6 +197,7 @@ export function Sidebar() {
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [navigationDelete, setNavigationDelete] = useState<NavigationDeleteTarget | null>(null);
+  const [conversationRename, setConversationRename] = useState<ConversationRenameTarget | null>(null);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
   const newChatWorkspaceIntent = useRef<string | null>(null);
   const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
@@ -457,7 +457,7 @@ export function Sidebar() {
           const workspaceMissions = isActiveWorkspace ? missions.filter((mission) => mission.workspaceId === workspace.id) : [];
           return (
             <div key={workspace.id} className="mb-2">
-              <ContextMenu><ContextMenuTrigger asChild><div
+              <div
                 className={`navigation-row group/workspace flex w-full items-center rounded-lg text-xs font-medium transition-colors ${sidebarCollapsed ? 'justify-center' : ''} ${isActiveWorkspace ? 'bg-primary/[0.06] text-sidebar-foreground' : 'text-sidebar-foreground/85 hover:bg-sidebar-accent'}`}
                 title={workspace.path}
               >
@@ -473,7 +473,7 @@ export function Sidebar() {
                   {!sidebarCollapsed && <span className="min-w-0 flex-1 truncate text-left">{workspace.name}</span>}
                 </button>
 
-                {!sidebarCollapsed && <NavigationDeleteAction label={`Remove workspace: ${workspace.name}`} onClick={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })} />}
+                {!sidebarCollapsed && <NavigationRowActions name={workspace.name} deleteLabel="Remove workspace…" onDelete={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })} />}
                 {!sidebarCollapsed && (
                   <Tooltip delayDuration={0}>
                     <TooltipTrigger asChild>
@@ -486,7 +486,7 @@ export function Sidebar() {
                     <TooltipContent side="right">New chat · Ctrl/Cmd+N</TooltipContent>
                   </Tooltip>
                 )}
-              </div></ContextMenuTrigger><ContextMenuContent><ContextMenuItem variant="destructive" onSelect={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })}><Trash2 className="h-3.5 w-3.5" />Remove workspace…</ContextMenuItem></ContextMenuContent></ContextMenu>
+              </div>
 
               {!sidebarCollapsed && isActiveWorkspace && (
                 <div className="ml-3 mb-3 pl-2">
@@ -494,7 +494,7 @@ export function Sidebar() {
                      <span className="navigation-section-title"><TerminalSquare className="h-3.5 w-3.5 text-primary" />Manual <span className="font-normal tabular-nums">{(manual.conversations[workspace.id] || []).length}</span></span>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
-                  {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} onDelete={() => setNavigationDelete({kind:'manual',conversation})} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
+                  {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} onRename={() => setConversationRename({kind:'manual',conversation})} onDelete={() => setNavigationDelete({kind:'manual',conversation})} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
                   <div className="mb-1 mt-3 flex h-7 items-center justify-between px-2">
                      <span className="navigation-section-title"><Workflow className="h-3.5 w-3.5 text-primary" />Orchestrator <span className="font-normal tabular-nums">{workspaceMissions.length}</span></span>
@@ -519,9 +519,7 @@ export function Sidebar() {
                      const deletionPending = mission.deletionState?.status === 'pending';
                      return (
                        <div key={mission.id} className="group/conversation mb-0.5">
-                         <ContextMenu>
-                           <ContextMenuTrigger asChild>
-                             <div
+                            <div
                                 data-active={isActiveMission}
                                 className="navigation-row flex items-center rounded-lg text-sidebar-foreground transition-colors hover:bg-sidebar-accent"
                                aria-busy={deletionPending || undefined}
@@ -544,21 +542,8 @@ export function Sidebar() {
                             </span>
                           </button>
 
-                          <NavigationDeleteAction label={`${deletionActionLabel.replace('…', '')}: ${mission.title}`} onClick={() => setPendingDeleteMission(mission)} />
-                              </div>
-                            </ContextMenuTrigger>
-                            <ContextMenuContent className="w-52">
-                              <ContextMenuItem
-                                variant="destructive"
-                                onSelect={() => {
-                                  setPendingDeleteMission(mission);
-                                }}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                                {deletionActionLabel}
-                              </ContextMenuItem>
-                            </ContextMenuContent>
-                          </ContextMenu>
+                           <NavigationRowActions name={mission.title} onRename={() => setConversationRename({kind:'orchestrator',mission})} renameDisabled={deletionPending} onDelete={() => setPendingDeleteMission(mission)} deleteLabel={deletionActionLabel} />
+                            </div>
 
                         {isActiveMission && rootAgents.length > 0 && (
                           <details className="ml-3 mt-1 rounded-lg border border-sidebar-border/50 bg-sidebar-accent/20 px-2 py-1">
@@ -589,6 +574,7 @@ export function Sidebar() {
       </div>
 
       {navigationDelete && <NavigationDeleteDialog target={navigationDelete} onClose={() => setNavigationDelete(null)}/>}
+      {conversationRename && <ConversationRenameDialog key={`${conversationRename.kind}-${conversationRename.kind === 'manual' ? conversationRename.conversation.id : conversationRename.mission.id}`} target={conversationRename} onClose={() => setConversationRename(null)} />}
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
       <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
       <ConversationDeleteDialog mission={dialogMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />

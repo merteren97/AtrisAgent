@@ -42,13 +42,15 @@ export const AtrisManualSession = async ({client}) => {
   const replyFile = path.join(root, 'opencode-question-reply.json');
   const modeFile = path.join(root, 'opencode-auto-mode.json');
   const modeRequestFile = path.join(root, 'opencode-auto-request.json');
+  const routeFile = path.join(root, 'opencode-route.json');
+  const activityFile = path.join(root, 'opencode-activity.json');
   let autoApprove = false;
   let modeBusy = false;
   const saveMode = (error) => {
-    try { fs.writeFileSync(modeFile+'.tmp', JSON.stringify({enabled:autoApprove, ...(error ? {error} : {})}), {mode:0o600}); fs.renameSync(modeFile+'.tmp', modeFile); } catch {}
+    try { fs.writeFileSync(modeFile+'.tmp', JSON.stringify({version:2, enabled:autoApprove, ...(error ? {error} : {})}), {mode:0o600}); fs.renameSync(modeFile+'.tmp', modeFile); } catch {}
   };
-  saveMode();
   try { fs.rmSync(modeRequestFile, {force:true}); } catch {}
+  saveMode();
   const modeTimer = setInterval(async () => {
     if (modeBusy) return;
     let request;
@@ -56,11 +58,9 @@ export const AtrisManualSession = async ({client}) => {
     if (typeof request?.enabled !== 'boolean') return;
     modeBusy = true;
     try {
-      if (request.enabled !== autoApprove) {
-        const result = await client.tui.executeCommand({body:{command:'permission.mode'}});
-        if (result.error || result.data !== true) throw new Error('OpenCode did not accept the mode change.');
-        autoApprove = request.enabled;
-      }
+      // TUI permission.mode cycles through several modes; its boolean result does
+      // not tell us which mode is active. Intercept only requests still asking.
+      autoApprove = request.enabled;
       saveMode();
     } catch { saveMode('Could not change OpenCode permission mode. Retry or use Code.'); }
     finally { try { fs.rmSync(modeRequestFile, {force:true}); } catch {} modeBusy = false; }
@@ -80,13 +80,23 @@ export const AtrisManualSession = async ({client}) => {
     try {
       const result = await client.question.reply({path:{requestID:reply.id},body:{answers:reply.answers}});
       if (result.error) return;
-      pending.delete(reply.id); savePending(); fs.rmSync(replyFile, {force:true});
+      pending.delete(reply.id); savePending(); activity('working'); fs.rmSync(replyFile, {force:true});
     } catch { /* Keep the request visible; retry when the provider is ready. */ }
   }, 250);
   replies.unref?.();
   let saved = {sessionId: null, messages: [], roles: {}};
   try { saved = JSON.parse(fs.readFileSync(output, 'utf8')); } catch {}
   let sessionId = saved.sessionId;
+  let activityState = '';
+  const activity = (state) => {
+    if (!sessionId || state === activityState) return;
+    activityState = state;
+    try {
+      fs.writeFileSync(activityFile+'.tmp', JSON.stringify({sessionId, state, at:new Date().toISOString()}), {mode:0o600});
+      fs.renameSync(activityFile+'.tmp', activityFile);
+    } catch { /* Activity must never interrupt the CLI. */ }
+  };
+  activity('ready');
   const messages = new Map((saved.messages || []).map(m => [m.id, m]));
   const roles = new Map(Object.entries(saved.roles || {}));
   let timer;
@@ -103,20 +113,40 @@ export const AtrisManualSession = async ({client}) => {
     }, 80);
   };
   return { "chat.message": async (input, output) => {
-    // Root session and configured model only; never rewrite subagent/model-switch choices.
-    if (manualReasoning && sessionId === input.sessionID && input.model && input.model.providerID+'/'+input.model.modelID === manualModel) output.message.variant = manualReasoning;
+    // The hook's input.model may be absent when the TUI uses its current model.
+    // The user message's model (including variant) is what OpenCode executes.
+    if (sessionId !== input.sessionID) return;
+    try {
+      const route = JSON.parse(fs.readFileSync(routeFile, 'utf8'));
+      const slash = route.model.indexOf('/');
+      if (slash < 1 || slash === route.model.length - 1) return;
+      output.message.model = {
+        providerID:route.model.slice(0,slash), modelID:route.model.slice(slash+1),
+        ...(route.reasoning ? {variant:route.reasoning} : {}),
+      };
+    } catch { /* Preserve the TUI route if the app's live route is unavailable. */ }
+  }, "permission.ask": async (input, output) => {
+    // Never override explicit deny rules or another CLI's permission policy.
+    if (autoApprove && output.status === 'ask') output.status = 'allow';
+    if (input.sessionID === sessionId && output.status === 'ask') activity('attention');
   }, event: async ({event}) => {
     const info = event.properties?.info;
-    if (event.type === 'session.created' && info?.id && !info.parentID) { sessionId = info.id; flush(); }
+    if (event.type === 'session.created' && info?.id && !info.parentID) { sessionId = info.id; activityState = ''; activity('ready'); flush(); }
+    if (event.properties?.sessionID === sessionId) {
+      if (event.type === 'session.idle' && !pending.size && activityState === 'working') activity('completed');
+      if (event.type === 'session.status' && event.properties?.status?.type === 'busy' && !pending.size) activity('working');
+    }
+    if (event.type === 'permission.asked' && event.properties?.sessionID === sessionId) activity('attention');
     if (event.type === 'message.updated' && info?.sessionID === sessionId && ['user','assistant'].includes(info.role)) {
       roles.set(info.id, info.role); flush();
     }
     if (event.type === 'question.asked' && event.properties?.sessionID === sessionId && event.properties?.id) {
       const request = event.properties;
+      activity('attention');
       pending.set(request.id, {id:request.id, sessionID:sessionId, questions:request.questions}); savePending(); return;
     }
     if (['question.replied','question.rejected'].includes(event.type) && event.properties?.requestID) {
-      pending.delete(event.properties.requestID); savePending(); return;
+      if (pending.delete(event.properties.requestID)) { savePending(); activity('working'); } return;
     }
     if (event.type !== 'message.part.updated') return;
     const part = event.properties?.part;
@@ -200,6 +230,15 @@ export function parseCodexManualTranscript(source: string, sessionId: string): M
 export class ManualProviderBridge {
   constructor(private dataDir: string) {}
   activity(agent: ManualAgent): { state: string; at?: string } {
+    if (agent.runtimeType === 'opencode') {
+      try {
+        const filename = path.join(this.directory(agent), 'opencode-activity.json');
+        if (fs.lstatSync(filename).isSymbolicLink() || fs.statSync(filename).size > 4096) return {state:'unknown'};
+        const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
+        if (record.sessionId !== this.openCodeHistory(agent).sessionId || !['ready','working','attention','completed'].includes(record.state) || typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))) return {state:'unknown'};
+        return {state:record.state,at:record.at};
+      } catch { return {state:'unknown'}; }
+    }
     if (!['claude_code', 'codex'].includes(agent.runtimeType)) return { state: 'unknown' };
     const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent);
     const current = bindings.at(-1);
@@ -285,13 +324,25 @@ export class ManualProviderBridge {
   }
   prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});
+    fs.rmSync(path.join(directory, 'opencode-activity.json'), {force:true});
     // A new TUI starts in normal mode. Never display a previous process's mode as active.
     fs.rmSync(path.join(directory, 'opencode-auto-mode.json'), {force:true});
-    const pluginSource = OPENCODE_SOURCE + '\nconst manualReasoning = ' + JSON.stringify(agent.reasoning || null) + ';\nconst manualModel = ' + JSON.stringify(agent.model) + ';\n';
-    const plugin = path.join(directory, `manual-plugin-${createHash('sha256').update(pluginSource).digest('hex').slice(0,16)}.mjs`); writeManaged(plugin, pluginSource);
+    fs.rmSync(path.join(directory, 'opencode-auto-request.json'), {force:true});
+    this.updateOpenCodeRoute(agent);
+    const plugin = path.join(directory, `manual-plugin-${createHash('sha256').update(OPENCODE_SOURCE).digest('hex').slice(0,16)}.mjs`); writeManaged(plugin, OPENCODE_SOURCE);
     const history = this.openCodeHistory(agent);
     // Merge inherited configuration inside the native launcher. Never send its possibly-secret contents to the UI.
     return {args: [...(history.sessionId ? ['--session', history.sessionId] : []), '--model', agent.model], env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href}};
+  }
+  updateOpenCodeRoute(agent: ManualAgent): void {
+    if (agent.runtimeType !== 'opencode' || !/^[^/]+\/.+$/.test(agent.model)) throw new Error('Invalid OpenCode model route.');
+    const filename = path.join(this.directory(agent), 'opencode-route.json');
+    fs.mkdirSync(path.dirname(filename), {recursive:true, mode:0o700});
+    for (const target of [filename, filename+'.tmp']) {
+      if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) throw new Error('Manual route path must not be a symbolic link.');
+    }
+    fs.writeFileSync(filename+'.tmp', JSON.stringify({model:agent.model, reasoning:agent.reasoning || null}), {mode:0o600});
+    fs.renameSync(filename+'.tmp', filename);
   }
   autoApprove(agent: ManualAgent): {available: boolean; enabled: boolean; error?: string} {
     if (agent.runtimeType !== 'opencode') return {available:false, enabled:false};
@@ -299,7 +350,7 @@ export class ManualProviderBridge {
       const filename = path.join(this.directory(agent), 'opencode-auto-mode.json');
       if (fs.statSync(filename).size > 4096) return {available:false, enabled:false};
       const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
-      if (typeof record.enabled !== 'boolean') return {available:false, enabled:false};
+      if (record.version !== 2 || typeof record.enabled !== 'boolean') return {available:false, enabled:false};
       return {available:true, enabled:record.enabled, ...(typeof record.error === 'string' ? {error:record.error} : {})};
     } catch { return {available:false, enabled:false}; }
   }

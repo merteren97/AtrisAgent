@@ -415,6 +415,17 @@ async function runTests() {
       const listBody = await listRes.json();
       assert(listRes.status === 200 && Array.isArray(listBody) && listBody.some((m: any) => m.id === createdMissionId), 'GET /api/missions returns missions for workspace');
 
+      const renameMission = (title: unknown) => authorizedFetch(`${baseUrl}/api/missions/${createdMissionId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }),
+      });
+      const invalidRename = await renameMission('   ');
+      assert(invalidRename.status === 400, 'PATCH /api/missions/:id rejects blank conversation names');
+      const renameRes = await renameMission('  A clearer conversation name  ');
+      const renamed = await renameRes.json();
+      const persistedName = await gateway.workspaceManager.getMission(createdMissionId);
+      assert(renameRes.status === 200 && renamed.title === 'A clearer conversation name' && persistedName?.title === renamed.title && persistedName?.description === 'Testing mission creation',
+        'PATCH /api/missions/:id durably renames only the conversation title');
+
       await gateway.configureMissionRouting(createdMissionId, {
         modelCatalogId: 'catalog-shared-model',
         reasoningLevel: 'high',

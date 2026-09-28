@@ -86,6 +86,15 @@ export function enrichOpenCodeModelVariants(models: ModelDescriptor[], providers
   }
 }
 
+export function openCodePromptRoute(model?: string, reasoningLevel?: string): { model?: { providerID: string; modelID: string }; variant?: string } {
+  const route = model?.split('#')[0];
+  const slash = route?.indexOf('/') ?? -1;
+  return {
+    ...(route && slash > 0 && slash < route.length - 1 ? { model: { providerID: route.slice(0, slash), modelID: route.slice(slash + 1) } } : {}),
+    ...(reasoningLevel ? { variant: reasoningLevel } : {}),
+  };
+}
+
 export class OpenCodeAdapter extends BaseRuntimeAdapter {
   readonly id = 'opencode';
   readonly name = 'OpenCode';
@@ -549,12 +558,11 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       if (options.preserveProviderSession) {
         this.reusableSessions.set(runtimeSessionId, { serverKey: server.key, profileId, cwd: workspaceCwd });
       }
-      const model = this.parseModelRoute(options.model);
       const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
       const response = await this.fetchServer(server, `/session/${encodeURIComponent(runtimeSessionId)}/prompt_async`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model,
+          ...openCodePromptRoute(options.model, options.reasoningLevel),
           agent: this.mapAgentMode(options.role),
           parts: [{ type: 'text', text: prompt }],
         }),
@@ -573,14 +581,6 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   private mapAgentMode(role?: string): 'build' | 'plan' {
     const normalized = String(role || 'builder').toLowerCase();
     return normalized === 'builder' ? 'build' : 'plan';
-  }
-
-  private parseModelRoute(model?: string): { providerID: string; modelID: string } | undefined {
-    if (!model) return undefined;
-    const normalized = model.split('#')[0];
-    const index = normalized.indexOf('/');
-    if (index < 1) return undefined;
-    return { providerID: normalized.slice(0, index), modelID: normalized.slice(index + 1) };
   }
 
   private async ensureServer(

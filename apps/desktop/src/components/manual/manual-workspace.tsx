@@ -12,7 +12,9 @@ import { isTauriRuntime } from '@/lib/secure-storage';
 import { TerminalCanvas } from './terminal-canvas';
 import { ensureManualTerminal, disposeManualTerminal, type TerminalSnapshot } from './manual-terminal';
 import { ContextTransfer } from './context-transfer';
-import { markManualLaunch, markManualClosed } from './manual-activity';
+import { markManualLaunch, markManualClosed, forgetManualActivity, useManualActivity } from './manual-activity';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Trash2 } from 'lucide-react';
 import { ManualComposer, addManualFiles, type OpenCodeAutoApprove } from './manual-composer';
 import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
@@ -117,17 +119,37 @@ export function ManualWorkspace() {
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
   const [attachments, setAttachments] = useState<Record<string, File[]>>({});
+  const [deleteTarget, setDeleteTarget] = useState<ManualAgent | null>(null);
+  const observations = useManualActivity(state => state.agents);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const dragDepth = useRef(0);
   const lifecycleEpoch = useRef(0);
   const visibleAgents = (conversation?.agents || []).filter(item => !hidden[item.id] && !['closed','exited','disconnected'].includes(statuses[item.id])).sort((a, b) => (order.includes(a.id) ? order.indexOf(a.id) : 999) - (order.includes(b.id) ? order.indexOf(b.id) : 999));
-  const agent = conversation?.agents.find(a => a.id === agentByConversation[conversation.id]) || visibleAgents[0] || conversation?.agents[0];
+  const agent = (surface === 'code' ? visibleAgents : conversation?.agents.filter(a => !hidden[a.id]) || []).find(a => a.id === agentByConversation[conversation!.id]) || (surface === 'code' ? visibleAgents[0] : undefined) || conversation?.agents.find(a => !hidden[a.id]);
   const openCount = (conversation?.agents || []).filter(item => statuses[item.id] === 'open' && !hidden[item.id]).length;
   const [generation, setGeneration] = useState(0);
   const messageEnd = useRef<HTMLDivElement>(null); const scroller = useRef<HTMLDivElement>(null); const following = useRef(true);
   const native = isTauriRuntime();
   const agentId = agent?.id;
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
+
+  useEffect(() => {
+    if (!agentId || surface !== 'chat' || document.visibilityState === 'hidden' || !document.hasFocus()) return;
+    const observation = observations[agentId];
+    if (observation?.lifecycle === 'open' && (observation.state === 'attention' || observation.state === 'completed') && observation.at) {
+      useManualStore.getState().acknowledgeActivity(agentId, `${observation.state}:${observation.at}`);
+    }
+  }, [agentId, surface, observations]);
+  useEffect(() => {
+    const acknowledgeVisible = () => {
+      if (document.visibilityState !== 'visible' || !document.hasFocus() || !agentId || surface !== 'chat') return;
+      const observation = useManualActivity.getState().agents[agentId];
+      if (observation?.at && (observation.state === 'attention' || observation.state === 'completed')) useManualStore.getState().acknowledgeActivity(agentId, `${observation.state}:${observation.at}`);
+    };
+    document.addEventListener('visibilitychange', acknowledgeVisible);
+    window.addEventListener('focus', acknowledgeVisible);
+    return () => { document.removeEventListener('visibilitychange', acknowledgeVisible); window.removeEventListener('focus', acknowledgeVisible); };
+  }, [agentId, surface]);
 
   useEffect(() => { setMessages([]); setQuestions([]); setAutoApprove(undefined); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
   useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
@@ -211,9 +233,11 @@ export function ManualWorkspace() {
     await invoke('manual_terminal_close', { id: target.id });
     lifecycleEpoch.current += 1;
     markManualClosed(target.id); setStatuses(previous => ({ ...previous, [target.id]: 'closed' }));
-    useManualStore.getState().hideAgent(target.id, true);
     await useManualStore.getState().removeAgent(target);
+    forgetManualActivity(target.id);
+    setAttachments(previous => { const { [target.id]: _removed, ...remaining } = previous; return remaining; });
     disposeManualTerminal(target.id);
+    setDeleteTarget(null);
   });
   const restart = (target: ManualAgent) => void action('restart', async () => {
     await invoke('manual_terminal_close', { id: target.id }); lifecycleEpoch.current += 1; markManualClosed(target.id);
@@ -225,6 +249,8 @@ export function ManualWorkspace() {
       if (independent) {
         const created = await useManualStore.getState().addAgent(agent.conversationId, undefined, model.catalogId, crypto.randomUUID(), reasoning);
         await launch(created, !supportsChat(created.runtimeType));
+      } else if (agent.runtimeType === 'opencode') {
+        await useManualStore.getState().updateModel(agent, model.catalogId, reasoning, Boolean(live));
       } else {
         await invoke('manual_terminal_close', { id: agent.id }); lifecycleEpoch.current += 1; markManualClosed(agent.id);
         setStatuses(previous => ({ ...previous, [agent.id]: 'closed' }));
@@ -280,10 +306,10 @@ export function ManualWorkspace() {
     {pending?.startsWith('Opening') && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs text-muted-foreground">{pending}</p>}
     {(error || connectionError) && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error || connectionError}</span><button aria-label="Dismiss error" onClick={() => { setError(null); setConnectionError(null); }}><X className="h-4 w-4" /></button></div>}
     {!conversation || !agent ? <div className="flex flex-1 items-center justify-center p-6"><div className="max-w-md text-center"><Bot className="mx-auto mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-lg font-medium">Your agents, your workflow</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">Group independent agents in a conversation. Each agent keeps its own context and stays under your control.</p><Button className="mt-5" disabled={!workspaceId} onClick={() => conversation ? setAdding(true) : setCreating(true)}><Plus className="mr-2 h-4 w-4" />{conversation ? 'Add first agent' : 'New manual conversation'}</Button></div></div> : <>
-      {surface === 'code' ? native ? visibleAgents.length ? <TerminalCanvas agents={visibleAgents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={close} onRestart={restart} onHandoff={setHandoff} onMove={(source, target) => useManualStore.getState().moveAgent(conversation.id, source, target)} /> : <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6"><Bot className="h-8 w-8 text-muted-foreground" /><h2 className="text-base font-medium">All terminal panes closed</h2><p className="text-sm text-muted-foreground">No terminals are running. Open an offline agent in Chat or add a new one.</p><Button variant="outline" onClick={() => setSurface(conversation.id, 'chat')}>View agents</Button></div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : <>
-        <ManualAgentSwitcher agents={conversation.agents} selectedId={agent.id} statuses={statuses} hidden={hidden} onSelect={id=>selectAgent(conversation.id,id)} />
+       {surface === 'code' ? native ? visibleAgents.length ? <TerminalCanvas agents={visibleAgents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={setDeleteTarget} onRestart={restart} onHandoff={setHandoff} onMove={(source, target) => useManualStore.getState().moveAgent(conversation.id, source, target)} /> : <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6"><Bot className="h-8 w-8 text-muted-foreground" /><h2 className="text-base font-medium">All terminal panes closed</h2><p className="text-sm text-muted-foreground">No terminals are running. Open an offline agent in Chat or add a new one.</p><Button variant="outline" onClick={() => setSurface(conversation.id, 'chat')}>View agents</Button></div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : <>
+         <ManualAgentSwitcher agents={conversation.agents} selectedId={agent.id} statuses={statuses} hidden={hidden} pending={Boolean(pending) || !native} onDelete={setDeleteTarget} onSelect={id=>selectAgent(conversation.id,id)} />
         <div className="mx-auto flex w-full max-w-3xl shrink-0 items-center justify-between gap-3 px-6 py-1.5">
-          <span className="flex items-center gap-2 text-xs text-muted-foreground"><span className={`h-1.5 w-1.5 rounded-full ${live ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} />{pending === 'model' ? 'Applying model…' : live ? 'CLI connected' : 'CLI closed'}<span className="hidden sm:inline">· Independent session</span></span>
+           <span className="flex items-center gap-2 text-xs text-muted-foreground"><span className={`h-1.5 w-1.5 rounded-full ${observations[agent.id]?.state === 'attention' && live ? 'bg-amber-500' : live ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} />{pending === 'model' ? 'Applying model…' : live && observations[agent.id]?.state === 'attention' ? 'Needs your response' : live && observations[agent.id]?.state === 'completed' ? 'Turn finished' : live ? 'CLI connected' : 'CLI closed'}<span className="hidden sm:inline">· Independent session</span></span>
           {!live ? <Button size="sm" variant="ghost" disabled={!native || Boolean(pending)} onClick={() => void action('open', () => launch(agent))}><RotateCcw className="mr-1 h-3 w-3" />Open agent</Button> : <Button size="sm" variant="ghost" disabled={Boolean(pending)} onClick={() => interrupt(agent)}><Square className="mr-1 h-3 w-3" />Interrupt</Button>}
         </div>
         <div ref={scroller} onScroll={() => { const node = scroller.current; if (node) following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100; }} className="min-h-0 flex-1 overflow-y-auto select-text">
@@ -305,5 +331,6 @@ export function ManualWorkspace() {
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
     {memory && conversation && <ManualMemory key={conversation.id+':'+(memory.message?.id||'notes')} conversation={conversation} agent={agent} message={memory.message} onClose={()=>setMemory(null)}/>}
+    {deleteTarget && <Dialog open onOpenChange={open => { if (!open && !pending) setDeleteTarget(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete agent?</DialogTitle><DialogDescription>This agent’s CLI will stop and its AtrisAgent record will be removed. Provider-owned history and saved project memory are retained.</DialogDescription></DialogHeader><div className="break-words rounded-xl border border-border bg-muted/30 p-4 text-sm font-medium">{deleteTarget.name}</div><DialogFooter><Button variant="outline" disabled={Boolean(pending)} onClick={() => setDeleteTarget(null)}>Cancel</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => close(deleteTarget)}><Trash2 className="mr-2 h-4 w-4" />{pending ? 'Removing…' : 'Delete agent'}</Button></DialogFooter></DialogContent></Dialog>}
   </section>;
 }

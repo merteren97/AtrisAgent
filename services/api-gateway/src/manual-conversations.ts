@@ -99,6 +99,15 @@ export class ManualConversationStore {
     })();
     return this.list(workspaceId).find(c => c.id === id)!;
   }
+  rename(id: string, title: string): ManualConversation {
+    return this.sqlite.transaction(() => {
+      const { workspaceId } = this.conversation(id);
+      this.sqlite.prepare('UPDATE manual_conversations SET title = ? WHERE id = ?').run(title, id);
+      // A user-supplied name takes precedence over a future automatic transcript title.
+      this.sqlite.prepare('DELETE FROM manual_automatic_titles WHERE conversation_id = ?').run(id);
+      return this.list(workspaceId).find(conversation => conversation.id === id)!;
+    })();
+  }
   agent(id: string): ManualAgent {
     const row = this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE id = ?').get(id) as {record: string} | undefined;
     return row ? JSON.parse(row.record) : fail('Agent not found.', 404);
@@ -237,6 +246,9 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   };
   const idParam = (req: Request, key: string) => required(req.params[key], key);
   app.get('/api/manual/conversations', route((req, res) => res.json(store.list(required(req.query.workspaceId, 'project')))));
+  app.patch('/api/manual/conversations/:conversationId', route((req, res) => {
+    res.json(store.rename(idParam(req, 'conversationId'), required(req.body?.title, 'title')));
+  }));
   app.delete('/api/manual/conversations/:conversationId', route((req, res) => {
     store.remove(idParam(req, 'conversationId'));
     res.status(204).end();
@@ -346,7 +358,16 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
     if (!profile || profile.authStatus !== 'connected') return fail('Connect this model account first.');
     if (profile.runtimeType !== agent.runtimeType || descriptor.accountProfileId !== agent.accountProfileId) return fail('A different CLI or account requires a new independent agent.', 409);
-    res.json(store.updateModel(agent.id, expected, descriptor.catalogId, descriptor.runtimeModelId, resolveReasoning(req.body.reasoning, descriptor)));
+    if (agent.runtimeType === 'opencode' && req.body.live === true && !bridge.autoApprove(agent).available) return fail('Reopen this OpenCode agent once to enable live model and reasoning changes.', 409);
+    const updated = store.updateModel(agent.id, expected, descriptor.catalogId, descriptor.runtimeModelId, resolveReasoning(req.body.reasoning, descriptor));
+    if (agent.runtimeType === 'opencode') {
+      try { bridge.updateOpenCodeRoute(updated); }
+      catch (error) {
+        store.updateModel(agent.id, updated.catalogId, agent.catalogId, agent.model, agent.reasoning);
+        throw error;
+      }
+    }
+    res.json(updated);
   }));
   return store;
 }

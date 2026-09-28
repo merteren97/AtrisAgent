@@ -14,6 +14,18 @@ export function markManualLaunch(id: string) {
 export function markManualClosed(id: string) {
   useManualActivity.setState(state => ({ launched: { ...state.launched, [id]: Date.now() }, agents: { ...state.agents, [id]: { lifecycle: 'closed', state: 'unknown', checkedAt: Date.now() } } }));
 }
+export function forgetManualActivity(id: string) {
+  useManualActivity.setState(state => {
+    const { [id]: _agent, ...agents } = state.agents;
+    const { [id]: _launch, ...launched } = state.launched;
+    return { agents, launched };
+  });
+}
+export function activityNotice(item: AgentActivity | undefined, acknowledged?: string, now = Date.now()): 'attention' | 'completed' | null {
+  if (!item || item.lifecycle !== 'open' || now - item.checkedAt > 15000 || !item.at || !Number.isFinite(Date.parse(item.at))) return null;
+  if (item.state !== 'attention' && item.state !== 'completed') return null;
+  return acknowledged === `${item.state}:${item.at}` ? null : item.state;
+}
 export function conversationActivity(agents: ManualAgent[], observations: Record<string, AgentActivity>, now: number) {
   if (!agents.length) return { text: 'No agents yet', kind: 'empty' };
   const items = agents.map(agent => observations[agent.id]);
@@ -44,11 +56,11 @@ export function useManualActivityMonitor() {
           try {
             const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after: 0, statusOnly: true });
             const activity: { state: string; at?: string; naming?: ManualNamingUpdate } = snapshot.status === 'open' ? await apiRequest<{ state: string; at?: string; naming?: ManualNamingUpdate }>(`/manual/agents/${id}/activity`).catch(() => ({ state: 'unknown', at: undefined })) : { state: 'unknown', at: undefined };
-            if (disposed || epoch !== useManualActivity.getState().launched[id]) return;
+            if (disposed || epoch !== useManualActivity.getState().launched[id] || !Object.values(useManualStore.getState().conversations).flat().some(c => c.agents.some(a => a.id === id))) return;
             useManualStore.getState().applyNaming(activity.naming);
             const verified = activity.at && Date.parse(activity.at) >= (epoch || 0) && Date.parse(activity.at) <= Date.now() + 5000;
             useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: snapshot.status, state: verified ? activity.state : 'unknown', at: verified ? activity.at : undefined, checkedAt: Date.now() } } }));
-          } catch { if (!disposed) useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: 'disconnected', state: 'unknown', checkedAt: Date.now() } } })); }
+          } catch { if (!disposed && Object.values(useManualStore.getState().conversations).flat().some(c => c.agents.some(a => a.id === id))) useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: 'disconnected', state: 'unknown', checkedAt: Date.now() } } })); }
         }));
       }
       if (!disposed) timer = setTimeout(poll, 3000);

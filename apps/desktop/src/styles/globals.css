@@ -278,6 +278,7 @@ body {
 .navigation-row-action { opacity: 0; pointer-events: none; transition: opacity 120ms ease, background-color 120ms ease; }
 .navigation-row:hover > .navigation-row-action,
 .navigation-row:focus-within > .navigation-row-action { opacity: 1; pointer-events: auto; }
+.navigation-row-action[data-state="open"] { opacity: 1; pointer-events: auto; }
 .navigation-row[data-active="true"] { background: var(--color-sidebar-accent); box-shadow: inset 2px 0 var(--color-primary); }
 .navigation-section-title { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; color: var(--color-sidebar-muted); }
 @media (hover: none) { .navigation-row-action { opacity: 1; pointer-events: auto; } }
