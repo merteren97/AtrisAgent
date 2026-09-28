@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Bot, Brain, Code2, MessageSquare, Plus, Send, Square, X, Loader2, RotateCcw } from 'lucide-react';
+import { Bot, Brain, Code2, MessageSquare, Plus, Square, X, Loader2, RotateCcw, ImagePlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
 import { MarkdownContent } from '@/components/chat/markdown-content';
@@ -14,7 +14,7 @@ import { TerminalCanvas } from './terminal-canvas';
 import { ensureManualTerminal, disposeManualTerminal, type TerminalSnapshot } from './manual-terminal';
 import { ContextTransfer } from './context-transfer';
 import { markManualLaunch, markManualClosed } from './manual-activity';
-import { ChatSessionControls } from './chat-session-controls';
+import { ManualComposer, addManualFiles } from './manual-composer';
 import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
 
@@ -107,11 +107,15 @@ export function ManualWorkspace() {
   const orders = useManualStore(state => state.orderByConversation);
   const order = conversation ? orders[conversation.id] || [] : [];
   const [pending, setPending] = useState<string | null>(null); const [error, setError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [bound, setBound] = useState(false);
   const actionPending = useRef(false);
   const [messages, setMessages] = useState<ManualMessage[]>([]); const [truncated, setTruncated] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
+  const [attachments, setAttachments] = useState<Record<string, File[]>>({});
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const dragDepth = useRef(0);
   const lifecycleEpoch = useRef(0);
   const visibleAgents = (conversation?.agents || []).filter(item => !hidden[item.id] && !['closed','exited','disconnected'].includes(statuses[item.id])).sort((a, b) => (order.includes(a.id) ? order.indexOf(a.id) : 999) - (order.includes(b.id) ? order.indexOf(b.id) : 999));
   const agent = conversation?.agents.find(a => a.id === agentByConversation[conversation.id]) || visibleAgents[0] || conversation?.agents[0];
@@ -122,7 +126,7 @@ export function ManualWorkspace() {
   const agentId = agent?.id;
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
 
-  useEffect(() => { setMessages([]); setTruncated(false); setBound(false); setError(null); following.current = true; }, [agentId]);
+  useEffect(() => { setMessages([]); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
   useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
@@ -158,7 +162,8 @@ export function ManualWorkspace() {
           await apiRequest(`/manual/conversations/${agent.conversationId}/memory/sync`, {method:'POST',body:JSON.stringify({agentId})});
           memorySignature = signature;
         }
-      } catch (e) { if (!disposed) setError(errorText(e)); }
+        if (!disposed) setConnectionError(null);
+      } catch (e) { if (!disposed) setConnectionError(errorText(e)); }
       finally { if (!disposed) timer = setTimeout(poll, 1500); }
     };
     void poll(); return () => { disposed = true; clearTimeout(timer); };
@@ -227,16 +232,34 @@ export function ManualWorkspace() {
   };
   const live = agent && statuses[agent.id] === 'open';
   const draft = agent ? drafts[agent.id] || '' : '';
+  const files = agent ? attachments[agent.id] || [] : [];
+  const addFiles = (incoming: File[]) => {
+    if (!agent || !incoming.length) return;
+    try {
+      const next = addManualFiles(files, incoming);
+      setAttachments(previous => ({ ...previous, [agent.id]: next }));
+      setError(null);
+    } catch (e) { setError(errorText(e)); }
+  };
   const send = () => agent && action('send', async () => {
     if (!live || !native) return;
-    const text = draft.trim(); if (!text) return;
-    await invoke('manual_terminal_write', { id: agent.id, data: text, paste: true });
+    const text = draft.trim(); if (!text && !files.length) return;
+    const staged = await Promise.all(files.map(async file => ({ name: file.name, path: await invoke<string>('manual_stage_attachment', { id: agent.id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }) })));
+    const references = staged.map(({ name, path }) => `- ${JSON.stringify(name)}: ${JSON.stringify(path)}`).join('\n');
+    const prompt = staged.length ? `${text}${text ? '\n\n' : ''}Attached files (read these local paths to inspect their contents, including images):\n${references}` : text;
+    await invoke('manual_terminal_write', { id: agent.id, data: prompt, paste: true });
     if (useManualStore.getState().drafts[agent.id] === draft) setDraft(agent.id, '');
+    setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(file => !files.includes(file)) }));
   });
 
   if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
 
-  return <section className="manual-workspace flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground" aria-label="Manual conversation">
+  return <section className="manual-workspace relative flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground" aria-label="Manual conversation"
+    onDragEnter={event => { if (surface !== 'chat' || !agent || !supportsChat(agent.runtimeType) || !event.dataTransfer.types.includes('Files')) return; event.preventDefault(); dragDepth.current++; setDraggingFiles(true); }}
+    onDragOver={event => { if (surface === 'chat' && event.dataTransfer.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = agent && supportsChat(agent.runtimeType) ? 'copy' : 'none'; } }}
+    onDragLeave={event => { if (!event.dataTransfer.types.includes('Files')) return; dragDepth.current = Math.max(0, dragDepth.current - 1); if (!dragDepth.current) setDraggingFiles(false); }}
+    onDrop={event => { if (surface !== 'chat' || !event.dataTransfer.files.length) return; event.preventDefault(); dragDepth.current = 0; setDraggingFiles(false); addFiles(Array.from(event.dataTransfer.files)); }}>
+    {draggingFiles && surface === 'chat' && <div role="status" className="manual-drop-overlay pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-background/90 backdrop-blur-sm"><div className="flex flex-col items-center gap-2 rounded-2xl bg-primary/10 px-10 py-8 text-center text-primary shadow-lg"><ImagePlus className="h-9 w-9" /><span className="text-base font-semibold">Drop files into this chat</span><span className="text-xs text-muted-foreground">Images and documents · preview before sending</span></div></div>}
     <header className="flex min-h-14 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-2">
       <div className="flex min-w-0 items-center gap-3"><h1 className="truncate text-sm font-medium">{conversation?.title || 'Independent agents'}</h1><span className="text-xs text-muted-foreground">{openCount} open</span></div>
       <div className="flex items-center gap-2">
@@ -246,7 +269,7 @@ export function ManualWorkspace() {
       </div>
     </header>
     {pending?.startsWith('Opening') && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs text-muted-foreground">{pending}</p>}
-    {error && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error}</span><button aria-label="Dismiss error" onClick={() => setError(null)}><X className="h-4 w-4" /></button></div>}
+    {(error || connectionError) && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error || connectionError}</span><button aria-label="Dismiss error" onClick={() => { setError(null); setConnectionError(null); }}><X className="h-4 w-4" /></button></div>}
     {!conversation || !agent ? <div className="flex flex-1 items-center justify-center p-6"><div className="max-w-md text-center"><Bot className="mx-auto mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-lg font-medium">Your agents, your workflow</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">Group independent agents in a conversation. Each agent keeps its own context and stays under your control.</p><Button className="mt-5" disabled={!workspaceId} onClick={() => conversation ? setAdding(true) : setCreating(true)}><Plus className="mr-2 h-4 w-4" />{conversation ? 'Add first agent' : 'New manual conversation'}</Button></div></div> : <>
       {surface === 'code' ? native ? visibleAgents.length ? <TerminalCanvas agents={visibleAgents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={close} onRestart={restart} onHandoff={setHandoff} onMove={(source, target) => useManualStore.getState().moveAgent(conversation.id, source, target)} /> : <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6"><Bot className="h-8 w-8 text-muted-foreground" /><h2 className="text-base font-medium">All terminal panes closed</h2><p className="text-sm text-muted-foreground">No terminals are running. Open an offline agent in Chat or add a new one.</p><Button variant="outline" onClick={() => setSurface(conversation.id, 'chat')}>View agents</Button></div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : <>
         <ManualAgentSwitcher agents={conversation.agents} selectedId={agent.id} statuses={statuses} hidden={hidden} onSelect={id=>selectAgent(conversation.id,id)} />
@@ -265,7 +288,7 @@ export function ManualWorkspace() {
             <div ref={messageEnd} />
           </div>
         </div>
-        <form aria-label="Manual message composer" className="shrink-0 px-4 pb-3 pt-2" onSubmit={e => { e.preventDefault(); if(supportsChat(agent.runtimeType))void send(); }}><div className="mx-auto max-w-3xl rounded-2xl border border-input bg-card p-3 shadow-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-ring/15">{supportsChat(agent.runtimeType)&&<textarea aria-label={`Message ${agent.name}`} value={draft} onChange={e => setDraft(agent.id, e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} placeholder={live ? 'Message this agent…' : 'Open the agent to continue…'} rows={2} maxLength={32000} className="max-h-40 min-h-16 w-full resize-y bg-transparent px-2 py-1 text-sm outline-none" />}<div className="flex items-center justify-between gap-2"><ChatSessionControls key={`${agent.id}:${agent.catalogId}`} agent={agent} agents={conversation.agents} pending={Boolean(pending)||!native} onApply={applyModel}/><div className="flex items-center gap-2"><Button type="button" variant="ghost" size="icon" aria-label="Open memory and references" onClick={()=>setMemory({})}><Brain className="h-4 w-4"/></Button><Button type="submit" size="sm" disabled={!supportsChat(agent.runtimeType)||!live || !native || Boolean(pending) || !draft.trim()}>{pending === 'send' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">Send</span></Button></div></div></div><p className="mx-auto mt-2 max-w-3xl px-2 text-[10px] text-muted-foreground">{agent.name} · {live?'CLI open':'Offline'} · Shift+Enter for a new line</p></form>
+        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
       </>}
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}

@@ -1,7 +1,7 @@
 //! Manual terminals belong to the application, never to a mounted view or mission watchdog.
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, VecDeque}, io::{Read, Write}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, path::Path};
+use std::{collections::{HashMap, VecDeque}, io::{Read, Write}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, path::{Path, PathBuf}, fs::OpenOptions};
 use tauri::State;
 
 const REPLAY_LIMIT: usize = 1024 * 1024;
@@ -229,6 +229,38 @@ pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String
         writer.flush().map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?
 }
+/// Stage WebView file bytes in an app-owned temporary directory so the CLI can read
+/// the actual image/document. The original filename is never used as a path.
+fn stage_attachment_file(directory: &Path, name: &str, data: &[u8]) -> Result<PathBuf, String> {
+    if data.is_empty() || data.len() > 10 * 1024 * 1024 { return Err("Attachment must be between 1 byte and 10 MB".into()); }
+    let extension = Path::new(name).extension().and_then(|value| value.to_str()).unwrap_or("");
+    let extension = if extension.len() <= 12 && extension.chars().all(|c| c.is_ascii_alphanumeric()) { extension } else { "" };
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random).map_err(|e| e.to_string())?;
+    let stem = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let filename = if extension.is_empty() { stem } else { format!("{stem}.{extension}") };
+    let path = directory.join(filename);
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+    if let Err(error) = file.write_all(data) { let _ = std::fs::remove_file(&path); return Err(error.to_string()); }
+    Ok(path)
+}
+
+#[tauri::command]
+pub async fn manual_stage_attachment(state: State<'_, ManualTerminals>, id: String, name: String, data: Vec<u8>) -> Result<String, String> {
+    if data.is_empty() || data.len() > 10 * 1024 * 1024 { return Err("Attachment must be between 1 byte and 10 MB".into()); }
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let slot = manager.slot(&id)?.ok_or("Open the agent first")?;
+        if slot.closing.load(Ordering::SeqCst) || !slot.terminal.lock().map_err(|_| "Agent state is unavailable")?.as_mut()
+            .map(|terminal| !terminal.closed && matches!(terminal.child.try_wait(), Ok(None))).unwrap_or(false) {
+            return Err("Agent is not connected".into());
+        }
+        let directory = std::env::temp_dir().join("atris-agent-attachments").join(&id);
+        let path = stage_attachment_file(&directory, &name, &data)?;
+        Ok(path.to_string_lossy().into_owned())
+    }).await.map_err(|e| e.to_string())?
+}
 #[tauri::command]
 pub async fn manual_terminal_resize(state: State<'_, ManualTerminals>, id: String, columns: u16, rows: u16) -> Result<(), String> {
     let manager = state.inner().clone();
@@ -267,6 +299,19 @@ pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_attachment_uses_private_random_name_and_preserves_bytes() {
+        let directory = std::env::temp_dir().join(format!("atris-attachment-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = stage_attachment_file(&directory, "../private screenshot.png", b"image bytes").unwrap();
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("png"));
+        assert!(!path.to_string_lossy().contains("private screenshot"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"image bytes");
+        let second = stage_attachment_file(&directory, "../private screenshot.png", b"second").unwrap();
+        assert_ne!(path, second);
+        assert!(stage_attachment_file(&directory, "empty.png", b"").is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn replay_is_bounded_and_preserves_monotonic_offsets() {
         let mut replay = Replay { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false };

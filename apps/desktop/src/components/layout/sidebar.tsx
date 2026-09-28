@@ -420,12 +420,6 @@ export function Sidebar() {
           <span data-tauri-drag-region className="text-sm font-semibold text-sidebar-foreground">Workspaces</span>
           <Button size="icon" variant="ghost" className="h-8 w-8 text-sidebar-muted" aria-label="Hide workspaces" onClick={toggleSidebar}><PanelLeftClose className="h-4 w-4" /></Button>
         </div>
-        <div className="px-3 pb-2">
-          <Button variant="ghost" className="h-9 w-full justify-start gap-2 bg-primary/10 px-3 text-xs font-medium text-sidebar-foreground hover:bg-primary/15" onClick={() => activeWorkspaceId ? handleNewChat() : setIsWorkspaceDialogOpen(true)}>
-            <SquarePen className="h-4 w-4 text-primary" />New conversation<kbd className="ml-auto text-[10px] font-normal text-sidebar-muted">Ctrl N</kbd>
-          </Button>
-        </div>
-
       <div className="mb-1 mt-2 flex items-center justify-between px-3">
         <p className="flex items-center gap-2 px-1 text-[11px] font-semibold tracking-wide text-sidebar-muted">Projects <span className="text-[10px] font-normal tabular-nums">{workspaces.length}</span>{attentionCount > 0 && <Badge variant="secondary" className="h-4 px-1 text-[9px]">{attentionCount} need attention</Badge>}</p>
         <Tooltip delayDuration={0}>
@@ -479,23 +473,19 @@ export function Sidebar() {
                   {!sidebarCollapsed && <span className="min-w-0 flex-1 truncate text-left">{workspace.name}</span>}
                 </button>
 
+                {!sidebarCollapsed && <NavigationDeleteAction label={`Remove workspace: ${workspace.name}`} onClick={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })} />}
                 {!sidebarCollapsed && (
                   <Tooltip delayDuration={0}>
                     <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={(event) => { event.stopPropagation(); handleNewChat(workspace.id); }}
-                        className="mr-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-primary"
-                        aria-label={`New chat in ${workspace.name}`}
-                      >
+                      <button type="button" onClick={(event) => { event.stopPropagation(); handleNewChat(workspace.id); }}
+                        className="mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-primary"
+                        aria-label={`New chat in ${workspace.name}`}>
                         <SquarePen className="h-3.5 w-3.5" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="right">New chat · Ctrl/Cmd+N</TooltipContent>
                   </Tooltip>
                 )}
-
-                {!sidebarCollapsed && <NavigationDeleteAction label={`Remove workspace: ${workspace.name}`} onClick={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })} />}
               </div></ContextMenuTrigger><ContextMenuContent><ContextMenuItem variant="destructive" onSelect={() => setNavigationDelete({ kind: 'workspace', id: workspace.id, name: workspace.name })}><Trash2 className="h-3.5 w-3.5" />Remove workspace…</ContextMenuItem></ContextMenuContent></ContextMenu>
 
               {!sidebarCollapsed && isActiveWorkspace && (
