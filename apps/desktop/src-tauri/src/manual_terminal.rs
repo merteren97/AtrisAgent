@@ -262,6 +262,22 @@ pub async fn manual_stage_attachment(state: State<'_, ManualTerminals>, id: Stri
     }).await.map_err(|e| e.to_string())?
 }
 #[tauri::command]
+pub async fn manual_attachment_preview(id: String, path: String) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_staged_image(&std::env::temp_dir(), &id, &path)).await.map_err(|e| e.to_string())?
+}
+fn read_staged_image(root: &Path, id: &str, path: &str) -> Result<Vec<u8>, String> {
+    if id.len() != 36 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return Err("Invalid agent identity".into()); }
+    let candidate = PathBuf::from(path);
+    let filename = candidate.file_name().and_then(|value| value.to_str()).ok_or("Invalid attachment")?;
+    let (stem, extension) = filename.rsplit_once('.').ok_or("Not an image")?;
+    if stem.len() != 32 || !stem.chars().all(|c| c.is_ascii_hexdigit()) || !["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.to_ascii_lowercase().as_str()) { return Err("Not a staged image".into()); }
+    let directory = root.join("atris-agent-attachments").join(id);
+    if candidate.parent() != Some(directory.as_path()) || std::fs::symlink_metadata(&candidate).map_err(|e| e.to_string())?.file_type().is_symlink() { return Err("Attachment is unavailable".into()); }
+    let metadata = std::fs::metadata(&candidate).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > 10 * 1024 * 1024 { return Err("Attachment is unavailable".into()); }
+    std::fs::read(candidate).map_err(|e| e.to_string())
+}
+#[tauri::command]
 pub async fn manual_terminal_resize(state: State<'_, ManualTerminals>, id: String, columns: u16, rows: u16) -> Result<(), String> {
     let manager = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -311,6 +327,17 @@ mod tests {
         assert_ne!(path, second);
         assert!(stage_attachment_file(&directory, "empty.png", b"").is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn image_preview_is_scoped_to_its_agent_and_staged_image() {
+        let root = std::env::temp_dir().join(format!("atris-preview-test-{}", std::process::id()));
+        let id = "00000000-0000-4000-8000-000000000001";
+        let directory = root.join("atris-agent-attachments").join(id);
+        let image = stage_attachment_file(&directory, "screen.png", b"image bytes").unwrap();
+        assert_eq!(read_staged_image(&root, id, image.to_str().unwrap()).unwrap(), b"image bytes");
+        assert!(read_staged_image(&root, "00000000-0000-4000-8000-000000000002", image.to_str().unwrap()).is_err());
+        assert!(read_staged_image(&root, id, stage_attachment_file(&directory, "private.txt", b"secret").unwrap().to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn replay_is_bounded_and_preserves_monotonic_offsets() {

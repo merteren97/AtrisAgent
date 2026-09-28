@@ -5,7 +5,7 @@ import { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { AccountProfileStatus, CapabilitySnapshot } from '@atris-agent-code/domain';
 import { ClaudeCodeAdapter } from './adapters/claude-code-adapter';
-import { OpenCodeAdapter } from './adapters/opencode-adapter';
+import { OpenCodeAdapter, enrichOpenCodeModelVariants } from './adapters/opencode-adapter';
 import { CodexAdapter } from './adapters/codex-adapter';
 import { AntigravityAdapter } from './adapters/antigravity-adapter';
 import { ModelCatalogService } from './model-catalog-service';
@@ -65,6 +65,13 @@ async function runTests() {
   }
 
   // Read-only roles must remain read-only across every CLI adapter.
+  {
+    const models = [{runtimeModelId:'openai/gpt-test', supportedReasoning:[] as string[], defaultReasoning:undefined as string | undefined}, {runtimeModelId:'other/model',supportedReasoning:[] as string[]}];
+    enrichOpenCodeModelVariants(models as any, [{id:'openai',models:{'gpt-test':{variants:{low:{},medium:{},high:{}}},'unlisted':{variants:{max:{}}}}}]);
+    assert(models[0].supportedReasoning.join(',') === 'low,medium,high' && models[0].defaultReasoning === 'medium', 'Shared OpenCode CLI model discovery enriches reasoning variants from the provider catalog');
+    assert(models[1].supportedReasoning.length === 0 && models.length === 2, 'Variant enrichment does not expose unverified models');
+  }
+
   {
     assert(isReadOnlyAgentRole('qa'), 'QA is classified as a read-only runtime role');
     assert(isReadOnlyAgentRole('reviewer'), 'Reviewer is classified as a read-only runtime role');

@@ -63,6 +63,29 @@ interface OpenCodeProvider {
   models?: Record<string, any> | any[];
 }
 
+function extractVariants(model: any): CanonicalReasoning[] {
+  const keys = Array.isArray(model.variants) ? model.variants : Object.keys(model.variants || {});
+  const normalized = keys
+    .map((value: string) => value.toLowerCase().replace('extra-high', 'xhigh'))
+    .filter((value: string) => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)) as CanonicalReasoning[];
+  return [...new Set(normalized)];
+}
+
+export function enrichOpenCodeModelVariants(models: ModelDescriptor[], providers: OpenCodeProvider[]): void {
+  for (const provider of providers) {
+    const entries = Array.isArray(provider.models)
+      ? provider.models.map((model: any) => [model.id || model.name, model] as const)
+      : Object.entries(provider.models || {});
+    for (const [modelId, model] of entries) {
+      const descriptor = models.find(item => item.runtimeModelId === `${provider.id}/${modelId}`);
+      if (!descriptor) continue;
+      const variants = extractVariants(model);
+      descriptor.supportedReasoning = variants;
+      descriptor.defaultReasoning = variants.includes('medium') ? 'medium' : variants[0];
+    }
+  }
+}
+
 export class OpenCodeAdapter extends BaseRuntimeAdapter {
   readonly id = 'opencode';
   readonly name = 'OpenCode';
@@ -305,7 +328,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       for (const [modelId, modelValue] of models) {
         if (!modelId) continue;
         const model = modelValue as any;
-        const variants = this.extractVariants(model);
+        const variants = extractVariants(model);
         descriptors.push({
           catalogId: `${this.id}:${profileId}:${providerId}/${modelId}`,
           runtimeId: this.runtimeType,
@@ -368,15 +391,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         discoveredAt: new Date().toISOString(),
       });
     }
+    // `opencode models` lists IDs but not model variants. The TUI's reasoning
+    // levels are variants; enrich only the CLI-verified models from the same
+    // profile's provider catalog, without treating catalog entries as available.
+    if (models.length) {
+      try {
+        const server = await this.ensureServer(profileId);
+        const response = await this.fetchServer(server, '/config/providers');
+        if (response.ok) {
+          const data = await response.json() as {providers?: OpenCodeProvider[]};
+          enrichOpenCodeModelVariants(models, data.providers || []);
+        }
+      } catch { /* A catalog probe must not hide models already verified by the CLI. */ }
+    }
     return models;
-  }
-
-  private extractVariants(model: any): CanonicalReasoning[] {
-    const keys = Array.isArray(model.variants) ? model.variants : Object.keys(model.variants || {});
-    const normalized = keys
-      .map((value: string) => value.toLowerCase().replace('extra-high', 'xhigh'))
-      .filter((value: string) => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)) as CanonicalReasoning[];
-    return [...new Set(normalized)];
   }
 
   private mapProvider(providerId: string): Provider {
