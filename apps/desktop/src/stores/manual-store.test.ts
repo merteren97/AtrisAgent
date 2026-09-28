@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { useManualStore, migrateManualNavigation, type ManualConversation } from './manual-store';
 import { useMissionStore } from './mission-store';
-import { conversationActivity, type AgentActivity } from '@/components/manual/manual-activity';
+import { activityNotice, conversationActivity, type AgentActivity } from '@/components/manual/manual-activity';
 import type { ManualAgent } from './manual-store';
 import { automaticLayout, layoutIds, moveInLayout, resizeLayout, reconcileLayout, minimumLayout, layoutRects, dropPlacement } from '@/components/manual/terminal-layout';
 
@@ -68,6 +68,8 @@ assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c','a'])
 store.getState().moveAgent('manual-a','a','b');
 assert.deepEqual(store.getState().orderByConversation['manual-a'],['a','b','c']);
 store.getState().hideAgent('a',true);
+store.getState().acknowledgeActivity('a','completed:2026-09-09T10:08:00Z');
+store.getState().setTerminalLayout('manual-a',automaticLayout(['a','b','c'],2));
 assert.equal(store.getState().conversations['project-a'][0].agents.length,3,'Temporary hiding during restart does not delete an agent');
 store.getState().selectAgent('manual-a','a');store.getState().setDraft('a','Discard on explicit close');
 globalThis.fetch = (async () => new Response(null,{status:204})) as typeof fetch;
@@ -76,7 +78,14 @@ assert.deepEqual(store.getState().conversations['project-a'][0].agents.map(agent
 assert.equal(store.getState().agentByConversation['manual-a'],'b');
 assert.equal(store.getState().drafts.a,undefined);
 assert.equal(store.getState().hiddenAgents.a,undefined);
+assert.equal(store.getState().acknowledgedActivity.a,undefined);
+assert.equal(store.getState().terminalLayouts['manual-a'],undefined,'Removal invalidates panes containing the deleted agent');
 assert.deepEqual(store.getState().orderByConversation['manual-a'],['b','c']);
+store.getState().selectAgent('manual-a','b');
+await store.getState().removeAgent(agents[1]);
+assert.equal(store.getState().agentByConversation['manual-a'],'c','Deleting the selected agent selects the next visible tab');
+await store.getState().removeAgent(agents[2]);
+assert.equal(store.getState().agentByConversation['manual-a'],'','Deleting the last agent leaves an empty selection');
 globalThis.fetch = oldFetch;
 const now = Date.parse('2026-09-09T10:10:00Z');
 const observed = (state: string, lifecycle: AgentActivity['lifecycle'] = 'open'): AgentActivity => ({state,lifecycle,checkedAt:now,at:'2026-09-09T10:08:00Z'});
@@ -87,6 +96,11 @@ assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('co
 assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('completed'),c:observed('completed')},now).text,'Turns finished 2m ago');
 assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('working'),c:observed('completed')},now).kind,'working');
 assert.equal(conversationActivity(agents,{a:observed('completed'),b:observed('attention'),c:observed('working')},now).kind,'attention');
+assert.equal(activityNotice(observed('attention'),undefined,now),'attention');
+assert.equal(activityNotice(observed('completed'),'completed:2026-09-09T10:08:00Z',now),null,'Viewed turns are acknowledged');
+assert.equal(activityNotice(observed('attention'),'completed:2026-09-09T10:08:00Z',now),'attention','A new question survives an earlier completion acknowledgement');
+assert.equal(activityNotice(observed('completed','exited'),undefined,now),null,'Closed CLI cannot advertise a stale turn');
+assert.equal(activityNotice({...observed('attention'),checkedAt:now-16000},undefined,now),null,'Disconnected observations do not produce unread badges');
 console.log('Manual navigation, independent drafts and stale hydration regression tests passed.');
 const initial = automaticLayout(['a','b','c','d'],2)!;
 assert.equal(initial.type,'split');

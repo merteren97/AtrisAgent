@@ -207,6 +207,7 @@ interface MissionState {
   fetchMissions: (workspaceId?: string) => Promise<void>;
   fetchMissionState: (missionId: string) => Promise<void>;
   refreshMission: (missionId: string) => Promise<Mission>;
+  renameMission: (id: string, title: string) => Promise<void>;
   fetchCommandQueue: (workspaceId: string) => Promise<void>;
   startMission: (request: string, workspaceId?: string, options?: StartMissionOptions) => Promise<void>;
   continueMission: (missionId: string, request: string, options?: StartMissionOptions) => Promise<void>;
@@ -1086,6 +1087,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       set({ error: message });
       throw new Error(message);
     }
+  },
+
+  renameMission: async (id, title) => {
+    const updated = await apiRequest<Mission>(`/missions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+    ++missionListRequestId;
+    set((state) => ({ missions: state.missions.map((mission) => mission.id === id ? { ...mission, ...updated } : mission) }));
   },
 
   startMission: async (request, workspaceId, options) => {

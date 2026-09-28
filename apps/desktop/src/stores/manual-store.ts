@@ -26,6 +26,8 @@ interface ManualState {
   terminalLayouts: Record<string, TerminalLayout | undefined>;
   setTerminalLayout: (conversationId: string, layout?: TerminalLayout) => void;
   hiddenAgents: Record<string, boolean>;
+  acknowledgedActivity: Record<string, string>;
+  acknowledgeActivity: (id: string, key: string) => void;
   moveAgent: (conversationId: string, source: string, target: string) => void;
   hideAgent: (id: string, hidden: boolean) => void;
   setLayout: (conversationId: string, panes: number) => void;
@@ -38,11 +40,12 @@ interface ManualState {
   setDraft: (id: string, text: string) => void;
   refresh: (workspaceId: string) => Promise<void>;
   create: (workspaceId: string, title: string | undefined, id: string) => Promise<ManualConversation>;
+  rename: (conversation: ManualConversation, title: string) => Promise<void>;
   applyNaming: (naming?: ManualNamingUpdate) => void;
   addAgent: (conversationId: string, name: string | undefined, catalogId: string, id: string, reasoning?: string) => Promise<ManualAgent>;
   remove: (conversation: ManualConversation) => Promise<void>;
   removeAgent: (agent: ManualAgent) => Promise<void>;
-  updateModel: (agent: ManualAgent, catalogId: string, reasoning?: string) => Promise<ManualAgent>;
+  updateModel: (agent: ManualAgent, catalogId: string, reasoning?: string, live?: boolean) => Promise<ManualAgent>;
   addAgents: (conversationId: string, agents: Array<{id: string; name?: string; catalogId: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
@@ -55,7 +58,8 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   creating: false, setCreating: creating => set({ creating }),
   mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, error: null,
   layoutByConversation: {},
-  orderByConversation: {}, hiddenAgents: {},
+  orderByConversation: {}, hiddenAgents: {}, acknowledgedActivity: {},
+  acknowledgeActivity: (id, key) => set(state => state.acknowledgedActivity[id] === key ? {} : ({ acknowledgedActivity: { ...state.acknowledgedActivity, [id]: key } })),
   terminalLayouts: {},
   setTerminalLayout: (conversationId, layout) => set(state => ({ terminalLayouts: { ...state.terminalLayouts, [conversationId]: layout } })),
   hideAgent: (id, hidden) => set(state => ({ hiddenAgents: { ...state.hiddenAgents, [id]: hidden } })),
@@ -104,6 +108,11 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     get().select(conversation);
     return conversation;
   },
+  rename: async (conversation, title) => {
+    const updated = await apiRequest<ManualConversation>(`/manual/conversations/${conversation.id}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+    fetchVersions.set(conversation.workspaceId, (fetchVersions.get(conversation.workspaceId) || 0) + 1);
+    set(state => ({ conversations: { ...state.conversations, [conversation.workspaceId]: (state.conversations[conversation.workspaceId] || []).map(item => item.id === updated.id ? { ...item, title: updated.title } : item) } }));
+  },
   addAgent: async (conversationId, name, catalogId, id, reasoning) => {
     const agent = await apiRequest<ManualAgent>(`/manual/conversations/${conversationId}/agents`, { method: 'POST', body: JSON.stringify({ name, catalogId, id, reasoning }) });
     const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === conversationId));
@@ -114,8 +123,8 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     get().selectAgent(conversationId, agent.id);
     return agent;
   },
-  updateModel: async (agent, catalogId, reasoning) => {
-    const updated = await apiRequest<ManualAgent>(`/manual/agents/${agent.id}/model`, { method: 'PATCH', body: JSON.stringify({ catalogId, expectedCatalogId: agent.catalogId, reasoning }) });
+  updateModel: async (agent, catalogId, reasoning, live) => {
+    const updated = await apiRequest<ManualAgent>(`/manual/agents/${agent.id}/model`, { method: 'PATCH', body: JSON.stringify({ catalogId, expectedCatalogId: agent.catalogId, reasoning, live }) });
     const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === agent.conversationId));
     if (workspaceId) {
       fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
@@ -129,11 +138,18 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     if (!workspaceId) return;
     fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
     set(state => {
+      const current = state.conversations[workspaceId].find(c => c.id === agent.conversationId);
+      const order = state.orderByConversation[agent.conversationId] || [];
+      const ordered = current ? [...current.agents].sort((a,b) => (order.includes(a.id) ? order.indexOf(a.id) : 999) - (order.includes(b.id) ? order.indexOf(b.id) : 999)) : [];
+      const index = ordered.findIndex(item => item.id === agent.id);
+      const nextVisible = [...ordered.slice(index + 1), ...ordered.slice(0, index)].find(item => item.id !== agent.id && !state.hiddenAgents[item.id]);
       const conversations = state.conversations[workspaceId].map(c => c.id === agent.conversationId ? { ...c, agents: c.agents.filter(item => item.id !== agent.id) } : c);
       const { [agent.id]: _draft, ...drafts } = state.drafts;
       const { [agent.id]: _hidden, ...hiddenAgents } = state.hiddenAgents;
-      return { conversations: { ...state.conversations, [workspaceId]: conversations }, drafts, hiddenAgents,
-        agentByConversation: { ...state.agentByConversation, [agent.conversationId]: state.agentByConversation[agent.conversationId] === agent.id ? conversations.find(c => c.id === agent.conversationId)?.agents[0]?.id || '' : state.agentByConversation[agent.conversationId] },
+      const { [agent.id]: _ack, ...acknowledgedActivity } = state.acknowledgedActivity;
+      return { conversations: { ...state.conversations, [workspaceId]: conversations }, drafts, hiddenAgents, acknowledgedActivity,
+        terminalLayouts: { ...state.terminalLayouts, [agent.conversationId]: undefined },
+        agentByConversation: { ...state.agentByConversation, [agent.conversationId]: state.agentByConversation[agent.conversationId] === agent.id ? nextVisible?.id || '' : state.agentByConversation[agent.conversationId] },
         orderByConversation: { ...state.orderByConversation, [agent.conversationId]: (state.orderByConversation[agent.conversationId] || []).filter(id => id !== agent.id) } };
     });
   },
@@ -159,4 +175,4 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   },
 }), { name: 'atris-manual-navigation', version: 1,
   migrate: migrateManualNavigation,
-  partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation, orderByConversation: state.orderByConversation, hiddenAgents: state.hiddenAgents, terminalLayouts: state.terminalLayouts }) }));
+   partialize: state => ({ mode: state.mode, activeByWorkspace: state.activeByWorkspace, agentByConversation: state.agentByConversation, surfaceByConversation: state.surfaceByConversation, layoutByConversation: state.layoutByConversation, orderByConversation: state.orderByConversation, hiddenAgents: state.hiddenAgents, terminalLayouts: state.terminalLayouts, acknowledgedActivity: state.acknowledgedActivity }) }));

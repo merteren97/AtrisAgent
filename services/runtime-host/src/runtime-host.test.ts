@@ -5,7 +5,7 @@ import { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { AccountProfileStatus, CapabilitySnapshot } from '@atris-agent-code/domain';
 import { ClaudeCodeAdapter } from './adapters/claude-code-adapter';
-import { OpenCodeAdapter, enrichOpenCodeModelVariants } from './adapters/opencode-adapter';
+import { OpenCodeAdapter, enrichOpenCodeModelVariants, openCodePromptRoute } from './adapters/opencode-adapter';
 import { CodexAdapter } from './adapters/codex-adapter';
 import { AntigravityAdapter } from './adapters/antigravity-adapter';
 import { ModelCatalogService } from './model-catalog-service';
@@ -257,6 +257,8 @@ async function runTests() {
 
     emittedEvents.length = 0;
     const openCodeAdapter = new OpenCodeAdapter(eventBus);
+    assert(JSON.stringify(openCodePromptRoute('openai/gpt-test', 'high')) === JSON.stringify({model:{providerID:'openai',modelID:'gpt-test'},variant:'high'}), 'OpenCode orchestrator prompts carry the selected reasoning variant');
+    assert(JSON.stringify(openCodePromptRoute('openai/gpt-test', 'none')) === JSON.stringify({model:{providerID:'openai',modelID:'gpt-test'},variant:'none'}), 'None is forwarded as the explicit non-reasoning variant');
     const originalFetch = globalThis.fetch;
     try {
       globalThis.fetch = async () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNREFUSED', message: 'connection refused' } }); };

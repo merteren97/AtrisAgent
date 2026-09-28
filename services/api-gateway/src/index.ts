@@ -1762,6 +1762,20 @@ app.get('/api/missions/:id', async (req: Request, res: Response) => {
   }
 });
 
+app.patch('/api/missions/:id', async (req: Request, res: Response) => {
+  try {
+    const missionId = routeParam(req.params.id);
+    const title = req.body?.title;
+    if (typeof title !== 'string' || !title.trim() || title.length > 200) return void res.status(400).json({ error: 'Invalid conversation name.' });
+    const mission = await workspaceManager.getMission(missionId);
+    if (!mission) return void res.status(404).json({ error: 'Conversation not found' });
+    if (isDeletionFenced('mission', missionId) || isDeletionFenced('workspace', mission.workspaceId)) return void res.status(409).json({ error: 'Conversation deletion is in progress.' });
+    res.json(await workspaceManager.updateMission(missionId, { title: title.trim() }));
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to rename conversation' });
+  }
+});
+
 app.delete('/api/missions/:id', async (req: Request, res: Response) => {
   try {
     const missionId = routeParam(req.params.id);
