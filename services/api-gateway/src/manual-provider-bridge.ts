@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
-import type { ManualAgent, ManualMessage } from './manual-conversations';
+import { createHash, randomUUID } from 'node:crypto';
+import type { ManualAgent, ManualMessage, ManualQuestion } from './manual-conversations';
 
 const MARKER = '// AtrisAgent managed manual session bridge v1';
 const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
@@ -35,9 +35,55 @@ const OPENCODE_SOURCE = `${MARKER}\n` + String.raw`
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-export const AtrisManualSession = async () => {
+export const AtrisManualSession = async ({client}) => {
   const root = path.dirname(fileURLToPath(import.meta.url));
   const output = path.join(root, 'opencode-history.json');
+  const pendingFile = path.join(root, 'opencode-questions.json');
+  const replyFile = path.join(root, 'opencode-question-reply.json');
+  const modeFile = path.join(root, 'opencode-auto-mode.json');
+  const modeRequestFile = path.join(root, 'opencode-auto-request.json');
+  let autoApprove = false;
+  let modeBusy = false;
+  const saveMode = (error) => {
+    try { fs.writeFileSync(modeFile+'.tmp', JSON.stringify({enabled:autoApprove, ...(error ? {error} : {})}), {mode:0o600}); fs.renameSync(modeFile+'.tmp', modeFile); } catch {}
+  };
+  saveMode();
+  try { fs.rmSync(modeRequestFile, {force:true}); } catch {}
+  const modeTimer = setInterval(async () => {
+    if (modeBusy) return;
+    let request;
+    try { request = JSON.parse(fs.readFileSync(modeRequestFile, 'utf8')); } catch { return; }
+    if (typeof request?.enabled !== 'boolean') return;
+    modeBusy = true;
+    try {
+      if (request.enabled !== autoApprove) {
+        const result = await client.tui.executeCommand({body:{command:'permission.mode'}});
+        if (result.error || result.data !== true) throw new Error('OpenCode did not accept the mode change.');
+        autoApprove = request.enabled;
+      }
+      saveMode();
+    } catch { saveMode('Could not change OpenCode permission mode. Retry or use Code.'); }
+    finally { try { fs.rmSync(modeRequestFile, {force:true}); } catch {} modeBusy = false; }
+  }, 250);
+  modeTimer.unref?.();
+  const pending = new Map();
+  const savePending = () => {
+    try { fs.writeFileSync(pendingFile+'.tmp', JSON.stringify([...pending.values()]), {mode: 0o600}); fs.renameSync(pendingFile+'.tmp', pendingFile); } catch {}
+  };
+  // A previous process's unanswered questions cannot be answered in a new CLI process.
+  savePending();
+  try { fs.rmSync(replyFile, {force:true}); } catch {}
+  const replies = setInterval(async () => {
+    let reply;
+    try { reply = JSON.parse(fs.readFileSync(replyFile, 'utf8')); } catch { return; }
+    if (!reply || !pending.has(reply.id) || pending.get(reply.id).sessionID !== reply.sessionID) return;
+    try {
+      const result = await client.question.reply({path:{requestID:reply.id},body:{answers:reply.answers}});
+      if (result.error) return;
+      pending.delete(reply.id); savePending(); fs.rmSync(replyFile, {force:true});
+    } catch { /* Keep the request visible; retry when the provider is ready. */ }
+  }, 250);
+  replies.unref?.();
   let saved = {sessionId: null, messages: [], roles: {}};
   try { saved = JSON.parse(fs.readFileSync(output, 'utf8')); } catch {}
   let sessionId = saved.sessionId;
@@ -64,6 +110,13 @@ export const AtrisManualSession = async () => {
     if (event.type === 'session.created' && info?.id && !info.parentID) { sessionId = info.id; flush(); }
     if (event.type === 'message.updated' && info?.sessionID === sessionId && ['user','assistant'].includes(info.role)) {
       roles.set(info.id, info.role); flush();
+    }
+    if (event.type === 'question.asked' && event.properties?.sessionID === sessionId && event.properties?.id) {
+      const request = event.properties;
+      pending.set(request.id, {id:request.id, sessionID:sessionId, questions:request.questions}); savePending(); return;
+    }
+    if (['question.replied','question.rejected'].includes(event.type) && event.properties?.requestID) {
+      pending.delete(event.properties.requestID); savePending(); return;
     }
     if (event.type !== 'message.part.updated') return;
     const part = event.properties?.part;
@@ -129,7 +182,14 @@ export function parseCodexManualTranscript(source: string, sessionId: string): M
       if (!text) continue;
       messages.push({ id: key, role: payload.role, text }); seen.add(key);
     } else if (['function_call','custom_tool_call'].includes(payload.type)) {
-      messages.push({ id: key, role: 'tool', toolName: payload.name || 'Tool', text: 'Tool requested. Open Code for live output and approvals.' }); seen.add(key);
+      let question: ManualQuestion | undefined;
+      if (payload.name === 'request_user_input') {
+        try {
+          const args = typeof payload.arguments === 'string' ? JSON.parse(payload.arguments) : payload.arguments;
+          if (Array.isArray(args?.questions)) question = {id:String(payload.call_id || key), questions:args.questions.filter((entry: any) => typeof entry.question === 'string' && Array.isArray(entry.options)).map((entry: any) => ({header:String(entry.header || ''),question:entry.question,options:entry.options.filter((option: any) => typeof option.label === 'string').map((option: any) => ({label:option.label,description:typeof option.description === 'string' ? option.description : undefined})),custom:true}))};
+        } catch { /* Malformed tool input stays in Code. */ }
+      }
+      messages.push({ id: key, role: 'tool', toolName: payload.name || 'Tool', text: 'Tool requested. Open Code for live output and approvals.', ...(question?.questions.length ? {question} : {}) }); seen.add(key);
     } else if (['function_call_output','custom_tool_call_output'].includes(payload.type)) {
       messages.push({ id: key, role: 'tool', text: 'Tool returned. Open Code to inspect its output.' }); seen.add(key);
     }
@@ -225,11 +285,30 @@ export class ManualProviderBridge {
   }
   prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});
+    // A new TUI starts in normal mode. Never display a previous process's mode as active.
+    fs.rmSync(path.join(directory, 'opencode-auto-mode.json'), {force:true});
     const pluginSource = OPENCODE_SOURCE + '\nconst manualReasoning = ' + JSON.stringify(agent.reasoning || null) + ';\nconst manualModel = ' + JSON.stringify(agent.model) + ';\n';
     const plugin = path.join(directory, `manual-plugin-${createHash('sha256').update(pluginSource).digest('hex').slice(0,16)}.mjs`); writeManaged(plugin, pluginSource);
     const history = this.openCodeHistory(agent);
     // Merge inherited configuration inside the native launcher. Never send its possibly-secret contents to the UI.
     return {args: [...(history.sessionId ? ['--session', history.sessionId] : []), '--model', agent.model], env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href}};
+  }
+  autoApprove(agent: ManualAgent): {available: boolean; enabled: boolean; error?: string} {
+    if (agent.runtimeType !== 'opencode') return {available:false, enabled:false};
+    try {
+      const filename = path.join(this.directory(agent), 'opencode-auto-mode.json');
+      if (fs.statSync(filename).size > 4096) return {available:false, enabled:false};
+      const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
+      if (typeof record.enabled !== 'boolean') return {available:false, enabled:false};
+      return {available:true, enabled:record.enabled, ...(typeof record.error === 'string' ? {error:record.error} : {})};
+    } catch { return {available:false, enabled:false}; }
+  }
+  setAutoApprove(agent: ManualAgent, enabled: unknown): void {
+    if (agent.runtimeType !== 'opencode' || typeof enabled !== 'boolean') throw Object.assign(new Error('Invalid OpenCode permission mode.'), {status:400});
+    if (!this.autoApprove(agent).available) throw Object.assign(new Error('Open this OpenCode agent before changing permissions.'), {status:409});
+    const filename = path.join(this.directory(agent), 'opencode-auto-request.json');
+    if (fs.existsSync(filename)) throw Object.assign(new Error('Permission mode is already changing.'), {status:409});
+    fs.writeFileSync(filename, JSON.stringify({id:randomUUID(),enabled}), {flag:'wx',mode:0o600});
   }
   private openCodeHistory(agent: ManualAgent): {sessionId: string | null; messages: ManualMessage[]} {
     const filename = path.join(this.directory(agent), 'opencode-history.json');
@@ -238,6 +317,28 @@ export class ManualProviderBridge {
     const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
     if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
     return {sessionId: record.sessionId, messages: Array.isArray(record.messages) ? record.messages.filter((m: any) => typeof m.id === 'string' && typeof m.text === 'string' && ['user','assistant','tool'].includes(m.role)) : []};
+  }
+  pendingQuestions(agent: ManualAgent): Array<{id: string; questions: Array<{header: string; question: string; options: Array<{label: string; description?: string}>; multiple?: boolean; custom?: boolean}>}> {
+    if (agent.runtimeType !== 'opencode') return [];
+    const sessionId = this.openCodeHistory(agent).sessionId;
+    if (!sessionId) return [];
+    const filename = path.join(this.directory(agent), 'opencode-questions.json');
+    try {
+      if (fs.statSync(filename).size > 65536) return [];
+      const records = JSON.parse(fs.readFileSync(filename, 'utf8'));
+      if (!Array.isArray(records)) return [];
+      return records.filter((record: any) => record.sessionID === sessionId && typeof record.id === 'string' && Array.isArray(record.questions))
+        .map((record: any) => ({id:record.id, questions:record.questions.filter((question: any) => typeof question.question === 'string' && Array.isArray(question.options)).map((question: any) => ({header:String(question.header || ''), question:question.question, options:question.options.filter((option: any) => typeof option.label === 'string').map((option: any) => ({label:option.label, description:typeof option.description === 'string' ? option.description : undefined})), multiple:Boolean(question.multiple), custom:question.custom !== false}))}));
+    } catch { return []; }
+  }
+  replyQuestion(agent: ManualAgent, id: string, answers: string[][]): void {
+    if (agent.runtimeType !== 'opencode') throw Object.assign(new Error('Answer this provider in Code.'), {status:400});
+    const question = this.pendingQuestions(agent).find(record => record.id === id);
+    if (!question) throw Object.assign(new Error('This question is no longer pending.'), {status:409});
+    if (!Array.isArray(answers) || answers.length !== question.questions.length || answers.some((answer, index) => !Array.isArray(answer) || !answer.length || (!question.questions[index].multiple && answer.length !== 1) || answer.some(value => typeof value !== 'string' || !value.trim() || value.length > 2000 || (!question.questions[index].custom && !question.questions[index].options.some(option => option.label === value))))) throw Object.assign(new Error('Select an answer for each question.'), {status:400});
+    const filename = path.join(this.directory(agent), 'opencode-question-reply.json');
+    if (fs.existsSync(filename)) throw Object.assign(new Error('An answer is already being delivered.'), {status:409});
+    fs.writeFileSync(filename, JSON.stringify({id, sessionID:this.openCodeHistory(agent).sessionId, answers}), {flag:'wx', mode:0o600});
   }
   read(agent: ManualAgent): {messages: ManualMessage[]; truncated: boolean; bound: boolean} {
     if (agent.runtimeType === 'opencode') {

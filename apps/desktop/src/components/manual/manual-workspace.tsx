@@ -3,8 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Bot, Brain, Code2, MessageSquare, Plus, Square, X, Loader2, RotateCcw, ImagePlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
-import { MarkdownContent } from '@/components/chat/markdown-content';
-import { useManualStore, type ManualAgent, type ManualMessage, type ManualNamingUpdate } from '@/stores/manual-store';
+import { useManualStore, type ManualAgent, type ManualMessage, type ManualNamingUpdate, type ManualQuestion } from '@/stores/manual-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { useSettingsStore } from '@/stores/settings-store';
@@ -14,9 +13,11 @@ import { TerminalCanvas } from './terminal-canvas';
 import { ensureManualTerminal, disposeManualTerminal, type TerminalSnapshot } from './manual-terminal';
 import { ContextTransfer } from './context-transfer';
 import { markManualLaunch, markManualClosed } from './manual-activity';
-import { ManualComposer, addManualFiles } from './manual-composer';
+import { ManualComposer, addManualFiles, type OpenCodeAutoApprove } from './manual-composer';
 import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
+import { ManualChatContent } from './manual-chat-content';
+import { ManualQuestionCard } from './manual-question';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode', 'antigravity'].includes(kind || '');
@@ -111,6 +112,8 @@ export function ManualWorkspace() {
   const [bound, setBound] = useState(false);
   const actionPending = useRef(false);
   const [messages, setMessages] = useState<ManualMessage[]>([]); const [truncated, setTruncated] = useState(false);
+  const [questions, setQuestions] = useState<ManualQuestion[]>([]);
+  const [autoApprove, setAutoApprove] = useState<OpenCodeAutoApprove>();
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
   const [attachments, setAttachments] = useState<Record<string, File[]>>({});
@@ -126,7 +129,7 @@ export function ManualWorkspace() {
   const agentId = agent?.id;
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
 
-  useEffect(() => { setMessages([]); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
+  useEffect(() => { setMessages([]); setQuestions([]); setAutoApprove(undefined); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
   useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
@@ -155,8 +158,8 @@ export function ManualWorkspace() {
     let memorySignature = '';
     const poll = async () => {
       try {
-        const result = await apiRequest<{messages: ManualMessage[]; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
-        if (!disposed) { setMessages(result.messages); setTruncated(result.truncated); setBound(Boolean(result.bound)); useManualStore.getState().applyNaming(result.naming); }
+        const result = await apiRequest<{messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: OpenCodeAutoApprove; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
+        if (!disposed) { setMessages(result.messages); setQuestions(result.questions || []); setAutoApprove(result.autoApprove); setTruncated(result.truncated); setBound(Boolean(result.bound)); useManualStore.getState().applyNaming(result.naming); }
         const signature = result.messages.filter(message => message.role === 'user').map(message => message.id+':'+message.text).join('\n');
         if (!disposed && result.bound && signature && signature !== memorySignature && agent?.conversationId) {
           await apiRequest(`/manual/conversations/${agent.conversationId}/memory/sync`, {method:'POST',body:JSON.stringify({agentId})});
@@ -168,7 +171,7 @@ export function ManualWorkspace() {
     };
     void poll(); return () => { disposed = true; clearTimeout(timer); };
   }, [agentId, agent?.runtimeType]);
-  useEffect(() => { if (following.current) messageEnd.current?.scrollIntoView({ block: 'end' }); }, [messages]);
+  useEffect(() => { if (following.current) messageEnd.current?.scrollIntoView({ block: 'end' }); }, [messages, questions]);
 
   const launch = async (target: ManualAgent, showCode = true) => {
     if (!native) return;
@@ -233,6 +236,12 @@ export function ManualWorkspace() {
   const live = agent && statuses[agent.id] === 'open';
   const draft = agent ? drafts[agent.id] || '' : '';
   const files = agent ? attachments[agent.id] || [] : [];
+  const lastVisible = [...messages].reverse().find(message => message.role !== 'tool');
+  const recentTools = lastVisible ? messages.slice(messages.lastIndexOf(lastVisible) + 1).filter(message => message.role === 'tool') : [];
+  const questionIndex = recentTools.map(message => Boolean(message.question)).lastIndexOf(true);
+  const unresolvedQuestion = questionIndex >= 0 && !recentTools.slice(questionIndex + 1).some(message => !message.toolName) ? recentTools[questionIndex].question : undefined;
+  const activity = recentTools[recentTools.length - 1];
+  const replyQuestion = async (question: ManualQuestion, answers: string[][]) => { await apiRequest(`/manual/agents/${agentId}/questions/${encodeURIComponent(question.id)}/reply`, { method: 'POST', body: JSON.stringify({ answers }) }); };
   const addFiles = (incoming: File[]) => {
     if (!agent || !incoming.length) return;
     try {
@@ -283,12 +292,15 @@ export function ManualWorkspace() {
               {!bound && <div role="status" className="flex items-start gap-3 rounded-xl bg-muted/40 px-4 py-3"><Code2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" /><p className="text-xs leading-5 text-muted-foreground">Connect this CLI’s history to see its replies here.{agent.runtimeType === 'codex' ? ' Review the AtrisAgent hook in /hooks.' : agent.runtimeType === 'antigravity' ? ' Reopen older agents once to enable their dedicated session link, then send a message.' : ' Complete CLI setup in Code and send your first message.'}<button className="ml-2 font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>Open terminal</button></p></div>}
               {truncated && <p className="text-xs text-muted-foreground">Showing recent messages from this long session.</p>}
               {!messages.length && <div className="py-8"><RuntimeBrandIcon runtimeId={agent.runtimeType} className="mb-4 h-9 w-9 text-foreground" /><h3 className="text-xl font-semibold tracking-tight">What would you like to work on?</h3><p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">Message {agent.name}, choose a model in the composer, or open Code for the live terminal. Each agent keeps its own conversation.</p><div className="mt-5 flex flex-wrap gap-2">{['Explore this project', 'Review recent changes', 'Help me plan a task'].map(prompt => <Button key={prompt} size="sm" variant="outline" className="rounded-full text-xs" onClick={() => setDraft(agent.id, prompt)}>{prompt}</Button>)}</div></div>}
-              {messages.map(message => message.role === 'tool' ? <details key={message.id} className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><summary className="cursor-pointer font-medium">{message.toolName || (message.failed ? 'Tool failed' : 'Tool result')}</summary><p className="mt-2 leading-5">{message.text}</p></details> : <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : agent.name}</p><MarkdownContent content={message.text} /></article>)}
+               {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : agent.name}</p><ManualChatContent text={message.text} agentId={agent.id} user={message.role === 'user'} /></article>)}
+               {unresolvedQuestion && !questions.length && <ManualQuestionCard key={unresolvedQuestion.id} request={unresolvedQuestion} onOpenCode={() => setSurface(conversation.id, 'code')} />}
+               {questions.map(question => <ManualQuestionCard key={question.id} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
+               {live && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
             </>}
             <div ref={messageEnd} />
           </div>
         </div>
-        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
+        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
       </>}
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}

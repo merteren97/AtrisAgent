@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type PointerEvent } from 'react';
-import { Brain, FileText, GripHorizontal, ImagePlus, Loader2, Send, X } from 'lucide-react';
+import { Brain, FileText, GripHorizontal, ImagePlus, Loader2, Send, Shield, ShieldCheck, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ChatSessionControls } from './chat-session-controls';
 import type { ManualAgent } from '@/stores/manual-store';
@@ -8,6 +8,7 @@ import type { DiscoveredModel } from '@/stores/account-store';
 export const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 export const MAX_ATTACHMENTS = 10;
 const MAX_TOTAL_SIZE = 25 * 1024 * 1024;
+export interface OpenCodeAutoApprove { available: boolean; enabled: boolean; error?: string }
 
 export function addManualFiles(current: File[], incoming: File[]): File[] {
   const next = [...current];
@@ -58,17 +59,35 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }) {
   </div>;
 }
 
-export function ManualComposer({ agent, agents, live, native, pending, draft, files, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply }: {
+export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply }: {
   agent: ManualAgent; agents: ManualAgent[]; live: boolean; native: boolean; pending: boolean;
+  autoApprove?: OpenCodeAutoApprove; onAutoApprove?: (enabled: boolean) => Promise<void>;
   draft: string; files: File[]; onDraft: (value: string) => void; onAddFiles: (files: File[]) => void; onRemoveFile: (file: File) => void;
   onSend: () => void; onMemory: () => void; onApply: (model: DiscoveredModel, independent: boolean, reasoning?: string) => void;
 }) {
   const input = useRef<HTMLInputElement>(null);
   const [height, setHeight] = useState(72);
   const [preview, setPreview] = useState<File | null>(null);
+  const [requestedMode, setRequestedMode] = useState<boolean | null>(null);
+  const [modeError, setModeError] = useState<string>();
   const drag = useRef<{ start: number; height: number } | null>(null);
   const ignoreClick = useRef(false);
   const canSend = native && live && !pending && (draft.trim().length > 0 || files.length > 0);
+  useEffect(() => {
+    if (requestedMode === null) return;
+    if (autoApprove?.enabled === requestedMode) setRequestedMode(null);
+  }, [autoApprove?.enabled, requestedMode]);
+  useEffect(() => {
+    if (requestedMode === null) return;
+    const timeout = setTimeout(() => { setRequestedMode(null); setModeError('OpenCode did not confirm the permission mode change.'); }, 5000);
+    return () => clearTimeout(timeout);
+  }, [requestedMode]);
+  const toggleAutoApprove = () => {
+    if (!onAutoApprove || !autoApprove?.available || requestedMode !== null) return;
+    const next = !autoApprove.enabled;
+    setModeError(undefined); setRequestedMode(next);
+    void onAutoApprove(next).catch(error => { setRequestedMode(null); setModeError(error instanceof Error ? error.message : String(error)); });
+  };
   const resize = (event: PointerEvent<HTMLButtonElement>) => {
     if (event.button !== 0) return;
     drag.current = { start: event.clientY, height };
@@ -84,11 +103,13 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
       <div className="flex items-center justify-between gap-2"><ChatSessionControls key={`${agent.id}:${agent.catalogId}`} agent={agent} agents={agents} pending={pending || !native} onApply={onApply}/><div className="flex items-center gap-1">
         <input ref={input} type="file" multiple className="sr-only" aria-label="Choose files to attach" onChange={(event: ChangeEvent<HTMLInputElement>) => { onAddFiles(Array.from(event.target.files || [])); event.target.value = ''; }} />
         <Button type="button" variant="ghost" size="icon" aria-label="Attach files or images" title="Attach files or images" onClick={() => input.current?.click()}><ImagePlus className="h-4 w-4" /></Button>
+        {agent.runtimeType === 'opencode' && <Button type="button" variant={autoApprove?.enabled ? 'secondary' : 'ghost'} size="icon" aria-label={autoApprove?.enabled ? 'Disable OpenCode auto-approve' : 'Enable OpenCode auto-approve'} aria-pressed={Boolean(autoApprove?.enabled)} title={autoApprove?.enabled ? 'Auto-approve on · click to turn off' : 'Auto-approve future permissions · explicit deny rules still apply'} disabled={!native || !live || pending || !autoApprove?.available || requestedMode !== null} onClick={toggleAutoApprove}>{requestedMode !== null ? <Loader2 className="h-4 w-4 animate-spin" /> : autoApprove?.enabled ? <ShieldCheck className="h-4 w-4 text-primary" /> : <Shield className="h-4 w-4" />}</Button>}
         <Button type="button" variant="ghost" size="icon" aria-label="Open memory and references" onClick={onMemory}><Brain className="h-4 w-4" /></Button>
         <Button type="submit" size="sm" disabled={!canSend}>{pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">Send</span></Button>
       </div></div>
     </div>
-    <p className="mx-auto mt-2 max-w-3xl px-2 text-[10px] text-muted-foreground">{agent.name} · {live ? 'CLI open' : 'Offline'} · Shift+Enter for a new line · Drag the handle to resize</p>
+    <p className="mx-auto mt-2 max-w-3xl px-2 text-[10px] text-muted-foreground">{agent.name} · {live ? 'CLI open' : 'Offline'}{agent.runtimeType === 'opencode' && autoApprove?.enabled ? ' · Auto-approve on' : ''} · Shift+Enter for a new line · Drag the handle to resize</p>
+    {requestedMode === null && (modeError || autoApprove?.error) && <p role="alert" className="mx-auto max-w-3xl px-2 text-xs text-destructive">{modeError || autoApprove?.error}</p>}
     {preview && <ImageLightbox file={preview} onClose={() => setPreview(null)} />}
   </form>;
 }
