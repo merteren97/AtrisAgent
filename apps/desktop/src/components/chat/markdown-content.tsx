@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 interface MarkdownContentProps {
   content: string;
   className?: string;
+  onLocalImageLink?: (path: string) => void;
 }
 
 interface Block {
@@ -109,8 +110,8 @@ function parseBlocks(source: string): Block[] {
   return blocks;
 }
 
-function inlineNodes(text: string, keyPrefix: string): ReactNode[] {
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g;
+function inlineNodes(text: string, keyPrefix: string, onLocalImageLink?: (path: string) => void): ReactNode[] {
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|!?\[[^\]]+\]\((?:https?:\/\/[^\s)]+|[^()\s]+\.(?:png|jpe?g|webp|gif))\))/gi;
   const parts = text.split(pattern).filter((part) => part.length > 0);
 
   return parts.map((part, index) => {
@@ -124,7 +125,7 @@ function inlineNodes(text: string, keyPrefix: string): ReactNode[] {
     if ((part.startsWith('*') && part.endsWith('*')) || (part.startsWith('_') && part.endsWith('_'))) {
       return <em key={key}>{part.slice(1, -1)}</em>;
     }
-    const link = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+    const link = part.match(/^!?\[([^\]]+)\]\(([^\s)]+)\)$/);
     if (link && isSafeLink(link[2])) {
       return (
         <a key={key} href={link[2]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary">
@@ -132,18 +133,21 @@ function inlineNodes(text: string, keyPrefix: string): ReactNode[] {
         </a>
       );
     }
+    if (link && onLocalImageLink && /\.(?:png|jpe?g|webp|gif)$/i.test(link[2])) {
+      return <button key={key} type="button" onClick={() => onLocalImageLink(link[2])} className="text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{link[1]}</button>;
+    }
     return <Fragment key={key}>{part}</Fragment>;
   });
 }
 
-function InlineText({ text, prefix }: { text: string; prefix: string }) {
+function InlineText({ text, prefix, onLocalImageLink }: { text: string; prefix: string; onLocalImageLink?: (path: string) => void }) {
   const lines = text.split('\n');
   return (
     <>
       {lines.map((line, index) => (
         <Fragment key={`${prefix}-line-${index}`}>
           {index > 0 && <br />}
-          {inlineNodes(line, `${prefix}-${index}`)}
+          {inlineNodes(line, `${prefix}-${index}`, onLocalImageLink)}
         </Fragment>
       ))}
     </>
@@ -172,7 +176,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   );
 }
 
-export function MarkdownContent({ content, className }: MarkdownContentProps) {
+export function MarkdownContent({ content, className, onLocalImageLink }: MarkdownContentProps) {
   const blocks = useMemo(() => parseBlocks(content), [content]);
 
   return (
@@ -184,7 +188,7 @@ export function MarkdownContent({ content, className }: MarkdownContentProps) {
         if (block.type === 'quote') {
           return (
             <blockquote key={key} className="border-l-2 border-primary/40 pl-3 text-foreground/75">
-              <InlineText text={block.text || ''} prefix={key} />
+              <InlineText text={block.text || ''} prefix={key} onLocalImageLink={onLocalImageLink} />
             </blockquote>
           );
         }
@@ -194,7 +198,7 @@ export function MarkdownContent({ content, className }: MarkdownContentProps) {
             <List key={key} className={cn('space-y-1 pl-5', block.ordered ? 'list-decimal' : 'list-disc')}>
               {(block.items || []).map((item, itemIndex) => (
                 <li key={`${key}-${itemIndex}`} className="pl-0.5 leading-relaxed marker:text-muted-foreground">
-                  <InlineText text={item} prefix={`${key}-${itemIndex}`} />
+                  <InlineText text={item} prefix={`${key}-${itemIndex}`} onLocalImageLink={onLocalImageLink} />
                 </li>
               ))}
             </List>
@@ -205,13 +209,13 @@ export function MarkdownContent({ content, className }: MarkdownContentProps) {
           const size = level <= 1 ? 'text-base' : level === 2 ? 'text-[15px]' : 'text-sm';
           return (
             <div key={key} className={cn('pt-1 font-semibold leading-snug text-foreground', size)}>
-              <InlineText text={block.text || ''} prefix={key} />
+              <InlineText text={block.text || ''} prefix={key} onLocalImageLink={onLocalImageLink} />
             </div>
           );
         }
         return (
           <p key={key} className="whitespace-normal leading-relaxed text-foreground/90">
-            <InlineText text={block.text || ''} prefix={key} />
+            <InlineText text={block.text || ''} prefix={key} onLocalImageLink={onLocalImageLink} />
           </p>
         );
       })}

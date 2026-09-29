@@ -28,6 +28,8 @@ function createEngine(id: string) {
   let error: string | null = null; let timer: ReturnType<typeof setTimeout>;
   let writes = Promise.resolve();
   let resizing = false; let frame = 0;
+  let resizePending = Promise.resolve();
+  let pollPending = Promise.resolve();
   const listeners = new Set<(error: string | null) => void>();
   const update = (value: string | null) => { error = value; listeners.forEach(listener => listener(error)); };
   const flushResize = async () => {
@@ -49,14 +51,18 @@ function createEngine(id: string) {
     if (frame || disposed || container.parentElement === parking) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
-      if (disposed || container.parentElement === parking || !container.clientWidth || !container.clientHeight) return;
-      const proposed = fit.proposeDimensions();
-      if (!proposed) return;
-      // Keep emulator dimensions identical to the native PTY's safety limits.
-      const cols = Math.min(500, Math.max(2, proposed.cols)), rows = Math.min(300, Math.max(2, proposed.rows));
-      if (terminal.cols !== cols || terminal.rows !== rows) terminal.resize(cols, rows);
-      terminal.refresh(0, Math.max(0, terminal.rows - 1));
-      void flushResize();
+      // Never change the xterm buffer width while a CLI frame is still parsing.
+      resizePending = resizePending.then(async () => {
+        await pollPending;
+        if (disposed || container.parentElement === parking || !container.clientWidth || !container.clientHeight) return;
+        const proposed = fit.proposeDimensions();
+        if (!proposed) return;
+        // Keep emulator dimensions identical to the native PTY's safety limits.
+        const cols = Math.min(500, Math.max(2, proposed.cols)), rows = Math.min(300, Math.max(2, proposed.rows));
+        if (terminal.cols !== cols || terminal.rows !== rows) terminal.resize(cols, rows);
+        await flushResize();
+        if (!disposed && container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
+      }).catch(e => { if (!disposed) update(String(e)); });
     });
   };
   const input = terminal.onData(data => {
@@ -66,15 +72,25 @@ function createEngine(id: string) {
   const poll = async () => {
     const pollEpoch = epoch;
     try {
-      const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after });
+      await resizePending;
       if (disposed || pollEpoch !== epoch) return;
-      status = snapshot.status;
-      if (snapshot.reset) terminal.reset();
-      after = snapshot.sequence;
-      if (snapshot.output) await new Promise<void>(resolve => terminal.write(snapshot.output, resolve));
-      if (disposed || pollEpoch !== epoch) return;
-      update(status === 'open' ? null : 'Agent '+status+'. Use Open agent to reconnect.');
-      resize();
+      pollPending = (async () => {
+        const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after });
+        if (disposed || pollEpoch !== epoch) return;
+        status = snapshot.status;
+        if (snapshot.reset) terminal.reset();
+        if (snapshot.output) {
+          await new Promise<void>(resolve => terminal.write(snapshot.output, resolve));
+          // Reparenting a hidden background terminal can leave WebView's canvas stale
+          // even after xterm has parsed the latest full-screen TUI frame.
+          if (container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
+        }
+        if (disposed || pollEpoch !== epoch) return;
+        after = snapshot.sequence;
+        update(status === 'open' ? null : 'Agent '+status+'. Use Open agent to reconnect.');
+        resize();
+      })();
+      await pollPending;
     } catch (e) { if (!disposed) update(String(e)); }
     finally { if (!disposed) timer = setTimeout(poll, status === 'open' ? 120 : 1500); }
   };
