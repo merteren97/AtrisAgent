@@ -405,7 +405,8 @@ export class ManualProviderBridge {
       let failure: any;
       try {
         const errorFile = path.join(this.directory(agent), 'opencode-question-error.json');
-        if (fs.statSync(errorFile).size < 4096) failure = JSON.parse(fs.readFileSync(errorFile, 'utf8'));
+        const {source, truncated} = readTail(errorFile, 4096);
+        if (!truncated) failure = JSON.parse(source);
       } catch {}
       return records.filter((record: any) => record.sessionID === sessionId && typeof record.id === 'string' && Array.isArray(record.questions))
         .map((record: any) => ({id:record.id, questions:record.questions.filter((question: any) => typeof question.question === 'string' && Array.isArray(question.options)).map((question: any) => ({header:String(question.header || ''), question:question.question, options:question.options.filter((option: any) => typeof option.label === 'string').map((option: any) => ({label:option.label, description:typeof option.description === 'string' ? option.description : undefined})), multiple:Boolean(question.multiple), custom:question.custom !== false})), ...(failure?.id === record.id && failure.sessionID === sessionId && typeof failure.error === 'string' ? {deliveryError:failure.error} : {})}));
