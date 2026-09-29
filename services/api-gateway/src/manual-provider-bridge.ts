@@ -35,11 +35,12 @@ const OPENCODE_SOURCE = `${MARKER}\n` + String.raw`
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-export const AtrisManualSession = async ({client}) => {
+export const AtrisManualSession = async ({client, directory}) => {
   const root = path.dirname(fileURLToPath(import.meta.url));
   const output = path.join(root, 'opencode-history.json');
   const pendingFile = path.join(root, 'opencode-questions.json');
   const replyFile = path.join(root, 'opencode-question-reply.json');
+  const replyErrorFile = path.join(root, 'opencode-question-error.json');
   const modeFile = path.join(root, 'opencode-auto-mode.json');
   const modeRequestFile = path.join(root, 'opencode-auto-request.json');
   const routeFile = path.join(root, 'opencode-route.json');
@@ -47,7 +48,7 @@ export const AtrisManualSession = async ({client}) => {
   let autoApprove = false;
   let modeBusy = false;
   const saveMode = (error) => {
-    try { fs.writeFileSync(modeFile+'.tmp', JSON.stringify({version:2, enabled:autoApprove, ...(error ? {error} : {})}), {mode:0o600}); fs.renameSync(modeFile+'.tmp', modeFile); } catch {}
+    try { fs.writeFileSync(modeFile+'.tmp', JSON.stringify({version:3, enabled:autoApprove, ...(error ? {error} : {})}), {mode:0o600}); fs.renameSync(modeFile+'.tmp', modeFile); } catch {}
   };
   try { fs.rmSync(modeRequestFile, {force:true}); } catch {}
   saveMode();
@@ -58,11 +59,14 @@ export const AtrisManualSession = async ({client}) => {
     if (typeof request?.enabled !== 'boolean') return;
     modeBusy = true;
     try {
-      // TUI permission.mode cycles through several modes; its boolean result does
-      // not tell us which mode is active. Intercept only requests still asking.
-      autoApprove = request.enabled;
+      // The TUI owns Auto mode. Only toggle it when our last confirmed state differs.
+      if (autoApprove !== request.enabled) {
+        const result = await client.tui.executeCommand({body:{command:'permission.mode'}});
+        if (result.error || result.data !== true) throw new Error('OpenCode did not accept the mode change.');
+        autoApprove = request.enabled;
+      }
       saveMode();
-    } catch { saveMode('Could not change OpenCode permission mode. Retry or use Code.'); }
+    } catch { saveMode('Could not change OpenCode Auto mode. Retry or use Code.'); }
     finally { try { fs.rmSync(modeRequestFile, {force:true}); } catch {} modeBusy = false; }
   }, 250);
   modeTimer.unref?.();
@@ -73,15 +77,27 @@ export const AtrisManualSession = async ({client}) => {
   // A previous process's unanswered questions cannot be answered in a new CLI process.
   savePending();
   try { fs.rmSync(replyFile, {force:true}); } catch {}
+  try { fs.rmSync(replyErrorFile, {force:true}); } catch {}
+  let replyBusy = false;
   const replies = setInterval(async () => {
+    if (replyBusy) return;
     let reply;
     try { reply = JSON.parse(fs.readFileSync(replyFile, 'utf8')); } catch { return; }
     if (!reply || !pending.has(reply.id) || pending.get(reply.id).sessionID !== reply.sessionID) return;
+    replyBusy = true;
     try {
-      const result = await client.question.reply({path:{requestID:reply.id},body:{answers:reply.answers}});
-      if (result.error) return;
+      // The plugin receives the v1 SDK client, which has no question namespace.
+      // Use its configured transport so authentication and directory routing are preserved.
+      const result = await client._client.post({url:'/question/{requestID}/reply',path:{requestID:reply.id},query:{directory},body:{answers:reply.answers},headers:{'Content-Type':'application/json'}});
+      if (result.error || result.data !== true) throw new Error('OpenCode did not accept the answer.');
       pending.delete(reply.id); savePending(); activity('working'); fs.rmSync(replyFile, {force:true});
-    } catch { /* Keep the request visible; retry when the provider is ready. */ }
+    } catch {
+      try {
+        fs.writeFileSync(replyErrorFile+'.tmp', JSON.stringify({id:reply.id,sessionID:reply.sessionID,error:'OpenCode did not accept the answer. Retry or answer in Code.'}), {mode:0o600});
+        fs.renameSync(replyErrorFile+'.tmp', replyErrorFile);
+        fs.rmSync(replyFile, {force:true});
+      } catch { /* Keep the request for a later attempt if the error cannot be reported. */ }
+    } finally { replyBusy = false; }
   }, 250);
   replies.unref?.();
   let saved = {sessionId: null, messages: [], roles: {}};
@@ -126,8 +142,7 @@ export const AtrisManualSession = async ({client}) => {
       };
     } catch { /* Preserve the TUI route if the app's live route is unavailable. */ }
   }, "permission.ask": async (input, output) => {
-    // Never override explicit deny rules or another CLI's permission policy.
-    if (autoApprove && output.status === 'ask') output.status = 'allow';
+    // The native TUI owns Auto; never change the provider's permission rules here.
     if (input.sessionID === sessionId && output.status === 'ask') activity('attention');
   }, event: async ({event}) => {
     const info = event.properties?.info;
@@ -146,7 +161,16 @@ export const AtrisManualSession = async ({client}) => {
       pending.set(request.id, {id:request.id, sessionID:sessionId, questions:request.questions}); savePending(); return;
     }
     if (['question.replied','question.rejected'].includes(event.type) && event.properties?.requestID) {
-      if (pending.delete(event.properties.requestID)) { savePending(); activity('working'); } return;
+      if (pending.delete(event.properties.requestID)) { savePending(); activity('working'); }
+      try {
+        const queued = JSON.parse(fs.readFileSync(replyFile, 'utf8'));
+        if (queued.id === event.properties.requestID && queued.sessionID === sessionId) fs.rmSync(replyFile, {force:true});
+      } catch {}
+      try {
+        const failed = JSON.parse(fs.readFileSync(replyErrorFile, 'utf8'));
+        if (failed.id === event.properties.requestID) fs.rmSync(replyErrorFile, {force:true});
+      } catch {}
+      return;
     }
     if (event.type !== 'message.part.updated') return;
     const part = event.properties?.part;
@@ -350,7 +374,7 @@ export class ManualProviderBridge {
       const filename = path.join(this.directory(agent), 'opencode-auto-mode.json');
       if (fs.statSync(filename).size > 4096) return {available:false, enabled:false};
       const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
-      if (record.version !== 2 || typeof record.enabled !== 'boolean') return {available:false, enabled:false};
+      if (record.version !== 3 || typeof record.enabled !== 'boolean') return {available:false, enabled:false};
       return {available:true, enabled:record.enabled, ...(typeof record.error === 'string' ? {error:record.error} : {})};
     } catch { return {available:false, enabled:false}; }
   }
@@ -369,7 +393,7 @@ export class ManualProviderBridge {
     if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
     return {sessionId: record.sessionId, messages: Array.isArray(record.messages) ? record.messages.filter((m: any) => typeof m.id === 'string' && typeof m.text === 'string' && ['user','assistant','tool'].includes(m.role)) : []};
   }
-  pendingQuestions(agent: ManualAgent): Array<{id: string; questions: Array<{header: string; question: string; options: Array<{label: string; description?: string}>; multiple?: boolean; custom?: boolean}>}> {
+  pendingQuestions(agent: ManualAgent): Array<{id: string; questions: Array<{header: string; question: string; options: Array<{label: string; description?: string}>; multiple?: boolean; custom?: boolean}>; deliveryError?: string}> {
     if (agent.runtimeType !== 'opencode') return [];
     const sessionId = this.openCodeHistory(agent).sessionId;
     if (!sessionId) return [];
@@ -378,8 +402,14 @@ export class ManualProviderBridge {
       if (fs.statSync(filename).size > 65536) return [];
       const records = JSON.parse(fs.readFileSync(filename, 'utf8'));
       if (!Array.isArray(records)) return [];
+      let failure: any;
+      try {
+        const errorFile = path.join(this.directory(agent), 'opencode-question-error.json');
+        const {source, truncated} = readTail(errorFile, 4096);
+        if (!truncated) failure = JSON.parse(source);
+      } catch {}
       return records.filter((record: any) => record.sessionID === sessionId && typeof record.id === 'string' && Array.isArray(record.questions))
-        .map((record: any) => ({id:record.id, questions:record.questions.filter((question: any) => typeof question.question === 'string' && Array.isArray(question.options)).map((question: any) => ({header:String(question.header || ''), question:question.question, options:question.options.filter((option: any) => typeof option.label === 'string').map((option: any) => ({label:option.label, description:typeof option.description === 'string' ? option.description : undefined})), multiple:Boolean(question.multiple), custom:question.custom !== false}))}));
+        .map((record: any) => ({id:record.id, questions:record.questions.filter((question: any) => typeof question.question === 'string' && Array.isArray(question.options)).map((question: any) => ({header:String(question.header || ''), question:question.question, options:question.options.filter((option: any) => typeof option.label === 'string').map((option: any) => ({label:option.label, description:typeof option.description === 'string' ? option.description : undefined})), multiple:Boolean(question.multiple), custom:question.custom !== false})), ...(failure?.id === record.id && failure.sessionID === sessionId && typeof failure.error === 'string' ? {deliveryError:failure.error} : {})}));
     } catch { return []; }
   }
   replyQuestion(agent: ManualAgent, id: string, answers: string[][]): void {
@@ -389,6 +419,7 @@ export class ManualProviderBridge {
     if (!Array.isArray(answers) || answers.length !== question.questions.length || answers.some((answer, index) => !Array.isArray(answer) || !answer.length || (!question.questions[index].multiple && answer.length !== 1) || answer.some(value => typeof value !== 'string' || !value.trim() || value.length > 2000 || (!question.questions[index].custom && !question.questions[index].options.some(option => option.label === value))))) throw Object.assign(new Error('Select an answer for each question.'), {status:400});
     const filename = path.join(this.directory(agent), 'opencode-question-reply.json');
     if (fs.existsSync(filename)) throw Object.assign(new Error('An answer is already being delivered.'), {status:409});
+    fs.rmSync(path.join(this.directory(agent), 'opencode-question-error.json'), {force:true});
     fs.writeFileSync(filename, JSON.stringify({id, sessionID:this.openCodeHistory(agent).sessionId, answers}), {flag:'wx', mode:0o600});
   }
   read(agent: ManualAgent): {messages: ManualMessage[]; truncated: boolean; bound: boolean} {

@@ -265,6 +265,33 @@ pub async fn manual_stage_attachment(state: State<'_, ManualTerminals>, id: Stri
 pub async fn manual_attachment_preview(id: String, path: String) -> Result<Vec<u8>, String> {
     tauri::async_runtime::spawn_blocking(move || read_staged_image(&std::env::temp_dir(), &id, &path)).await.map_err(|e| e.to_string())?
 }
+#[tauri::command]
+pub async fn manual_project_image_preview(cwd: String, path: String) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_project_image(Path::new(&cwd), &path)).await.map_err(|e| e.to_string())?
+}
+fn read_project_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> {
+    if reference.is_empty() || reference.len() > 2048 || reference.chars().any(char::is_control) { return Err("Invalid image path".into()); }
+    let root = std::fs::canonicalize(root).map_err(|_| "Project is unavailable")?;
+    if !root.is_dir() { return Err("Project is unavailable".into()); }
+    let supplied = Path::new(reference);
+    let candidate = std::fs::canonicalize(if supplied.is_absolute() { supplied.to_path_buf() } else { root.join(supplied) })
+        .map_err(|_| "Image is unavailable")?;
+    if !candidate.starts_with(&root) { return Err("Image is outside this project".into()); }
+    let extension = candidate.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.as_str()) { return Err("Not a supported image".into()); }
+    let metadata = std::fs::metadata(&candidate).map_err(|_| "Image is unavailable")?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 8 * 1024 * 1024 { return Err("Image is unavailable or exceeds 8 MB".into()); }
+    let bytes = std::fs::read(&candidate).map_err(|_| "Image is unavailable")?;
+    let valid = match extension.as_str() {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()),
+        _ => false,
+    };
+    if !valid { return Err("Image format does not match its filename".into()); }
+    Ok(bytes)
+}
 fn read_staged_image(root: &Path, id: &str, path: &str) -> Result<Vec<u8>, String> {
     if id.len() != 36 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return Err("Invalid agent identity".into()); }
     let candidate = PathBuf::from(path);
@@ -337,6 +364,21 @@ mod tests {
         assert_eq!(read_staged_image(&root, id, image.to_str().unwrap()).unwrap(), b"image bytes");
         assert!(read_staged_image(&root, "00000000-0000-4000-8000-000000000002", image.to_str().unwrap()).is_err());
         assert!(read_staged_image(&root, id, stage_attachment_file(&directory, "private.txt", b"secret").unwrap().to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn project_image_preview_accepts_only_project_local_image_bytes() {
+        let root = std::env::temp_dir().join(format!("atris-project-image-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let project = root.join("workspace");
+        std::fs::create_dir_all(project.join("AtrisAgent")).unwrap();
+        let image = b"\x89PNG\r\n\x1a\npreview";
+        std::fs::write(project.join("AtrisAgent/screen.png"), image).unwrap();
+        std::fs::write(root.join("private.png"), image).unwrap();
+        std::fs::write(project.join("not-image.png"), b"private data").unwrap();
+        assert_eq!(read_project_image(&project, "AtrisAgent/screen.png").unwrap(), image.to_vec());
+        assert_eq!(read_project_image(&project, project.join("AtrisAgent/screen.png").to_str().unwrap()).unwrap(), image.to_vec());
+        assert!(read_project_image(&project, "../private.png").is_err());
+        assert!(read_project_image(&project, "not-image.png").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -92,7 +92,7 @@ function normalizeReleasePlatform(platform: string): ReleasePlatform | null {
 
 export function configuredReleasePlatforms(): ReleasePlatform[] {
   const configured = process.env.AGENT_RELEASE_PLATFORMS?.trim();
-  if (!configured) return ["windows"];
+  if (!configured) return ["windows", "linux"];
   const platforms = configured
     .split(",")
     .map((platform) => normalizeReleasePlatform(platform.trim()))
@@ -263,6 +263,7 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
         }
         asset = eligibleAssets
           .filter((candidate) => matchesPlatformAsset(assetOrPlatform, candidate.name))
+          .filter((candidate) => assetOrPlatform !== "linux-deb" || candidate.name.toLowerCase().endsWith(".deb"))
           .sort((first, second) => assetPriority(assetOrPlatform, second.name) - assetPriority(assetOrPlatform, first.name))[0];
         if (!asset) {
           return response.status(404).send(`No AtrisAgent release asset found for platform: ${assetOrPlatform}`);

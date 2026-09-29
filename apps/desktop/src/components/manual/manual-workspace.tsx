@@ -206,11 +206,11 @@ export function ManualWorkspace() {
     // Let the user finish the CLI's own trust/login/permission prompts in its real terminal.
     if (showCode) setSurface(target.conversationId, 'code');
   };
-  const action = async (label: string, run: () => Promise<unknown>) => {
-    if (actionPending.current) return;
+  const action = async (label: string, run: () => Promise<unknown>): Promise<boolean> => {
+    if (actionPending.current) return false;
     actionPending.current = true;
     setPending(label); setError(null);
-    try { await run(); } catch (e) { setError(errorText(e)); } finally { setPending(null); actionPending.current = false; }
+    try { await run(); return true; } catch (e) { setError(errorText(e)); return false; } finally { setPending(null); actionPending.current = false; }
   };
   const created = async (targets: ManualAgent[]) => {
     setCreating(false); setAdding(false); setError(null);
@@ -243,9 +243,9 @@ export function ManualWorkspace() {
     await invoke('manual_terminal_close', { id: target.id }); lifecycleEpoch.current += 1; markManualClosed(target.id);
     setStatuses(previous => ({ ...previous, [target.id]: 'closed' })); await launch(target);
   });
-  const applyModel = (model: DiscoveredModel, independent: boolean, reasoning?: string) => {
-    if (!agent || !native) return;
-    void action('model', async () => {
+  const applyModel = (model: DiscoveredModel, independent: boolean, reasoning?: string): Promise<boolean> => {
+    if (!agent || !native) return Promise.resolve(false);
+    return action('model', async () => {
       if (independent) {
         const created = await useManualStore.getState().addAgent(agent.conversationId, undefined, model.catalogId, crypto.randomUUID(), reasoning);
         await launch(created, !supportsChat(created.runtimeType));
@@ -318,7 +318,7 @@ export function ManualWorkspace() {
               {!bound && <div role="status" className="flex items-start gap-3 rounded-xl bg-muted/40 px-4 py-3"><Code2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" /><p className="text-xs leading-5 text-muted-foreground">Connect this CLI’s history to see its replies here.{agent.runtimeType === 'codex' ? ' Review the AtrisAgent hook in /hooks.' : agent.runtimeType === 'antigravity' ? ' Reopen older agents once to enable their dedicated session link, then send a message.' : ' Complete CLI setup in Code and send your first message.'}<button className="ml-2 font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>Open terminal</button></p></div>}
               {truncated && <p className="text-xs text-muted-foreground">Showing recent messages from this long session.</p>}
               {!messages.length && <div className="py-8"><RuntimeBrandIcon runtimeId={agent.runtimeType} className="mb-4 h-9 w-9 text-foreground" /><h3 className="text-xl font-semibold tracking-tight">What would you like to work on?</h3><p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">Message {agent.name}, choose a model in the composer, or open Code for the live terminal. Each agent keeps its own conversation.</p><div className="mt-5 flex flex-wrap gap-2">{['Explore this project', 'Review recent changes', 'Help me plan a task'].map(prompt => <Button key={prompt} size="sm" variant="outline" className="rounded-full text-xs" onClick={() => setDraft(agent.id, prompt)}>{prompt}</Button>)}</div></div>}
-               {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : agent.name}</p><ManualChatContent text={message.text} agentId={agent.id} user={message.role === 'user'} /></article>)}
+                {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : agent.name}</p><ManualChatContent text={message.text} agentId={agent.id} cwd={agent.cwd} user={message.role === 'user'} /></article>)}
                {unresolvedQuestion && !questions.length && <ManualQuestionCard key={unresolvedQuestion.id} request={unresolvedQuestion} onOpenCode={() => setSurface(conversation.id, 'code')} />}
                {questions.map(question => <ManualQuestionCard key={question.id} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
                {live && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}

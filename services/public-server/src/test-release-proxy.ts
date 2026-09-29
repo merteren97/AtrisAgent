@@ -28,10 +28,10 @@ async function main() {
     assetPriority("windows-x86_64", "AtrisAgent-setup.exe") > assetPriority("windows-x86_64", "AtrisAgent.msi"),
     "Windows setup exe should be preferred.",
   );
-  assertStrict.deepEqual(configuredReleasePlatforms(), ["windows"], "Windows must be the default supported release platform.");
+   assertStrict.deepEqual(configuredReleasePlatforms(), ["windows", "linux"], "Published Windows and Linux releases should be supported by default.");
   assert(isAllowedReleaseAsset({ id: 101, name: "AtrisAgent-setup.exe" }), "Main installer should be downloadable.");
   assert(!isAllowedReleaseAsset({ id: 102, name: "AtrisAgent-setup.exe.sig" }), "Signature assets must not be directly downloadable.");
-  assert(!isAllowedReleaseAsset({ id: 201, name: "AtrisAgent.AppImage" }), "Linux assets must stay disabled by default.");
+   assert(isAllowedReleaseAsset({ id: 201, name: "AtrisAgent.AppImage" }), "Published Linux assets must be downloadable by default.");
   assert(isAllowedReleaseAsset({ id: 201, name: "AtrisAgent.AppImage" }, ["linux"]), "Explicit Linux allowlist should remain testable.");
   assert(semverCompare("0.2.0", "0.1.9") > 0, "Newer semantic version should compare higher.");
   assert(
@@ -51,7 +51,8 @@ async function main() {
     assets: [
       { id: 101, name: "AtrisAgent_0.2.0_x64-setup.exe" },
       { id: 102, name: "AtrisAgent_0.2.0_x64-setup.exe.sig" },
-      { id: 201, name: "AtrisAgent_0.2.0_x64.AppImage" },
+       { id: 201, name: "AtrisAgent_0.2.0_x64.AppImage" },
+       { id: 202, name: "AtrisAgent_0.2.0_amd64.deb" },
     ],
   };
 
@@ -68,6 +69,9 @@ async function main() {
       });
     }
     if (url.endsWith("/releases/assets/102")) return new Response("signed-update-value");
+    if (url.endsWith("/releases/assets/201") || url.endsWith("/releases/assets/202")) {
+      return new Response(null, { status: 302, headers: { Location: "https://release-assets.githubusercontent.com/atris-agent-linux" } });
+    }
     return new Response("not found", { status: 404 });
   };
 
@@ -141,10 +145,12 @@ async function main() {
     assert(currentResponse.status === 204, "Current version should return no update.");
     const missingResponse = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/unknown-platform`);
     assert(missingResponse.status === 404, "Unknown platform should return a controlled 404.");
-    const linuxResponse = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/linux`);
-    assert(linuxResponse.status === 404, "Linux downloads must remain unavailable while the runtime is Windows-only.");
+    const linuxResponse = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/linux`, { redirect: "manual" });
+    assert(linuxResponse.status === 302, "Linux AppImage should redirect to the published asset.");
+    const debResponse = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/linux-deb`, { redirect: "manual" });
+    assert(debResponse.status === 302, "Linux deb should redirect to the published asset.");
     const linuxUpdateResponse = await fetch(`http://127.0.0.1:${port}/api/agent-github/update/linux-x86_64/0.1.0`);
-    assert(linuxUpdateResponse.status === 204, "Linux updater metadata must remain unavailable while unsupported.");
+    assert(linuxUpdateResponse.status === 204, "Unsigned Linux updates should not be offered.");
     const missingSignatureResponse = await fetch(`http://127.0.0.1:${port}/missing-signature/api/agent-github/update/windows-x86_64/0.1.0`);
     assert(missingSignatureResponse.status === 204, "Unsigned update should not be offered.");
     const upstreamFailureResponse = await fetch(`http://127.0.0.1:${port}/upstream-failure/api/agent-github/download/win`);

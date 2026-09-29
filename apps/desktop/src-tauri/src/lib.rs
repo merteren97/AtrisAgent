@@ -389,6 +389,7 @@ pub fn run() {
             manual_terminal::manual_terminal_write,
             manual_terminal::manual_stage_attachment,
             manual_terminal::manual_attachment_preview,
+            manual_terminal::manual_project_image_preview,
             manual_terminal::manual_terminal_resize,
             manual_terminal::manual_terminal_close,
             store_local_secret,
