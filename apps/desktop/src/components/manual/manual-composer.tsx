@@ -59,9 +59,10 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }) {
   </div>;
 }
 
-export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply }: {
+export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, routeStatus, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply }: {
   agent: ManualAgent; agents: ManualAgent[]; live: boolean; native: boolean; pending: boolean;
   autoApprove?: OpenCodeAutoApprove; onAutoApprove?: (enabled: boolean) => Promise<void>;
+  routeStatus?: {pending: boolean; error?: string};
   draft: string; files: File[]; onDraft: (value: string) => void; onAddFiles: (files: File[]) => void; onRemoveFile: (file: File) => void;
   onSend: () => void; onMemory: () => void; onApply: (model: DiscoveredModel, independent: boolean, reasoning?: string) => Promise<boolean>;
 }) {
@@ -110,6 +111,8 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
     </div>
     <p className="mx-auto mt-2 max-w-3xl px-2 text-[10px] text-muted-foreground">{agent.name} · {live ? 'CLI open' : 'Offline'}{agent.runtimeType === 'opencode' && autoApprove?.enabled ? ' · Auto-approve on' : ''} · Shift+Enter for a new line · Drag the handle to resize</p>
     {requestedMode === null && (modeError || autoApprove?.error) && <p role="alert" className="mx-auto max-w-3xl px-2 text-xs text-destructive">{modeError || autoApprove?.error}</p>}
+    {live && routeStatus?.error && <p role="alert" className="mx-auto max-w-3xl px-2 text-xs text-destructive">{routeStatus.error}</p>}
+    {live && routeStatus?.pending && !routeStatus.error && <p role="status" className="mx-auto max-w-3xl px-2 text-[10px] text-muted-foreground">CLI selection is syncing… Active turns keep their current reasoning; a different model is restored after its next message.</p>}
     {preview && <ImageLightbox file={preview} onClose={() => setPreview(null)} />}
   </form>;
 }

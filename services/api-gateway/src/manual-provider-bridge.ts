@@ -4,6 +4,7 @@ import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { ManualAgent, ManualMessage, ManualQuestion } from './manual-conversations';
+import { MANUAL_OPENCODE_TUI } from './manual-opencode-tui';
 
 const MARKER = '// AtrisAgent managed manual session bridge v1';
 const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
@@ -41,35 +42,8 @@ export const AtrisManualSession = async ({client, directory}) => {
   const pendingFile = path.join(root, 'opencode-questions.json');
   const replyFile = path.join(root, 'opencode-question-reply.json');
   const replyErrorFile = path.join(root, 'opencode-question-error.json');
-  const modeFile = path.join(root, 'opencode-auto-mode.json');
-  const modeRequestFile = path.join(root, 'opencode-auto-request.json');
   const routeFile = path.join(root, 'opencode-route.json');
   const activityFile = path.join(root, 'opencode-activity.json');
-  let autoApprove = false;
-  let modeBusy = false;
-  const saveMode = (error) => {
-    try { fs.writeFileSync(modeFile+'.tmp', JSON.stringify({version:3, enabled:autoApprove, ...(error ? {error} : {})}), {mode:0o600}); fs.renameSync(modeFile+'.tmp', modeFile); } catch {}
-  };
-  try { fs.rmSync(modeRequestFile, {force:true}); } catch {}
-  saveMode();
-  const modeTimer = setInterval(async () => {
-    if (modeBusy) return;
-    let request;
-    try { request = JSON.parse(fs.readFileSync(modeRequestFile, 'utf8')); } catch { return; }
-    if (typeof request?.enabled !== 'boolean') return;
-    modeBusy = true;
-    try {
-      // The TUI owns Auto mode. Only toggle it when our last confirmed state differs.
-      if (autoApprove !== request.enabled) {
-        const result = await client.tui.executeCommand({body:{command:'permission.mode'}});
-        if (result.error || result.data !== true) throw new Error('OpenCode did not accept the mode change.');
-        autoApprove = request.enabled;
-      }
-      saveMode();
-    } catch { saveMode('Could not change OpenCode Auto mode. Retry or use Code.'); }
-    finally { try { fs.rmSync(modeRequestFile, {force:true}); } catch {} modeBusy = false; }
-  }, 250);
-  modeTimer.unref?.();
   const pending = new Map();
   const savePending = () => {
     try { fs.writeFileSync(pendingFile+'.tmp', JSON.stringify([...pending.values()]), {mode: 0o600}); fs.renameSync(pendingFile+'.tmp', pendingFile); } catch {}
@@ -354,9 +328,12 @@ export class ManualProviderBridge {
     fs.rmSync(path.join(directory, 'opencode-auto-request.json'), {force:true});
     this.updateOpenCodeRoute(agent);
     const plugin = path.join(directory, `manual-plugin-${createHash('sha256').update(OPENCODE_SOURCE).digest('hex').slice(0,16)}.mjs`); writeManaged(plugin, OPENCODE_SOURCE);
+    const tuiPlugin = path.join(directory, `manual-tui-${createHash('sha256').update(MANUAL_OPENCODE_TUI).digest('hex').slice(0,16)}.mjs`); writeManaged(tuiPlugin, MANUAL_OPENCODE_TUI);
+    const tuiConfig = path.join(directory, 'tui.json');
+    writeManaged(tuiConfig, '// AtrisAgent managed manual session bridge v1\n'+JSON.stringify({$schema:'https://opencode.ai/tui.json',plugin:[[pathToFileURL(tuiPlugin).href,{model:agent.model}]]}));
     const history = this.openCodeHistory(agent);
     // Merge inherited configuration inside the native launcher. Never send its possibly-secret contents to the UI.
-    return {args: [...(history.sessionId ? ['--session', history.sessionId] : []), '--model', agent.model], env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href}};
+    return {args: [...(history.sessionId ? ['--session', history.sessionId] : []), '--model', agent.model], env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href, ATRIS_MANUAL_OPENCODE_TUI_CONFIG:tuiConfig, XDG_STATE_HOME:path.join(directory,'state')}};
   }
   updateOpenCodeRoute(agent: ManualAgent): void {
     if (agent.runtimeType !== 'opencode' || !/^[^/]+\/.+$/.test(agent.model)) throw new Error('Invalid OpenCode model route.');
@@ -365,7 +342,7 @@ export class ManualProviderBridge {
     for (const target of [filename, filename+'.tmp']) {
       if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) throw new Error('Manual route path must not be a symbolic link.');
     }
-    fs.writeFileSync(filename+'.tmp', JSON.stringify({model:agent.model, reasoning:agent.reasoning || null}), {mode:0o600});
+    fs.writeFileSync(filename+'.tmp', JSON.stringify({id:randomUUID(), model:agent.model, reasoning:agent.reasoning || null}), {mode:0o600});
     fs.renameSync(filename+'.tmp', filename);
   }
   autoApprove(agent: ManualAgent): {available: boolean; enabled: boolean; error?: string} {
@@ -374,16 +351,26 @@ export class ManualProviderBridge {
       const filename = path.join(this.directory(agent), 'opencode-auto-mode.json');
       if (fs.statSync(filename).size > 4096) return {available:false, enabled:false};
       const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
-      if (record.version !== 3 || typeof record.enabled !== 'boolean') return {available:false, enabled:false};
+      if (record.version !== 4 || typeof record.enabled !== 'boolean' || typeof record.at !== 'number' || Date.now()-record.at > 10000) return {available:false, enabled:false};
       return {available:true, enabled:record.enabled, ...(typeof record.error === 'string' ? {error:record.error} : {})};
     } catch { return {available:false, enabled:false}; }
+  }
+  openCodeRouteStatus(agent: ManualAgent): {pending: boolean; error?: string} | undefined {
+    if (agent.runtimeType !== 'opencode') return undefined;
+    try {
+      const root = this.directory(agent);
+      const route = JSON.parse(fs.readFileSync(path.join(root,'opencode-route.json'),'utf8'));
+      const state = JSON.parse(fs.readFileSync(path.join(root,'opencode-route-state.json'),'utf8'));
+      if (state.id !== route.id) return {pending:true};
+      return {pending:state.applied !== true,...(typeof state.error === 'string' ? {error:state.error} : {})};
+    } catch { return {pending:true}; }
   }
   setAutoApprove(agent: ManualAgent, enabled: unknown): void {
     if (agent.runtimeType !== 'opencode' || typeof enabled !== 'boolean') throw Object.assign(new Error('Invalid OpenCode permission mode.'), {status:400});
     if (!this.autoApprove(agent).available) throw Object.assign(new Error('Open this OpenCode agent before changing permissions.'), {status:409});
     const filename = path.join(this.directory(agent), 'opencode-auto-request.json');
     if (fs.existsSync(filename)) throw Object.assign(new Error('Permission mode is already changing.'), {status:409});
-    fs.writeFileSync(filename, JSON.stringify({id:randomUUID(),enabled}), {flag:'wx',mode:0o600});
+    fs.writeFileSync(filename, JSON.stringify({id:randomUUID(),enabled,at:Date.now()}), {flag:'wx',mode:0o600});
   }
   private openCodeHistory(agent: ManualAgent): {sessionId: string | null; messages: ManualMessage[]} {
     const filename = path.join(this.directory(agent), 'opencode-history.json');

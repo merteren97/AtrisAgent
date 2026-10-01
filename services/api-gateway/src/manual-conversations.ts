@@ -135,13 +135,13 @@ export class ManualConversationStore {
   markMemoryProcessed(agentId: string, sourceId: string): void {
     this.sqlite.prepare('INSERT OR IGNORE INTO manual_memory_receipts VALUES (?, ?)').run(agentId, sourceId);
   }
-  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate } {
+  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate } {
     const agent = this.agent(id);
     const result = agent.runtimeType === 'antigravity'
       ? {supported:true,...new ManualAntigravityBridge(this.dataDir).read(agent)}
       : readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
     const bridge = new ManualProviderBridge(this.dataDir);
-    return { ...result, questions: bridge.pendingQuestions(agent), autoApprove: agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined, naming: this.syncTitles(id, result.bound ? result.messages : []) };
+    return { ...result, questions: bridge.pendingQuestions(agent), autoApprove: agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined, routeStatus:bridge.openCodeRouteStatus(agent), naming: this.syncTitles(id, result.bound ? result.messages : []) };
   }
   needsTitle(id: string): boolean {
     const agent = this.agent(id);

@@ -5,7 +5,11 @@ import { FitAddon } from '@xterm/addon-fit';
 import { useTheme } from 'next-themes';
 import '@xterm/xterm/css/xterm.css';
 
-export interface TerminalSnapshot { id: string; status: 'open' | 'closed' | 'exited' | 'disconnected'; sequence: number; output: string; reset: boolean }
+export interface TerminalSnapshot {
+  id: string; status: 'open' | 'closed' | 'exited' | 'disconnected'; sequence: number; output: string; reset: boolean;
+  columns?: number; rows?: number;
+  resizes?: { offset: number; columns: number; rows: number }[];
+}
 
 // The emulator, including device/cursor replies, lives beyond any React view.
 // A background CLI must not wait for a user to reopen its Code pane.
@@ -20,88 +24,92 @@ function createEngine(id: string) {
   document.body.appendChild(parking); parking.appendChild(container);
   const terminal = new Terminal({ cols: 120, rows: 30, cursorBlink: true, fontSize: 13,
     fontFamily: 'Cascadia Mono, Consolas, monospace', scrollback: 5000, allowProposedApi: false,
-    // ConPTY already performs wrapping. Normal Unix reflow can duplicate or
-    // scatter a full-screen CLI when panes change size (same policy as AtrisWork).
+    // Use ConPTY's row-growth policy. Width reflow still follows xterm's defaults.
     windowsPty: /Windows/i.test(navigator.userAgent) ? { backend: 'conpty' } : undefined });
   const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
   let disposed = false; let after = 0; let status = 'disconnected'; let size = ''; let epoch = 0;
   let error: string | null = null; let timer: ReturnType<typeof setTimeout>;
   let writes = Promise.resolve();
-  let resizing = false; let frame = 0;
-  let resizePending = Promise.resolve();
-  let pollPending = Promise.resolve();
+  let frame = 0;
+  let operations = Promise.resolve();
   const listeners = new Set<(error: string | null) => void>();
   const update = (value: string | null) => { error = value; listeners.forEach(listener => listener(error)); };
-  const flushResize = async () => {
-    if (resizing || disposed || status !== 'open' || container.parentElement === parking) return;
-    resizing = true;
-    try {
-      while (!disposed && status === 'open') {
-        const next = terminal.cols+':'+terminal.rows;
-        if (next === size) break;
-        const resizeEpoch = epoch;
-        await invoke('manual_terminal_resize', { id, columns: terminal.cols, rows: terminal.rows });
-        if (resizeEpoch !== epoch) break;
-        size = next;
-      }
-    } catch (e) { if (!disposed) update(String(e)); }
-    finally { resizing = false; }
+  // Parsing, geometry changes and resets share one queue. In particular, a reset
+  // cannot run halfway through an asynchronous xterm write from the previous CLI.
+  const enqueue = (run: () => Promise<void> | void) => {
+    operations = operations.then(run).catch(e => { if (!disposed) update(String(e)); });
+    return operations;
   };
   const resize = () => {
     if (frame || disposed || container.parentElement === parking) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
-      // Never change the xterm buffer width while a CLI frame is still parsing.
-      resizePending = resizePending.then(async () => {
-        await pollPending;
-        if (disposed || container.parentElement === parking || !container.clientWidth || !container.clientHeight) return;
+      const resizeEpoch = epoch;
+      void enqueue(async () => {
+        if (disposed || resizeEpoch !== epoch || status === 'disconnected' || container.parentElement === parking || !container.clientWidth || !container.clientHeight) return;
         const proposed = fit.proposeDimensions();
         if (!proposed) return;
         // Keep emulator dimensions identical to the native PTY's safety limits.
         const cols = Math.min(500, Math.max(2, proposed.cols)), rows = Math.min(300, Math.max(2, proposed.rows));
         if (terminal.cols !== cols || terminal.rows !== rows) terminal.resize(cols, rows);
-        await flushResize();
+        const next = cols+':'+rows;
+        if (status === 'open' && next !== size) {
+          await invoke('manual_terminal_resize', { id, columns: cols, rows });
+          if (disposed || resizeEpoch !== epoch) return;
+          size = next;
+        }
         if (!disposed && container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
-      }).catch(e => { if (!disposed) update(String(e)); });
+      });
     });
   };
   const input = terminal.onData(data => {
     if (status !== 'open') return;
-    writes = writes.then(() => disposed ? undefined : invoke<void>('manual_terminal_write', { id, data, paste: false })).catch(e => { if (!disposed) update(String(e)); });
+    const inputEpoch = epoch;
+    writes = writes.then(() => disposed || inputEpoch !== epoch ? undefined : invoke<void>('manual_terminal_write', { id, data, paste: false })).catch(e => { if (!disposed) update(String(e)); });
   });
   const poll = async () => {
     const pollEpoch = epoch;
     try {
-      await resizePending;
-      if (disposed || pollEpoch !== epoch) return;
-      pollPending = (async () => {
+      await enqueue(async () => {
+        if (disposed || pollEpoch !== epoch) return;
         const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after });
         if (disposed || pollEpoch !== epoch) return;
         status = snapshot.status;
         if (snapshot.reset) terminal.reset();
-        if (snapshot.output) {
-          await new Promise<void>(resolve => terminal.write(snapshot.output, resolve));
-          // Reparenting a hidden background terminal can leave WebView's canvas stale
-          // even after xterm has parsed the latest full-screen TUI frame.
-          if (container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
+        // A replay may span several native grids. Apply each resize at its stream
+        // boundary rather than interpreting all historical cursor moves at today's size.
+        let offset = 0;
+        const write = async (text: string) => { if (text) await new Promise<void>(resolve => terminal.write(text, resolve)); };
+        for (const geometry of snapshot.resizes || []) {
+          await write(snapshot.output.slice(offset, geometry.offset));
+          if (disposed || pollEpoch !== epoch) return;
+          terminal.resize(geometry.columns, geometry.rows);
+          offset = geometry.offset;
         }
+        await write(snapshot.output.slice(offset));
         if (disposed || pollEpoch !== epoch) return;
+        if (snapshot.columns && snapshot.rows) size = snapshot.columns+':'+snapshot.rows;
+        if ((snapshot.output || snapshot.resizes?.length) && container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
         after = snapshot.sequence;
         update(status === 'open' ? null : 'Agent '+status+'. Use Open agent to reconnect.');
         resize();
-      })();
-      await pollPending;
+      });
     } catch (e) { if (!disposed) update(String(e)); }
-    finally { if (!disposed) timer = setTimeout(poll, status === 'open' ? 120 : 1500); }
+    finally { if (!disposed && pollEpoch === epoch) timer = setTimeout(poll, status === 'open' ? 120 : 1500); }
   };
   void poll();
   void document.fonts?.ready.then(() => resize());
   return { terminal, container, resize,
-    attach(root: HTMLElement) { if (disposed) return; root.appendChild(container); size = ''; resize(); },
+    attach(root: HTMLElement) { if (disposed) return; root.appendChild(container); resize(); },
     park() { if (disposed) return; parking.style.width = `${container.clientWidth || 960}px`; parking.style.height = `${container.clientHeight || 600}px`; parking.appendChild(container); },
-    restart() { epoch += 1; after = 0; status = 'disconnected'; size = ''; terminal.reset(); update(null); },
+    restart() {
+      epoch += 1; after = 0; status = 'disconnected'; size = ''; clearTimeout(timer);
+      const restartEpoch = epoch;
+      void enqueue(() => { if (!disposed && restartEpoch === epoch) { terminal.reset(); update(null); } });
+      void poll();
+    },
     subscribe(listener: (error: string | null) => void) { listeners.add(listener); listener(error); return () => { listeners.delete(listener); }; },
-    dispose() { disposed = true; clearTimeout(timer); cancelAnimationFrame(frame); input.dispose(); terminal.dispose(); parking.remove(); listeners.clear(); },
+    dispose() { disposed = true; clearTimeout(timer); cancelAnimationFrame(frame); input.dispose(); terminal.dispose(); container.remove(); parking.remove(); listeners.clear(); },
   };
 }
 

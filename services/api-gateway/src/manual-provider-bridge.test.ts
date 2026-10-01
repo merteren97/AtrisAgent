@@ -78,7 +78,14 @@ try {
   const commands: unknown[] = [];
   let acceptMode = true;
   let failReply = false;
-  const observer = await plugin.AtrisManualSession({directory:temporary,client:{_client:{post:async (value: unknown) => { replies.push(value); return failReply ? {error:{message:'Unavailable'}} : {data:true}; }},tui:{executeCommand:async (value: unknown) => { commands.push(value); return {data:acceptMode}; }}}});
+  const observer = await plugin.AtrisManualSession({directory:temporary,client:{_client:{post:async (value: unknown) => { replies.push(value); return failReply ? {error:{message:'Unavailable'}} : {data:true}; }}}});
+  assert.equal(bridge.autoApprove(openAgent).available,false,'A server observer cannot confirm the native TUI mode');
+  const tuiConfig = fs.readFileSync(prepared.env.ATRIS_MANUAL_OPENCODE_TUI_CONFIG,'utf8').split('\n').slice(1).join('\n');
+  const tuiPlugin = await import(JSON.parse(tuiConfig).plugin[0][0]);
+  let nativeAuto = false;
+  let disposeTui: () => void = () => {};
+  await tuiPlugin.tui({state:{ready:true,path:{state:temporary},provider:[]},route:{current:{name:'home'},register:()=>()=>{}},ui:{dialog:{open:false}},keymap:{getCommandEntries:()=>[{command:{name:'permission.mode',title:nativeAuto ? 'Disable auto-approve permissions' : 'Enable auto-approve permissions'}}],dispatchCommand:async (command: string)=>{commands.push(command);if(acceptMode)nativeAuto=!nativeAuto;}},lifecycle:{onDispose:(callback:()=>void)=>{disposeTui=callback;}}});
+  await new Promise(resolve=>setTimeout(resolve,350));
   assert.deepEqual(bridge.autoApprove(openAgent),{available:true,enabled:false});
   assert.deepEqual(bridge.autoApprove({...openAgent,id:randomUUID()}),{available:false,enabled:false}, 'Permission mode belongs to this agent only');
   assert.throws(() => bridge.setAutoApprove(openAgent,'true'), /Invalid OpenCode/);
@@ -92,7 +99,7 @@ try {
   assert.throws(() => bridge.setAutoApprove(openAgent,false), /already changing/);
   await new Promise(resolve=>setTimeout(resolve,350));
   assert.deepEqual(bridge.autoApprove(openAgent),{available:true,enabled:true});
-  assert.deepEqual(commands,[{body:{command:'permission.mode'}}], 'The native OpenCode TUI enters Auto mode');
+  assert.deepEqual(commands,['permission.mode'], 'The TUI dispatches its actual command rather than the legacy HTTP alias map');
   assert.equal(await permission('ask'),'ask','The plugin never overrides OpenCode permission rules');
   assert.equal(await permission('deny'),'deny','Explicit denials remain authoritative');
   bridge.setAutoApprove(openAgent,false);
@@ -100,6 +107,11 @@ try {
   assert.deepEqual(bridge.autoApprove(openAgent),{available:true,enabled:false});
   assert.equal(commands.length,2,'Disabling Auto toggles the native TUI back to normal');
   assert.equal(await permission('ask'),'ask','Disabling restores the normal permission flow');
+  nativeAuto = true;
+  await new Promise(resolve=>setTimeout(resolve,350));
+  assert.equal(bridge.autoApprove(openAgent).enabled,true,'Changing Auto directly in Code is reflected back in Chat');
+  nativeAuto = false;
+  await new Promise(resolve=>setTimeout(resolve,350));
   await observer.event({event:{type:'session.created',properties:{info:{id:'ses_root'}}}});
   await new Promise(resolve=>setTimeout(resolve,120));
   assert.equal(bridge.activity(openAgent).state,'ready');
@@ -180,6 +192,7 @@ try {
   await observer.event({event:{type:'session.idle',properties:{sessionID:'ses_root'}}});
   assert.equal(bridge.activity(openAgent).state,'completed');
   assert.equal(bridge.activity({...openAgent,id:randomUUID()}).state,'unknown');
+  disposeTui();
   assert.deepEqual(bridge.prepareOpenCode(openAgent).args.slice(0,2),['--session','ses_root']);
   assert.equal(bridge.activity(openAgent).state,'unknown','Restart does not reuse a previous turn notification');
   assert.deepEqual(bridge.autoApprove(openAgent),{available:false,enabled:false}, 'A restarted TUI never inherits a stale permission indicator');
