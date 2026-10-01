@@ -5,15 +5,42 @@ use std::{collections::{HashMap, VecDeque}, io::{Read, Write}, sync::{Arc, Mutex
 use tauri::State;
 
 const REPLAY_LIMIT: usize = 1024 * 1024;
-struct Replay { chunks: VecDeque<(u64, String)>, sequence: u64, bytes: usize, ended: bool }
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geometry { columns: u16, rows: u16 }
+const INITIAL_GEOMETRY: Geometry = Geometry { columns: 120, rows: 30 };
+#[derive(Serialize, Debug, PartialEq)]
+struct ReplayResize { offset: usize, columns: u16, rows: u16 }
+struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, bytes: usize, ended: bool, geometry: Geometry }
 impl Replay {
+    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY } }
     fn push(&mut self, text: String) {
         self.sequence += 1;
         self.bytes += text.len();
-        self.chunks.push_back((self.sequence, text));
-        while self.bytes > REPLAY_LIMIT && self.chunks.len() > 1 {
-            if let Some((_, value)) = self.chunks.pop_front() { self.bytes -= value.len(); }
+        self.chunks.push_back((self.sequence, text, self.geometry));
+        while (self.bytes > REPLAY_LIMIT || self.chunks.len() > 4096) && self.chunks.len() > 1 {
+            if let Some((_, value, _)) = self.chunks.pop_front() { self.bytes -= value.len(); }
         }
+    }
+    fn resized(&mut self, geometry: Geometry) {
+        self.geometry = geometry;
+        // A resize is an ordered replay event, even if the CLI hasn't emitted a repaint yet.
+        self.push(String::new());
+    }
+    fn output_after(&self, after: u64, reset: bool) -> (String, Vec<ReplayResize>) {
+        let mut output = String::new();
+        let mut resizes = Vec::new();
+        let mut geometry = None;
+        let mut offset = 0;
+        for (_, text, size) in self.chunks.iter().filter(|(seq, _, _)| reset || *seq > after) {
+            if geometry != Some(*size) {
+                resizes.push(ReplayResize { offset, columns: size.columns, rows: size.rows });
+                geometry = Some(*size);
+            }
+            // Offsets are JavaScript string positions, not UTF-8 byte offsets.
+            offset += text.encode_utf16().count();
+            output.push_str(text);
+        }
+        (output, resizes)
     }
 }
 struct Terminal {
@@ -64,7 +91,7 @@ impl ManualTerminals {
 pub struct Launch { id: String, executable: String, args: Vec<String>, cwd: String, #[serde(default)] env: HashMap<String, String> }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Snapshot { id: String, status: String, sequence: u64, output: String, reset: bool }
+pub struct Snapshot { id: String, status: String, sequence: u64, output: String, reset: bool, columns: u16, rows: u16, resizes: Vec<ReplayResize> }
 
 fn close(terminal: &mut Terminal) -> Result<(), String> {
     if terminal.closed { return Ok(()); }
@@ -103,7 +130,7 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
         if !existing.closed && matches!(existing.child.try_wait(), Ok(None)) { return Ok(()); }
         close(existing)?;
     }
-    let pair = native_pty_system().openpty(PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
+    let pair = native_pty_system().openpty(PtySize { rows: INITIAL_GEOMETRY.rows, cols: INITIAL_GEOMETRY.columns, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
     let extension = Path::new(&request.executable).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let mut command = if cfg!(windows) && ["cmd", "bat", "ps1"].contains(&extension.as_str()) {
         // Data travels in environment variables, never interpolated into PowerShell source.
@@ -118,6 +145,11 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     command.cwd(&request.cwd);
     command.env("TERM", "xterm-256color");
     for (key, value) in request.env {
+        if key == "ATRIS_MANUAL_OPENCODE_TUI_CONFIG" {
+            let config_file = prepare_tui_config(&value, std::env::var("OPENCODE_TUI_CONFIG").ok().as_deref())?;
+            command.env("OPENCODE_TUI_CONFIG", config_file);
+            continue;
+        }
         if key == "ATRIS_MANUAL_OPENCODE_PLUGIN" {
             let mut config: serde_json::Value = match std::env::var("OPENCODE_CONFIG_CONTENT") {
                 Ok(value) => serde_json::from_str(&value).map_err(|_| "Inherited OpenCode configuration is not valid JSON")?,
@@ -130,7 +162,7 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
             command.env("OPENCODE_CONFIG_CONTENT", serde_json::to_string(&config).map_err(|_| "Could not prepare OpenCode configuration")?);
             continue;
         }
-        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
+        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
         command.env(key, value);
     }
     // Acquire handles before spawn so a handle error cannot orphan a newly started CLI.
@@ -138,7 +170,7 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
     let child = pair.slave.spawn_command(command).map_err(|e| e.to_string())?;
     drop(pair.slave);
-    let replay = Arc::new(Mutex::new(Replay { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false }));
+    let replay = Arc::new(Mutex::new(Replay::new()));
     let output = replay.clone();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 8192];
@@ -188,7 +220,8 @@ pub async fn manual_terminal_snapshot(state: State<'_, ManualTerminals>, id: Str
     tauri::async_runtime::spawn_blocking(move || snapshot(&manager, id, after, status_only.unwrap_or(false))).await.map_err(|e| e.to_string())?
 }
 fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool) -> Result<Snapshot, String> {
-    let disconnected = || Snapshot { id: id.clone(), status: "disconnected".into(), sequence: 0, output: String::new(), reset: true };
+    let disconnected = || Snapshot { id: id.clone(), status: "disconnected".into(), sequence: 0, output: String::new(), reset: true,
+        columns: INITIAL_GEOMETRY.columns, rows: INITIAL_GEOMETRY.rows, resizes: Vec::new() };
     let Some(slot) = manager.slot(&id)? else { return Ok(disconnected()); };
     let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
     let Some(terminal) = terminal_slot.as_mut() else { return Ok(disconnected()); };
@@ -196,9 +229,10 @@ fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool
     let status = if terminal.closed { "closed" } else {
         match terminal.child.try_wait() { Ok(Some(_)) => "exited", Ok(None) if !replay.ended => "open", _ => "disconnected" }
     };
-    let reset = after > replay.sequence || replay.chunks.front().map(|(seq, _)| after.saturating_add(1) < *seq).unwrap_or(false);
-    let output = if status_only { String::new() } else { replay.chunks.iter().filter(|(seq, _)| reset || *seq > after).map(|(_, text)| text.as_str()).collect::<String>() };
-    let snapshot = Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset };
+    let reset = after > replay.sequence || replay.chunks.front().map(|(seq, _, _)| after.saturating_add(1) < *seq).unwrap_or(false);
+    let (output, resizes) = if status_only { (String::new(), Vec::new()) } else { replay.output_after(after, reset) };
+    let snapshot = Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset,
+        columns: replay.geometry.columns, rows: replay.geometry.rows, resizes };
     drop(replay);
     // Snapshot is observational. Status-only polling can race with the full
     // output poll, so only an explicit close may release the terminal slot.
@@ -265,6 +299,83 @@ pub async fn manual_stage_attachment(state: State<'_, ManualTerminals>, id: Stri
 pub async fn manual_attachment_preview(id: String, path: String) -> Result<Vec<u8>, String> {
     tauri::async_runtime::spawn_blocking(move || read_staged_image(&std::env::temp_dir(), &id, &path)).await.map_err(|e| e.to_string())?
 }
+
+// Keep an inherited explicit TUI configuration local to the native process.
+// OpenCode accepts JSONC (comments/trailing commas), including in .json files.
+fn read_jsonc(source: &str) -> Result<serde_json::Value, String> {
+    let chars: Vec<char> = source.trim_start_matches('\u{feff}').chars().collect();
+    let mut clean = String::new();
+    let (mut i, mut quoted, mut escaped) = (0, false, false);
+    while i < chars.len() {
+        let c = chars[i];
+        if quoted {
+            clean.push(c);
+            if escaped { escaped = false; }
+            else if c == '\\' { escaped = true; }
+            else if c == '"' { quoted = false; }
+        } else if c == '"' { quoted = true; clean.push(c); }
+        else if c == '/' && chars.get(i+1) == Some(&'/') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' { i += 1; }
+            clean.push('\n');
+            continue;
+        } else if c == '/' && chars.get(i+1) == Some(&'*') {
+            i += 2;
+            while i+1 < chars.len() && !(chars[i] == '*' && chars[i+1] == '/') { i += 1; }
+            if i+1 >= chars.len() { return Err("Unterminated OpenCode TUI config comment".into()); }
+            i += 2;
+            clean.push(' ');
+            continue;
+        } else { clean.push(c); }
+        i += 1;
+    }
+    let chars: Vec<char> = clean.chars().collect();
+    let mut result = String::new();
+    quoted = false; escaped = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if !quoted && c == ',' && matches!(chars[i+1..].iter().find(|c| !c.is_whitespace()), Some('}') | Some(']')) { continue; }
+        result.push(c);
+        if quoted {
+            if escaped { escaped = false; }
+            else if c == '\\' { escaped = true; }
+            else if c == '"' { quoted = false; }
+        } else if c == '"' { quoted = true; }
+    }
+    serde_json::from_str(&result).map_err(|_| "Inherited OpenCode TUI configuration is not valid JSONC".into())
+}
+
+fn prepare_tui_config(managed: &str, inherited: Option<&str>) -> Result<String, String> {
+    let Some(inherited) = inherited.filter(|value| !value.is_empty() && *value != managed) else { return Ok(managed.into()); };
+    let mut config = read_jsonc(&std::fs::read_to_string(inherited).map_err(|_| "Could not read inherited OpenCode TUI configuration")?)?;
+    let managed_config = read_jsonc(&std::fs::read_to_string(managed).map_err(|_| "Could not read managed OpenCode TUI configuration")?)?;
+    let object = config.as_object_mut().ok_or("OpenCode TUI configuration must be an object")?;
+    if let Some(serde_json::Value::Object(nested)) = object.remove("tui") {
+        for (key, value) in nested { object.entry(key).or_insert(value); }
+    }
+    let plugins = object.entry("plugin").or_insert_with(|| serde_json::json!([])).as_array_mut().ok_or("OpenCode TUI plugins must be an array")?;
+    for plugin in managed_config["plugin"].as_array().ok_or("Managed TUI plugins are missing")? {
+        if !plugins.contains(plugin) { plugins.push(plugin.clone()); }
+    }
+    // Relative plugins must keep resolving against their original config directory.
+    let parent = Path::new(inherited).parent().unwrap_or(Path::new("."));
+    for plugin in plugins {
+        let target = if plugin.is_array() { plugin.get_mut(0) } else { Some(plugin) };
+        if let Some(target) = target {
+            if let Some(spec) = target.as_str() {
+                if spec.starts_with("./") || spec.starts_with("../") { *target = serde_json::Value::String(parent.join(spec).to_string_lossy().into_owned()); }
+            }
+        }
+    }
+    let destination = Path::new(managed).with_file_name("tui-inherited.json");
+    if std::fs::symlink_metadata(&destination).map(|meta| meta.file_type().is_symlink()).unwrap_or(false) { return Err("Managed TUI configuration must not be a symbolic link".into()); }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    let mut output = options.open(&destination).map_err(|_| "Could not save OpenCode TUI configuration")?;
+    output.write_all(&serde_json::to_vec(&config).map_err(|_| "Could not encode OpenCode TUI configuration")?).map_err(|_| "Could not save OpenCode TUI configuration")?;
+    Ok(destination.to_string_lossy().into_owned())
+}
 #[tauri::command]
 pub async fn manual_project_image_preview(cwd: String, path: String) -> Result<Vec<u8>, String> {
     tauri::async_runtime::spawn_blocking(move || read_project_image(Path::new(&cwd), &path)).await.map_err(|e| e.to_string())?
@@ -307,14 +418,20 @@ fn read_staged_image(root: &Path, id: &str, path: &str) -> Result<Vec<u8>, Strin
 #[tauri::command]
 pub async fn manual_terminal_resize(state: State<'_, ManualTerminals>, id: String, columns: u16, rows: u16) -> Result<(), String> {
     let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || resize(&manager, &id, columns, rows)).await.map_err(|e| e.to_string())?
+}
+fn resize(manager: &ManualTerminals, id: &str, columns: u16, rows: u16) -> Result<(), String> {
     let slot = manager.slot(&id)?.ok_or("Open the agent first")?;
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     let terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     let terminal = terminal_slot.as_ref().ok_or("Open the agent first")?;
-    terminal.master.resize(PtySize { rows: rows.clamp(2, 300), cols: columns.clamp(2, 500), pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())
-    }).await.map_err(|e| e.to_string())?
+    let geometry = Geometry { rows: rows.clamp(2, 300), columns: columns.clamp(2, 500) };
+    let mut replay = terminal.replay.lock().map_err(|_| "Terminal output is unavailable")?;
+    if replay.geometry == geometry { return Ok(()); }
+    terminal.master.resize(PtySize { rows: geometry.rows, cols: geometry.columns, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
+    replay.resized(geometry);
+    Ok(())
 }
 
 fn close_session(manager: &ManualTerminals, id: &str) -> Result<(), String> {
@@ -342,6 +459,82 @@ pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tui_config_preserves_inherited_jsonc_and_relative_plugins() {
+        let root = std::env::temp_dir().join(format!("atris-tui-config-{}",std::process::id()));
+        std::fs::create_dir_all(root.join("inherited")).unwrap();
+        let inherited = root.join("inherited/tui.jsonc");
+        let managed = root.join("tui.json");
+        let source = r#"{/* comment */ "theme":"light", "plugin":[["./own.ts",{"url":"https://host/*literal*/"}],], "keybinds":{"x":"ctrl+x",},}"#;
+        std::fs::write(&inherited,source).unwrap();
+        std::fs::write(&managed,r#"// managed
+{"plugin":["file:///managed.mjs"]}"#).unwrap();
+        let merged = prepare_tui_config(managed.to_str().unwrap(),Some(inherited.to_str().unwrap())).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(merged).unwrap()).unwrap();
+        assert_eq!(config["theme"],"light");
+        assert_eq!(config["keybinds"]["x"],"ctrl+x");
+        assert_eq!(config["plugin"][0][1]["url"],"https://host/*literal*/");
+        assert_eq!(config["plugin"][0][0],root.join("inherited").join("./own.ts").to_string_lossy().as_ref());
+        assert_eq!(config["plugin"][1],"file:///managed.mjs");
+        assert_eq!(std::fs::read_to_string(inherited).unwrap(),source);
+        assert!(read_jsonc("{/* unclosed").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_opencode_tui_controls() {
+        let Ok(fixture) = std::env::var("ATRIS_TEST_OPENCODE_FIXTURE") else { return; };
+        let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        let request: Launch = serde_json::from_value(fixture.clone()).unwrap();
+        let id = request.id.clone();
+        let root = PathBuf::from(fixture["root"].as_str().unwrap());
+        let manager = ManualTerminals::default();
+        struct Cleanup(ManualTerminals);
+        impl Drop for Cleanup { fn drop(&mut self) { self.0.shutdown(); } }
+        let _cleanup = Cleanup(manager.clone());
+        start_with_cleanup(manager.clone(),request).unwrap();
+        let mut sequence = 0;
+        let mut output = String::new();
+        let mut wait_for = |file: &str, matches: &dyn Fn(&serde_json::Value)->bool| {
+            let deadline = std::time::Instant::now()+std::time::Duration::from_secs(45);
+            loop {
+                let snapshot = snapshot(&manager,id.clone(),sequence,false).unwrap();
+                sequence = snapshot.sequence;
+                output.push_str(&snapshot.output);
+                if snapshot.output.contains("\x1b[6n") {
+                    let slot = manager.slot(&id).unwrap().unwrap();
+                    let slot = slot.terminal.lock().unwrap();
+                    let mut writer = slot.as_ref().unwrap().writer.lock().unwrap();
+                    writer.write_all(b"\x1b[1;1R").unwrap(); writer.flush().unwrap();
+                }
+                if let Ok(value) = std::fs::read_to_string(root.join(file)) {
+                    if let Ok(value) = serde_json::from_str(&value) { if matches(&value) { return; } }
+                }
+                assert!(snapshot.status == "open" && std::time::Instant::now()<deadline,"OpenCode did not confirm {file}: route={:?}, output={output}",std::fs::read_to_string(root.join("opencode-route-state.json")));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        wait_for("opencode-auto-mode.json", &|value|value["version"]==4 && value["enabled"]==false);
+        // The previous low/none unit-test route is replaced with a fresh real high selection.
+        std::fs::write(root.join("opencode-route.json"),r#"{"id":"native-high","model":"openai/test","reasoning":"high"}"#).unwrap();
+        wait_for("opencode-route-state.json", &|value|value["id"]=="native-high" && value["applied"]==true);
+        std::fs::write(root.join("opencode-route.json"),r#"{"id":"native-low","model":"openai/test","reasoning":"low"}"#).unwrap();
+        wait_for("opencode-route-state.json", &|value|value["id"]=="native-low" && value["applied"]==true);
+        std::fs::write(root.join("opencode-auto-request.json"),r#"{"id":"native-auto","enabled":true}"#).unwrap();
+        wait_for("opencode-auto-mode.json", &|value|value["enabled"]==true);
+        std::fs::write(root.join("opencode-auto-request.json"),r#"{"id":"native-normal","enabled":false}"#).unwrap();
+        wait_for("opencode-auto-mode.json", &|value|value["enabled"]==false);
+        let selected: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("state/opencode/model.json")).unwrap()).unwrap();
+        assert_eq!(selected["variant"]["openai/test"],"low");
+        resize(&manager,&id,57,46).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let replay = snapshot(&manager,id.clone(),0,false).unwrap();
+        println!("Installed OpenCode TUI confirmed high → low reasoning and Auto → normal without submitting a provider prompt.");
+        if let Ok(destination) = std::env::var("ATRIS_TEST_OPENCODE_CAPTURE") { std::fs::write(destination,serde_json::to_vec(&replay).unwrap()).unwrap(); }
+        close_session(&manager,&id).unwrap();
+    }
+
     #[test]
     fn staged_attachment_uses_private_random_name_and_preserves_bytes() {
         let directory = std::env::temp_dir().join(format!("atris-attachment-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -383,11 +576,87 @@ mod tests {
     }
     #[test]
     fn replay_is_bounded_and_preserves_monotonic_offsets() {
-        let mut replay = Replay { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false };
+        let mut replay = Replay::new();
         for _ in 0..200 { replay.push("x".repeat(8192)); }
         assert!(replay.bytes <= REPLAY_LIMIT);
         assert_eq!(replay.sequence, 200);
         assert!(replay.chunks.front().unwrap().0 > 1);
+    }
+
+    #[test]
+    fn replay_preserves_resize_boundaries_and_javascript_offsets() {
+        let mut replay = Replay::new();
+        replay.push("\x1b[Hready 🦀".into());
+        let first = replay.sequence;
+        replay.resized(Geometry { columns: 57, rows: 46 });
+        replay.push("\x1b[46;1Hfooter".into());
+        let (output, resizes) = replay.output_after(0, false);
+        assert_eq!(output, "\x1b[Hready 🦀\x1b[46;1Hfooter");
+        assert_eq!(resizes, vec![ReplayResize { offset: 0, columns: 120, rows: 30 }, ReplayResize { offset: 11, columns: 57, rows: 46 }]);
+        assert_eq!(replay.output_after(first, false).1, vec![ReplayResize { offset: 0, columns: 57, rows: 46 }]);
+        assert_eq!(replay.output_after(replay.sequence, false), (String::new(), Vec::new()));
+        replay.resized(Geometry { columns: 80, rows: 24 });
+        assert_eq!(replay.output_after(replay.sequence - 1, false), (String::new(), vec![ReplayResize { offset: 0, columns: 80, rows: 24 }]));
+    }
+
+    #[test]
+    fn evicted_replay_keeps_geometry_of_the_retained_output() {
+        let mut replay = Replay::new();
+        replay.push("old".into());
+        replay.resized(Geometry { columns: 57, rows: 46 });
+        for _ in 0..200 { replay.push("x".repeat(8192)); }
+        assert_eq!(replay.output_after(0, true).1, vec![ReplayResize { offset: 0, columns: 57, rows: 46 }]);
+        // Empty resize events are bounded too.
+        for _ in 0..5000 { replay.resized(Geometry { columns: 80, rows: 24 }); }
+        assert!(replay.chunks.len() <= 4096);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_pty_resize_replay_retains_screen_geometry() {
+        let manager = ManualTerminals::default();
+        let id = "00000000-0000-4000-8000-000000000099";
+        let executable = std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe").to_string_lossy().to_string();
+        // A disposable full-screen TUI. It exits on its own; no user process or session is touched.
+        let script = "$e=[char]27; $last=''; $end=(Get-Date).AddSeconds(5); [Console]::Write($e+'[?1049h'); while((Get-Date) -lt $end) { $w=[Console]::WindowWidth; $h=[Console]::WindowHeight; $key=$w.ToString()+'x'+$h; if($key -ne $last) { [Console]::Write($e+'[2J'+$e+'[1;1HHEADER-'+$key+$e+'[2;1H'+('TRANSCRIPT '*28)+$e+'['+$h+';1HFOOTER-'+$key); $last=$key }; Start-Sleep -Milliseconds 50 }";
+        start(manager.clone(), Launch { id: id.into(), executable,
+            args: vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(), script.into()],
+            cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new() }).unwrap();
+        let wait_for = |after: u64, text: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let mut replied = false;
+            loop {
+                let result = snapshot(&manager, id.into(), after, false).unwrap();
+                if !replied && result.output.contains("\x1b[6n") {
+                    let slot = manager.slot(id).unwrap().unwrap();
+                    let slot = slot.terminal.lock().unwrap();
+                    let mut writer = slot.as_ref().unwrap().writer.lock().unwrap();
+                    writer.write_all(b"\x1b[1;1R").unwrap(); writer.flush().unwrap(); replied = true;
+                }
+                if result.output.contains(text) { return result; }
+                assert!(std::time::Instant::now() < deadline, "Native TUI did not emit {text}: {:?}", result.output);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        };
+        let initial = wait_for(0, "FOOTER-120x30");
+        assert_eq!(initial.resizes.first(), Some(&ReplayResize { offset: 0, columns: 120, rows: 30 }));
+        resize(&manager, id, 57, 20).unwrap();
+        let narrow = wait_for(initial.sequence, "FOOTER-57x20");
+        assert_eq!((narrow.columns, narrow.rows), (57, 20));
+        let resize_events = || manager.slot(id).unwrap().unwrap().terminal.lock().unwrap().as_ref().unwrap().replay.lock().unwrap().chunks.iter().filter(|(_, text, _)| text.is_empty()).count();
+        let events = resize_events();
+        resize(&manager, id, 57, 20).unwrap();
+        assert_eq!(resize_events(), events, "same-size resize must not emit a replay event");
+        let replay = snapshot(&manager, id.into(), 0, false).unwrap();
+        assert!(replay.resizes.iter().any(|size| size.columns == 120 && size.rows == 30));
+        assert!(replay.resizes.iter().any(|size| size.columns == 57 && size.rows == 20));
+        println!("TERMINAL_NATIVE_FIXTURE={}", serde_json::to_string(&serde_json::json!({ "initial": initial, "narrow": narrow, "replay": replay })).unwrap());
+        // Keep the output reader alive until the fixture exits naturally.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while snapshot(&manager, id.into(), replay.sequence, true).unwrap().status == "open" {
+            assert!(std::time::Instant::now() < deadline, "Native fixture failed to exit naturally");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]

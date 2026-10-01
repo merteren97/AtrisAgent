@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
@@ -185,6 +186,8 @@ try {
   assert.equal((await openPatch(true)).status,409,'A running older plugin cannot silently claim live model support');
   const openPlugin = await import(openLaunch.env.ATRIS_MANUAL_OPENCODE_PLUGIN);
   const observer = await openPlugin.AtrisManualSession({client:{}});
+  assert.equal((await openPatch(true)).status,409,'The server plugin alone cannot advertise a working TUI bridge');
+  fs.writeFileSync(path.join(path.dirname(fileURLToPath(openLaunch.env.ATRIS_MANUAL_OPENCODE_PLUGIN)), 'opencode-auto-mode.json'), JSON.stringify({version:4,enabled:false,at:Date.now()}));
   await observer.event({event:{type:'session.created',properties:{info:{id:'ses_manual'}}}});
   const liveChange = await openPatch(true);
   assert.equal(liveChange.status,200,'A live OpenCode route is accepted without a terminal restart');

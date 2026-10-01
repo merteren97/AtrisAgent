@@ -116,6 +116,7 @@ export function ManualWorkspace() {
   const [messages, setMessages] = useState<ManualMessage[]>([]); const [truncated, setTruncated] = useState(false);
   const [questions, setQuestions] = useState<ManualQuestion[]>([]);
   const [autoApprove, setAutoApprove] = useState<OpenCodeAutoApprove>();
+  const [routeStatus, setRouteStatus] = useState<{pending: boolean; error?: string}>();
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
   const [attachments, setAttachments] = useState<Record<string, File[]>>({});
@@ -151,7 +152,7 @@ export function ManualWorkspace() {
     return () => { document.removeEventListener('visibilitychange', acknowledgeVisible); window.removeEventListener('focus', acknowledgeVisible); };
   }, [agentId, surface]);
 
-  useEffect(() => { setMessages([]); setQuestions([]); setAutoApprove(undefined); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
+  useEffect(() => { setMessages([]); setQuestions([]); setAutoApprove(undefined); setRouteStatus(undefined); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
   useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
@@ -180,8 +181,8 @@ export function ManualWorkspace() {
     let memorySignature = '';
     const poll = async () => {
       try {
-        const result = await apiRequest<{messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: OpenCodeAutoApprove; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
-        if (!disposed) { setMessages(result.messages); setQuestions(result.questions || []); setAutoApprove(result.autoApprove); setTruncated(result.truncated); setBound(Boolean(result.bound)); useManualStore.getState().applyNaming(result.naming); }
+        const result = await apiRequest<{messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: OpenCodeAutoApprove; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
+        if (!disposed) { setMessages(result.messages); setQuestions(result.questions || []); setAutoApprove(result.autoApprove); setRouteStatus(result.routeStatus); setTruncated(result.truncated); setBound(Boolean(result.bound)); useManualStore.getState().applyNaming(result.naming); }
         const signature = result.messages.filter(message => message.role === 'user').map(message => message.id+':'+message.text).join('\n');
         if (!disposed && result.bound && signature && signature !== memorySignature && agent?.conversationId) {
           await apiRequest(`/manual/conversations/${agent.conversationId}/memory/sync`, {method:'POST',body:JSON.stringify({agentId})});
@@ -326,7 +327,7 @@ export function ManualWorkspace() {
             <div ref={messageEnd} />
           </div>
         </div>
-        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
+        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
       </>}
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
