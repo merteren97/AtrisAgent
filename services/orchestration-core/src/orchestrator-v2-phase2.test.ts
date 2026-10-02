@@ -348,11 +348,12 @@ async function runTests() {
     );
     assert(taskCreatedCount === 0, 'plan-only turn starts no runtime worker');
     assert(result.tasks.every((task) => task.status === 'planned'), 'plan-only tasks remain planned for inspection');
-    assert(manager.mission.status === 'waiting_for_approval' && planApprovals === 1, 'plan-only Builder execution requests approval under the ask policy');
-    await orchestrator.handleApprovalDecision(missionId, 'plan', true);
-    assert(taskCreatedCount === 1 && manager.mission.status === 'running', 'approving the plan in Chat converts the preview into execution and dispatches the Builder');
-    assert((orchestrator as unknown as { planActions: Map<string, string> }).planActions.get(result.planId) === 'execute',
-      'approved plan-only execution keeps execute semantics for terminal reconciliation');
+    assert(manager.mission.status === 'completed' && planApprovals === 0, 'explicit natural-language plan-only request stays preview-only under the ask policy');
+    let executionRejected = false;
+    try { await orchestrator.handleApprovalDecision(missionId, 'plan', true); } catch { executionRejected = true; }
+    assert(executionRejected && taskCreatedCount === 0, 'plan approval cannot promote a strict preview into execution');
+    assert((orchestrator as unknown as { planActions: Map<string, string> }).planActions.get(result.planId) === 'plan_only',
+      'strict preview keeps plan-only semantics for terminal reconciliation');
   }
 
   // A supervisor-requested route review persists the plan and pauses before
@@ -486,8 +487,7 @@ async function runTests() {
   }
   registerSupervisorPlanningResourcesProvider(null);
 
-  // An explicitly auto-approved plan-only Builder lane may continue into the
-  // normal scheduler path instead of stopping at a completed preview.
+  // An explicit plan command stays preview-only even under Auto trust.
   {
     const missionId = 'conversation-plan-only-auto';
     const manager = new FakeWorkspaceManager({ missionId, description: 'Auto-run the prepared plan.' });
@@ -515,8 +515,8 @@ async function runTests() {
     );
 
     const result = await orchestrator.startMission(missionId, 'Prepare and continue the refactor.', { command: 'plan' });
-    assert(result.tasks.length === 3 && taskCreatedCount === 1, 'auto-approved plan-only Builder lane dispatches its dependency-free Builder');
-    assert(planApprovals === 0 && manager.mission.status === 'running', 'auto-approved plan-only lane continues without a chat approval gate');
+    assert(result.tasks.length === 3 && taskCreatedCount === 0, 'explicit plan command forbids Builder dispatch under Auto trust');
+    assert(planApprovals === 0 && manager.mission.status === 'completed', 'explicit plan command completes as a preview without an execution approval');
   }
 
   // The desktop's legacy start route may persist executionMode without the
@@ -550,8 +550,8 @@ async function runTests() {
     );
 
     const result = await orchestrator.startMission(missionId, 'Prepare and continue the legacy refactor.', { command: 'plan' });
-    assert(result.tasks.length === 3 && manager.mission.status === 'running',
-      'autonomous execution mode infers Auto for a mission without an automation snapshot');
+    assert(result.tasks.length === 3 && manager.mission.status === 'completed' && result.tasks.every((task) => task.status === 'planned'),
+      'explicit plan command forbids dispatch under legacy autonomous execution mode');
     assert(planApprovals === 0, 'autonomous mode ignores a supervisor-generated plan approval request');
   }
 

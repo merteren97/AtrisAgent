@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { AGENT_ROLES, type AgentRole, type TaskRoutePreference } from '@atris-agent-code/domain';
+import { AGENT_ROLES, normalizeOrchestratorRequestOptions, type AttachmentRef, type OrchestratorRequestOptions, type AgentRole, type TaskRoutePreference } from '@atris-agent-code/domain';
 import { ApiError, apiRequest, apiRequestWithHeaders, isApiRequestTimeout } from '@/lib/api-client';
 import { useAgentStore } from '@/stores/agent-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -120,7 +120,9 @@ export interface TimelineItem {
   metadata?: Record<string, unknown>;
 }
 
-export interface StartMissionOptions {
+export interface StartMissionOptions extends OrchestratorRequestOptions {
+  /** UI-only immutable refs. Only attachmentIds cross the request boundary. */
+  attachments?: AttachmentRef[];
   model?: string;
   orchestratorModel?: string;
   orchestratorReasoningLevel?: string;
@@ -852,16 +854,44 @@ export function normalizeAgentProfileIds(value: unknown): Partial<Record<AgentRo
   return selections;
 }
 
+export function normalizeAttachmentRefs(value: unknown): AttachmentRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 10).flatMap((ref) => {
+    if (!isRecord(ref) || typeof ref.id !== 'string' || !ref.id.trim()
+      || typeof ref.workspaceId !== 'string' || typeof ref.name !== 'string'
+      || typeof ref.mimeType !== 'string' || typeof ref.byteSize !== 'number'
+      || typeof ref.sha256 !== 'string' || typeof ref.createdAt !== 'string') return [];
+    return [{ id: ref.id, workspaceId: ref.workspaceId, name: ref.name, mimeType: ref.mimeType,
+      byteSize: ref.byteSize, sha256: ref.sha256, createdAt: ref.createdAt }];
+  });
+}
+
 function normalizeMissionOptions(options?: StartMissionOptions): StartMissionOptions | undefined {
   if (!options) return undefined;
   const agentProfileIds = normalizeAgentProfileIds(options.agentProfileIds);
+  const normalized = normalizeOrchestratorRequestOptions(options);
   return {
     ...options,
+    attachmentIds: options.attachmentIds === undefined ? undefined : normalized.attachmentIds,
+    workMode: options.workMode === undefined ? undefined : normalized.workMode,
+    teamLaunch: options.teamLaunch === undefined ? undefined : normalized.teamLaunch,
+    attachments: options.attachments === undefined ? undefined : normalizeAttachmentRefs(options.attachments),
     agentProfileIds: Object.keys(agentProfileIds).length > 0 ? agentProfileIds : undefined,
   };
 }
 
+function missionRequestText(request: string, options?: StartMissionOptions): string {
+  return request.trim() || (options?.attachmentIds?.length ? 'Inspect the attached files.' : '');
+}
+
+function attachmentMetadata(options?: StartMissionOptions): Record<string, unknown> {
+  return { attachmentIds: options?.attachmentIds, attachments: options?.attachments,
+    workMode: options?.workMode, teamLaunch: options?.teamLaunch };
+}
+
 export function buildMissionRequestBody(request: string, workspaceId: string | undefined, options?: StartMissionOptions, clientMessageId?: string): Record<string, unknown> {
+  options = normalizeMissionOptions(options);
+  request = missionRequestText(request, options);
   const agentProfileIds = normalizeAgentProfileIds(options?.agentProfileIds);
   return {
     request,
@@ -880,6 +910,9 @@ export function buildMissionRequestBody(request: string, workspaceId: string | u
     agentProfileIds: Object.keys(agentProfileIds).length > 0 ? agentProfileIds : undefined,
     command: options?.command,
     automationSettings: options?.automationSettings,
+    attachmentIds: options?.attachmentIds,
+    workMode: options?.workMode,
+    teamLaunch: options?.teamLaunch,
     clientMessageId,
   };
 }
@@ -951,10 +984,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
   fetchCommandQueue: async (workspaceId) => {
     const requestId = ++commandQueueRequestId;
-    set({ commandQueue: [], error: null });
+    set({ commandQueue: [] });
     try {
       const result = await apiRequest<{ items: DurableMissionCommand[] }>(`/mission-commands?workspaceId=${encodeURIComponent(workspaceId)}&limit=50`);
-      if (requestId === commandQueueRequestId) set({ commandQueue: result.items, error: null });
+      if (requestId === commandQueueRequestId) set({ commandQueue: result.items });
     } catch (error: any) {
       if (requestId === commandQueueRequestId) set({ commandQueue: [], error: error?.message || 'Failed to fetch queued commands.' });
     }
@@ -975,7 +1008,18 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       // slower response hydrate its agents/timeline over the current mission.
       if (missionStateRequestIds.get(missionId) !== requestId || get().activeMissionId !== missionId) return;
 
-      const restoredTimeline = restoreMissionTimeline(state.mission, events);
+      const restoredTimeline = restoreMissionTimeline(state.mission, events).map((item) => {
+        if (item.type !== 'user_message') return item;
+        const live = get().timeline.find((entry) => sameUserTurn(entry, item));
+        if (!live && item.id === `request-${missionId}`) {
+          // The initial event can lag acceptance. Keep its refs instead of a duplicate legacy fallback card.
+          const pendingStart = get().timeline.find((entry) => entry.type === 'user_message'
+            && entry.metadata?.starting === true && entry.metadata?.clientMessageId
+            && !entry.metadata?.queueId && entry.content === item.content);
+          if (pendingStart) return pendingStart;
+        }
+        return live ? { ...item, metadata: compactTimelineMetadata({ ...attachmentMetadataFromItem(live), ...item.metadata }) } : item;
+      });
 
       // The event request is a snapshot. SSE may have delivered later agent
       // events while it was in flight; replay those too before replacing the
@@ -1010,6 +1054,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         const restoredIds = new Set(restoredTimeline.map((item) => item.id));
         const liveOnlyItems = current.timeline.filter((item) => (
           (!restoredIds.has(item.id) || hasUnpersistedStreamFragment(item, persistedEventIds, persistedMaxSequence))
+          && (item.type !== 'user_message' || !restoredTimeline.some((restored) => sameUserTurn(item, restored)))
           && (item.type !== 'user_message'
             || item.metadata?.queued === true
             || item.metadata?.starting === true
@@ -1096,7 +1141,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
 
   startMission: async (request, workspaceId, options) => {
-    const trimmed = request.trim();
+    try { options = normalizeMissionOptions(options); }
+    catch (error) { set({ error: error instanceof Error ? error.message : 'Invalid mission options.' }); return; }
+    const trimmed = missionRequestText(request, options);
     if (!trimmed) return;
     set({ loading: true, error: null });
 
@@ -1107,6 +1154,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       content: trimmed,
       timestamp: nowLabel(),
       metadata: compactTimelineMetadata({
+        ...attachmentMetadata(options),
+        workspaceId,
+        starting: true,
         targetRole: options?.targetRole,
         routeRole: options?.routeRole,
         routeScope: options?.routeScope,
@@ -1183,7 +1233,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         set((state) => ({
           timeline: boundTimeline([...state.timeline, pendingCard]),
           loading: false,
-          error: null,
+          error: message,
           pendingMissionStart: {
             clientMessageId,
             request: trimmed,
@@ -1204,7 +1254,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         agentRole: 'orchestrator',
       };
       set((state) => ({
-        timeline: boundTimeline([...state.timeline, errorCard]),
+        timeline: boundTimeline([...state.timeline.map((item) => item.id === clientMessageId
+          ? { ...item, metadata: { ...item.metadata, starting: false, failed: true } } : item), errorCard]),
         loading: false,
         error: message,
         pendingMissionStart: null,
@@ -1213,7 +1264,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
 
   continueMission: async (missionId, request, options) => {
-    const trimmed = request.trim();
+    const trimmed = missionRequestText(request, options);
     if (!trimmed) return;
     const mission = get().missions.find((item) => item.id === missionId);
     if (!mission) {
@@ -1236,9 +1287,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
 
   sendMissionCommand: async (missionId, request, delivery, options) => {
-    const trimmed = request.trim();
+    let safeOptions: StartMissionOptions | undefined;
+    try { safeOptions = normalizeMissionOptions(options); }
+    catch (error) { set({ error: error instanceof Error ? error.message : 'Invalid mission options.' }); return; }
+    const trimmed = missionRequestText(request, safeOptions);
     if (!trimmed) return;
-    const safeOptions = normalizeMissionOptions(options);
     const queueId = crypto.randomUUID();
     const queuedAt = new Date().toISOString();
     const previousMissionStatus = get().missions.find((mission) => mission.id === missionId)?.status;
@@ -1248,6 +1301,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       content: trimmed,
       timestamp: nowLabel(),
       metadata: compactTimelineMetadata({
+        ...attachmentMetadata(safeOptions),
+        workspaceId: get().missions.find((mission) => mission.id === missionId)?.workspaceId,
         queued: delivery !== 'stop_and_replan',
         starting: delivery === 'stop_and_replan',
         queueId,
@@ -1288,13 +1343,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const durable = await apiRequest<Record<string, any>>(`/missions/${missionId}/messages`, {
         method: 'POST',
         headers: { 'Idempotency-Key': queueId },
-        body: JSON.stringify({ content: trimmed, delivery, options: safeOptions }),
+        body: JSON.stringify({ content: trimmed, delivery, options: buildMissionCommandOptions(safeOptions) }),
       });
       const turnId = String(durable.turnId || durable.turn?.id || durable.commandId || durable.command?.id || durable.id || queueId);
+      const durableRefs = normalizeAttachmentRefs(durable.attachments ?? durable.turn?.attachments ?? durable.turn?.options?.attachments ?? durable.options?.attachments);
       set((state) => ({
-        queuedTurns: state.queuedTurns.map((turn) => turn.id === queueId ? { ...turn, turnId } : turn),
+        queuedTurns: state.queuedTurns.map((turn) => turn.id === queueId ? { ...turn, turnId,
+          options: durableRefs.length ? { ...turn.options, attachments: durableRefs } : turn.options } : turn),
         timeline: state.timeline.map((item) => item.metadata?.queueId === queueId
-          ? { ...item, metadata: { ...item.metadata, durable: true, turnId, delivery } }
+          ? { ...item, metadata: { ...item.metadata, ...(durableRefs.length ? { attachments: durableRefs } : {}), durable: true, turnId, delivery } }
           : item),
       }));
       const mission = get().missions.find((item) => item.id === missionId);
@@ -1377,6 +1434,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       }
       : {};
     const turnId = metadataString(item.metadata, 'turnId') || metadataString(item.metadata, 'commandId');
+    if (item.type === 'user_message') {
+      const optimisticIndex = state.timeline.findIndex((entry) => sameUserTurn(entry, item));
+      if (optimisticIndex >= 0) {
+        const timeline = [...state.timeline];
+        const optimistic = timeline[optimisticIndex];
+        timeline[optimisticIndex] = { ...item, metadata: compactTimelineMetadata({ ...optimistic.metadata, ...item.metadata, starting: false, queued: false }) };
+        return { ...missionPatch, timeline: boundTimeline(timeline) };
+      }
+    }
     if (turnId && item.eventType?.startsWith('turn_')) {
       const clientMessageId = metadataString(item.metadata, 'clientMessageId');
       const reconciled = state.timeline.map((entry) => {
@@ -1521,3 +1587,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
   },
 }));
+
+/** Use the same explicit transport whitelist for starts and durable commands. */
+export function buildMissionCommandOptions(options?: StartMissionOptions): Record<string, unknown> | undefined {
+  if (!options) return undefined;
+  const { request: _request, title: _title, workspaceId: _workspace, clientMessageId: _client,
+    ...serialized } = buildMissionRequestBody('', undefined, options);
+  // Legacy follow-ups without a policy selection inherit the mission policy.
+  if (!options.executionMode && !options.trustMode) delete serialized.executionMode;
+  return serialized;
+}
+
+function attachmentMetadataFromItem(item: TimelineItem): Record<string, unknown> {
+  return { attachments: item.metadata?.attachments, attachmentIds: item.metadata?.attachmentIds,
+    workspaceId: item.metadata?.workspaceId, workMode: item.metadata?.workMode, teamLaunch: item.metadata?.teamLaunch };
+}
+
+function sameUserTurn(left: TimelineItem, right: TimelineItem): boolean {
+  if (left.type !== 'user_message' || right.type !== 'user_message') return false;
+  if (left.id === right.id) return true;
+  const clientId = metadataString(right.metadata, 'clientMessageId');
+  const turnId = metadataString(right.metadata, 'turnId');
+  return Boolean((clientId && (left.id === clientId || left.metadata?.clientMessageId === clientId || left.metadata?.queueId === clientId))
+    || (turnId && left.metadata?.turnId === turnId));
+}

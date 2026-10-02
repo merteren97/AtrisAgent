@@ -259,6 +259,48 @@ export interface FileChanged extends BaseEvent {
   agentInstanceId?: string;
 }
 
+/** User information requests are independent of consequential-action approvals. */
+export interface QuestionInfo {
+  header: string;
+  question: string;
+  options: { label: string; description: string }[];
+  multiple?: boolean;
+  custom?: boolean;
+}
+
+export interface QuestionCorrelation extends BaseEvent {
+  questionId: string;
+  requestId: string;
+  taskId: string;
+  attemptId?: string;
+  agentInstanceId: string;
+  runtimeSessionId: string;
+  adapterId: string;
+}
+
+export interface QuestionAsked extends QuestionCorrelation {
+  type: 'question_asked';
+  questions: QuestionInfo[];
+}
+
+export interface QuestionReplied extends QuestionCorrelation {
+  type: 'question_replied';
+  answers: string[][];
+}
+
+export interface QuestionRejected extends QuestionCorrelation {
+  type: 'question_rejected';
+  reason: string;
+  outcome: 'rejected' | 'cancelled';
+}
+
+export interface QuestionReplyUpdated extends QuestionCorrelation {
+  type: 'question_reply_updated';
+  clientRequestId: string;
+  status: 'delivering' | 'delivered' | 'delivery_failed' | 'stale';
+  error?: string;
+}
+
 export interface ApprovalRequested extends BaseEvent {
   type: 'approval_requested';
   approvalId: string;
@@ -530,6 +572,10 @@ export type AgentEvent =
   | ToolCallCompleted
   | FileChanged
   | ApprovalRequested
+  | QuestionAsked
+  | QuestionReplied
+  | QuestionRejected
+  | QuestionReplyUpdated
   | ApprovalResponded
   | ApprovalReconciled
   | CheckCompleted

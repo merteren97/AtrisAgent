@@ -12,6 +12,9 @@ import { useAgentStore } from '@/stores/agent-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { DEFAULT_TIMELINE_WINDOW, growTimelineWindow, tailWindow } from '@/lib/timeline-window';
 import { ArrowDown, Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, MessageSquarePlus, FolderGit2 } from 'lucide-react';
+import { OrchestratorQuestions } from '@/components/orchestrator/orchestrator-questions';
+import { OrchestratorWorkCard } from '@/components/orchestrator/orchestrator-work-card';
+import { useAccountStore } from '@/stores/account-store';
 
 const COMPACT_EVENT_TYPES = new Set([
   'task_created',
@@ -133,6 +136,7 @@ export function prepareTimeline(items: TimelineItem[], showLiveThinking: boolean
 }
 
 export function ChatTimeline() {
+  const modelsReady = useAccountStore(state => state.serviceOnline && state.discoveredModels.some(model => model.available && (!model.suitableRoles.length || model.suitableRoles.some(role => role.toLowerCase() === 'orchestrator'))));
   const timeline = useMissionStore((state) => state.timeline);
   const missions = useMissionStore((state) => state.missions);
   const activeMissionId = useMissionStore((state) => state.activeMissionId);
@@ -288,16 +292,16 @@ export function ChatTimeline() {
 
       <div className="relative flex h-14 w-14 items-center justify-center rounded-2xl border border-primary/20 bg-primary/10 text-primary shadow-sm">
         <MessageSquarePlus className="h-5 w-5" />
-        <span className="absolute -right-1 -top-1 h-3 w-3 rounded-full border-2 border-background bg-emerald-400" />
+        {modelsReady && <span className="absolute -right-1 -top-1 h-3 w-3 rounded-full border-2 border-background bg-primary" />}
       </div>
-      <h2 className="mt-5 text-xl font-semibold tracking-tight">Start a fresh conversation</h2>
+      <h2 className="mt-5 text-xl font-semibold tracking-tight">What would you like to accomplish?</h2>
       <p className="mt-2 max-w-lg text-xs leading-relaxed text-muted-foreground">
-        This creates a separate mission thread inside <span className="font-medium text-foreground/90">{activeWorkspace.name}</span>. Your existing conversations, plans, agents, and activity stay available in the workspace sidebar.
+        Describe your goal or add a reference image. AtrisAgent will choose the right expertise, coordinate the work, and bring the results back here.
       </p>
 
       <div className="mt-6 flex items-center gap-2 rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-[10px] text-muted-foreground">
         <Sparkles className="h-3 w-3 text-primary" />
-        Each conversation keeps its own mission timeline and agent team.
+        Project ready · {modelsReady ? 'Model connected' : 'Model connection needed'} · Team chosen automatically
       </div>
 
       <div className="mt-7 flex max-w-xl flex-wrap justify-center gap-2">
@@ -332,6 +336,8 @@ export function ChatTimeline() {
         onViewportScroll={handleViewportScroll}
       >
         <div role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation timeline" className="mx-auto min-w-0 max-w-4xl space-y-3 px-4 py-6">
+          <OrchestratorWorkCard />
+          <OrchestratorQuestions />
           {timelineWindow.hiddenCount > 0 && (
             <div className="flex justify-center pb-1">
               <Button type="button" variant="outline" size="sm" className="h-7 text-[10px]" onClick={loadOlder}>
@@ -366,10 +372,10 @@ export function ChatTimeline() {
             const item = entry.item;
             if (item.type === 'user_message') {
               const deliveryState = item.metadata?.failed ? 'failed' : item.metadata?.cancelled ? 'cancelled' : item.metadata?.starting ? 'starting' : item.metadata?.queued ? 'queued' : undefined;
-              return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} deliveryState={deliveryState} />;
+              return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} deliveryState={deliveryState} metadata={item.metadata} workspaceId={activeWorkspace?.id} />;
             }
             if (item.type === 'orchestrator_message') {
-              return <MessageCard key={item.id} role="orchestrator" content={item.content} timestamp={item.timestamp} />;
+              return <MessageCard key={item.id} role="orchestrator" content={item.content} timestamp={item.timestamp} metadata={item.metadata} workspaceId={activeWorkspace?.id} />;
             }
             return (
               <EventCard

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { LocalEventBus, Unsubscribe } from '@atris-agent-code/event-bus';
-import type { ApprovalRequested, TaskCompleted, TaskCreated, TaskFailed } from '@atris-agent-code/event-schema';
+import type { ApprovalRequested, QuestionAsked, TaskCompleted, TaskCreated, TaskFailed } from '@atris-agent-code/event-schema';
 import type {
   AgentSession,
   AgentProfile,
@@ -205,6 +205,7 @@ export class RuntimeHost {
   private watchdog?: ReturnType<typeof setInterval>;
   private watchdogRunning = false;
   private finishingSessions = new Set<string>();
+  private questionSessionAdapters = new Map<string, { adapter: BaseRuntimeAdapter; missionId: string }>();
   private pendingRuntimeApprovals = new Map<string, {
     missionId: string;
     taskId?: string;
@@ -1094,6 +1095,8 @@ export class RuntimeHost {
     try {
       session = await adapter.spawnAgent({
         sessionId: event.agentInstanceId,
+        attemptId: attempt?.id,
+        runId: event.runId,
         taskId: event.taskId,
         missionId: event.missionId,
         prompt,
@@ -1362,6 +1365,14 @@ export class RuntimeHost {
         if (this.finishingSessions.has(sessionId)) return;
         const adapter = this.adapters.get(active.adapterId);
         if (!adapter?.isSessionAlive(sessionId)) return;
+        // Waiting for information is legitimate idle time, not an execution timeout.
+        // Keep the durable attempt lease alive while the originating process remains alive.
+        if (adapter.isAwaitingUser?.(sessionId)) {
+          active.lastProtocolResponseAt = now.getTime();
+          active.probeFailures = 0;
+          await this.heartbeatSession(sessionId, now).catch(() => false);
+          return;
+        }
         const idleFor = Math.max(0, now.getTime() - active.lastProtocolResponseAt);
         if (idleFor <= this.sessionIdleGraceMs()) {
           await this.heartbeatSession(sessionId, now).catch(() => false);
@@ -1464,6 +1475,45 @@ export class RuntimeHost {
     }
     await adapter.approveToolCall(requestId, decision);
     this.pendingRuntimeApprovals.delete(requestId);
+  }
+
+  /** Isolated supervisor lanes register before spawn so early questions can be answered. */
+  protected registerQuestionSessionAdapter(sessionId: string, adapter: BaseRuntimeAdapter, missionId: string): () => void {
+    const entry = { adapter, missionId };
+    this.questionSessionAdapters.set(sessionId, entry);
+    return () => { if (this.questionSessionAdapters.get(sessionId) === entry) this.questionSessionAdapters.delete(sessionId); };
+  }
+
+  private questionAdapter(question: QuestionAsked): BaseRuntimeAdapter | undefined {
+    const lane = this.questionSessionAdapters.get(question.agentInstanceId);
+    const adapter = lane?.adapter || this.adapters.get(question.adapterId);
+    if (!adapter || adapter.id !== question.adapterId || !adapter.isSessionAlive(question.agentInstanceId)) return undefined;
+    const pending = adapter.getPendingQuestion(question.agentInstanceId, question.requestId);
+    if (!pending || pending.questionId !== question.questionId || pending.runtimeSessionId !== question.runtimeSessionId
+      || pending.taskId !== question.taskId || pending.attemptId !== question.attemptId
+      || (lane?.missionId || pending.missionId) !== question.missionId) return undefined;
+    const active = this.activeSessions.get(question.agentInstanceId);
+    if (active && (active.missionId !== question.missionId || active.taskId !== question.taskId || active.attemptId !== question.attemptId)) return undefined;
+    if ([...this.activeSessions.values()].some(candidate => candidate.missionId === question.missionId
+      && candidate.taskId === question.taskId && candidate.attemptId !== question.attemptId
+      && candidate.startedAt > Date.parse(question.timestamp))) return undefined;
+    return adapter;
+  }
+
+  isRuntimeQuestionActive(question: QuestionAsked): boolean {
+    return Boolean(this.questionAdapter(question));
+  }
+
+  async respondToRuntimeQuestion(question: QuestionAsked, answers: string[][]): Promise<void> {
+    const adapter = this.questionAdapter(question);
+    if (!adapter) throw new Error('Question is stale or its originating task attempt/session is no longer active.');
+    await adapter.respondToQuestion(question.agentInstanceId, question.requestId, answers);
+  }
+
+  async rejectRuntimeQuestion(question: QuestionAsked): Promise<void> {
+    const adapter = this.questionAdapter(question);
+    if (!adapter) throw new Error('Question is stale or its originating task attempt/session is no longer active.');
+    await adapter.rejectQuestion(question.agentInstanceId, question.requestId);
   }
 
   async stopMission(missionId: string, runId?: string): Promise<void> {

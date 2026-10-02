@@ -4,10 +4,14 @@ import type {
   OrchestratorTurnAction,
   BuilderTargetDescriptor,
   TaskRoutePreference,
+  WorkMode,
+  TeamLaunch,
+  ProviderAttachment,
 } from '@atris-agent-code/domain';
 import { parseBuilderTargetDescriptor, validateDirectChildProjectName } from '@atris-agent-code/domain';
 import type { SupervisorPlanningModel, SupervisorPlanningResources, SupervisorPlanningSpecialist } from '@atris-agent-code/event-bus';
 import type { StructuredTaskPlan } from './orchestrator';
+import { attachmentContext, effectiveWorkMode } from './request-policy';
 
 const ACTIONS = new Set<OrchestratorTurnAction>(['respond', 'clarify', 'delegate', 'execute', 'plan_only']);
 const WORKER_ROLES = new Set<OrchestratorDelegation['role']>(['researcher', 'builder', 'reviewer', 'qa']);
@@ -100,6 +104,9 @@ export interface SupervisorTurnContext {
   explicitCommand?: string;
   explicitTargetRole?: string;
   planningResources?: SupervisorPlanningResources;
+  workMode?: WorkMode;
+  teamLaunch?: TeamLaunch;
+  attachments?: ProviderAttachment[];
 }
 
 const EMPTY_PLANNING_RESOURCES: SupervisorPlanningResources = { models: [], specialists: [] };
@@ -203,7 +210,20 @@ export function normalizeSupervisorDecision(
   context: SupervisorTurnContext,
   options?: { reusePriorResearch?: boolean },
 ): OrchestratorDecision {
-  const normalized = decision.action === 'delegate' && hasExplicitImplementationIntent(context)
+  const mode = effectiveWorkMode(context.workMode, context.userMessage, context.explicitCommand);
+  if (mode === 'research' && decision.action !== 'respond' && decision.action !== 'clarify') {
+    const researchers = (decision.delegations || []).filter((item) => item.role === 'researcher');
+    const ids = new Set(researchers.map((item) => item.id));
+    return { ...decision, action: 'delegate', delegations: researchers.length ? researchers.map((item) => ({ ...item,
+      requiredCapabilities: ['read_file', 'grep_search', 'view_file'],
+      dependsOnDelegationIds: (item.dependsOnDelegationIds || []).filter((id) => ids.has(id)),
+    })) : [{ id: 'research-1', role: 'researcher', objective: context.userMessage, requiredCapabilities: ['read_file', 'grep_search', 'view_file'] }] };
+  }
+  if (mode === 'plan' && decision.action !== 'clarify') {
+    return { ...decision, action: 'plan_only', delegations: decision.delegations?.length ? decision.delegations
+      : [{ id: 'plan-1', role: 'researcher', objective: context.userMessage, requiredCapabilities: ['research'] }] };
+  }
+  const normalized = decision.action === 'delegate' && (mode === 'execute' || hasExplicitImplementationIntent(context))
     ? { ...decision, action: 'execute' as const }
     : decision;
   let delegations = [...(normalized.delegations || [])];
@@ -397,6 +417,9 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- Never imply a route is guaranteed before dispatch. User-fixed routes and role policies take precedence where applicable; an unavailable fixed route must fail closed instead of silently switching models.',
     '- Never invent completed work. If current code/evidence must be inspected, delegate it.',
     '- Keep delegations focused; each objective should be independently understandable.',
+    '- Work mode is independent of trust/action approval policy. Explicit plan means preview only: no workers, writes or execution, even under Auto trust. Research means read-only research, never Builder dispatch. Execute permits implementation when intent and requirements are clear. Auto infers the appropriate action from this turn.',
+    '- Honor explicit natural-language stopping boundaries such as "analyze then wait" and "show a plan, do not implement". Research followed by waiting is not permission to build. If execution intent is genuinely ambiguous, clarify before any write delegation.',
+    '- Team launch confirm means propose a concrete team/task plan for approval before any worker starts. Direct answers and blocking clarification require no team launch. This approval is independent of tool/action trust.',
     '',
     'Return STRICT JSON only with this shape:',
     '{',
@@ -424,6 +447,9 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     `Turn id: ${context.turnId}`,
     `Explicit command: ${context.explicitCommand || '(none)'}`,
     `Explicit target role: ${context.explicitTargetRole || '(none)'}`,
+    `Work mode: ${effectiveWorkMode(context.workMode, context.userMessage, context.explicitCommand)}`,
+    `Team launch: ${context.teamLaunch || 'automatic'}`,
+    attachmentContext(context.attachments),
     '',
     'Live model routes by fixed worker role (an empty list means scheduler-selected route):',
     JSON.stringify(modelsByRole),
@@ -450,7 +476,7 @@ export function fallbackSupervisorDecision(context: SupervisorTurnContext): Orch
   const command = String(context.explicitCommand || '').toLowerCase();
   const targetRole = String(context.explicitTargetRole || '').toLowerCase();
   const planRequested = command === 'plan' || /\b(plan|planla|planlama|plan oluştur|plan yap)\b/i.test(text);
-  const implementationRequested = hasExplicitImplementationIntent(context);
+  const implementationRequested = context.workMode === 'execute' || hasExplicitImplementationIntent(context);
   const researchRequested = targetRole === 'researcher'
     || /(araştır|research|analiz|incele|investigate|karşılaştır|compare)/i.test(text);
 

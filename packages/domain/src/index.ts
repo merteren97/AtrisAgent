@@ -21,3 +21,4 @@ export * from './worker-request';
 export * from './review-pack';
 export * from './memory';
 export * from './quality-result';
+export * from './orchestrator-request';

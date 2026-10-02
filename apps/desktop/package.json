@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "pretest": "npm run test:manual",
+    "pretest": "npm run test:manual && npm run test:orchestrator",
+    "test:orchestrator": "tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 src/stores/orchestrator-preferences-store.test.ts src/lib/orchestrator-route.test.ts && tsx --tsconfig tsconfig.app.json src/stores/orchestrator-attachments-store.test.ts && tsx --tsconfig tsconfig.app.json src/stores/mission-store.attachments.test.ts && tsx --tsconfig tsconfig.app.json src/components/agents/AgentsView.test.ts && tsx --tsconfig tsconfig.app.json src/components/composer/agent-profile-selector.test.ts",
     "test:manual": "tsx --tsconfig tsconfig.app.json src/stores/manual-store.test.ts && tsx --tsconfig tsconfig.app.json src/components/manual/manual-composer.test.ts",
     "dev": "vite",
     "build": "tsc -b && vite build",

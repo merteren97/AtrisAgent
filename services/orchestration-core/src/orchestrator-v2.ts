@@ -24,8 +24,11 @@ import type {
   OrchestratorTurnAction,
   QualityResultEnvelope,
   PostApplyVerificationResult,
+  WorkMode,
+  TeamLaunch,
+  ProviderAttachment,
 } from '@atris-agent-code/domain';
-import { parseQualityResultEnvelope } from '@atris-agent-code/domain';
+import { normalizeOrchestratorRequestOptions, parseQualityResultEnvelope } from '@atris-agent-code/domain';
 import { PolicyEngine, resolveAutomationAction, trustProfileForExecutionMode } from '@atris-agent-code/policy-engine';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator as LegacyOrchestrator } from './orchestrator';
@@ -44,6 +47,7 @@ import {
   type SupervisorTurnContext,
 } from './supervisor-turn';
 import { allocateWorkerBatch } from './worker-pool';
+import { attachmentContext, effectiveWorkMode } from './request-policy';
 
 const TERMINAL_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const NON_PROGRESSING_MISSION_STATUSES = new Set(['blocked', ...TERMINAL_MISSION_STATUSES]);
@@ -200,6 +204,10 @@ function inferQualityVerdict(
 }
 
 interface StartMissionOptionsV2 {
+  attachmentIds?: string[];
+  attachments?: ProviderAttachment[];
+  workMode?: WorkMode;
+  teamLaunch?: TeamLaunch;
   modelCatalogId?: string;
   reasoningLevel?: string;
   targetRole?: string;
@@ -235,6 +243,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
    private readonly v2ExecuteApplyVerificationOperation?: OrchestratorConfig['executeApplyVerificationOperation'];
   private readonly missionQueues = new Map<string, Promise<void>>();
   private readonly planActions = new Map<string, OrchestratorTurnAction>();
+  private readonly planRequestOptions = new Map<string, StartMissionOptionsV2>();
   private readonly synthesizedPlans = new Set<string>();
   private readonly deferredCompletionMissions = new Set<string>();
   private readonly deferredCompletions = new Map<string, { summary: string; tasksCompleted: number; totalTasks: number }>();
@@ -292,6 +301,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   }
 
   override emitEvent(event: AgentEvent): void {
+    if (event.type === 'plan_generated') {
+      const requestOptions = this.planRequestOptions.get(event.planId);
+      if (requestOptions) Object.assign(event, { requestOptions });
+    }
     if (event.type === 'review_completed' && this.suppressedLegacyReviewEvents.has(event.missionId)) {
       this.trace('legacy-review-event-suppressed', {
         missionId: event.missionId,
@@ -517,6 +530,14 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const task = this.v2WorkspaceManager ? await this.v2WorkspaceManager.getTask(taskId) : null;
     const lifecycle = task ? this.lifecycleByMission.get(task.missionId) : undefined;
     try {
+      if (task) {
+        const policy = await this.requestPolicyForPlan(task.missionId, task.planId);
+        const mission = await this.v2WorkspaceManager!.getMission(task.missionId);
+        if (mission?.planId && task.planId !== mission.planId) throw new Error('Cannot dispatch a task from a superseded plan.');
+        if (policy?.workMode === 'plan') throw new Error('Plan work mode forbids all worker dispatch. Start a new execution turn.');
+        if (policy?.workMode === 'research' && (agentRole || task.assignedRole) !== 'researcher') throw new Error('Research work mode forbids non-research worker dispatch.');
+        if (policy?.teamLaunch === 'confirm' && mission?.status === 'waiting_for_approval') throw new Error('Team launch is awaiting plan approval.');
+      }
       if (lifecycle?.runId && this.cancelledRunIds.has(lifecycle.runId)) {
         throw new Error('The orchestration run was cancelled.');
       }
@@ -815,12 +836,16 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const tasks = manager ? await manager.listTasks(missionId) : [];
     const taskById = new Map(tasks.map((task) => [task.id, task]));
     const completedTurnIds = new Set<string>();
+    const turnAttachments = new Map<string, ProviderAttachment[]>();
     let rows: Array<{ type: string; payload: Record<string, unknown>; taskId: string | null; createdAt: string }> = [];
 
     if (this.v2Db) {
-      const turns = await this.v2Db.select({ id: conversationTurns.id, status: conversationTurns.status })
+      const turns = await this.v2Db.select({ id: conversationTurns.id, status: conversationTurns.status, options: conversationTurns.options })
         .from(conversationTurns).where(eq(conversationTurns.missionId, missionId));
       for (const turn of turns) if (turn.status === 'completed') completedTurnIds.add(turn.id);
+      for (const turn of turns) {
+        if (turn.status === 'completed' && Array.isArray(turn.options?.attachments)) turnAttachments.set(turn.id, turn.options.attachments as ProviderAttachment[]);
+      }
       rows = (await this.v2Db
         .select({
           type: missionEvents.type,
@@ -848,6 +873,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         case 'user_message': {
           const content = compact(payload.content);
           if (content) lines.push(`User: ${content}`);
+          if (typeof payload.turnId === 'string') {
+            const files = attachmentContext(turnAttachments.get(payload.turnId));
+            if (files) lines.push(files);
+          }
           break;
         }
         case 'task_completed': {
@@ -934,6 +963,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       explicitCommand: options?.command,
       explicitTargetRole: options?.targetRole,
       planningResources,
+      workMode: options?.workMode,
+      teamLaunch: options?.teamLaunch,
+      attachments: options?.attachments,
     };
     const reusableResearchBundle = loaded.priorResearchBundle && isPriorResearchImplementationFollowUp(context)
       ? loaded.priorResearchBundle
@@ -1028,6 +1060,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     previousPlanId?: string | null;
     hasPriorConversation: boolean;
     agentProfileIds?: Partial<Record<AgentRole, string>>;
+    options?: StartMissionOptionsV2;
   }): Promise<{
     missionId: string;
     planId: string;
@@ -1044,7 +1077,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     const planId = crypto.randomUUID();
-    const taskSpecs = decisionToTaskPlan(params.decision);
+    this.planRequestOptions.set(planId, params.options || {});
+    const fileContext = attachmentContext(params.options?.attachments);
+    const taskSpecs = decisionToTaskPlan(params.decision).map((task) => ({ ...task,
+      description: [task.description, fileContext].filter(Boolean).join('\n\n'),
+    }));
     const structuredPlan: StructuredPlan = {
       planId,
       assumptions: ['This is a plan-only turn. No worker is started until the user explicitly asks to execute.'],
@@ -1115,11 +1152,12 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       : 'ask';
     const explicitAutoPlan = planDecision === 'auto'
       && (effectiveProfile === 'auto' || automationPolicy?.overrides?.plan === 'auto');
-    const autoContinue = builderTasks.length === 0
+    const previewOnly = params.options?.workMode === 'plan';
+    const autoContinue = !previewOnly && params.options?.teamLaunch !== 'confirm' && (builderTasks.length === 0
       || explicitAutoPlan
-      || (!params.decision.needsUserApproval && (planDecision === 'auto' || planDecision === 'review'));
+      || (!params.decision.needsUserApproval && (planDecision === 'auto' || planDecision === 'review')));
 
-    if (builderTasks.length > 0 && planDecision === 'deny') {
+    if (!previewOnly && builderTasks.length > 0 && planDecision === 'deny') {
       const reason = 'Mission policy denies Builder execution for this plan.';
       await this.transitionMissionDiagnostic({
         missionId: params.missionId,
@@ -1140,7 +1178,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         : `Prepared a ${createdTasks.length}-step plan without starting execution.`,
     });
 
-    if (builderTasks.length > 0 && !autoContinue) {
+    if (!previewOnly && (builderTasks.length > 0 || params.options?.teamLaunch === 'confirm') && !autoContinue) {
       await manager.updateMission(params.missionId, {
         planId,
         status: 'waiting_for_approval',
@@ -1149,7 +1187,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       await this.emitApprovalRequested({
         missionId: params.missionId,
         approvalType: 'plan',
-        description: `Plan with ${createdTasks.length} tasks is ready. Approve before Builder execution begins.`,
+        description: `Plan with ${createdTasks.length} tasks is ready. Approve before the team starts.\n${createdTasks.map((task) => `• ${task.title} — ${task.assignedRole}`).join('\n')}`,
       });
       return { missionId: params.missionId, planId, tasks: createdTasks, structuredPlan };
     }
@@ -1190,6 +1228,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     tasks: TaskSelect[];
     structuredPlan: StructuredPlan;
   }> {
+    options = { ...options, ...normalizeOrchestratorRequestOptions(options || {}) };
+    options.workMode = effectiveWorkMode(options.workMode, request, options.command);
     const manager = this.v2WorkspaceManager;
     if (!manager) return super.startMission(missionId, request, options);
 
@@ -1202,7 +1242,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     await this.ensureRunIsCurrent(missionId, options?.runId);
     this.lifecycleByMission.set(missionId, { turnId, runId: options?.runId });
     await this.ensureTurnUserMessage(missionId, turnId, request, initialPlanId);
-    if (initialPlanId && SCHEDULABLE_MISSION_STATUSES.has(String(initialMission.status))) {
+    if (initialPlanId && options.workMode !== 'plan' && options.workMode !== 'research'
+      && SCHEDULABLE_MISSION_STATUSES.has(String(initialMission.status))) {
       await this.reconcileMissionPlan(missionId, initialPlanId);
     }
 
@@ -1269,6 +1310,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           previousPlanId,
           hasPriorConversation,
           agentProfileIds: options?.agentProfileIds,
+          options,
         });
       } catch (error) {
         if (!this.isRunFenceError(error)) {
@@ -1284,7 +1326,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     let taskPlan: StructuredTaskPlan[];
     try {
-      taskPlan = decisionToTaskPlan(decision).map((task) => task.role === 'builder' && priorResearchBundle
+      taskPlan = decisionToTaskPlan(decision).map((task) => ({ ...task,
+        description: [task.description, attachmentContext(options?.attachments),
+          options?.workMode === 'research' ? 'This turn is research-only. Do not write files, install packages, execute mutating commands, or implement changes. Return findings and wait for a new user turn.' : '',
+        ].filter(Boolean).join('\n\n'),
+      })).map((task) => task.role === 'builder' && priorResearchBundle
         ? {
             ...task,
             description: `${task.description}\n\n${RESEARCH_CONTEXT_START}\nReuse this completed research from prior plan ${priorResearchBundle.planId}. Preserve provenance and verify conflicts/uncertainty:\n${JSON.stringify(priorResearchBundle)}\n${RESEARCH_CONTEXT_END}`,
@@ -1297,6 +1343,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         reason: `Execution plan could not be normalized before dispatch: ${error instanceof Error ? error.message : String(error)}`,
       });
       throw error;
+    }
+    if (options.teamLaunch === 'confirm' && decision.needsUserApproval && !taskPlan.some((task) => task.routePreference)) {
+      // A team preview does not require the supervisor to invent a model-choice
+      // checkpoint. The real plan approval below owns the launch decision.
+      decision = { ...decision, needsUserApproval: false };
     }
     if (decision.needsUserApproval && !taskPlan.some((task) => task.routePreference)) {
       // An approval card must name a real, validated model choice. Otherwise
@@ -1316,6 +1367,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       });
     }
     const normalizedPlanId = crypto.randomUUID();
+    this.planRequestOptions.set(normalizedPlanId, options);
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.trace('plan-normalized', {
       missionId,
@@ -1341,6 +1393,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       await this.ensureRunIsCurrent(missionId, options?.runId);
       result = await super.startMission(missionId, request, {
         ...options,
+        // V2 has already normalized explicit role/command intent into the graph.
+        // Do not let legacy direct routing replace the policy-constrained DAG.
+        targetRole: undefined,
+        command: undefined,
         rawModelPlanOutput,
         researchContextPlanId: priorResearchBundle?.planId,
         ...(decision.needsUserApproval ? {
@@ -2142,8 +2198,18 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       reason?: string;
       operationId?: string;
       idempotencyKey?: string;
+      expectedPlanId?: string;
+      expectedRunId?: string;
     },
   ): Promise<void> {
+    const currentMission = await this.v2WorkspaceManager?.getMission(missionId);
+    if ((options?.expectedPlanId && options.expectedPlanId !== currentMission?.planId)
+      || (options?.expectedRunId && options.expectedRunId !== currentMission?.activeRunId)) {
+      throw new Error('The approval no longer belongs to the current plan/run.');
+    }
+    const requestPolicy = currentMission?.planId ? await this.requestPolicyForPlan(missionId, currentMission.planId) : undefined;
+    if (approved && requestPolicy?.workMode === 'plan') throw new Error('Plan work mode cannot be approved into execution. Start a new execute or research turn.');
+    if (approved && approvalType === 'apply' && requestPolicy?.workMode === 'research') throw new Error('Research work mode cannot apply changes.');
     if (approvalType === 'worker_route' && approved) {
       const mission = await this.v2WorkspaceManager?.getMission(missionId);
       if (!mission || mission.status !== 'waiting_for_approval' || !mission.planId) {
@@ -2154,7 +2220,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         ? resolveAutomationAction(policy.profile, 'plan', policy.overrides)
         : null;
       if (planDecision === 'deny') throw new Error('Mission policy denies plan execution.');
-      const planAutoApproved = planDecision
+      const planAutoApproved = requestPolicy?.teamLaunch === 'confirm' ? false : planDecision
         ? planDecision === 'auto' || planDecision === 'review'
         : await new PolicyEngine(mission.executionMode).requestApproval('plan', 'Approve the selected worker plan');
       if (!planAutoApproved) {
@@ -2184,6 +2250,31 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     await this.enqueueMission(missionId, () => this.applyApprovedChanges(missionId, options));
+  }
+
+  /** Plan events retain the accepted request policy across restart and retries. */
+  private async requestPolicyForPlan(missionId: string, planId: string | null | undefined): Promise<StartMissionOptionsV2 | undefined> {
+    if (!planId) return undefined;
+    const cached = this.planRequestOptions.get(planId);
+    if (cached) return cached;
+    if (!this.v2Db) return undefined;
+    const events = await this.v2Db.select({ payload: missionEvents.payload }).from(missionEvents)
+      .where(and(eq(missionEvents.missionId, missionId), eq(missionEvents.type, 'plan_generated')));
+    const payload = events.find((row) => row.payload?.planId === planId)?.payload;
+    if (payload?.requestOptions && typeof payload.requestOptions === 'object') {
+      const policy = payload.requestOptions as StartMissionOptionsV2;
+      this.planRequestOptions.set(planId, policy);
+      return policy;
+    }
+    return undefined;
+  }
+
+  async assertWorkspaceWriteAllowed(missionId: string, planId?: string | null): Promise<void> {
+    const mission = await this.v2WorkspaceManager?.getMission(missionId);
+    const policy = await this.requestPolicyForPlan(missionId, planId || mission?.planId);
+    if (policy?.workMode === 'plan' || policy?.workMode === 'research') {
+      throw Object.assign(new Error(`${policy.workMode} work mode forbids workspace writes.`), { statusCode: 409, code: 'WORK_MODE_READ_ONLY' });
+    }
   }
 
   private async recoverNonProgressingPlan(

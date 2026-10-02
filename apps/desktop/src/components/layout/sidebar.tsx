@@ -359,7 +359,7 @@ export function Sidebar() {
           <SidebarItem collapsed icon={<PanelLeftOpen className="h-4 w-4" />} label="Workspaces" expanded={!sidebarCollapsed} controls="workspace-list-pane" onClick={toggleSidebar} />
           <SidebarItem collapsed icon={<History className="h-4 w-4" />} label="History" onClick={() => setIsHistoryDialogOpen(true)} />
           <SidebarItem collapsed icon={<BarChart2 className="h-4 w-4" />} label="Insights" isActive={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
-          <SidebarItem collapsed icon={<UsersRound className="h-4 w-4" />} label="Agents" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
+          <SidebarItem collapsed icon={<UsersRound className="h-4 w-4" />} label="Teams & specialists" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
         </nav>
         <div className="mt-auto flex w-full flex-col gap-1 border-t border-sidebar-border/70 pt-2">
           <DropdownMenu>

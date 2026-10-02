@@ -35,7 +35,7 @@ export function InspectorPanel() {
     </DialogPrimitive.Trigger>
     <DialogPrimitive.Portal>
       <DialogPrimitive.Overlay className="fixed inset-0 z-[100] bg-background/60 backdrop-blur-md data-[state=open]:animate-in data-[state=open]:fade-in-0 motion-reduce:animate-none" />
-      <DialogPrimitive.Content id="mission-workbench" aria-describedby="workbench-description" onCloseAutoFocus={event => { event.preventDefault(); triggerRef.current?.focus(); }} className="fixed inset-3 z-[110] flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl outline-none sm:inset-5 lg:inset-6">
+      <DialogPrimitive.Content id="mission-workbench" aria-describedby="workbench-description" onCloseAutoFocus={event => { event.preventDefault(); triggerRef.current?.focus(); }} className="fixed inset-3 z-[110] flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl outline-none sm:inset-5 lg:inset-y-3 lg:left-auto lg:right-3 lg:w-[min(760px,calc(100vw-2rem))]">
         <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-5 py-5 sm:px-8">
           <div className="min-w-0">
             <p className="mb-1 text-xs font-medium text-muted-foreground">Orchestrator</p>
