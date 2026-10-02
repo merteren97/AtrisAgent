@@ -237,7 +237,7 @@ globalThis.fetch = async () => { throw new ApiRequestTimeoutError(30_000); };
 await useMissionStore.getState().startMission('Timed mission start', 'workspace-timeout');
 const timeoutState = useMissionStore.getState();
 assert.equal(timeoutState.loading, false, 'a mission start timeout stops the loading state');
-assert.equal(timeoutState.error, null, 'a mission start timeout is not presented as a definitive failure');
+assert.match(timeoutState.error || '', /timed out/, 'an uncertain start preserves its error so the composer cannot clear an unaccepted draft');
 assert.equal(timeoutState.pendingMissionStart?.reason, 'deadline', 'a mission start timeout records an uncertain pending request');
 assert(!timeoutState.timeline.some((entry) => entry.eventType === 'mission_failed'), 'a mission start timeout does not synthesize a failure event');
 globalThis.fetch = originalFetch;

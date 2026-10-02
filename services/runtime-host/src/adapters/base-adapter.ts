@@ -1,6 +1,6 @@
 import type { ChildProcess } from 'child_process';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
-import type { AgentEvent } from '@atris-agent-code/event-schema';
+import type { AgentEvent, QuestionAsked } from '@atris-agent-code/event-schema';
 import type {
   RuntimeAdapter,
   CapabilitySnapshot,
@@ -23,6 +23,8 @@ import { terminateProcessTree } from '../runtime-utils';
 
 export interface SpawnAgentOptions {
   sessionId?: string;
+  attemptId?: string;
+  runId?: string;
   taskId: string;
   missionId: string;
   prompt: string;
@@ -124,6 +126,22 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
 
   getSessionContinuityCapabilities(): SessionContinuityCapabilities {
     return { reuseWhileAlive: false, resumeAfterRestart: false };
+  }
+
+  getPendingQuestion(_sessionId: string, _requestId: string): QuestionAsked | undefined {
+    return undefined;
+  }
+
+  isAwaitingUser(_sessionId: string): boolean {
+    return false;
+  }
+
+  async respondToQuestion(_sessionId: string, _requestId: string, _answers: string[][]): Promise<void> {
+    throw new Error(`${this.name} does not support native interactive questions in this execution mode.`);
+  }
+
+  async rejectQuestion(_sessionId: string, _requestId: string): Promise<void> {
+    throw new Error(`${this.name} does not support native question cancellation in this execution mode.`);
   }
 
   async probeProviderSession(_providerSessionId: string, _options?: { profileId?: string; cwd?: string }): Promise<boolean> {

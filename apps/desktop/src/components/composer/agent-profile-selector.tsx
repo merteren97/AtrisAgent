@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertCircle, Check, ChevronDown, Loader2, UsersRound } from 'lucide-react';
-import type { AgentRole, CanonicalReasoning, RouteSelectionMode } from '@atris-agent-code/domain';
+import { AlertCircle, Check, ChevronDown, Loader2, UsersRound, Settings2, RefreshCw } from 'lucide-react';
+import type { AgentRole, CanonicalReasoning, RouteSelectionMode, RuntimeType } from '@atris-agent-code/domain';
 import { AGENT_ROLES, parseAgentProfile } from '@atris-agent-code/domain';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { apiRequest } from '@/lib/api-client';
 import { useSettingsStore } from '@/stores/settings-store';
 import { cn } from '@/lib/utils';
+import { useOrchestratorPreferences } from '@/stores/orchestrator-preferences-store';
 
 export interface DesktopAgentProfileRoutePolicy {
   selectionMode?: RouteSelectionMode;
@@ -15,6 +16,10 @@ export interface DesktopAgentProfileRoutePolicy {
   modelCatalogId?: string;
   reasoningLevel?: CanonicalReasoning;
   fallbackCatalogIds?: string[];
+  allowedCatalogIds?: string[];
+  allowedModelCatalogIds?: string[];
+  allowedAccountProfileIds?: string[];
+  allowedRuntimeTypes?: RuntimeType[];
 }
 
 /** UI-safe profile data. Unknown API fields are intentionally discarded. */
@@ -58,6 +63,10 @@ function safeRoutePolicy(value: unknown): DesktopAgentProfileRoutePolicy | undef
       .map((item) => item.trim())));
     if (fallbackCatalogIds.length) route.fallbackCatalogIds = fallbackCatalogIds;
   }
+  for (const key of ['allowedCatalogIds', 'allowedModelCatalogIds', 'allowedAccountProfileIds'] as const) {
+    if (Array.isArray(record[key])) route[key] = Array.from(new Set(record[key].filter((item): item is string => Boolean(cleanString(item))).map((item) => item.trim())));
+  }
+  if (Array.isArray(record.allowedRuntimeTypes)) route.allowedRuntimeTypes = record.allowedRuntimeTypes.filter((item): item is RuntimeType => ['codex', 'claude_code', 'antigravity', 'opencode'].includes(String(item)));
   return Object.keys(route).length ? route : undefined;
 }
 
@@ -114,9 +123,17 @@ export function normalizeAgentProfiles(input: unknown): DesktopAgentProfile[] {
   });
 }
 
+/** A saved ID is valid only when it still belongs to the same safety role. */
+export function invalidAgentProfileRoles(selections: Partial<Record<AgentRole, string>>, profiles: DesktopAgentProfile[]): AgentRole[] {
+  return PROFILE_ROLES.filter((role) => Boolean(selections[role]) && !profiles.some((profile) => profile.id === selections[role] && profile.role === role));
+}
+
 export function AgentProfileSelector() {
-  const agentProfileIds = useSettingsStore((state) => state.agentProfileIds);
-  const setAgentProfileId = useSettingsStore((state) => state.setAgentProfileId);
+  const { preferences, updatePreferences, scopeKey } = useOrchestratorPreferences();
+  const agentProfileIds = preferences.agentProfileIds;
+  const setActiveView = useSettingsStore((state) => state.setActiveView);
+  const [open, setOpen] = useState(false);
+  const [refresh, setRefresh] = useState(0);
   const [profiles, setProfiles] = useState<DesktopAgentProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -127,19 +144,22 @@ export function AgentProfileSelector() {
     setError(null);
     void apiRequest<unknown>('/agent-profiles')
       .then((response) => {
-        if (!cancelled) setProfiles(normalizeAgentProfiles(response));
+        if (cancelled) return;
+        const next = normalizeAgentProfiles(response);
+        setProfiles(next);
+        const invalid = invalidAgentProfileRoles(agentProfileIds, next);
+        if (invalid.length) updatePreferences({ agentProfileIds: Object.fromEntries(Object.entries(agentProfileIds).filter(([role]) => !invalid.includes(role as AgentRole))) });
       })
       .catch((cause) => {
         if (!cancelled) {
-          setProfiles([]);
-          setError(cause instanceof Error ? cause.message : 'Named profiles are unavailable.');
+          setError(cause instanceof Error ? cause.message : 'Specialists could not be loaded.');
         }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [refresh, updatePreferences, scopeKey, agentProfileIds]);
 
   const selectedCount = useMemo(
     () => PROFILE_ROLES.filter((role) => Boolean(agentProfileIds[role])).length,
@@ -147,17 +167,17 @@ export function AgentProfileSelector() {
   );
 
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={(next) => { setOpen(next); if (next) setRefresh((current) => current + 1); }}>
       <DropdownMenuTrigger asChild>
         <Button
           variant="ghost"
           size="sm"
           className="h-6 max-w-[150px] gap-1 px-2 text-[10px] text-muted-foreground hover:text-foreground"
-          aria-label={selectedCount ? `${selectedCount} named agent profiles selected` : 'Select named agent profiles'}
-          title="Optional named profiles by fixed role"
+          aria-label={selectedCount ? `${selectedCount} specialists selected` : 'Select saved specialists'}
+          title="Saved specialists by safety role"
         >
           {loading ? <Loader2 className="h-3 w-3 animate-spin text-primary" aria-hidden="true" /> : <UsersRound className="h-3 w-3" aria-hidden="true" />}
-          <span className="truncate">Profiles{selectedCount ? ` Â· ${selectedCount}` : ''}</span>
+          <span className="truncate">Specialists{selectedCount ? ` · ${selectedCount}` : ''}</span>
           <ChevronDown className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
         </Button>
       </DropdownMenuTrigger>
@@ -169,13 +189,13 @@ export function AgentProfileSelector() {
       >
         <div className="border-b border-border px-2 pb-2">
           <div className="flex items-center justify-between gap-2">
-            <div className="text-xs font-semibold">Named profiles</div>
+            <div className="text-xs font-semibold">Saved specialists</div>
             <Badge variant="outline" className="text-[9px]">Optional overrides</Badge>
           </div>
-          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">Choose a safe named identity for each fixed role. Empty roles use the team/default profile.</p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Optional overrides for this run. Unselected roles use automatic specialist selection and saved defaults.</p>
         </div>
         <div className="max-h-[360px] space-y-1 overflow-y-auto py-2">
-          {PROFILE_ROLES.map((role) => {
+          {PROFILE_ROLES.filter((role) => profiles.some((profile) => profile.role === role) || agentProfileIds[role]).map((role) => {
             const roleProfiles = profiles.filter((profile) => profile.role === role);
             const selectedId = agentProfileIds[role] || '';
             const selected = roleProfiles.find((profile) => profile.id === selectedId);
@@ -187,22 +207,26 @@ export function AgentProfileSelector() {
                 </span>
                 <select
                   id={`agent-profile-${role}`}
-                  aria-label={`Named profile for ${profileRoleLabel(role)}`}
+                  aria-label={`Specialist for ${profileRoleLabel(role)}`}
                   value={selectedId}
-                  onChange={(event) => setAgentProfileId(role, event.target.value || null)}
+                  disabled={loading || Boolean(error)}
+                  onChange={(event) => updatePreferences({ agentProfileIds: Object.fromEntries(Object.entries({ ...agentProfileIds, [role]: event.target.value }).filter(([, id]) => id)) })}
                   className={cn('h-8 w-full rounded-md border border-input bg-background px-2 text-[10px] outline-none focus:border-primary', selectedId ? 'text-foreground' : 'text-muted-foreground')}
                 >
-                  <option value="">Default {profileRoleLabel(role)}</option>
+                  <option value="">Automatic {profileRoleLabel(role)}</option>
                   {roleProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                  {selectedId && !selected && <option value={selectedId}>Saved specialist (not verified)</option>}
                 </select>
                 {selected?.description && <span className="mt-1 block truncate text-[9px] text-muted-foreground">{selected.description}</span>}
-                {!loading && roleProfiles.length === 0 && <span className="mt-1 block text-[9px] text-muted-foreground">No named profile; the runtime default remains active.</span>}
               </label>
             );
           })}
         </div>
-        {loading && <div className="flex items-center gap-2 border-t border-border px-2 pt-2 text-[10px] text-muted-foreground"><Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />Loading profilesâ€¦</div>}
-        {error && <div role="alert" className="flex items-start gap-2 border-t border-border px-2 pt-2 text-[10px] text-amber-400"><AlertCircle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" /><span>Profile catalog unavailable; saved selections are verified when you run.</span></div>}
+        {!loading && !error && !profiles.length && <p className="px-2 pb-2 text-xs leading-relaxed text-muted-foreground">No saved specialists yet. The orchestrator uses built-in role defaults to assemble your team.</p>}
+        {loading && <div role="status" className="flex items-center gap-2 px-2 pb-2 text-xs text-muted-foreground"><Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />Loading specialists…</div>}
+        {error && <div role="alert" className="space-y-2 px-2 pb-2 text-xs text-destructive"><div className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" /><span className="min-w-0 break-words">{error}</span></div><Button variant="outline" size="sm" onClick={() => setRefresh((current) => current + 1)}><RefreshCw className="mr-1 h-3 w-3" />Retry</Button></div>}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => setActiveView('agents')}><Settings2 className="h-4 w-4" />{profiles.length ? 'Manage specialists' : 'Create a specialist'}</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );

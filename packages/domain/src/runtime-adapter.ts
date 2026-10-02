@@ -96,6 +96,9 @@ export interface RuntimeAdapter {
   sendInput(sessionId: string, input: AgentInput): Promise<void>;
   streamEvents(sessionId: string): AsyncIterable<AgentEvent>;
   respondToApproval(requestId: string, decision: ApprovalDecision): Promise<void>;
+  /** Optional native question transport. Absence means unsupported, never a synthetic answer. */
+  respondToQuestion?(sessionId: string, requestId: string, answers: string[][]): Promise<void>;
+  rejectQuestion?(sessionId: string, requestId: string): Promise<void>;
   cancel(sessionId: string): Promise<void>;
   shutdown(): Promise<void>;
 

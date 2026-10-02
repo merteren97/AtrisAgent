@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import type { ChildProcess } from 'child_process';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
-import type { AgentEvent } from '@atris-agent-code/event-schema';
+import type { AgentEvent, QuestionAsked, QuestionInfo } from '@atris-agent-code/event-schema';
 import type {
   RuntimeType,
   AgentSession,
@@ -103,7 +103,9 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   private servers = new Map<string, ServerInstance>();
   private authResults = new Map<string, AuthInitiationResult & { profileId: string }>();
   private abortControllers = new Map<string, AbortController>();
-  private sessionContext = new Map<string, { missionId: string; taskId: string; serverKey: string; runtimeSessionId: string }>();
+  private sessionContext = new Map<string, { missionId: string; taskId: string; attemptId?: string; runId?: string; serverKey: string; runtimeSessionId: string }>();
+  private pendingQuestions = new Map<string, QuestionAsked>();
+  private questionDeliveries = new Set<string>();
   private profileModes = new Map<string, 'isolated' | 'shared_cli'>();
   private reusableSessions = new Map<string, { serverKey: string; profileId: string; cwd: string }>();
 
@@ -193,6 +195,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       reasoningControl: true,
       toolCallEvents: true,
       interactiveApproval: true,
+      interactiveQuestions: true,
       usageInfo: false,
       cancellation: true,
       worktreeAwareness: true,
@@ -491,6 +494,51 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (!response.ok) throw new Error(`OpenCode permission response failed (${response.status}).`);
   }
 
+  override getPendingQuestion(sessionId: string, requestId: string): QuestionAsked | undefined {
+    return this.pendingQuestions.get(JSON.stringify([sessionId, requestId]));
+  }
+
+  override isAwaitingUser(sessionId: string): boolean {
+    return [...this.pendingQuestions.values()].some(question => question.agentInstanceId === sessionId);
+  }
+
+  override async respondToQuestion(sessionId: string, requestId: string, answers: string[][]): Promise<void> {
+    await this.deliverQuestion(sessionId, requestId, 'reply', answers);
+  }
+
+  override async rejectQuestion(sessionId: string, requestId: string): Promise<void> {
+    await this.deliverQuestion(sessionId, requestId, 'reject');
+  }
+
+  private async deliverQuestion(sessionId: string, requestId: string, action: 'reply' | 'reject', answers?: string[][]): Promise<void> {
+    const key = JSON.stringify([sessionId, requestId]);
+    const question = this.pendingQuestions.get(key);
+    const context = this.sessionContext.get(sessionId);
+    if (!question || !context || question.runtimeSessionId !== context.runtimeSessionId || !this.activeSessions.has(sessionId)) {
+      throw new Error('This OpenCode question is no longer pending in the originating session. Reload or retry the task.');
+    }
+    if (this.questionDeliveries.has(key)) throw new Error('An answer is already being delivered for this question.');
+    this.questionDeliveries.add(key);
+    try {
+      const server = this.getServer(context.serverKey);
+      // Use this session's authenticated server AND directory; never a new unauthenticated client.
+      const response = await this.fetchServer(server, `/question/${encodeURIComponent(requestId)}/${action}?directory=${encodeURIComponent(server.cwd)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        ...(action === 'reply' ? { body: JSON.stringify({ answers }) } : {}),
+      });
+      if (!response.ok) throw new Error(`OpenCode question ${action} failed (${response.status}).`);
+      const confirmed = await response.json().catch(() => null);
+      if (confirmed !== true) throw new Error('OpenCode did not confirm acceptance of the question response. Reload before retrying.');
+      // A true result is authoritative provider acceptance, even if SSE arrives later or is lost.
+      if (this.pendingQuestions.get(key) === question) {
+        this.pendingQuestions.delete(key);
+        this.emitEvent(action === 'reply'
+          ? { ...question, id: crypto.randomUUID(), type: 'question_replied', answers: answers!, timestamp: new Date().toISOString() }
+          : { ...question, id: crypto.randomUUID(), type: 'question_rejected', reason: 'Question cancelled by user', outcome: 'rejected', timestamp: new Date().toISOString() });
+      }
+    } finally { this.questionDeliveries.delete(key); }
+  }
+
   override async cancel(sessionId: string): Promise<void> {
     this.markSessionCancelled(sessionId);
     const context = this.sessionContext.get(sessionId);
@@ -546,14 +594,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       this.sessionContext.set(agentInstanceId, {
         missionId: options.missionId,
         taskId: options.taskId,
+        attemptId: options.attemptId,
+        runId: options.runId,
         serverKey: server.key,
         runtimeSessionId,
       });
       this.emitEvent({ id: crypto.randomUUID(), type: 'agent_started', missionId: options.missionId, agentInstanceId, role: String(options.role || 'builder'), model: options.model || 'OpenCode default', timestamp: new Date().toISOString() });
 
-      this.startEventStream(agentInstanceId, server).catch((error) => {
-        this.emitFailure(agentInstanceId, error.message);
-        this.cleanupSession(agentInstanceId);
+      // Establish subscription before submitting a prompt: a fast question must not be lost.
+      await new Promise<void>((resolve, reject) => {
+        void this.startEventStream(agentInstanceId, server, resolve).catch((error) => {
+          reject(error);
+          this.emitFailure(agentInstanceId, error.message);
+          this.cleanupSession(agentInstanceId);
+        });
       });
       if (options.preserveProviderSession) {
         this.reusableSessions.set(runtimeSessionId, { serverKey: server.key, profileId, cwd: workspaceCwd });
@@ -693,11 +747,12 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     }
   }
 
-  private async startEventStream(sessionId: string, server: ServerInstance): Promise<void> {
+  private async startEventStream(sessionId: string, server: ServerInstance, ready?: () => void): Promise<void> {
     const controller = new AbortController();
     this.abortControllers.set(sessionId, controller);
     const response = await this.fetchServer(server, '/event', { signal: controller.signal, headers: { Accept: 'text/event-stream' } });
     if (!response.ok || !response.body) throw new Error(`OpenCode event stream failed (${response.status}).`);
+    ready?.();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -727,7 +782,41 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (relatedSessionId && relatedSessionId !== context.runtimeSessionId) return;
     const type = event.type || envelope.type;
     const timestamp = new Date().toISOString();
-    if (type === 'message.part.updated') {
+    if (type === 'question.asked') {
+      // Global streams may contain other sessions; questions require an explicit session match.
+      if (relatedSessionId !== context.runtimeSessionId || typeof properties.id !== 'string') return;
+      const questions = normalizeOpenCodeQuestions(properties.questions);
+      if (!questions) {
+        this.emitFailure(sessionId, 'OpenCode question payload is malformed or exceeds supported question limits.');
+        this.cleanupSession(sessionId);
+        return;
+      }
+      const key = JSON.stringify([sessionId, properties.id]);
+      if (this.pendingQuestions.has(key)) return;
+      if ([...this.pendingQuestions.values()].filter(question => question.agentInstanceId === sessionId).length >= 32) {
+        this.emitFailure(sessionId, 'OpenCode exceeded the limit of 32 pending question requests per session.');
+        this.cleanupSession(sessionId);
+        return;
+      }
+      const question: QuestionAsked = {
+        id: crypto.randomUUID(), type: 'question_asked', missionId: context.missionId,
+        taskId: context.taskId, attemptId: context.attemptId, runId: context.runId,
+        agentInstanceId: sessionId, runtimeSessionId: context.runtimeSessionId, adapterId: this.id,
+        requestId: properties.id, questionId: `${sessionId}:${properties.id}`, questions, timestamp,
+      };
+      this.pendingQuestions.set(key, question);
+      this.emitEvent(question);
+    } else if (type === 'question.replied' || type === 'question.rejected') {
+      if (relatedSessionId !== context.runtimeSessionId) return;
+      const requestId = properties.requestID || properties.requestId || properties.id;
+      const key = JSON.stringify([sessionId, requestId]);
+      const question = this.pendingQuestions.get(key);
+      if (!question) return;
+      this.pendingQuestions.delete(key);
+      this.emitEvent(type === 'question.replied'
+        ? { ...question, id: crypto.randomUUID(), type: 'question_replied', answers: properties.answers || [], timestamp }
+        : { ...question, id: crypto.randomUUID(), type: 'question_rejected', reason: 'OpenCode rejected the question', outcome: 'rejected', timestamp });
+    } else if (type === 'message.part.updated') {
       const part = properties.part || {};
       const text = properties.delta || part.text;
       if (part.type === 'text' && text) this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: text, timestamp });
@@ -757,6 +846,8 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         timestamp,
       });
     } else if (type === 'session.idle') {
+      if (relatedSessionId !== context.runtimeSessionId) return;
+      if (this.isAwaitingUser(sessionId)) return;
       this.recordProviderUsage(sessionId, properties);
       this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: 'OpenCode session completed', timestamp });
       const session = this.activeSessions.get(sessionId);
@@ -770,6 +861,11 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
   private cleanupSession(sessionId: string): void {
     const context = this.sessionContext.get(sessionId);
+    for (const [key, question] of this.pendingQuestions) {
+      if (question.agentInstanceId !== sessionId) continue;
+      this.pendingQuestions.delete(key);
+      this.emitEvent({ ...question, id: crypto.randomUUID(), type: 'question_rejected', reason: 'Originating runtime session ended', outcome: 'cancelled', timestamp: new Date().toISOString() });
+    }
     this.abortControllers.get(sessionId)?.abort();
     this.abortControllers.delete(sessionId);
     this.activeSessions.delete(sessionId);
@@ -793,6 +889,22 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
 function processEnv(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...process.env, ...extra };
+}
+
+export function normalizeOpenCodeQuestions(value: unknown): QuestionInfo[] | undefined {
+  if (!Array.isArray(value) || !value.length || value.length > 20) return undefined;
+  const result: QuestionInfo[] = [];
+  for (const item of value) {
+    if (!item || typeof item.question !== 'string' || !item.question.trim() || item.question.length > 16_000
+      || (typeof item.header === 'string' && item.header.length > 256) || !Array.isArray(item.options) || item.options.length > 100) return undefined;
+    if (!item.options.every((option: any) => option && typeof option.label === 'string' && option.label.length > 0
+      && option.label.length <= 1000 && (typeof option.description !== 'string' || option.description.length <= 4000))) return undefined;
+    if (new Set(item.options.map((option: any) => option.label)).size !== item.options.length) return undefined;
+    result.push({ header: typeof item.header === 'string' ? item.header : 'Question', question: item.question,
+      options: item.options.map((option: any) => ({ label: option.label, description: typeof option.description === 'string' ? option.description : '' })),
+      multiple: item.multiple === true, custom: item.custom !== false });
+  }
+  return result;
 }
 
 function identifierValue(...values: unknown[]): string | undefined {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { normalizeAgentProfiles } from './agent-profile-selector';
+import { invalidAgentProfileRoles, normalizeAgentProfiles } from './agent-profile-selector';
 
 const profiles = normalizeAgentProfiles({
   profiles: [
@@ -35,5 +35,10 @@ assert.deepEqual(profiles[0]?.routePolicy, {
 });
 assert(!JSON.stringify(profiles).includes('rawToken'), 'unknown credential-like fields are discarded');
 assert(!JSON.stringify(profiles).includes('must-not-reach-the-ui'), 'credential-like values never reach the display model');
+
+assert.deepEqual(invalidAgentProfileRoles({ builder: 'builder-ui', reviewer: 'builder-ui', researcher: 'deleted' }, profiles), ['reviewer', 'researcher'], 'deleted and wrong-role IDs are cleared; valid selections survive');
+assert.deepEqual(invalidAgentProfileRoles({}, []), [], 'empty automatic selections need no reconciliation');
+const constrained = normalizeAgentProfiles([{ id: 'constrained', name: 'Constrained', role: 'builder', routePolicy: { allowedCatalogIds: [], allowedAccountProfileIds: ['safe-account'], allowedRuntimeTypes: ['codex'] } }]);
+assert.deepEqual(constrained[0]?.routePolicy, { allowedCatalogIds: [], allowedAccountProfileIds: ['safe-account'], allowedRuntimeTypes: ['codex'] }, 'normalization preserves safe restrictive route settings including deny-all lists');
 
 console.log('agent profile selector tests passed');

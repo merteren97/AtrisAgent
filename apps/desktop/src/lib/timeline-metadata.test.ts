@@ -34,4 +34,12 @@ const lateFields: Record<string, unknown> = Object.fromEntries(Array.from({ leng
 lateFields.approvalId = 'approval-late';
 assert.equal(compactTimelineMetadata(lateFields)?.approvalId, 'approval-late', 'important late metadata fields survive object bounding');
 
+const attachment = { id: 'file-1', workspaceId: 'workspace-1', name: 'reference.png', mimeType: 'image/png',
+  byteSize: 68, sha256: 'digest', createdAt: '2026-10-02T12:00:00Z' };
+const attachmentMetadata = compactTimelineMetadata({ ...lateFields, attachmentIds: [attachment.id], attachments: [attachment], workMode: 'plan', teamLaunch: 'confirm' });
+assert.deepEqual(attachmentMetadata?.attachments, [attachment], 'bounded metadata retains complete public attachment refs');
+assert.deepEqual(attachmentMetadata?.attachmentIds, ['file-1']);
+assert.equal(attachmentMetadata?.workMode, 'plan');
+assert.equal(attachmentMetadata?.teamLaunch, 'confirm');
+
 console.log('timeline metadata projection tests passed');

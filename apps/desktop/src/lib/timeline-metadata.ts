@@ -7,6 +7,7 @@ const MAX_METADATA_NODES = 512;
 const DUPLICATED_CONTENT_KEYS = new Set(['content', 'thought']);
 const PRIORITY_METADATA_KEYS = [
   'id', 'type', 'missionId', 'sequence', 'schemaVersion', 'timestamp', 'turnId', 'runId', 'clientMessageId',
+  'workspaceId', 'attachmentIds', 'attachments', 'workMode', 'teamLaunch',
   'agentInstanceId', 'taskId', 'role', 'agentRole', 'assignedRole', 'toolCallId', 'toolName', 'args', 'result',
   'success', 'approvalId', 'approvalType', 'approvalStatus', 'approved', 'decidedBy', 'path', 'command',
   'description', 'error', 'summary', 'status', 'state',

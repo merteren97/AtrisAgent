@@ -1,495 +1,138 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react';
-import {
-  AlertCircle,
-  AtSign,
-  CheckCircle2,
-  ChevronDown,
-  Loader2,
-  Paperclip,
-  RefreshCw,
-  Search,
-  Send,
-  Settings2,
-  Sparkles,
-  Terminal,
-} from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { AtSign, ChevronDown, Clock3, Loader2, Paperclip, Send, Settings2, Sparkles, Terminal, UsersRound } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { TeamTemplateSelector } from './team-template-selector';
 import { AgentProfileSelector } from './agent-profile-selector';
-import { TrustModeSelector } from './trust-mode-selector';
-import { useMissionStore } from '@/stores/mission-store';
-import { useWorkspaceStore } from '@/stores/workspace-store';
+import { OrchestratorModelSelector } from '@/components/orchestrator/orchestrator-model-selector';
+import { OrchestratorPreferenceFields } from '@/components/orchestrator/orchestrator-defaults';
+import { OrchestratorAttachmentTray, useOrchestratorAttachments } from '@/components/orchestrator/orchestrator-attachments';
+import { useOrchestratorPreferences, useOrchestratorPreferencesStore } from '@/stores/orchestrator-preferences-store';
+import { useMissionStore, type StartMissionOptions, type TurnDelivery } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
-import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
+import { useAccountStore } from '@/stores/account-store';
+import { AGENT_ROLES, parseAgentDirective } from '@/lib/agent-directive';
+import { resolveOrchestratorRoute } from '@/lib/orchestrator-route';
 import { cn } from '@/lib/utils';
-import { AGENT_ROLES, buildComposerRouteOptions, parseAgentDirective } from '@/lib/agent-directive';
 
-const ROLES = AGENT_ROLES;
-const COMMANDS = [
-  { id: 'plan', label: 'Create or revise the mission plan' },
-  { id: 'agent', label: 'Delegate a focused task to a specialist agent' },
-  { id: 'review', label: 'Request a focused review' },
-  { id: 'summarize', label: 'Summarize current mission state' },
-] as const;
-const TERMINAL_CONVERSATION_STATUSES = new Set(['completed', 'failed', 'cancelled', 'blocked']);
-
-function titleCase(value: string): string {
-  return value === 'xhigh' ? 'Extra High' : value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-function modelSupportsRole(model: DiscoveredModel, role: string): boolean {
-  return model.suitableRoles.length === 0
-    || model.suitableRoles.some((candidate) => candidate.toLowerCase() === role.toLowerCase());
-}
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'blocked']);
+const COMMANDS = [{ id: 'plan', label: 'Plan without launching workers' }, { id: 'agent', label: 'Delegate a focused task' }, { id: 'review', label: 'Request a focused review' }, { id: 'summarize', label: 'Summarize the current work' }];
+const MODE_LABELS = { auto: 'Auto', research: 'Research · read-only', plan: 'Plan · no execution', execute: 'Execute & verify' };
 
 export function ChatComposer() {
-  const [message, setMessage] = useState('');
-  const [mentionOpen, setMentionOpen] = useState(false);
-  const [mentionFilter, setMentionFilter] = useState('');
-  const [commandOpen, setCommandOpen] = useState(false);
-  const [commandFilter, setCommandFilter] = useState('');
-  const [modelSearch, setModelSearch] = useState('');
-  const [modelRuntimeFilter, setModelRuntimeFilter] = useState<'all' | DiscoveredModel['runtimeType']>('all');
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const { preferences, updatePreferences, scopeKey, workspaceId, missionId, draft: message, setDraft: setMessage, customized } = useOrchestratorPreferences();
+  const attachmentState = useOrchestratorAttachments(scopeKey, workspaceId);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  const startMission = useMissionStore((state) => state.startMission);
-  const continueMission = useMissionStore((state) => state.continueMission);
-  const activeMissionId = useMissionStore((state) => state.activeMissionId);
-  const missions = useMissionStore((state) => state.missions);
-  const loading = useMissionStore((state) => state.loading);
-  const pendingMissionStart = useMissionStore((state) => state.pendingMissionStart);
-  const composerInput = useMissionStore((state) => state.composerInput);
-  const setComposerInput = useMissionStore((state) => state.setComposerInput);
-  const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
-  const discoveredModels = useAccountStore((state) => state.discoveredModels);
-  const modelCatalogLoading = useAccountStore((state) => state.modelCatalogLoading);
-  const modelCatalogReady = useAccountStore((state) => state.modelCatalogReady);
-  const modelCatalogError = useAccountStore((state) => state.modelCatalogError);
-  const serviceOnline = useAccountStore((state) => state.serviceOnline);
-  const refreshModels = useAccountStore((state) => state.refreshModels);
-
-  const {
-    selectedModel,
-    reasoningLevel,
-    trustMode,
-    automationSettings,
-    teamTemplate,
-    agentProfileIds,
-    setSelectedRole,
-    setSelectedModel,
-    setReasoningLevel,
-    setActiveView,
-  } = useSettingsStore();
-
-  useEffect(() => { setSelectedRole('Orchestrator'); }, [setSelectedRole]);
-
-  const activeMission = useMemo(
-    () => missions.find((mission) => mission.id === activeMissionId),
-    [activeMissionId, missions],
-  );
-  const activeConversationCanContinue = Boolean(
-    activeMission && TERMINAL_CONVERSATION_STATUSES.has(activeMission.status),
-  );
-  const activeConversationBusy = Boolean(activeMission && !activeConversationCanContinue);
-  const missionStartPending = Boolean(pendingMissionStart);
-
-  const selectedModelObject = useMemo(
-    () => discoveredModels.find((model) => model.catalogId === selectedModel),
-    [discoveredModels, selectedModel],
-  );
-
-  const directive = useMemo(
-    () => parseAgentDirective(message, discoveredModels, 'Orchestrator'),
-    [message, discoveredModels],
-  );
-  const directiveModel = useMemo(
-    () => discoveredModels.find((model) => model.catalogId === directive.modelCatalogId),
-    [discoveredModels, directive.modelCatalogId],
-  );
-  const directiveTargetRole = directive.targetRole || 'Orchestrator';
-  const directiveModelRoleCompatible = !directiveModel || (directive.teamWideModel
-    ? ['Builder', 'Reviewer', 'Researcher', 'QA'].every((role) => modelSupportsRole(directiveModel, role))
-    : modelSupportsRole(directiveModel, directiveTargetRole));
-  const directiveReasoningSupported = !directive.reasoningLevel
-    || !directiveModel
-    || directiveModel.supportedReasoning.length === 0
-    || directiveModel.supportedReasoning.includes(directive.reasoningLevel as never);
-  const routeResolution = useMemo(() => buildComposerRouteOptions(directive, {
-    selectedModel: selectedModelObject?.available ? selectedModel : undefined,
-    selectedReasoning: reasoningLevel,
-    directiveModelDefaultReasoning: directiveModel?.defaultReasoning || directiveModel?.supportedReasoning[0],
-    directiveReasoningSupported,
-  }), [directive, directiveModel, directiveReasoningSupported, reasoningLevel, selectedModel, selectedModelObject]);
-
-  useEffect(() => {
-    if (!selectedModel) return;
-    if (!modelCatalogReady || modelCatalogLoading) return;
-    if (selectedModelObject?.available && modelSupportsRole(selectedModelObject, 'Orchestrator')) return;
-    setSelectedModel('');
-  }, [modelCatalogLoading, modelCatalogReady, selectedModel, selectedModelObject, setSelectedModel]);
-
-  useEffect(() => {
-    if (!selectedModelObject) return;
-    const supported = selectedModelObject.supportedReasoning;
-    if (!supported.length) {
-      if (reasoningLevel !== 'none') setReasoningLevel('none');
-      return;
-    }
-    if (!supported.includes(reasoningLevel as never)) {
-      setReasoningLevel(selectedModelObject.defaultReasoning || supported[0]);
-    }
-  }, [selectedModelObject, reasoningLevel, setReasoningLevel]);
-
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [sending, setSending] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [saveNotice, setSaveNotice] = useState('');
+  const [delivery, setDelivery] = useState<TurnDelivery>('queue');
+  const [picker, setPicker] = useState<'mention' | 'command' | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const { missions, loading, pendingMissionStart, composerInput, setComposerInput, queuedTurns, error } = useMissionStore();
+  const { discoveredModels, serviceOnline } = useAccountStore();
+  const mission = missions.find(item => item.id === missionId);
+  const busy = Boolean(mission && !TERMINAL.has(mission.status));
+  const locked = sending || attachmentState.uploading || loading || Boolean(pendingMissionStart) || !workspaceId;
+  const directive = useMemo(() => parseAgentDirective(message, discoveredModels, 'Orchestrator'), [message, discoveredModels]);
+  const route = useMemo(() => resolveOrchestratorRoute(directive, preferences, discoveredModels), [directive, preferences, discoveredModels]);
+  const hasModel = discoveredModels.some(model => model.available && (!model.suitableRoles.length || model.suitableRoles.some(role => role.toLowerCase() === 'orchestrator')));
+  const selectedSpecialists = Object.values(preferences.agentProfileIds).filter(Boolean).length;
+  const filter = message.match(/@(\w*)$/)?.[1]?.toLowerCase() || '';
+  const commandFilter = message.match(/^\/(\w*)$/)?.[1]?.toLowerCase() || '';
+  const queued = queuedTurns.filter(turn => turn.missionId === missionId).length;
+  const resize = () => {
+    const input = textareaRef.current;
+    if (input) { input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 170)}px`; }
+  };
+  useEffect(() => { resize(); }, [message, scopeKey]);
+  useEffect(() => { setPicker(null); setLocalError(null); setSaveNotice(''); setDelivery('queue'); }, [scopeKey]);
   useEffect(() => {
     if (!composerInput) return;
-    setMessage(composerInput);
-    setComposerInput('');
+    setMessage(composerInput); setComposerInput('');
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [composerInput, setComposerInput]);
-
-  const filteredAgents = ROLES.filter((role) => role.toLowerCase().includes(mentionFilter));
-  const filteredCommands = COMMANDS.filter((command) => command.id.includes(commandFilter));
-  const reasoningOptions = selectedModelObject?.supportedReasoning.length ? selectedModelObject.supportedReasoning : [];
-
-  const matchingModels = useMemo(() => {
-    const search = modelSearch.trim().toLowerCase();
-    return discoveredModels.filter((model) => {
-      if (!model.available) return false;
-      if (!modelSupportsRole(model, 'Orchestrator')) return false;
-      if (modelRuntimeFilter !== 'all' && model.runtimeType !== modelRuntimeFilter) return false;
-      return !search || [model.name, model.routeLabel, model.accountName, model.provider, model.runtimeModelId]
-        .some((value) => value.toLowerCase().includes(search));
-    });
-  }, [discoveredModels, modelRuntimeFilter, modelSearch]);
-
-  const recommendedModels = matchingModels.filter((model) => model.available && model.category === 'recommended');
-  const connectedModels = matchingModels.filter((model) => model.available && !recommendedModels.includes(model));
-
-  const resizeInput = () => {
-    if (!textareaRef.current) return;
-    textareaRef.current.style.height = 'auto';
-    textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 170)}px`;
-  };
+  }, [composerInput, setComposerInput, setMessage]);
 
   const submit = async () => {
-    const prompt = message.trim();
-    if (!prompt || loading || missionStartPending || activeConversationBusy || !directiveModelRoleCompatible || routeResolution.error || !activeWorkspaceId) return;
-    if (!serviceOnline) {
-      setActiveView('accounts');
-      return;
-    }
-
-    const options = {
-      teamTemplate,
-      agentProfileIds,
-      trustMode,
-      automationSettings,
-      ...routeResolution.options,
-    };
-
-    setMessage('');
-    setAttachments([]);
-    setMentionOpen(false);
-    setCommandOpen(false);
-    if (activeMissionId && activeConversationCanContinue) {
-      await continueMission(activeMissionId, prompt, options);
-    } else {
-      await startMission(prompt, activeWorkspaceId, options);
-    }
-    requestAnimationFrame(resizeInput);
+    if (locked || !serviceOnline || !hasModel || route.error || (!message.trim() && !attachmentState.files.length)) return;
+    setSending(true); setLocalError(null);
+    const submittedKey = scopeKey;
+    const submittedPreferences = preferences;
+    const submittedMessage = message;
+    try {
+      const uploaded = await attachmentState.upload();
+      const liveModels = useAccountStore.getState().discoveredModels;
+      const liveRoute = resolveOrchestratorRoute(parseAgentDirective(submittedMessage, liveModels, 'Orchestrator'), submittedPreferences, liveModels);
+      if (liveRoute.error) throw new Error(liveRoute.error);
+      const options: StartMissionOptions = {
+        teamTemplate: preferences.teamTemplate, agentProfileIds: preferences.agentProfileIds,
+        trustMode: preferences.trustMode, automationSettings: preferences.automationSettings,
+        ...liveRoute.options, ...uploaded,
+        // Pure guidance must not create a new turn just because defaults are serialized.
+        ...(!busy || delivery !== 'steer' || uploaded.attachmentIds.length ? { workMode: preferences.workMode, teamLaunch: preferences.teamLaunch } : {}),
+      };
+      const store = useMissionStore.getState();
+      if (missionId && busy) await store.sendMissionCommand(missionId, message, delivery, options);
+      else if (missionId) await store.continueMission(missionId, message, options);
+      else await store.startMission(message, workspaceId || undefined, options);
+      const result = useMissionStore.getState();
+      if (result.error) throw new Error(result.error);
+      const prefStore = useOrchestratorPreferencesStore.getState();
+      const destination = missionId || result.activeMissionId;
+      const destinationKey = destination ? `conversation:${destination}` : submittedKey;
+      if (!missionId && !prefStore.conversations[destinationKey]) prefStore.setConversation(destinationKey, submittedPreferences);
+      if (prefStore.drafts[submittedKey] === submittedMessage) prefStore.setDraft(submittedKey, '');
+      attachmentState.clearFiles();
+      setPicker(null);
+    } catch (cause) {
+      setLocalError(cause instanceof Error ? cause.message : 'Message could not be delivered. Your draft and attachments are retained.');
+    } finally { setSending(false); }
   };
-
-  const handleChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
-    const value = event.target.value;
-    setMessage(value);
-    resizeInput();
-    const mention = value.match(/@(\w*)$/);
-    const command = value.match(/^\/(\w*)$/);
-    setMentionOpen(Boolean(mention));
-    setMentionFilter(mention?.[1]?.toLowerCase() || '');
-    setCommandOpen(Boolean(command));
-    setCommandFilter(command?.[1]?.toLowerCase() || '');
-  };
-
-  const insertMention = (role: string) => {
-    setMessage((current) => current.replace(/@\w*$/, `@${role} `));
-    setMentionOpen(false);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  };
-
-  const insertCommand = (command: string) => {
-    setMessage((current) => current.replace(/^\/\w*$/, `/${command} `));
-    setCommandOpen(false);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  };
-
-  const appendToken = (token: string) => {
-    setMessage((current) => `${current}${current && !current.endsWith(' ') ? ' ' : ''}${token}`);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  };
-
-  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key !== 'Enter' || event.shiftKey) return;
+  const chooseMention = (role: string) => { setMessage(message.replace(/@\w*$/, `@${role} `)); setPicker(null); textareaRef.current?.focus(); };
+  const chooseCommand = (command: string) => { setMessage(message.replace(/^\/\w*$/, `/${command} `)); setPicker(null); textareaRef.current?.focus(); };
+  const keyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) return;
     event.preventDefault();
-    if (mentionOpen && filteredAgents[0]) insertMention(filteredAgents[0]);
-    else if (commandOpen && filteredCommands[0]) insertCommand(filteredCommands[0].id);
+    const role = AGENT_ROLES.find(value => value.toLowerCase().includes(filter));
+    const command = COMMANDS.find(value => value.id.includes(commandFilter));
+    if (picker === 'mention' && role) chooseMention(role);
+    else if (picker === 'command' && command) chooseCommand(command.id);
     else void submit();
   };
-
-  const pickAttachments = () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.multiple = true;
-    input.onchange = () => setAttachments(Array.from(input.files || []).map((file) => file.name));
-    input.click();
-  };
-
-  const renderModelButton = (model: DiscoveredModel) => (
-    <button
-      key={model.catalogId}
-      type="button"
-      onClick={(event) => {
-        event.preventDefault();
-        setSelectedModel(model.catalogId);
-        setReasoningLevel(model.defaultReasoning || model.supportedReasoning[0] || 'none');
-      }}
-      className={cn(
-        'flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors',
-        selectedModel === model.catalogId ? 'bg-primary/10 text-foreground' : 'hover:bg-muted/60',
-      )}
-    >
-      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-background">
-        <RuntimeBrandIcon runtimeId={model.runtimeType} className="h-3.5 w-3.5" />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-[11px] font-medium">{model.name}</span>
-        <span className="block truncate text-[9px] text-muted-foreground">{model.accountName} · {model.routeLabel}</span>
-      </span>
-      {selectedModel === model.catalogId && <CheckCircle2 className="h-3.5 w-3.5 text-primary" />}
-    </button>
-  );
-
-  const routeLabel = selectedModelObject?.name || 'Auto';
-  const composerPlaceholder = !activeWorkspaceId
-    ? 'Open a project before starting a mission…'
-    : missionStartPending
-      ? 'A previous mission start is still being reconciled. Select a mission before retrying…'
-    : activeConversationBusy
-      ? 'This mission is still running. Finish or stop it before sending the next turn…'
-      : activeConversationCanContinue
-        ? 'Continue this conversation with AtrisAgent…'
-        : 'Ask AtrisAgent to build, investigate, or review…';
-
-  return (
-    <div className="border-t border-border bg-background">
-      <div className="mx-auto max-w-4xl px-4 py-3">
-        {(directive.dynamicAgent || directive.teamWideModel || routeResolution.error) && (
-          <div className={cn(
-            'mb-2 flex items-center gap-2 rounded-lg border px-3 py-1.5 text-[10px]',
-            directiveReasoningSupported && directiveModelRoleCompatible && !routeResolution.error ? 'border-primary/25 bg-primary/[0.04]' : 'border-amber-500/40 bg-amber-500/[0.04]',
-          )}>
-            <Sparkles className="h-3 w-3 shrink-0 text-primary" />
-            <span className="font-medium">{directive.teamWideModel ? `All subagents: ${directiveModel?.name || selectedModelObject?.name || 'model required'}` : `Delegate to ${directive.targetRole || 'specialist'}`}</span>
-            {!directive.teamWideModel && <span className="truncate text-muted-foreground">{directive.modelName || 'role policy'}{directive.reasoningLevel ? ` · ${titleCase(directive.reasoningLevel)}` : ''}</span>}
-            {!directiveModelRoleCompatible && <span className="ml-auto text-amber-400">Incompatible model</span>}
-            {routeResolution.error && <span className="ml-auto text-amber-400">{routeResolution.error}</span>}
-          </div>
-        )}
-
-        <div className="relative rounded-xl border border-border/70 bg-card/70 px-3 pb-2 pt-3 shadow-sm transition-all focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/10">
-          {mentionOpen && filteredAgents.length > 0 && (
-            <div className="absolute bottom-full left-2 z-50 mb-2 w-52 overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl">
-              {filteredAgents.map((role) => (
-                <button key={role} type="button" onClick={() => insertMention(role)} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted">
-                  <AtSign className="h-3 w-3 text-muted-foreground" />{role}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {commandOpen && filteredCommands.length > 0 && (
-            <div className="absolute bottom-full left-2 z-50 mb-2 w-72 overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl">
-              {filteredCommands.map((command) => (
-                <button key={command.id} type="button" onClick={() => insertCommand(command.id)} className="w-full rounded-md px-2 py-1.5 text-left hover:bg-muted">
-                  <div className="flex items-center gap-2 text-xs"><Terminal className="h-3 w-3 text-muted-foreground" />/{command.id}</div>
-                  <div className="pl-5 text-[10px] text-muted-foreground">{command.label}</div>
-                </button>
-              ))}
-            </div>
-          )}
-
-          {attachments.length > 0 && (
-            <div className="mb-2 flex flex-wrap gap-1">
-              {attachments.map((name) => <Badge key={name} variant="secondary" className="h-5 max-w-[180px] truncate px-1.5 text-[9px]">{name}</Badge>)}
-            </div>
-          )}
-
-          <textarea
-            ref={textareaRef}
-            value={message}
-            onChange={handleChange}
-            onKeyDown={handleKeyDown}
-            rows={1}
-            placeholder={composerPlaceholder}
-            aria-label="Mission message"
-            disabled={loading || missionStartPending || !activeWorkspaceId}
-            className="block max-h-[170px] min-h-[42px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/75 disabled:cursor-not-allowed disabled:opacity-60"
-          />
-
-          <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
-            <div className="flex items-center gap-0.5">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label="Attach context" className="h-7 w-7 text-muted-foreground" onClick={pickAttachments} disabled={loading || missionStartPending}>
-                    <Paperclip className="h-3.5 w-3.5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Attach context</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-7 w-7 text-muted-foreground" onClick={() => appendToken('@')} disabled={loading || missionStartPending}>
-                    <AtSign className="h-3.5 w-3.5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Target a specialist</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" aria-label="Mission commands" className="h-7 w-7 text-muted-foreground" onClick={() => { setMessage('/'); setCommandOpen(true); setCommandFilter(''); }} disabled={loading || missionStartPending}>
-                    <Terminal className="h-3.5 w-3.5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Mission commands</TooltipContent>
-              </Tooltip>
-            </div>
-
-            <div className="flex min-w-0 items-center gap-1.5">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm" className="h-7 max-w-[260px] gap-1.5 px-2 text-[10px] text-muted-foreground">
-                    {selectedModelObject
-                      ? <RuntimeBrandIcon runtimeId={selectedModelObject.runtimeType} className="h-3 w-3 shrink-0" />
-                      : <Sparkles className="h-3 w-3 shrink-0 text-primary" />}
-                    <span className="truncate">{routeLabel}</span>
-                    <ChevronDown className="h-3 w-3 shrink-0" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" sideOffset={8} className="w-[min(500px,calc(100vw-1.5rem))] overflow-hidden p-0" onCloseAutoFocus={(event) => event.preventDefault()}>
-                  <div className="flex items-center justify-between border-b border-border bg-muted/20 px-3 py-2.5">
-                    <div>
-                      <div className="flex items-center gap-1.5 text-xs font-semibold"><Settings2 className="h-3.5 w-3.5 text-primary" />Run settings</div>
-                      <p className="mt-0.5 text-[9px] text-muted-foreground">{directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : 'This picker selects the Orchestrator model. Child models are matched to each task unless a role is Fixed.'}</p>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <Button variant="ghost" size="sm" className="h-6 gap-1 px-2 text-[9px] text-muted-foreground" disabled={modelCatalogLoading} onClick={(event) => { event.preventDefault(); void refreshModels().catch(() => undefined); }}>
-                        <RefreshCw className={cn('h-3 w-3', modelCatalogLoading && 'animate-spin')} />{modelCatalogLoading ? 'Discovering…' : 'Refresh routes'}
-                      </Button>
-                      <Badge variant="outline" className="text-[9px]">{trustMode}</Badge>
-                    </div>
-                  </div>
-
-                  <div className="border-b border-border p-3">
-                    <button
-                      type="button"
-                      onClick={(event) => { event.preventDefault(); setSelectedModel(''); }}
-                      className={cn(
-                        'flex w-full items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors',
-                        !selectedModel ? 'border-primary/40 bg-primary/[0.06]' : 'border-border hover:bg-muted/50',
-                      )}
-                    >
-                      <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10"><Sparkles className="h-4 w-4 text-primary" /></span>
-                      <span className="min-w-0 flex-1"><span className="block text-xs font-semibold">Auto routing</span><span className="block text-[9px] text-muted-foreground">Orchestrator stays automatic; child models are matched to each task and role. Fixed role policies remain in effect.</span></span>
-                      {!selectedModel && <CheckCircle2 className="h-4 w-4 text-primary" />}
-                    </button>
-
-                    <div className="mt-2 flex items-center gap-1">
-                      <button type="button" onClick={(event) => { event.preventDefault(); setModelRuntimeFilter('all'); }} className={cn('rounded-md border px-2 py-1 text-[9px]', modelRuntimeFilter === 'all' ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground')}>All</button>
-                      {RUNTIME_BRANDS.map((runtime) => (
-                        <Tooltip key={runtime.id}>
-                          <TooltipTrigger asChild>
-                            <button type="button" aria-label={`Filter ${runtime.label} routes`} aria-pressed={modelRuntimeFilter === runtime.id} onClick={(event) => { event.preventDefault(); setModelRuntimeFilter(runtime.id); }} className={cn('flex h-7 w-7 items-center justify-center rounded-md border', modelRuntimeFilter === runtime.id ? 'border-primary bg-primary/10' : 'border-border text-muted-foreground')}>
-                              <RuntimeBrandIcon runtimeId={runtime.id} className="h-3.5 w-3.5" />
-                            </button>
-                          </TooltipTrigger>
-                          <TooltipContent>{runtime.label}</TooltipContent>
-                        </Tooltip>
-                      ))}
-                      <div className="relative ml-auto w-[190px]">
-                        <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
-                        <input aria-label="Search connected routes" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="Search routes…" className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[10px] outline-none focus:border-primary" />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="max-h-[240px] overflow-y-auto p-2">
-                    {!matchingModels.length && (
-                      <div className="flex items-start gap-2 rounded-lg border border-dashed border-border p-4 text-[10px] text-muted-foreground">
-                        {modelCatalogLoading ? <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" /> : <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />}
-                        {modelCatalogLoading ? (
-                          <span>Discovering connected model routes…</span>
-                        ) : modelCatalogError ? (
-                          <><span className="min-w-0 flex-1">Model discovery failed. Check the connected runtime and retry.</span><button type="button" className="shrink-0 text-primary hover:underline" onClick={() => { void refreshModels().catch(() => undefined); }}>Retry</button></>
-                        ) : (
-                          <><span className="min-w-0 flex-1">No compatible connected routes.</span><button type="button" className="shrink-0 text-primary hover:underline" onClick={() => setActiveView('accounts')}>Accounts</button></>
-                        )}
-                      </div>
-                    )}
-                    {recommendedModels.length > 0 && <div className="mb-1 px-2 text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Recommended</div>}
-                    {recommendedModels.map(renderModelButton)}
-                    {connectedModels.length > 0 && <div className="mb-1 mt-2 px-2 text-[8px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Connected</div>}
-                    {connectedModels.map(renderModelButton)}
-                  </div>
-
-                  <div className="space-y-2 border-t border-border bg-muted/15 p-3" onClick={(event) => event.stopPropagation()}>
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Team & autonomy</span>
-                      <div className="flex flex-wrap items-center justify-end gap-1"><TeamTemplateSelector /><AgentProfileSelector /><TrustModeSelector /></div>
-                    </div>
-                    {selectedModelObject && (
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Reasoning</span>
-                        <div className="flex flex-wrap justify-end gap-1">
-                          {reasoningOptions.length > 0 ? reasoningOptions.map((level) => (
-                            <Button key={level} variant={reasoningLevel === level ? 'default' : 'outline'} size="sm" className="h-6 rounded-full px-2 text-[9px]" onClick={(event) => { event.preventDefault(); setReasoningLevel(level); }}>
-                              {titleCase(level)}
-                            </Button>
-                          )) : <Badge variant="outline" className="text-[9px]">Runtime default</Badge>}
-                        </div>
-                      </div>
-                    )}
-                    <div className="text-[9px] text-muted-foreground">Team: {teamTemplate} · {directive.teamWideModel && selectedModelObject ? `All mission agents: ${selectedModelObject.name}` : selectedModelObject ? `Orchestrator: ${selectedModelObject.name} · child models match each task unless a role is Fixed` : 'Task-based worker routing follows role policies and live model compatibility.'}</div>
-                  </div>
-                </DropdownMenuContent>
-              </DropdownMenu>
-
-              <Button
-                size="icon"
-                className="h-8 w-8 rounded-lg"
-                disabled={!message.trim() || loading || missionStartPending || activeConversationBusy || !serviceOnline || !activeWorkspaceId || !directiveModelRoleCompatible || Boolean(routeResolution.error)}
-                onClick={() => void submit()}
-                aria-label={activeConversationCanContinue ? 'Continue conversation' : 'Send mission'}
-              >
-                {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-              </Button>
-            </div>
-          </div>
-        </div>
-
-        <div className="mt-1.5 flex items-center justify-between px-1 text-[9px] text-muted-foreground/70">
-          <span>{missionStartPending ? 'Mission start is being reconciled · select a mission before retrying' : activeConversationBusy ? 'Mission is running · stop or finish it before the next turn' : activeWorkspaceId ? 'Enter to send · Shift+Enter for a new line' : 'Open a workspace to begin'}</span>
-          {message.length > 0 && <span>~{Math.ceil(message.length / 4)} tokens</span>}
+  const visibleError = localError || attachmentState.error || route.error || error;
+  return <div className="shrink-0 border-t border-border bg-background">
+    <div className="mx-auto max-w-4xl px-4 py-3">
+      {busy && <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground"><Clock3 className="h-3.5 w-3.5" /><span>Work is in progress. Keep the conversation going.</span>{queued > 0 && <span className="ml-auto">{queued} queued</span>}</div>}
+      {(directive.dynamicAgent || directive.teamWideModel) && <div className="mb-2 flex items-start gap-2 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs"><Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" /><span>{directive.teamWideModel ? `Worker override: ${directive.modelName || 'selected model'} · coordinator unchanged` : `Delegate to ${directive.targetRole || 'a specialist'}`}</span></div>}
+      <div className={cn('relative rounded-xl border bg-card px-3 pb-2 pt-3 transition-colors focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/10', dragging ? 'border-primary bg-primary/5' : 'border-border')} onDragOver={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); if (!locked) setDragging(true); } }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); if (!locked) attachmentState.addFiles(Array.from(event.dataTransfer.files)); }}>
+        {dragging && <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-background/95 text-sm font-medium">Drop files into this conversation</div>}
+        {picker && <div className="absolute bottom-full left-0 z-20 mb-2 w-[min(300px,calc(100vw-2rem))] rounded-lg border border-border bg-popover p-1 shadow-lg">
+          {picker === 'mention' ? AGENT_ROLES.filter(role => role.toLowerCase().includes(filter)).map(role => <button key={role} type="button" onClick={() => chooseMention(role)} className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-xs hover:bg-accent"><AtSign className="h-3.5 w-3.5" />{role}</button>) : COMMANDS.filter(command => command.id.includes(commandFilter)).map(command => <button key={command.id} type="button" onClick={() => chooseCommand(command.id)} className="block w-full rounded-md px-3 py-2 text-left hover:bg-accent"><span className="block text-xs font-medium">/{command.id}</span><span className="text-xs text-muted-foreground">{command.label}</span></button>)}
+        </div>}
+        <OrchestratorAttachmentTray files={attachmentState.files} onRemove={attachmentState.removeFile} />
+        <textarea ref={textareaRef} aria-label="Mission message" rows={1} value={message} disabled={locked} placeholder={!workspaceId ? 'Open a project to begin…' : busy ? 'Add a follow-up or guide the current work…' : 'Describe your goal. AtrisAgent will assemble the right team…'} onChange={event => { const value = event.target.value; setMessage(value); setPicker(/@\w*$/.test(value) ? 'mention' : /^\/\w*$/.test(value) ? 'command' : null); setLocalError(null); }} onKeyDown={keyDown} onPaste={event => { const files = Array.from(event.clipboardData.files); if (files.length && !locked) { event.preventDefault(); attachmentState.addFiles(files); } }} className="block max-h-[170px] min-h-[48px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 outline-none placeholder:text-muted-foreground disabled:opacity-60" />
+        <input ref={fileRef} type="file" multiple tabIndex={-1} className="hidden" aria-label="Attach files" onChange={event => { attachmentState.addFiles(Array.from(event.target.files || [])); event.target.value = ''; }} />
+        <div className="mt-2 flex items-center justify-between gap-2 border-t border-border pt-2">
+          <div className="flex items-center gap-0.5"><Button type="button" variant="ghost" size="icon" aria-label="Attach files" className="h-8 w-8 text-muted-foreground" disabled={locked} onClick={() => fileRef.current?.click()}><Paperclip className="h-4 w-4" /></Button><Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-8 w-8 text-muted-foreground" disabled={locked} onClick={() => { setMessage(`${message}${message ? ' ' : ''}@`); setPicker('mention'); textareaRef.current?.focus(); }}><AtSign className="h-4 w-4" /></Button><Button variant="ghost" size="icon" aria-label="Mission commands" className="hidden h-8 w-8 text-muted-foreground sm:flex" disabled={locked} onClick={() => { setMessage('/'); setPicker('command'); textareaRef.current?.focus(); }}><Terminal className="h-4 w-4" /></Button></div>
+          <div className="flex min-w-0 items-center gap-1"><OrchestratorModelSelector /><Button size="icon" className="h-8 w-8 shrink-0" aria-label={busy ? `Send with ${delivery} delivery` : missionId ? 'Continue conversation' : 'Send mission'} disabled={locked || !serviceOnline || !hasModel || Boolean(route.error) || (!message.trim() && !attachmentState.files.length)} onClick={() => void submit()}>{sending || attachmentState.uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}</Button></div>
         </div>
       </div>
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
+          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="sm" aria-label="Team selection" className="h-7 gap-1.5 px-2 text-xs text-muted-foreground"><UsersRound className="h-3.5 w-3.5" />Team: {selectedSpecialists ? `${selectedSpecialists} specialists` : 'Auto'}<ChevronDown className="h-3 w-3" /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="w-[min(360px,calc(100vw-2rem))] space-y-3 p-4"><div><h3 className="text-sm font-semibold">Your team</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">The orchestrator chooses the expertise each task needs. Saved specialists and templates are optional.</p></div><div className="flex flex-wrap gap-2"><TeamTemplateSelector /><AgentProfileSelector /></div><label className="block text-xs font-medium">Team launch<select aria-label="Conversation team launch" value={preferences.teamLaunch} onChange={event => updatePreferences({ teamLaunch: event.target.value as 'automatic' | 'confirm' })} className="mt-2 h-9 w-full rounded-md border border-input bg-background px-2 text-xs"><option value="automatic">Choose and launch automatically</option><option value="confirm">Show team plan before launching</option></select></label><Button variant="outline" size="sm" className="w-full" onClick={() => useSettingsStore.getState().setActiveView('agents')}>Manage teams &amp; specialists</Button></DropdownMenuContent></DropdownMenu>
+          <Button variant="ghost" size="sm" aria-label="Conversation settings" className="h-7 gap-1.5 px-2 text-xs text-muted-foreground" onClick={() => { setSaveNotice(''); setSettingsOpen(true); }}><Settings2 className="h-3.5 w-3.5" />Work settings</Button>
+          <span className="px-1 text-[11px] text-muted-foreground">{MODE_LABELS[preferences.workMode]}{preferences.teamLaunch === 'confirm' ? ' · team approval' : ''}{preferences.modelScope === 'all' ? ' · model for everyone' : ''}</span>
+        </div>
+        {busy ? <select aria-label="Message delivery" className="h-7 max-w-full rounded-md border border-input bg-background px-2 text-xs" value={delivery} onChange={event => setDelivery(event.target.value as TurnDelivery)}><option value="queue">Queue for next turn</option><option value="steer">Guide current work</option><option value="stop_and_replan">Stop and replan</option></select> : <span className="hidden text-[11px] text-muted-foreground sm:inline">Enter to send · Shift+Enter for a new line</span>}
+      </div>
+      {visibleError && <p role="alert" className="mt-2 break-words text-xs text-destructive">{visibleError}</p>}
+      {(!serviceOnline || !hasModel) && <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>{!serviceOnline ? 'Connecting to the local service…' : 'Connect a compatible model to start.'}</span><Button variant="link" size="sm" className="h-6 text-xs" onClick={() => useSettingsStore.getState().setActiveView('accounts')}>Connections</Button></div>}
+      {busy && delivery === 'steer' && <p className="mt-1 text-[11px] text-muted-foreground">Guidance reaches the next safe boundary. Attachments start a new turn; other settings apply to queued work.</p>}
+      {pendingMissionStart && <p role="status" className="mt-2 text-xs text-muted-foreground">Checking durable start acceptance before another request can be sent…</p>}
     </div>
-  );
+    <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}><DialogContent className="max-w-xl"><DialogHeader><DialogTitle>Conversation settings</DialogTitle><DialogDescription>These choices apply to this conversation and its next turns. Active workers keep their current settings.</DialogDescription></DialogHeader><OrchestratorPreferenceFields value={preferences} onChange={updatePreferences} /><div className="flex flex-wrap gap-2 border-t border-border pt-4"><Button variant="outline" size="sm" disabled={!workspaceId} onClick={() => { useOrchestratorPreferencesStore.getState().saveDefaults(preferences, workspaceId || undefined); setSaveNotice('Saved as this project’s defaults.'); }}>Save as project defaults</Button><Button variant="ghost" size="sm" onClick={() => { useOrchestratorPreferencesStore.getState().saveDefaults(preferences); setSaveNotice('Saved as application defaults.'); }}>Save as application defaults</Button>{customized && <Button variant="ghost" size="sm" onClick={() => { useOrchestratorPreferencesStore.getState().resetConversation(scopeKey); setSaveNotice('Using inherited defaults.'); }}>Reset to defaults</Button>}</div>{saveNotice && <p role="status" className="text-xs text-muted-foreground">{saveNotice}</p>}</DialogContent></Dialog>
+  </div>;
 }

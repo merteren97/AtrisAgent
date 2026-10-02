@@ -466,6 +466,8 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     const sessionId = `orchestrator-${request.turnId}`;
     const syntheticMissionId = `supervisor-${request.missionId}`;
     const syntheticTaskId = `turn-${request.turnId}`;
+    const supervisorAttemptId = crypto.randomUUID();
+    const unregisterQuestions = this.registerQuestionSessionAdapter(sessionId, adapter, request.missionId);
     let streamedText = '';
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -503,6 +505,11 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       unsubscribeActivity = () => undefined;
     };
 
+    const armTimeout = (onTimeout: () => void) => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(onTimeout, SUPERVISOR_TIMEOUT_MS);
+    };
+
     const resultPromise = new Promise<string>((resolve, reject) => {
       const finish = (callback: () => void) => {
         if (settled) return;
@@ -529,6 +536,18 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       });
       unsubscribeActivity = turnBus.on('*', (event) => {
         if (!('agentInstanceId' in event) || event.agentInstanceId !== sessionId) return;
+        if (event.type === 'question_asked' || event.type === 'question_replied' || event.type === 'question_rejected') {
+          this.observationBus?.emit({ ...event, missionId: request.missionId, turnId: request.turnId });
+          if (adapter.isAwaitingUser?.(sessionId)) {
+            if (timeout) clearTimeout(timeout);
+            timeout = undefined;
+          } else {
+            armTimeout(() => {
+              emitObservation({ type: 'process_failed', error: 'Supervisor turn timed out after question response.' });
+              finish(() => reject(new Error('Supervisor turn timed out after question response.')));
+            });
+          }
+        }
         if (event.type === 'tool_call_started') {
           emitObservation({
             type: 'process_tool_started',
@@ -545,10 +564,10 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
           });
         }
       });
-      timeout = setTimeout(() => {
+      armTimeout(() => {
         emitObservation({ type: 'process_failed', error: `Supervisor turn timed out after ${SUPERVISOR_TIMEOUT_MS / 1000}s.` });
         finish(() => reject(new Error(`Supervisor turn timed out after ${SUPERVISOR_TIMEOUT_MS / 1000}s.`)));
-      }, SUPERVISOR_TIMEOUT_MS);
+      });
     });
     const activeTurn = { adapter, cancel: () => cancelTurn() };
     const missionTurns = this.activeSupervisorTurns.get(request.missionId) || new Set();
@@ -560,6 +579,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
         emitObservation({ type: 'process_started', model: route.model?.displayName || route.model?.runtimeModelId, phase: 'turn', agentProfileId: agentProfile.profile.id, agentProfileName: agentProfile.profile.name });
         const spawned = await adapter.spawnAgent({
           sessionId,
+          attemptId: supervisorAttemptId,
           taskId: syntheticTaskId,
           missionId: syntheticMissionId,
           prompt: [
@@ -627,6 +647,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       }
       return await resultPromise;
     } finally {
+      unregisterQuestions();
       cleanup();
       const active = this.activeSupervisorTurns.get(request.missionId);
       active?.delete(activeTurn);

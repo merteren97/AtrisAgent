@@ -8,7 +8,8 @@ import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { ThemePaletteSelector } from '@/components/theme-palette-selector';
 import { ExecutionPolicyEditor } from './ExecutionPolicyEditor';
-import { Bell, Braces, Download, KeyRound, Loader2, Minimize2, MonitorCog, Palette, Power, RefreshCw, Rocket, ShieldCheck, Terminal } from 'lucide-react';
+import { OrchestratorDefaults } from '@/components/orchestrator/orchestrator-defaults';
+import { Bell, Download, KeyRound, Loader2, Minimize2, MonitorCog, Palette, Power, RefreshCw, Rocket, ShieldCheck, Terminal } from 'lucide-react';
 
 const closeBehaviorOptions: Array<{
   value: CloseBehavior;
@@ -70,8 +71,6 @@ export function SettingsView() {
     devMode,
     toggleDevMode,
     setActiveView,
-    trustMode,
-    setTrustMode,
     closeBehavior,
     setCloseBehavior,
     updateBehavior,
@@ -209,19 +208,9 @@ export function SettingsView() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader><CardTitle className="flex items-center gap-2 text-base"><Braces className="h-4 w-4 text-primary" /> Approval policy</CardTitle><CardDescription>The selected trust mode controls approvals at the Atris policy layer. Runtime sandboxes remain enabled independently.</CardDescription></CardHeader>
-          <CardContent className="grid gap-3 sm:grid-cols-3">
-            {(['Review Driven', 'Balanced', 'Autonomous'] as const).map((mode) => (
-              <button key={mode} onClick={() => setTrustMode(mode)} className={`rounded-xl border p-4 text-left transition-colors ${trustMode === mode ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted/30'}`}>
-                <div className="flex items-center justify-between gap-2"><span className="text-sm font-semibold">{mode}</span>{trustMode === mode && <Badge>Active</Badge>}</div>
-                <p className="mt-2 text-xs text-muted-foreground">{mode === 'Review Driven' ? 'Approve plans, risky commands and applying changes.' : mode === 'Balanced' ? 'Safe workspace work proceeds; risky operations require approval.' : 'Run inside configured workspace boundaries with minimal interruption.'}</p>
-              </button>
-            ))}
-          </CardContent>
-        </Card>
-
-        <ExecutionPolicyEditor />
+        <OrchestratorDefaults />
+        <div className="flex justify-end"><Button variant="outline" onClick={() => setActiveView('agents')}>Manage teams &amp; specialists</Button></div>
+        <details className="rounded-xl border border-border bg-card"><summary className="cursor-pointer px-5 py-4 text-sm font-medium">Advanced model routing</summary><div className="p-4 pt-0"><ExecutionPolicyEditor /></div></details>
 
         <Card>
           <CardHeader><CardTitle className="flex items-center gap-2 text-base"><Terminal className="h-4 w-4 text-amber-400" /> Developer surfaces</CardTitle><CardDescription>Raw console output is intentionally hidden from the normal mission experience.</CardDescription></CardHeader>

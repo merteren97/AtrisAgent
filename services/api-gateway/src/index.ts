@@ -20,6 +20,7 @@ import {
   isAgentRole,
   normalizeAgentProfile,
   resolveWorkerPoolPolicy,
+  normalizeOrchestratorRequestOptions,
 } from '@atris-agent-code/domain';
 import type {
   AgentProfile,
@@ -52,6 +53,8 @@ import { ApplyVerificationOperationStore, executeApplyVerificationOperation } fr
 import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-sibling';
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 import { installManualConversations } from './manual-conversations';
+import { AttachmentStore, installAttachmentRoutes } from './attachments';
+import { registerOrchestratorInteractions } from './orchestrator-interactions';
 
 import path from 'path';
 import fs from 'fs';
@@ -321,6 +324,7 @@ migrateDatabase(sqlite as any);
 const db = drizzle(sqlite, { schema }) as unknown as AtrisDatabase;
 const deletionStore = new DeletionOperationStore(sqlite);
 const approvalOutbox = new ApprovalOutbox(sqlite);
+export const attachmentStore = new AttachmentStore(sqlite, gatewayDataPath.dataDir);
 
 // Seed default team template
 try {
@@ -478,6 +482,7 @@ app.use(cors({
   },
 }));
 app.use(createRuntimeTokenMiddleware(RUNTIME_TOKEN));
+app.use('/api/attachments', express.json({ limit: '14mb' }));
 app.use(express.json({ limit: '2mb' }));
 
 // AtrisHub remains the authoritative identity and Premium entitlement service.
@@ -500,6 +505,7 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
   }),
   closeDatabase: async () => {
     await waitForDeletionExecutions();
+    orchestratorInteractions.dispose();
     if ((sqlite as Database.Database).open) sqlite.close();
   },
 }, {
@@ -513,6 +519,8 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
 installRuntimeShutdownRoute(app, RUNTIME_TOKEN, shutdownCoordinator);
 installAuthRoutes(app, authService, RUNTIME_TOKEN);
 export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
+installAttachmentRoutes(app, attachmentStore, (workspaceId) => isDeletionFenced('workspace', workspaceId));
+export const orchestratorInteractions = registerOrchestratorInteractions(app, { sqlite, eventBus, runtimeHost });
 
 function routeParam(value: string | string[]): string {
   return Array.isArray(value) ? value[0] || '' : value;
@@ -976,6 +984,7 @@ function normalizeMissionStartOptions(body: Record<string, any>, automationPolic
     : typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
   const agentProfileIds = normalizeAgentProfileIds(body.agentProfileIds);
   return {
+    ...normalizeOrchestratorRequestOptions(body),
     modelCatalogId,
     accountProfileId: typeof body.accountProfileId === 'string' && body.accountProfileId.trim() ? body.accountProfileId.trim() : undefined,
     orchestratorModelCatalogId: typeof body.orchestratorModelCatalogId === 'string' ? body.orchestratorModelCatalogId.trim() || undefined : undefined,
@@ -1069,7 +1078,8 @@ function turnDto(turn: any, command?: any): Record<string, unknown> {
     commandId: turn.command_id || command?.id || null,
     content: turn.content,
     delivery: turn.delivery,
-    options,
+    options: { ...options, attachments: publicAttachmentRefs(options.attachments) },
+    attachments: publicAttachmentRefs(options.attachments),
     status: turn.status,
     priorityPending: turn.status === 'pending_priority',
     createdAt: turn.created_at,
@@ -1079,7 +1089,20 @@ function turnDto(turn: any, command?: any): Record<string, unknown> {
 }
 
 function emitTurnEvent(event: AgentEvent): void {
+  if (event.type === 'user_message' || event.type === 'turn_queued') {
+    const turn = event.turnId ? sqlite.prepare('SELECT options FROM conversation_turns WHERE id = ?').get(event.turnId) as { options: string } | undefined : undefined;
+    if (turn) Object.assign(event, { attachments: publicAttachmentRefs(JSON.parse(turn.options || '{}').attachments) });
+  }
   eventBus.emit(event);
+}
+
+function publicAttachmentRefs(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.map(({ providerPath: _path, dataBase64: _data, ...ref }) => ref) : [];
+}
+
+function resolveTurnAttachments(options: Record<string, any>, workspaceId: string): Record<string, any> {
+  const normalized = normalizeOrchestratorRequestOptions(options);
+  return { ...options, ...normalized, attachments: attachmentStore.resolve(normalized.attachmentIds, workspaceId) };
 }
 
 function activeRunIsResearchOnly(missionId: string): boolean {
@@ -1121,7 +1144,9 @@ async function startDurableTurn(command: any, turn: any): Promise<void> {
       sqlite.prepare("UPDATE missions SET active_run_id = ?, status = CASE WHEN status = 'cancelled' THEN status ELSE 'planning' END, completed_at = CASE WHEN status = 'cancelled' THEN completed_at ELSE NULL END, updated_at = ? WHERE id = ?")
         .run(runId, now, command.mission_id);
     })();
-    const options = turn.options ? JSON.parse(turn.options) : {};
+    const mission = await workspaceManager.getMission(command.mission_id);
+    if (!mission) throw new Error('Mission not found while resolving attachments.');
+    const options = resolveTurnAttachments(turn.options ? JSON.parse(turn.options) : {}, mission.workspaceId);
     stage = 'routing';
     emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId: command.mission_id, turnId: turn.id,
       content: turn.content, clientMessageId: options.clientMessageId, timestamp: now });
@@ -1197,7 +1222,15 @@ function drainMissionCommands(missionId: string): Promise<void> {
   return drain;
 }
 
-async function startMissionWithDurability(missionId: string, content: string, options: Record<string, any>): Promise<any> {
+async function startMissionWithDurability(missionId: string, content: string, options: Record<string, any>, idempotencyKey?: string): Promise<any> {
+  const requestHash = turnRequestHash(missionId, content, 'start', options);
+  if (idempotencyKey) {
+    const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?').get(missionId, idempotencyKey) as any;
+    if (existing) {
+      if (existing.request_hash !== requestHash) throw Object.assign(new Error('Idempotency key was already used for a different start.'), { statusCode: 409, code: 'IDEMPOTENCY_KEY_REUSED' });
+      return { accepted: true, duplicate: true, missionId, turnId: existing.id, turn: turnDto(existing) };
+    }
+  }
   const now = new Date().toISOString();
   const turnId = crypto.randomUUID();
   const runId = crypto.randomUUID();
@@ -1212,8 +1245,8 @@ async function startMissionWithDurability(missionId: string, content: string, op
       }
       applyMissionPolicyAtTurnClaim(missionId, options);
       sqlite.prepare(`INSERT INTO conversation_turns
-        (id, mission_id, content, delivery, options, status, created_at, started_at)
-        VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now);
+        (id, mission_id, content, delivery, options, status, created_at, started_at, idempotency_key, request_hash)
+        VALUES (?, ?, ?, 'queue', ?, 'starting', ?, ?, ?, ?)`).run(turnId, missionId, content, JSON.stringify(options), now, now, idempotencyKey || null, requestHash);
       sqlite.prepare(`INSERT INTO mission_runs (id, mission_id, turn_id, status, started_at, heartbeat_at)
         VALUES (?, ?, ?, 'starting', ?, ?)`).run(runId, missionId, turnId, now, now);
       sqlite.prepare("UPDATE missions SET active_run_id = ?, status = CASE WHEN status = 'cancelled' THEN status ELSE 'planning' END, completed_at = CASE WHEN status = 'cancelled' THEN completed_at ELSE NULL END, updated_at = ? WHERE id = ?")
@@ -1274,7 +1307,12 @@ function createDurableMissionRetry(missionId: string, requestedTaskIds?: string[
   const commandId = crypto.randomUUID();
   const runId = crypto.randomUUID();
   const retryContent = requestedTaskIds?.length ? 'Retry selected failed mission tasks.' : 'Retry failed mission tasks.';
-  const retryOptions = { retryTaskIds: requestedTaskIds || null };
+  const previousOptions = sqlite.prepare(`SELECT t.options FROM conversation_turns t JOIN mission_runs r ON r.turn_id = t.id
+    WHERE r.mission_id = ? AND r.plan_id = (SELECT plan_id FROM missions WHERE id = ?) ORDER BY r.started_at DESC LIMIT 1`).get(missionId, missionId) as { options: string } | undefined;
+  const retryMission = sqlite.prepare('SELECT workspace_id FROM missions WHERE id = ?').get(missionId) as { workspace_id: string } | undefined;
+  const inheritedOptions = previousOptions && retryMission ? resolveTurnAttachments(JSON.parse(previousOptions.options || '{}'), retryMission.workspace_id) : {};
+  if (inheritedOptions.workMode === 'plan') throw missionRetryError('Plan-only turns cannot dispatch retry workers. Start an execute or research turn.');
+  const retryOptions = { ...inheritedOptions, retryTaskIds: requestedTaskIds || null };
   const requestHash = turnRequestHash(missionId, retryContent, 'queue', retryOptions);
 
   return sqlite.transaction(() => {
@@ -1556,14 +1594,16 @@ async function cleanupMissionResources(missionId: string): Promise<void> {
 // Routing was persisted before this boundary. Child-only preferences must not
 // also become the supervisor's own model selection.
 export function supervisorStartOptions(options: Record<string, any>): Record<string, any> {
-  if (options.routeScope !== 'subagents') return options;
+  const childScope = options.routeScope === 'subagents'
+    || (options.routeScope === 'role' && typeof options.orchestratorModelCatalogId === 'string' && String(options.routeRole || options.targetRole).toLowerCase() !== 'orchestrator');
+  if (!childScope) return options;
   const { modelCatalogId: _model, accountProfileId: _account, reasoningLevel: _reasoning,
     fallbackCatalogIds: _fallbacks, routeSelectionMode: _mode, orchestratorModelCatalogId, orchestratorReasoningLevel, ...supervisorOptions } = options;
   return { ...supervisorOptions, modelCatalogId: orchestratorModelCatalogId, reasoningLevel: orchestratorReasoningLevel };
 }
 
 export async function configureMissionRouting(missionId: string, body: Record<string, any>): Promise<void> {
-  if (body.routeScope === 'subagents' && typeof body.orchestratorModelCatalogId === 'string' && body.orchestratorModelCatalogId.trim()) {
+  if ((body.routeScope === 'subagents' || (body.routeScope === 'role' && String(body.routeRole || body.targetRole).toLowerCase() !== 'orchestrator')) && typeof body.orchestratorModelCatalogId === 'string' && body.orchestratorModelCatalogId.trim()) {
     await configureMissionRouting(missionId, {modelCatalogId:body.orchestratorModelCatalogId,reasoningLevel:body.orchestratorReasoningLevel,routeScope:'role',routeRole:'orchestrator'});
   }
   const modelCatalogId = typeof body.modelCatalogId === 'string' && body.modelCatalogId ? body.modelCatalogId : undefined;
@@ -1817,7 +1857,8 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     if (isDeletionFenced('mission', missionId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Conversation deletion is in progress.' });
     const mission = await workspaceManager.getMission(missionId);
     if (!mission) return void res.status(404).json({ error: 'Mission not found' });
-    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    const content = (typeof req.body?.content === 'string' ? req.body.content.trim() : '')
+      || (Array.isArray(req.body?.options?.attachmentIds) && req.body.options.attachmentIds.length ? 'Inspect the attached files.' : '');
     let delivery = String(req.body?.delivery || '');
     if (!content || !['steer', 'queue', 'stop_and_replan'].includes(delivery)) {
       return void res.status(400).json({ error: "content and delivery ('steer', 'queue', or 'stop_and_replan') are required" });
@@ -1831,13 +1872,18 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     if (req.body?.options !== undefined && !isRecord(req.body.options)) {
       return void res.status(400).json({ code: 'INVALID_AUTOMATION_POLICY', error: 'options must be an object.' });
     }
-    const requestedOptions = isRecord(req.body?.options) ? req.body.options : {};
+    const requestedOptions = isRecord(req.body?.options) ? { ...req.body.options } : {};
+    if (delivery === 'stop_and_replan' && requestedOptions.attachmentIds === undefined) {
+      const previous = sqlite.prepare(`SELECT t.options FROM conversation_turns t JOIN mission_runs r ON r.turn_id = t.id
+        WHERE r.mission_id = ? ORDER BY r.started_at DESC LIMIT 1`).get(missionId) as { options: string } | undefined;
+      if (previous) requestedOptions.attachmentIds = JSON.parse(previous.options || '{}').attachmentIds;
+    }
     const agentProfileIds = normalizeAgentProfileIds(requestedOptions.agentProfileIds);
-    const turnOptions = {
+    const turnOptions = resolveTurnAttachments({
       ...requestedOptions,
       modelCatalogId: requestedOptions.modelCatalogId || requestedOptions.model || undefined,
       agentProfileIds,
-    };
+    }, mission.workspaceId);
     delete turnOptions.model;
     if (hasExplicitAutomationPolicy(turnOptions)) normalizeAutomationPolicy(turnOptions);
     await validateAgentProfileIds(agentProfileIds, missionId);
@@ -1854,7 +1900,9 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       || turnOptions.fallbackCatalogIds?.length
       || turnOptions.routeScope,
     );
-    if (queuedImplementationFollowUp || queuedRoutingFollowUp) delivery = 'queue';
+    const queuedRequestOptions = active && delivery === 'steer' && Boolean(turnOptions.attachmentIds.length
+      || requestedOptions.workMode !== undefined || requestedOptions.teamLaunch !== undefined);
+    if (queuedImplementationFollowUp || queuedRoutingFollowUp || queuedRequestOptions) delivery = 'queue';
     const requestHash = turnRequestHash(missionId, content, requestedDelivery, turnOptions);
     if (idempotencyKey) {
       const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?')
@@ -1957,7 +2005,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     }
     res.status(202).json({
       ...turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }),
-      ...(queuedImplementationFollowUp || queuedRoutingFollowUp ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
+      ...(queuedImplementationFollowUp || queuedRoutingFollowUp || queuedRequestOptions ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
     });
   } catch (error: any) {
     const profileStatus = profileErrorStatus(error);
@@ -1970,7 +2018,8 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       if (existing) {
         const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
         const delivery = String(req.body?.delivery || '');
-        const requested = req.body?.options && typeof req.body.options === 'object' ? { ...req.body.options } : {};
+        const mission = await workspaceManager.getMission(missionId);
+        const requested = resolveTurnAttachments(req.body?.options && typeof req.body.options === 'object' ? { ...req.body.options } : {}, mission!.workspaceId);
         requested.modelCatalogId = requested.modelCatalogId || requested.model || undefined;
         delete requested.model;
         if (existing.request_hash && existing.request_hash !== turnRequestHash(missionId, content, delivery, requested)) {
@@ -1992,10 +2041,10 @@ app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
     if (!existingMission) return void res.status(404).json({ error: 'Mission not found' });
     const userRequest = req.body?.request || existingMission?.title || 'Execute Mission';
     const requestedPolicy = hasExplicitAutomationPolicy(req.body) ? normalizeAutomationPolicy(req.body, existingMission.automationPolicy || undefined) : undefined;
-    const startOptions = normalizeMissionStartOptions(req.body || {}, requestedPolicy);
+    const startOptions = resolveTurnAttachments(normalizeMissionStartOptions(req.body || {}, requestedPolicy), existingMission.workspaceId);
     await validateAgentProfileIds(startOptions.agentProfileIds, missionId);
     await configureMissionRouting(missionId, req.body || {});
-    res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, startOptions)));
+    res.json(await trackMissionTurn(missionId, () => startMissionWithDurability(missionId, userRequest, startOptions, req.header('Idempotency-Key') || req.body?.clientMessageId)));
   } catch (error: any) {
     const message = error?.message || 'Failed to start mission';
     const profileStatus = profileErrorStatus(error);
@@ -2024,7 +2073,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
     } = req.body || {};
     const automationPolicy = normalizeAutomationPolicy({ trustMode, executionMode, automationSettings, automationOverrides, trustProfile, executionStrategy });
     const normalizedExecutionMode = executionModeForNewMission(req.body || {}, automationPolicy);
-    const promptText = request || title;
+    const promptText = request || title || (Array.isArray(req.body?.attachmentIds) && req.body.attachmentIds.length ? 'Inspect the attached files.' : '');
     if (!promptText) return void res.status(400).json({ error: 'title or request is required' });
 
     let targetWorkspaceId = workspaceId;
@@ -2036,7 +2085,7 @@ app.post('/api/missions/start', async (req: Request, res: Response) => {
     if (isDeletionFenced('workspace', targetWorkspaceId)) return void res.status(409).json({ code: 'DELETION_IN_PROGRESS', error: 'Workspace deletion is in progress.' });
 
     const startOptions: Record<string, any> = {
-      ...normalizeMissionStartOptions(req.body || {}, automationPolicy),
+      ...resolveTurnAttachments(normalizeMissionStartOptions(req.body || {}, automationPolicy), targetWorkspaceId),
       executionMode: normalizedExecutionMode,
       // Keep workspace scope in the idempotency fingerprint without relying on
       // the generated mission id, which would make retries impossible to match.
@@ -2093,6 +2142,7 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
     const taskId = routeParam(req.params.id);
     const task = await workspaceManager.getTask(taskId);
     if (!task) return void res.status(404).json({ error: 'Task not found' });
+    await orchestrator.assertWorkspaceWriteAllowed(task.missionId, task.planId);
     const mission = await workspaceManager.getMission(task.missionId);
     const policy = mission?.automationPolicy as any;
     const profile = policy?.profile === 'auto' || policy?.profile === 'review' || policy?.profile === 'ask'
@@ -2114,7 +2164,7 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
     if (!result.success) return void res.status(400).json({ error: result.output });
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to merge worktree' });
+    res.status(profileErrorStatus(error) || 500).json({ code: error?.code, error: error?.message || 'Failed to merge worktree' });
   }
 });
 
@@ -3028,6 +3078,7 @@ const deletionHandlers: DeletionHandlers = {
     else await projectMemory.detachWorkspace(operation.targetId);
   },
   relational: async (operation) => {
+    if (operation.targetType === 'workspace') attachmentStore.cleanupWorkspace(operation.targetId);
     sqlite.prepare(`DELETE FROM ${operation.targetType === 'workspace' ? 'workspaces' : 'missions'} WHERE id = ?`).run(operation.targetId);
   },
 };
@@ -3151,6 +3202,18 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
       .where(eq((schema as any).approvals.id, req.params.id)).all() as any[])[0];
     if (!existingApproval) return void res.status(404).json({ error: 'Approval not found' });
     if (existingApproval.status !== 'pending') return void res.status(409).json({ error: `Approval has already been ${existingApproval.status}.` });
+    if (existingApproval.type === 'plan' || existingApproval.type === 'worker_route') {
+      const mission = await workspaceManager.getMission(existingApproval.missionId);
+      const event = (sqlite.prepare("SELECT payload FROM mission_events WHERE mission_id = ? AND type = 'approval_requested' ORDER BY sequence DESC")
+        .all(existingApproval.missionId) as { payload: string }[])
+        .map((row) => JSON.parse(row.payload)).find((payload) => payload.approvalId === existingApproval.id);
+      if ((decision === 'approved' || existingApproval.runId || event?.planId) && (!mission || mission.status !== 'waiting_for_approval'
+        || (decision === 'approved' && !existingApproval.runId && !event?.planId)
+        || (existingApproval.runId && existingApproval.runId !== mission.activeRunId)
+        || (event?.planId && event.planId !== mission.planId))) {
+        return void res.status(409).json({ code: 'STALE_PLAN_APPROVAL', error: 'This approval no longer belongs to the current held plan.' });
+      }
+    }
     claimedApproval = claimApproval(req.params.id, decision as 'approved' | 'rejected');
     if (!claimedApproval) return void res.status(409).json({ error: 'Approval is already being processed.' });
     const approval = claimedApproval;
@@ -3163,6 +3226,11 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
         reason: typeof req.body?.reason === 'string' ? req.body.reason : undefined,
         operationId: approval.operationId,
         idempotencyKey: approval.idempotencyKey,
+        expectedRunId: approval.runId || undefined,
+        expectedPlanId: (approval.type === 'plan' || approval.type === 'worker_route')
+          ? (sqlite.prepare("SELECT payload FROM mission_events WHERE mission_id = ? AND type = 'approval_requested' ORDER BY sequence DESC")
+            .all(approval.missionId) as { payload: string }[]).map((row) => JSON.parse(row.payload))
+            .find((payload) => payload.approvalId === approval.id)?.planId : undefined,
       });
     }
 

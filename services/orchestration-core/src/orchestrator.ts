@@ -551,19 +551,20 @@ export class Orchestrator {
     const missionId = params.missionId ?? this.config.missionId ?? '';
     const approvalId = crypto.randomUUID();
     const timestamp = new Date().toISOString();
+    const mission = this.workspaceManager ? await this.workspaceManager.getMission(missionId) : undefined;
     if (this.db) {
       await this.db.insert(approvalsTable).values({
         id: approvalId,
         missionId,
         taskId: params.taskId ?? null,
-        runId: null,
+        runId: mission?.activeRunId ?? null,
         type: params.approvalType as any,
         description: params.description,
         status: 'pending',
         createdAt: timestamp,
       });
     }
-    this.emitEvent({
+    this.emitEvent(Object.assign({
       id: crypto.randomUUID(),
       type: 'approval_requested',
       missionId,
@@ -571,7 +572,7 @@ export class Orchestrator {
       approvalType: params.approvalType,
       description: params.description,
       timestamp,
-    });
+    } as AgentEvent, { planId: mission?.planId, runId: mission?.activeRunId }));
     return approvalId;
   }
 
@@ -806,7 +807,10 @@ export class Orchestrator {
       agentProfileIds?: Partial<Record<AgentRole, string>>;
       rawModelPlanOutput?: string;
       researchContextPlanId?: string;
-      preDispatchApproval?: { type: 'worker_route'; description: string };
+      preDispatchApproval?: { type: 'worker_route' | 'plan'; description: string };
+      workMode?: import('@atris-agent-code/domain').WorkMode;
+      teamLaunch?: import('@atris-agent-code/domain').TeamLaunch;
+      previewOnly?: boolean;
     }
   ): Promise<{
     missionId: string;
@@ -1064,6 +1068,15 @@ export class Orchestrator {
     }
 
     const firstTasks = this.dependencyFreeRoots(createdTasks);
+    if (options?.previewOnly || options?.workMode === 'plan') {
+      if (this.workspaceManager) await this.workspaceManager.updateMission(missionId, { status: 'completed', completedAt: new Date().toISOString() });
+      else {
+        const mission = this.inMemoryMissions.get(missionId);
+        if (mission) this.inMemoryMissions.set(missionId, { ...mission, status: 'completed', completedAt: new Date().toISOString() });
+      }
+      this.emitMissionCompleted({ missionId, summary: 'Plan prepared without dispatching workers.', tasksCompleted: 0, totalTasks: createdTasks.length });
+      return { missionId, planId, tasks: createdTasks, structuredPlan };
+    }
     if (createdTasks.length > 0 && firstTasks.length === 0) {
       await this.failBlockedPlan(missionId, planId, createdTasks);
       return {
@@ -1098,7 +1111,7 @@ export class Orchestrator {
       });
       return { missionId, planId, tasks: createdTasks, structuredPlan };
     }
-    const autoApproved = planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
+    const autoApproved = options?.teamLaunch === 'confirm' ? false : planDecision ? planDecision === 'auto' || planDecision === 'review' : await policyEngine.requestApproval(
       'plan', `Approve execution plan with ${createdTasks.length} tasks for: ${request}`);
 
     if (!autoApproved) {
@@ -1700,6 +1713,8 @@ export class Orchestrator {
       reason?: string;
       operationId?: string;
       idempotencyKey?: string;
+      expectedPlanId?: string;
+      expectedRunId?: string;
     },
   ): Promise<void> {
     if (!this.workspaceManager) {
@@ -1707,6 +1722,10 @@ export class Orchestrator {
     }
 
     const mission = await this.workspaceManager.getMission(missionId);
+    if ((options?.expectedPlanId && options.expectedPlanId !== mission?.planId)
+      || (options?.expectedRunId && options.expectedRunId !== mission?.activeRunId)) {
+      throw new Error('The approval no longer belongs to the current plan/run.');
+    }
     if (mission && TERMINAL_MISSION_STATUSES.has(String(mission.status))) {
       throw new Error(`Mission '${missionId}' is already ${mission.status} and cannot resume an approval action.`);
     }
