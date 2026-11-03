@@ -38,6 +38,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
       let geometry = { columns: 120, rows: 30 };
       const chunks = [];
       const calls = [];
+      let speculativeResizes = 0;
       const append = (output, size = geometry) => chunks.push({ sequence: ++sequence, output, ...size });
       // A main-screen TUI with wrapped transcript, a pinned header and footer.
       // Resize repaint is a delta, as with a ConPTY screen dump, not a clear/reset.
@@ -49,6 +50,10 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
         calls.push({ command, ...args });
         if (command === 'manual_terminal_resize') {
           if (geometry.columns === args.columns && geometry.rows === args.rows) return;
+          if (engine.terminal.cols !== geometry.columns || engine.terminal.rows !== geometry.rows) speculativeResizes += 1;
+          // Output emitted after the last poll but before native resize must be
+          // interpreted on the old grid, without a speculative A→B→A transition.
+          append('\x1b[2;1HLATE-old-grid');
           const oldRows = geometry.rows;
           geometry = { columns: args.columns, rows: args.rows };
           append('', geometry);
@@ -115,7 +120,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
       document.querySelector('#host').style.height = '450px'; engine.resize(); await sleep(200);
       const closedRows = engine.terminal.rows;
       const closedResizes = calls.filter(call => call.command === 'manual_terminal_resize').length - beforeClosedFit;
-      window.terminalTestResult = { live, replayed, raced, revealResizes, resetsDuringWrite, closedRows, closedResizes, calls };
+      window.terminalTestResult = { live, replayed, raced, revealResizes, resetsDuringWrite, closedRows, closedResizes, speculativeResizes, calls };
       window.disposeTerminalTest = () => disposeManualTerminal('replay-test');
       return window.terminalTestResult;
     });
@@ -124,6 +129,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
     assert.deepEqual(result.replayed, result.live, 'replaying a resized TUI must reproduce its live screen');
     assert.deepEqual(result.raced, result.live, 'an old in-flight snapshot must not contaminate restart');
     assert.equal(result.revealResizes, 0, 'same-size reveal must not resize/reprint the PTY');
+    assert.equal(result.speculativeResizes, 0, 'unread old-grid output must precede the emulator resize');
     assert.equal(result.resetsDuringWrite, 0, 'restart must not reset xterm while a previous frame is still parsing');
     assert.equal(result.closedRows, 30, 'an exited terminal must still fit its visible pane');
     assert.equal(result.closedResizes, 0, 'fitting an exited terminal must not resize a native session');

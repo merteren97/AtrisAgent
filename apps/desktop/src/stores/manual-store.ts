@@ -3,10 +3,12 @@ import { persist } from 'zustand/middleware';
 import { apiRequest } from '@/lib/api-client';
 import type { TerminalLayout } from '@/components/manual/terminal-layout';
 import type { RuntimeType } from '@atris-agent-code/domain';
+import type { CodexPermissionMode } from '@atris-agent-code/domain';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string; runtimeType: RuntimeType;
   reasoning?: string; model: string; accountProfileId: string; providerSessionId: string; cwd: string; createdAt: string;
+  codexPermissionMode?: CodexPermissionMode;
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
 export interface ManualQuestion { id: string; questions: Array<{ header: string; question: string; options: Array<{ label: string; description?: string }>; multiple?: boolean; custom?: boolean }>; deliveryError?: string }
@@ -46,6 +48,7 @@ interface ManualState {
   remove: (conversation: ManualConversation) => Promise<void>;
   removeAgent: (agent: ManualAgent) => Promise<void>;
   updateModel: (agent: ManualAgent, catalogId: string, reasoning?: string, live?: boolean) => Promise<ManualAgent>;
+  updateCodexPermissions: (agent: ManualAgent, mode: CodexPermissionMode, fullAccessConfirmed: boolean) => Promise<ManualAgent>;
   addAgents: (conversationId: string, agents: Array<{id: string; name?: string; catalogId: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
@@ -129,6 +132,15 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     if (workspaceId) {
       fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
       set(state => ({ conversations: { ...state.conversations, [workspaceId]: state.conversations[workspaceId].map(c => c.id === agent.conversationId ? { ...c, agents: c.agents.map(item => item.id === agent.id ? updated : item) } : c) } }));
+    }
+    return updated;
+  },
+  updateCodexPermissions: async (agent, mode, fullAccessConfirmed) => {
+    const updated = await apiRequest<ManualAgent>(`/manual/agents/${agent.id}/permissions`, { method:'PATCH', body:JSON.stringify({mode, expectedMode:agent.codexPermissionMode || null, fullAccessConfirmed}) });
+    const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === agent.conversationId));
+    if (workspaceId) {
+      fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
+      set(state => ({conversations:{...state.conversations, [workspaceId]:state.conversations[workspaceId].map(c => c.id === agent.conversationId ? {...c, agents:c.agents.map(item => item.id === agent.id ? updated : item)} : c)}}));
     }
     return updated;
   },

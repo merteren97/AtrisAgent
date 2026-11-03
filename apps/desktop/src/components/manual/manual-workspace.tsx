@@ -20,6 +20,8 @@ import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
 import { ManualChatContent } from './manual-chat-content';
 import { ManualQuestionCard } from './manual-question';
+import { CodexPermissions } from './codex-permissions';
+import type { CodexPermissionMode } from '@atris-agent-code/domain';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode', 'antigravity'].includes(kind || '');
@@ -112,6 +114,7 @@ export function ManualWorkspace() {
   const [pending, setPending] = useState<string | null>(null); const [error, setError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [bound, setBound] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const actionPending = useRef(false);
   const [messages, setMessages] = useState<ManualMessage[]>([]); const [truncated, setTruncated] = useState(false);
   const [questions, setQuestions] = useState<ManualQuestion[]>([]);
@@ -152,7 +155,7 @@ export function ManualWorkspace() {
     return () => { document.removeEventListener('visibilitychange', acknowledgeVisible); window.removeEventListener('focus', acknowledgeVisible); };
   }, [agentId, surface]);
 
-  useEffect(() => { setMessages([]); setQuestions([]); setAutoApprove(undefined); setRouteStatus(undefined); setTruncated(false); setBound(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
+  useEffect(() => { setMessages([]); setQuestions([]); setAutoApprove(undefined); setRouteStatus(undefined); setTruncated(false); setBound(false); setHistoryLoading(false); setError(null); setConnectionError(null); following.current = true; }, [agentId]);
   useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
@@ -181,8 +184,8 @@ export function ManualWorkspace() {
     let memorySignature = '';
     const poll = async () => {
       try {
-        const result = await apiRequest<{messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: OpenCodeAutoApprove; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
-        if (!disposed) { setMessages(result.messages); setQuestions(result.questions || []); setAutoApprove(result.autoApprove); setRouteStatus(result.routeStatus); setTruncated(result.truncated); setBound(Boolean(result.bound)); useManualStore.getState().applyNaming(result.naming); }
+        const result = await apiRequest<{messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: OpenCodeAutoApprove; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; loading?: boolean; naming?: ManualNamingUpdate}>(`/manual/agents/${agentId}/messages`);
+        if (!disposed) { setMessages(result.messages); setQuestions(result.questions || []); setAutoApprove(result.autoApprove); setRouteStatus(result.routeStatus); setTruncated(result.truncated); setBound(Boolean(result.bound)); setHistoryLoading(Boolean(result.loading)); useManualStore.getState().applyNaming(result.naming); }
         const signature = result.messages.filter(message => message.role === 'user').map(message => message.id+':'+message.text).join('\n');
         if (!disposed && result.bound && signature && signature !== memorySignature && agent?.conversationId) {
           await apiRequest(`/manual/conversations/${agent.conversationId}/memory/sync`, {method:'POST',body:JSON.stringify({agentId})});
@@ -260,6 +263,21 @@ export function ManualWorkspace() {
       }
     });
   };
+  const applyPermissions = (mode: CodexPermissionMode, reopen: boolean, confirmed: boolean): Promise<boolean> => {
+    if (!agent || !native) return Promise.resolve(false);
+    return action('permissions', async () => {
+      if (reopen) {
+        const history = await apiRequest<{bound:boolean}>(`/manual/agents/${agent.id}/messages`);
+        if (!history.bound) throw new Error('Wait for this Codex session to bind before reopening.');
+      }
+      const updated = await useManualStore.getState().updateCodexPermissions(agent, mode, confirmed);
+      if (reopen) {
+        await invoke('manual_terminal_close', {id:agent.id}); lifecycleEpoch.current += 1; markManualClosed(agent.id);
+        setStatuses(previous => ({...previous, [agent.id]:'closed'}));
+        await launch(updated);
+      }
+    });
+  };
   const live = agent && statuses[agent.id] === 'open';
   const draft = agent ? drafts[agent.id] || '' : '';
   const files = agent ? attachments[agent.id] || [] : [];
@@ -299,6 +317,7 @@ export function ManualWorkspace() {
     <header className="flex min-h-14 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-2">
       <div className="flex min-w-0 items-center gap-3"><h1 className="truncate text-sm font-medium">{conversation?.title || 'Independent agents'}</h1><span className="text-xs text-muted-foreground">{openCount} open</span></div>
       <div className="flex items-center gap-2">
+        {agent?.runtimeType === 'codex' && <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} bound={bound} disabled={!native || Boolean(pending)} onApply={applyPermissions} onOpenCode={() => conversation && setSurface(conversation.id, 'code')} />}
         {conversation && <Button size="sm" variant="ghost" onClick={() => setMemory({})}><Brain className="mr-1.5 h-3.5 w-3.5"/>Memory</Button>}
         <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1" aria-label="Conversation view">{(['chat', 'code'] as const).map(view => <Button key={view} variant={surface === view ? 'secondary' : 'ghost'} size="sm" aria-pressed={surface === view} disabled={!conversation} onClick={() => conversation && setSurface(conversation.id, view)}>{view === 'chat' ? <MessageSquare className="mr-1.5 h-3.5 w-3.5" /> : <Code2 className="mr-1.5 h-3.5 w-3.5" />}{view === 'chat' ? 'Chat' : 'Code'}</Button>)}</div>
         {conversation && <Button size="sm" variant="ghost" disabled={Boolean(pending) || conversation.agents.length >= 30} onClick={() => setAdding(true)} title={conversation.agents.length >= 30 ? '30-agent limit reached' : 'Add independent agents'}><Plus className="mr-1 h-3.5 w-3.5" />Add agents</Button>}
@@ -318,11 +337,12 @@ export function ManualWorkspace() {
             {!supportsChat(agent.runtimeType) ? <div className="rounded-lg border border-border p-5"><h3 className="text-sm font-medium">Continue in Code</h3><p className="mt-2 text-sm leading-6 text-muted-foreground">This provider’s structured Chat history is not connected yet. Use its interactive terminal to continue this agent.</p><Button className="mt-3" variant="outline" onClick={() => setSurface(conversation.id, 'code')}>Open Code</Button></div> : <>
               {!bound && <div role="status" className="flex items-start gap-3 rounded-xl bg-muted/40 px-4 py-3"><Code2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" /><p className="text-xs leading-5 text-muted-foreground">Connect this CLI’s history to see its replies here.{agent.runtimeType === 'codex' ? ' Review the AtrisAgent hook in /hooks.' : agent.runtimeType === 'antigravity' ? ' Reopen older agents once to enable their dedicated session link, then send a message.' : ' Complete CLI setup in Code and send your first message.'}<button className="ml-2 font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>Open terminal</button></p></div>}
               {truncated && <p className="text-xs text-muted-foreground">Showing recent messages from this long session.</p>}
+              {historyLoading && <p role="status" className="text-xs text-muted-foreground">Syncing Codex history… Displayed messages remain available while records arrive.</p>}
               {!messages.length && <div className="py-8"><RuntimeBrandIcon runtimeId={agent.runtimeType} className="mb-4 h-9 w-9 text-foreground" /><h3 className="text-xl font-semibold tracking-tight">What would you like to work on?</h3><p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">Message {agent.name}, choose a model in the composer, or open Code for the live terminal. Each agent keeps its own conversation.</p><div className="mt-5 flex flex-wrap gap-2">{['Explore this project', 'Review recent changes', 'Help me plan a task'].map(prompt => <Button key={prompt} size="sm" variant="outline" className="rounded-full text-xs" onClick={() => setDraft(agent.id, prompt)}>{prompt}</Button>)}</div></div>}
                 {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : agent.name}</p><ManualChatContent text={message.text} agentId={agent.id} cwd={agent.cwd} user={message.role === 'user'} /></article>)}
                {unresolvedQuestion && !questions.length && <ManualQuestionCard key={unresolvedQuestion.id} request={unresolvedQuestion} onOpenCode={() => setSurface(conversation.id, 'code')} />}
                {questions.map(question => <ManualQuestionCard key={question.id} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
-               {live && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
+               {live && observations[agent.id]?.state !== 'completed' && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
             </>}
             <div ref={messageEnd} />
           </div>
