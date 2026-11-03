@@ -3,8 +3,11 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import type { ManualAgent, ManualMessage, ManualQuestion } from './manual-conversations';
+import type { ManualAgent, ManualMessage } from './manual-conversations';
 import { MANUAL_OPENCODE_TUI } from './manual-opencode-tui';
+import { readCodexManualHistory } from './manual-codex-history';
+import { codexPermissionArgs } from './manual-codex-permissions';
+export { parseCodexManualTranscript } from './manual-codex-history';
 
 const MARKER = '// AtrisAgent managed manual session bridge v1';
 const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
@@ -185,44 +188,24 @@ export function readTail(filename: string, limit = MAX_HISTORY_BYTES): {source: 
 function codexIdentity(filename: string, id: string): boolean {
   const file = fs.openSync(filename, 'r');
   try {
-    const buffer = Buffer.alloc(65536); const read = fs.readSync(file, buffer, 0, buffer.length, 0);
-    const first = JSON.parse(buffer.subarray(0, read).toString('utf8').split('\n')[0]);
-    return first.type === 'session_meta' && (first.payload?.id === id || first.payload?.session_id === id);
+    // Modern session_meta may include instructions larger than a single 64 KiB
+    // read. Read the complete first record, with an explicit upper bound.
+    const parts: Buffer[] = [];
+    let offset = 0;
+    while (offset < MAX_HISTORY_BYTES) {
+      const buffer = Buffer.alloc(Math.min(65536, MAX_HISTORY_BYTES - offset));
+      const read = fs.readSync(file, buffer, 0, buffer.length, offset);
+      if (!read) break;
+      const newline = buffer.subarray(0,read).indexOf(10);
+      parts.push(buffer.subarray(0,newline >= 0 ? newline : read));
+      offset += read;
+      if (newline >= 0) break;
+    }
+    const first = JSON.parse(Buffer.concat(parts).toString('utf8'));
+    const source = first?.payload?.source;
+    return first?.type === 'session_meta' && (first.payload?.id === id || first.payload?.session_id === id)
+      && !(source && typeof source === 'object' && ('subagent' in source || source.type === 'subagent'));
   } catch { return false; } finally { fs.closeSync(file); }
-}
-
-/** Provider transcript formats are versioned defensively; unknown records never become assistant claims. */
-export function parseCodexManualTranscript(source: string, sessionId: string): ManualMessage[] {
-  const messages: ManualMessage[] = [];
-  const seen = new Set<string>();
-  for (const line of source.split('\n')) {
-    let item: any; try { item = JSON.parse(line); } catch { continue; }
-    const payload = item.payload;
-    if (!payload) continue;
-    const key = `${sessionId}:${payload.type}:${payload.id || payload.call_id || createHash('sha256').update(line).digest('hex').slice(0,24)}`;
-    if (seen.has(key)) continue;
-    if (item.type === 'event_msg' && payload.type === 'user_message' && typeof payload.message === 'string') {
-      messages.push({id:key, role:'user', text:payload.message}); seen.add(key); continue;
-    }
-    if (item.type !== 'response_item') continue;
-    if (payload.type === 'message' && payload.role === 'assistant' && payload.channel !== 'analysis') {
-      const text = (Array.isArray(payload.content) ? payload.content : []).filter((part: any) => ['input_text','output_text','text'].includes(part.type)).map((part: any) => part.text || '').join('\n');
-      if (!text) continue;
-      messages.push({ id: key, role: payload.role, text }); seen.add(key);
-    } else if (['function_call','custom_tool_call'].includes(payload.type)) {
-      let question: ManualQuestion | undefined;
-      if (payload.name === 'request_user_input') {
-        try {
-          const args = typeof payload.arguments === 'string' ? JSON.parse(payload.arguments) : payload.arguments;
-          if (Array.isArray(args?.questions)) question = {id:String(payload.call_id || key), questions:args.questions.filter((entry: any) => typeof entry.question === 'string' && Array.isArray(entry.options)).map((entry: any) => ({header:String(entry.header || ''),question:entry.question,options:entry.options.filter((option: any) => typeof option.label === 'string').map((option: any) => ({label:option.label,description:typeof option.description === 'string' ? option.description : undefined})),custom:true}))};
-        } catch { /* Malformed tool input stays in Code. */ }
-      }
-      messages.push({ id: key, role: 'tool', toolName: payload.name || 'Tool', text: 'Tool requested. Open Code for live output and approvals.', ...(question?.questions.length ? {question} : {}) }); seen.add(key);
-    } else if (['function_call_output','custom_tool_call_output'].includes(payload.type)) {
-      messages.push({ id: key, role: 'tool', text: 'Tool returned. Open Code to inspect its output.' }); seen.add(key);
-    }
-  }
-  return messages;
 }
 
 export class ManualProviderBridge {
@@ -238,7 +221,7 @@ export class ManualProviderBridge {
       } catch { return {state:'unknown'}; }
     }
     if (!['claude_code', 'codex'].includes(agent.runtimeType)) return { state: 'unknown' };
-    const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent);
+    const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent, 'activity');
     const current = bindings.at(-1);
     if (!current) return { state: 'unknown' };
     const states: Record<string, string> = { SessionStart: 'ready', UserPromptSubmit: 'working', PostToolUse: 'working', PermissionRequest: 'attention', Stop: 'completed' };
@@ -293,7 +276,7 @@ export class ManualProviderBridge {
     writeManaged(settingsFile, settings);
     return ['--model', agent.model, ...(bound || hasInitialTranscript ? ['--resume', bound?.sessionId || agent.providerSessionId] : ['--session-id', agent.providerSessionId]), '--settings', settingsFile, ...(agent.reasoning ? ['--effort', agent.reasoning] : [])];
   }
-  private codexBindings(agent: ManualAgent): {sessionId: string; transcriptPath: string}[] {
+  private codexBindings(agent: ManualAgent, order: 'session' | 'activity' = 'session'): {sessionId: string; transcriptPath: string}[] {
     const filename = path.join(this.directory(agent), 'bindings.jsonl');
     if (!fs.existsSync(filename)) return [];
     const records = new Map<string, {sessionId: string; transcriptPath: string}>();
@@ -305,7 +288,10 @@ export class ManualProviderBridge {
         const actual = fs.realpathSync(binding.transcriptPath);
         const relative = path.relative(root, actual);
         if (relative.startsWith('..') || path.isAbsolute(relative) || !codexIdentity(actual, binding.sessionId)) continue;
-        records.delete(binding.sessionId); records.set(binding.sessionId, {sessionId: binding.sessionId, transcriptPath: actual});
+        // Chat history keeps first-observed session order, but resume/activity
+        // must follow the last valid binding when the user returns to an older thread.
+        if (order === 'activity') records.delete(binding.sessionId);
+        records.set(binding.sessionId, {sessionId: binding.sessionId, transcriptPath: actual});
       } catch { /* Partial/invalid/foreign bindings are never attributed. */ }
     }
     return [...records.values()];
@@ -317,8 +303,8 @@ export class ManualProviderBridge {
     // Profile layers add hooks alongside existing hooks; neither user config nor credentials are copied.
     const config = '# AtrisAgent managed manual session bridge v1\n' + ['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PostToolUse'].map(event => `\n[[hooks.${event}]]\n[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${JSON.stringify(command)}\ncommand_windows = ${JSON.stringify(commandWindows)}\ntimeout = 5\n`).join('');
     writeManaged(path.join(root, `${profile}.config.toml`), config);
-    const bound = this.codexBindings(agent).at(-1);
-    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : [])];
+    const bound = this.codexBindings(agent, 'activity').at(-1);
+    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : []), ...codexPermissionArgs(agent.codexPermissionMode)];
   }
   prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});
@@ -409,13 +395,18 @@ export class ManualProviderBridge {
     fs.rmSync(path.join(this.directory(agent), 'opencode-question-error.json'), {force:true});
     fs.writeFileSync(filename, JSON.stringify({id, sessionID:this.openCodeHistory(agent).sessionId, answers}), {flag:'wx', mode:0o600});
   }
-  read(agent: ManualAgent): {messages: ManualMessage[]; truncated: boolean; bound: boolean} {
+  read(agent: ManualAgent): {messages: ManualMessage[]; truncated: boolean; bound: boolean; loading?: boolean} {
     if (agent.runtimeType === 'opencode') {
       const history = this.openCodeHistory(agent); return {messages:history.messages, truncated:history.messages.length >= 2000, bound:Boolean(history.sessionId)};
     }
     const bindings = this.codexBindings(agent);
     let truncated = bindings.length > 8;
-    const messages = bindings.slice(-8).flatMap(binding => { const tail = readTail(binding.transcriptPath); truncated ||= tail.truncated; return parseCodexManualTranscript(tail.source, binding.sessionId); });
-    return {messages, truncated, bound:bindings.length > 0};
+    let loading = false;
+    const messages = bindings.slice(-8).flatMap(binding => {
+      const history = readCodexManualHistory(binding.transcriptPath, binding.sessionId, this.directory(agent));
+      truncated ||= history.truncated; loading ||= Boolean(history.loading);
+      return history.messages;
+    });
+    return {messages, truncated, bound:bindings.length > 0, loading};
   }
 }

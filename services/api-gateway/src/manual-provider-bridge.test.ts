@@ -3,10 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { ManualProviderBridge, parseCodexManualTranscript } from './manual-provider-bridge';
 import type { ManualAgent } from './manual-conversations';
+import { CODEX_PERMISSION_MODES } from '@atris-agent-code/domain';
+import { codexPermissionArgs } from './manual-codex-permissions';
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-manual-providers-'));
 const agent: ManualAgent = {id:randomUUID(), conversationId:randomUUID(), providerSessionId:randomUUID(), name:'Test agent', catalogId:'test', runtimeType:'codex', model:'test-model', accountProfileId:'test', cwd:temporary, configDir:path.join(temporary,'profile'), sharedProfile:false, createdAt:new Date().toISOString()};
@@ -19,7 +21,7 @@ const publicTranscript = [
   line('response_item',{type:'message',role:'user',content:[{type:'input_text',text:'Injected environment'}]}),
   line('response_item',{type:'message',role:'assistant',channel:'analysis',content:[{type:'output_text',text:'Private reasoning'}]}),
   line('response_item',{type:'message',role:'assistant',channel:'final',content:[{type:'output_text',text:'Visible response'}]}),
-].join('\n');
+].join('\n')+'\n';
 try {
   const claude = {...agent,id:randomUUID(),runtimeType:'claude_code'};
   const claudeArgs = bridge.prepareClaude(claude, false);
@@ -47,11 +49,37 @@ try {
   assert.equal(bridge.read(agent).bound,true);
   assert.equal(bridge.read(agent).messages.length,2);
   assert.deepEqual(bridge.prepareCodex(agent).slice(0,2),['resume',agent.providerSessionId]);
+  assert.deepEqual(codexPermissionArgs(), [], 'Existing agents inherit CLI permissions until a mode is explicitly selected');
+  for (const mode of CODEX_PERMISSION_MODES) {
+    const modeArgs = bridge.prepareCodex({...agent,codexPermissionMode:mode});
+    assert.deepEqual(modeArgs.slice(0,2), ['resume',agent.providerSessionId], 'Permission changes resume only the exact bound thread');
+    assert.equal(modeArgs[modeArgs.indexOf('--sandbox')+1], mode === 'read-only' ? 'read-only' : mode === 'full-access' ? 'danger-full-access' : 'workspace-write');
+    assert.equal(modeArgs[modeArgs.indexOf('--ask-for-approval')+1], mode === 'full-access' ? 'never' : 'on-request');
+    assert.ok(modeArgs.includes(`approvals_reviewer="${mode === 'approve-for-me' ? 'auto_review' : 'user'}"`), 'Leaving automatic review explicitly restores the human reviewer');
+  }
   assert.equal(callHook(randomUUID(),transcript).status,0);
   assert.equal(bridge.read(agent).messages.length,2,'Wrong session headers are rejected');
   const external = path.join(temporary,'outside-profile.jsonl'); fs.writeFileSync(external,publicTranscript);
   callHook(agent.providerSessionId,external);
   assert.equal(bridge.read(agent).messages.length,2,'Out-of-profile history paths cannot replace a binding');
+  const largeHeader = path.join(agent.configDir,'large-header.jsonl');
+  fs.writeFileSync(largeHeader,line('session_meta',{id:agent.providerSessionId,instructions:'x'.repeat(100000)})+'\n'+publicTranscript.split('\n').slice(1).join('\n'));
+  callHook(agent.providerSessionId,largeHeader);
+  assert.equal(bridge.read(agent).messages.length,2,'A valid session header larger than 64 KiB still binds');
+  const childId = randomUUID(), child = path.join(agent.configDir,'child.jsonl');
+  fs.writeFileSync(child,line('session_meta',{id:childId,source:{subagent:{parent_thread_id:agent.providerSessionId}}})+'\n'+line('event_msg',{type:'user_message',message:'Foreign child'})+'\n');
+  callHook(childId,child);
+  assert.equal(bridge.read(agent).messages.length,2,'A child transcript cannot contribute to the root conversation');
+  callHook(agent.providerSessionId,transcript);
+  const switchedAgent = {...agent,id:randomUUID()};
+  bridge.prepareCodex(switchedAgent);
+  const secondSession = randomUUID(), secondTranscript = path.join(agent.configDir,'second-root.jsonl');
+  fs.writeFileSync(secondTranscript,line('session_meta',{id:secondSession})+'\n'+line('event_msg',{type:'user_message',message:'Second session'})+'\n');
+  const switchedBindings = path.join(temporary,'manual-sessions',switchedAgent.id,'bindings.jsonl');
+  fs.writeFileSync(switchedBindings,[{sessionId:agent.providerSessionId,transcriptPath:transcript,event:'SessionStart'}, {sessionId:secondSession,transcriptPath:secondTranscript,event:'SessionStart'}, {sessionId:agent.providerSessionId,transcriptPath:transcript,event:'Stop'}].map(record=>JSON.stringify({...record,at:new Date().toISOString()})).join('\n')+'\n');
+  assert.deepEqual(bridge.read(switchedAgent).messages.map(message=>message.text),['Hello','Visible response','Second session'],'Returning to an older thread does not reorder Chat history');
+  assert.deepEqual(bridge.prepareCodex(switchedAgent).slice(0,2),['resume',agent.providerSessionId],'A→B→A resumes the last active A thread, not the last created B thread');
+  assert.equal(bridge.activity(switchedAgent).state,'completed','Activity follows the same currently bound thread as resume');
   const activityAt = new Date(Date.now() + 1000).toISOString();
   fs.appendFileSync(bindingFile, JSON.stringify({sessionId:agent.providerSessionId,transcriptPath:transcript,event:'UserPromptSubmit',at:activityAt})+'\n');
   assert.deepEqual(bridge.activity(agent), {state:'working',at:activityAt});
@@ -65,6 +93,10 @@ try {
   if (process.env.ATRIS_TEST_CODEX_EXECUTABLE) {
     const smoke = spawnSync(process.env.ATRIS_TEST_CODEX_EXECUTABLE,['--profile',`atris-manual-${agent.id}`,'mcp','list'],{env:{...process.env,CODEX_HOME:agent.configDir},encoding:'utf8',timeout:10000});
     assert.equal(smoke.status,0,`Installed Codex rejected the generated profile: ${smoke.stderr}`);
+    for (const mode of CODEX_PERMISSION_MODES) {
+      const result: SpawnSyncReturns<string> = spawnSync(process.env.ATRIS_TEST_CODEX_EXECUTABLE,['--profile',`atris-manual-${agent.id}`,...codexPermissionArgs(mode),'mcp','list'],{env:{...process.env,CODEX_HOME:agent.configDir},encoding:'utf8',timeout:10000});
+      assert.equal(result.status,0,`Installed Codex rejected ${mode}: ${result.stderr}`);
+    }
     console.log('Installed Codex accepted the generated layered hook profile.');
   }
 

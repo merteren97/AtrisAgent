@@ -121,6 +121,23 @@ try {
   const first = await post(`/conversations/${conversationId}/agents`, input);
   assert.equal(first.status, 200);
   const agent = await first.json();
+  const codex = {...agent,id:randomUUID(),runtimeType:'codex'};
+  store.save(codex);
+  const permissions = (id:string, mode:unknown, expectedMode:unknown, fullAccessConfirmed = false) => fetch(`${base}/agents/${id}/permissions`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode,expectedMode,fullAccessConfirmed})});
+  assert.equal((await permissions(agent.id,'read-only',null)).status,400,'Other providers cannot use Codex permission controls');
+  assert.equal((await permissions(codex.id,'unknown',null)).status,400);
+  assert.equal((await permissions(codex.id,'full-access',null)).status,400,'Full Access requires explicit confirmation');
+  let previousMode: string | null = null;
+  for (const mode of ['ask-for-approval','approve-for-me','full-access','read-only']) {
+    const response = await permissions(codex.id,mode,previousMode,mode === 'full-access');
+    assert.equal(response.status,200);
+    assert.equal((await response.json()).codexPermissionMode,mode);
+    assert.equal(new ManualConversationStore(sqlite).agent(codex.id).codexPermissionMode,mode,'Permission preference survives reload');
+    previousMode = mode;
+  }
+  assert.equal((await permissions(codex.id,'approve-for-me',null)).status,409,'Stale preference cannot overwrite a newer choice');
+  assert.equal(store.agent(agent.id).codexPermissionMode,undefined,'Permission choice is isolated to this agent');
+  store.removeAgent(codex.id);
   store.syncTitles(agent.id,[{id:'custom',role:'user',text:'A new task title'}]);
   assert.equal(store.agent(agent.id).name,'Agent one','Existing explicit agent names are preserved');
   assert.equal(store.list('project-a').find(c=>c.id===conversationId)!.title,'Independent work','Existing explicit conversation titles are preserved');

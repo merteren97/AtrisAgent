@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { useTheme } from 'next-themes';
 import '@xterm/xterm/css/xterm.css';
+import { TerminalOutputFrames } from './terminal-output-frames';
 
 export interface TerminalSnapshot {
   id: string; status: 'open' | 'closed' | 'exited' | 'disconnected'; sequence: number; output: string; reset: boolean;
@@ -32,6 +33,7 @@ function createEngine(id: string) {
   let writes = Promise.resolve();
   let frame = 0;
   let operations = Promise.resolve();
+  const outputFrames = new TerminalOutputFrames();
   const listeners = new Set<(error: string | null) => void>();
   const update = (value: string | null) => { error = value; listeners.forEach(listener => listener(error)); };
   // Parsing, geometry changes and resets share one queue. In particular, a reset
@@ -39,6 +41,29 @@ function createEngine(id: string) {
   const enqueue = (run: () => Promise<void> | void) => {
     operations = operations.then(run).catch(e => { if (!disposed) update(String(e)); });
     return operations;
+  };
+  const applySnapshot = async (snapshot: TerminalSnapshot, snapshotEpoch: number) => {
+    if (disposed || snapshotEpoch !== epoch) return;
+    status = snapshot.status;
+    if (snapshot.reset) { outputFrames.reset(); terminal.reset(); }
+    const write = async (text: string) => { if (text) await new Promise<void>(resolve => terminal.write(text, resolve)); };
+    let offset = 0;
+    for (const geometry of snapshot.resizes || []) {
+      await write(outputFrames.push(snapshot.output.slice(offset, geometry.offset)));
+      if (disposed || snapshotEpoch !== epoch) return;
+      if (terminal.cols !== geometry.columns || terminal.rows !== geometry.rows) {
+        await write(outputFrames.flush());
+        if (disposed || snapshotEpoch !== epoch) return;
+        terminal.resize(geometry.columns, geometry.rows);
+      }
+      offset = geometry.offset;
+    }
+    await write(outputFrames.push(snapshot.output.slice(offset)));
+    await write(status === 'open' ? outputFrames.flushExpired() : outputFrames.flush());
+    if (disposed || snapshotEpoch !== epoch) return;
+    if (snapshot.columns && snapshot.rows) size = snapshot.columns+':'+snapshot.rows;
+    after = snapshot.sequence;
+    update(status === 'open' ? null : 'Agent '+status+'. Use Open agent to reconnect.');
   };
   const resize = () => {
     if (frame || disposed || container.parentElement === parking) return;
@@ -51,12 +76,16 @@ function createEngine(id: string) {
         if (!proposed) return;
         // Keep emulator dimensions identical to the native PTY's safety limits.
         const cols = Math.min(500, Math.max(2, proposed.cols)), rows = Math.min(300, Math.max(2, proposed.rows));
-        if (terminal.cols !== cols || terminal.rows !== rows) terminal.resize(cols, rows);
         const next = cols+':'+rows;
         if (status === 'open' && next !== size) {
+          // Do not resize xterm optimistically: unread bytes still belong to the
+          // old grid. Consume the native acknowledgement and its ordered output
+          // before changing the emulator at the recorded resize boundary.
           await invoke('manual_terminal_resize', { id, columns: cols, rows });
           if (disposed || resizeEpoch !== epoch) return;
-          size = next;
+          await applySnapshot(await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after }), resizeEpoch);
+        } else if (status !== 'open' && (terminal.cols !== cols || terminal.rows !== rows)) {
+          terminal.resize(cols, rows);
         }
         if (!disposed && container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
       });
@@ -74,24 +103,7 @@ function createEngine(id: string) {
         if (disposed || pollEpoch !== epoch) return;
         const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after });
         if (disposed || pollEpoch !== epoch) return;
-        status = snapshot.status;
-        if (snapshot.reset) terminal.reset();
-        // A replay may span several native grids. Apply each resize at its stream
-        // boundary rather than interpreting all historical cursor moves at today's size.
-        let offset = 0;
-        const write = async (text: string) => { if (text) await new Promise<void>(resolve => terminal.write(text, resolve)); };
-        for (const geometry of snapshot.resizes || []) {
-          await write(snapshot.output.slice(offset, geometry.offset));
-          if (disposed || pollEpoch !== epoch) return;
-          terminal.resize(geometry.columns, geometry.rows);
-          offset = geometry.offset;
-        }
-        await write(snapshot.output.slice(offset));
-        if (disposed || pollEpoch !== epoch) return;
-        if (snapshot.columns && snapshot.rows) size = snapshot.columns+':'+snapshot.rows;
-        if ((snapshot.output || snapshot.resizes?.length) && container.parentElement !== parking) terminal.refresh(0, Math.max(0, terminal.rows - 1));
-        after = snapshot.sequence;
-        update(status === 'open' ? null : 'Agent '+status+'. Use Open agent to reconnect.');
+        await applySnapshot(snapshot, pollEpoch);
         resize();
       });
     } catch (e) { if (!disposed) update(String(e)); }
@@ -105,7 +117,7 @@ function createEngine(id: string) {
     restart() {
       epoch += 1; after = 0; status = 'disconnected'; size = ''; clearTimeout(timer);
       const restartEpoch = epoch;
-      void enqueue(() => { if (!disposed && restartEpoch === epoch) { terminal.reset(); update(null); } });
+      void enqueue(() => { if (!disposed && restartEpoch === epoch) { outputFrames.reset(); terminal.reset(); update(null); } });
       void poll();
     },
     subscribe(listener: (error: string | null) => void) { listeners.add(listener); listener(error); return () => { listeners.delete(listener); }; },

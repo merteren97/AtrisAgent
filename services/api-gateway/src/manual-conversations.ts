@@ -9,12 +9,15 @@ import { runCommand } from '@atris-agent-code/runtime-host';
 import { ManualProviderBridge, readTail } from './manual-provider-bridge';
 import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 import { manualContentTitle, manualProviderName } from './manual-titles';
+import type { CodexPermissionMode } from '@atris-agent-code/domain';
+import { isCodexPermissionMode } from './manual-codex-permissions';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
   runtimeType: string; model: string; accountProfileId: string; providerSessionId: string;
   cwd: string; configDir: string; sharedProfile: boolean; createdAt: string;
   reasoning?: string;
+  codexPermissionMode?: CodexPermissionMode;
   autoName?: boolean;
   nameSourceId?: string;
 }
@@ -135,7 +138,7 @@ export class ManualConversationStore {
   markMemoryProcessed(agentId: string, sourceId: string): void {
     this.sqlite.prepare('INSERT OR IGNORE INTO manual_memory_receipts VALUES (?, ?)').run(agentId, sourceId);
   }
-  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; naming?: ManualNamingUpdate } {
+  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; loading?: boolean; naming?: ManualNamingUpdate } {
     const agent = this.agent(id);
     const result = agent.runtimeType === 'antigravity'
       ? {supported:true,...new ManualAntigravityBridge(this.dataDir).read(agent)}
@@ -177,6 +180,17 @@ export class ManualConversationStore {
       const agent = this.agent(id);
       if (agent.catalogId !== expectedCatalogId) return fail('This agent model changed elsewhere. Refresh before applying.', 409);
       const updated = { ...agent, catalogId, model, reasoning };
+      this.sqlite.prepare('UPDATE manual_agent_sessions SET record = ? WHERE id = ?').run(JSON.stringify(updated), id);
+      return updated;
+    })();
+  }
+  updateCodexPermissions(id: string, mode: unknown, expectedMode: unknown, fullAccessConfirmed: unknown): ManualAgent {
+    return this.sqlite.transaction(() => {
+      const agent = this.agent(id);
+      if (agent.runtimeType !== 'codex' || !isCodexPermissionMode(mode)) return fail('Invalid Codex permission mode.');
+      if ((agent.codexPermissionMode || null) !== expectedMode) return fail('Permission preference changed elsewhere. Refresh before applying.', 409);
+      if (mode === 'full-access' && fullAccessConfirmed !== true) return fail('Confirm Full Access before applying this mode.');
+      const updated = {...agent, codexPermissionMode:mode};
       this.sqlite.prepare('UPDATE manual_agent_sessions SET record = ? WHERE id = ?').run(JSON.stringify(updated), id);
       return updated;
     })();
@@ -335,6 +349,9 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     res.json({ id: agent.id, executable: installation.path, args, cwd: agent.cwd, env });
   }));
   app.get('/api/manual/agents/:id/messages', route((req, res) => res.json(store.readMessages(idParam(req, 'id')))));
+  app.patch('/api/manual/agents/:id/permissions', route((req, res) => {
+    res.json(store.updateCodexPermissions(idParam(req, 'id'), req.body?.mode, req.body?.expectedMode, req.body?.fullAccessConfirmed));
+  }));
   app.post('/api/manual/agents/:id/auto-approve', route((req, res) => {
     bridge.setAutoApprove(store.agent(idParam(req, 'id')), req.body.enabled);
     res.status(202).json({accepted:true});
