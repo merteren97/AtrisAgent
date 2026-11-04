@@ -36,9 +36,14 @@ try {
   assert.equal(askedCodex[0].question?.questions[0]?.question,'Proceed?');
   const args = bridge.prepareCodex(agent);
   assert.ok(args.includes('--profile'));
+  assert.equal(args[args.indexOf('--sandbox')+1], 'workspace-write', 'First launch has an explicit sandbox instead of opening the permissions picker');
+  assert.equal(args[args.indexOf('--ask-for-approval')+1], 'on-request');
   assert.ok(!args.some(arg => arg.includes('bypass')), 'Hook trust is never bypassed');
   const profileText = fs.readFileSync(path.join(agent.configDir, `atris-manual-${agent.id}.config.toml`), 'utf8');
   assert.ok(profileText.includes('command_windows = "powershell.exe'));
+  assert.ok(profileText.includes(`[projects.${JSON.stringify(fs.realpathSync.native(agent.cwd))}]\ntrust_level = "trusted"`), 'Folder consent is scoped to the explicitly selected workspace in this launch profile');
+  assert.equal((profileText.match(/trusted_hash = "sha256:/g) || []).length, 5, 'Only the five generated history handlers receive declaration-specific trust');
+  assert.ok(!fs.existsSync(path.join(agent.configDir, 'config.toml')), 'Preparing a managed launch never creates or changes shared user preferences');
   const script = path.join(temporary,'manual-sessions',agent.id,'bind-session.cjs');
   const bindingFile = path.join(temporary,'manual-sessions',agent.id,'bindings.jsonl');
   const transcript = path.join(agent.configDir, `${agent.providerSessionId}.jsonl`);

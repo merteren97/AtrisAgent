@@ -18,7 +18,7 @@ export function CodexPermissions({agent, live, bound, disabled, onApply, onOpenC
   onOpenCode: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState<CodexPermissionMode | undefined>(agent.codexPermissionMode);
+  const [selected, setSelected] = useState<CodexPermissionMode>(agent.codexPermissionMode || 'ask-for-approval');
   const [confirmed, setConfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
@@ -33,12 +33,12 @@ export function CodexPermissions({agent, live, bound, disabled, onApply, onOpenC
   };
   const canApply = Boolean(selected) && (selected !== 'full-access' || confirmed) && !saving && !disabled;
   return <Dialog open={open} onOpenChange={value => {if (!saving) setOpen(value);}}>
-    <DialogTrigger asChild><Button type="button" size="sm" variant="outline" disabled={disabled} aria-label={`Codex permissions for ${agent.name}`} onClick={() => {setSelected(agent.codexPermissionMode); setConfirmed(false); setError(undefined);}}><Shield className="mr-1.5 h-3.5 w-3.5" />Permissions</Button></DialogTrigger>
+    <DialogTrigger asChild><Button type="button" size="icon" variant="ghost" disabled={disabled} aria-label={`Codex permissions for ${agent.name}`} title={`Codex permissions · ${modes.find(mode => mode.id === (agent.codexPermissionMode || 'ask-for-approval'))?.label}`} onClick={() => {setSelected(agent.codexPermissionMode || 'ask-for-approval'); setConfirmed(false); setError(undefined);}}><Shield className="h-4 w-4" /></Button></DialogTrigger>
     <DialogContent className="flex flex-col overflow-hidden sm:max-w-lg"><DialogHeader>
       <DialogTitle>Codex permissions</DialogTitle>
       <DialogDescription>{agent.name} · Choose this agent’s permission mode for its next start or resume. The CLI remains authoritative for live permissions.</DialogDescription>
     </DialogHeader>
-      <div className="min-h-0 space-y-4 overflow-y-auto p-0.5"><p className="text-xs text-muted-foreground">Saved launch preference: <span className="font-medium text-foreground">{modes.find(mode => mode.id === agent.codexPermissionMode)?.label || 'Inherited from CLI'}</span></p>
+      <div className="min-h-0 space-y-4 overflow-y-auto p-0.5"><p className="text-xs text-muted-foreground">Launch preference: <span className="font-medium text-foreground">{modes.find(mode => mode.id === (agent.codexPermissionMode || 'ask-for-approval'))?.label}</span></p>
       <fieldset disabled={saving || disabled} className="space-y-2"><legend className="sr-only">Permission mode</legend>{modes.map(mode => <label key={mode.id} className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 focus-within:ring-2 focus-within:ring-ring ${selected === mode.id ? 'border-primary bg-primary/5' : 'border-border'}`}>
         <input type="radio" name={`codex-permissions-${agent.id}`} value={mode.id} checked={selected === mode.id} onChange={() => {setSelected(mode.id); setConfirmed(false);}} className="mt-1 shrink-0 accent-primary" />
         <span><span className="block text-sm font-medium">{mode.label}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{mode.description}</span></span>

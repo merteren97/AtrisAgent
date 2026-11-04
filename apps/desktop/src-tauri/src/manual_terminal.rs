@@ -10,10 +10,22 @@ struct Geometry { columns: u16, rows: u16 }
 const INITIAL_GEOMETRY: Geometry = Geometry { columns: 120, rows: 30 };
 #[derive(Serialize, Debug, PartialEq)]
 struct ReplayResize { offset: usize, columns: u16, rows: u16 }
-struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, bytes: usize, ended: bool, geometry: Geometry }
+struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, bytes: usize, ended: bool, geometry: Geometry, input_ready: Option<bool>, signal_tail: String }
 impl Replay {
-    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY } }
+    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY, input_ready: None, signal_tail: String::new() } }
     fn push(&mut self, text: String) {
+        if self.input_ready == Some(false) {
+            self.signal_tail.push_str(&text);
+            // Codex emits this terminal state only after protected startup screens.
+            if self.signal_tail.contains("\x1b]7501;state=idle:app=codex\x1b\\") || self.signal_tail.contains("\x1b]7501;state=idle:app=codex\x07") {
+                self.input_ready = Some(true);
+                self.signal_tail.clear();
+            } else if self.signal_tail.len() > 128 {
+                let mut start = self.signal_tail.len() - 128;
+                while !self.signal_tail.is_char_boundary(start) { start += 1; }
+                self.signal_tail.drain(..start);
+            }
+        }
         self.sequence += 1;
         self.bytes += text.len();
         self.chunks.push_back((self.sequence, text, self.geometry));
@@ -91,7 +103,7 @@ impl ManualTerminals {
 pub struct Launch { id: String, executable: String, args: Vec<String>, cwd: String, #[serde(default)] env: HashMap<String, String> }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Snapshot { id: String, status: String, sequence: u64, output: String, reset: bool, columns: u16, rows: u16, resizes: Vec<ReplayResize> }
+pub struct Snapshot { id: String, status: String, sequence: u64, output: String, reset: bool, columns: u16, rows: u16, resizes: Vec<ReplayResize>, input_ready: Option<bool> }
 
 fn close(terminal: &mut Terminal) -> Result<(), String> {
     if terminal.closed { return Ok(()); }
@@ -170,7 +182,9 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
     let child = pair.slave.spawn_command(command).map_err(|e| e.to_string())?;
     drop(pair.slave);
-    let replay = Arc::new(Mutex::new(Replay::new()));
+    let mut initial_replay = Replay::new();
+    if request.args.iter().any(|arg| arg.starts_with("atris-manual-")) { initial_replay.input_ready = Some(false); }
+    let replay = Arc::new(Mutex::new(initial_replay));
     let output = replay.clone();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 8192];
@@ -221,7 +235,7 @@ pub async fn manual_terminal_snapshot(state: State<'_, ManualTerminals>, id: Str
 }
 fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool) -> Result<Snapshot, String> {
     let disconnected = || Snapshot { id: id.clone(), status: "disconnected".into(), sequence: 0, output: String::new(), reset: true,
-        columns: INITIAL_GEOMETRY.columns, rows: INITIAL_GEOMETRY.rows, resizes: Vec::new() };
+        columns: INITIAL_GEOMETRY.columns, rows: INITIAL_GEOMETRY.rows, resizes: Vec::new(), input_ready: None };
     let Some(slot) = manager.slot(&id)? else { return Ok(disconnected()); };
     let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
     let Some(terminal) = terminal_slot.as_mut() else { return Ok(disconnected()); };
@@ -232,7 +246,7 @@ fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool
     let reset = after > replay.sequence || replay.chunks.front().map(|(seq, _, _)| after.saturating_add(1) < *seq).unwrap_or(false);
     let (output, resizes) = if status_only { (String::new(), Vec::new()) } else { replay.output_after(after, reset) };
     let snapshot = Snapshot { id, status: status.into(), sequence: replay.sequence, output, reset,
-        columns: replay.geometry.columns, rows: replay.geometry.rows, resizes };
+        columns: replay.geometry.columns, rows: replay.geometry.rows, resizes, input_ready: replay.input_ready };
     drop(replay);
     // Snapshot is observational. Status-only polling can race with the full
     // output poll, so only an explicit close may release the terminal slot.
@@ -240,28 +254,76 @@ fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool
 }
 #[tauri::command]
 pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String, data: String, paste: bool) -> Result<(), String> {
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || write_input(&manager, &id, &data, paste)).await.map_err(|e| e.to_string())?
+}
+fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> Result<(), String> {
     if data.len() > 65536 { return Err("Terminal input is too large".into()); }
     if paste && data.chars().any(|c| c.is_control() && c != '\n' && c != '\t') { return Err("Message contains unsupported control characters".into()); }
-    let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let slot = manager.slot(&id)?.ok_or("Open the agent first")?;
-        if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
-        let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
-        if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
-        let terminal = terminal_slot.as_mut().ok_or("Open the agent first")?;
-        if terminal.closed || !matches!(terminal.child.try_wait(), Ok(None)) { return Err("Agent is not connected".into()); }
-        let writer = terminal.writer.clone();
-        // A full PTY input buffer must not prevent Close from reaching the child.
-        drop(terminal_slot);
-        let mut writer = writer.lock().map_err(|_| "Terminal input is unavailable")?;
-        if paste {
-            writer.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
-            writer.flush().map_err(|e| e.to_string())?;
-            std::thread::sleep(std::time::Duration::from_millis(80));
-            writer.write_all(b"\r").map_err(|e| e.to_string())?;
-        } else { writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?; }
-        writer.flush().map_err(|e| e.to_string())
-    }).await.map_err(|e| e.to_string())?
+    let slot = manager.slot(id)?.ok_or("Open the agent first")?;
+    if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+    let mut terminal_slot = slot.terminal.lock().map_err(|_| "Agent state is unavailable")?;
+    if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+    let terminal = terminal_slot.as_mut().ok_or("Open the agent first")?;
+    if terminal.closed || !matches!(terminal.child.try_wait(), Ok(None)) { return Err("Agent is not connected".into()); }
+    if paste && terminal.replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready == Some(false) {
+        return Err("Codex is still starting. Your draft is kept; check CLI setup in Code.".into());
+    }
+    let writer = terminal.writer.clone();
+    let replay = terminal.replay.clone();
+    let codex = replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready.is_some();
+    // A full PTY input buffer must not prevent Close from reaching the child.
+    drop(terminal_slot);
+    let mut writer = writer.lock().map_err(|_| "Terminal input is unavailable")?;
+    if paste {
+        let after = replay.lock().map_err(|_| "Terminal output is unavailable")?.sequence;
+        writer.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        // Codex's Win32 input path can classify ConPTY paste as key bursts.
+        // Enter inside its 120 ms suppression window becomes a newline.
+        // Wait for the paste repaint to settle as well, so a long input's
+        // queued keys cannot make the delay expire before the CLI reads them.
+        let started = std::time::Instant::now();
+        let mut quiet_since = started;
+        let mut sequence = after;
+        // The Windows console can take seconds to decode tens of thousands
+        // of keys. A timer alone cannot acknowledge that paste. Codex's
+        // collapsed-paste label includes the received Unicode character count.
+        let paste_labels = (codex && data.chars().count() > 1000).then(|| {
+            let count = data.chars().count();
+            // Win32 may insert the held first character directly before
+            // collapsing the remainder. Both spellings acknowledge all keys.
+            [format!("Pasted Content {count} chars"), format!("Pasted Content {} chars", count - 1)]
+        });
+        let mut acknowledged_at = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+            let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
+            let current = state.sequence;
+            if let Some(labels) = &paste_labels {
+                if acknowledged_at.is_none() && current != sequence {
+                    let output = state.output_after(after, false).0;
+                    if labels.iter().any(|label| output.contains(label)) { acknowledged_at = Some(std::time::Instant::now()); }
+                }
+            }
+            drop(state);
+            if current != sequence { sequence = current; quiet_since = std::time::Instant::now(); }
+            if paste_labels.is_some() {
+                if acknowledged_at.map(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_millis(200)).unwrap_or(false) { break; }
+                if started.elapsed() >= std::time::Duration::from_secs(30) {
+                    return Err("Message was pasted but Codex did not confirm the complete input. Open Code to inspect it and press Enter once; it was not submitted automatically.".into());
+                }
+                continue;
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(250)
+                && quiet_since.elapsed() >= std::time::Duration::from_millis(200) { break; }
+            if started.elapsed() >= std::time::Duration::from_secs(2) { break; }
+        }
+        // Exactly one submit key; never retry Enter against an unknown dialog.
+        writer.write_all(b"\r").map_err(|e| e.to_string())?;
+    } else { writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?; }
+    writer.flush().map_err(|e| e.to_string())
 }
 /// Stage WebView file bytes in an app-owned temporary directory so the CLI can read
 /// the actual image/document. The original filename is never used as a path.
@@ -459,6 +521,72 @@ pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_readiness_requires_a_complete_cli_signal() {
+        let mut replay = Replay::new();
+        replay.input_ready = Some(false);
+        replay.push("Folder access\nTrust and continue\n".into());
+        assert_eq!(replay.input_ready, Some(false));
+        replay.push("\x1b]7501;state=idle:app=codex".into());
+        assert_eq!(replay.input_ready, Some(false));
+        replay.push("\x1b\\".into());
+        assert_eq!(replay.input_ready, Some(true));
+        let mut other = Replay::new();
+        other.push("\x1b]7501;state=idle:app=codex\x07".into());
+        assert_eq!(other.input_ready, None, "Other providers retain their existing input behavior");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn installed_codex_first_chat_paste_submits_once() {
+        let Ok(fixture) = std::env::var("ATRIS_TEST_CODEX_PASTE_FIXTURE") else { return; };
+        let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        let request: Launch = serde_json::from_value(fixture["launch"].clone()).unwrap();
+        let id = request.id.clone();
+        let received = PathBuf::from(fixture["received"].as_str().unwrap());
+        let prompt = fixture["prompt"].as_str().unwrap();
+        let manager = ManualTerminals::default();
+        struct Cleanup(ManualTerminals);
+        impl Drop for Cleanup { fn drop(&mut self) { self.0.shutdown(); } }
+        let _cleanup = Cleanup(manager.clone());
+        start_with_cleanup(manager.clone(), request).unwrap();
+        let mut sequence = 0;
+        let mut output = String::new();
+        let mut cursor_replied = false;
+        let mut read = || {
+            let result = snapshot(&manager, id.clone(), sequence, false).unwrap();
+            sequence = result.sequence;
+            if !cursor_replied && result.output.contains("\x1b[6n") {
+                write_input(&manager, &id, "\x1b[1;1R", false).unwrap();
+                cursor_replied = true;
+            }
+            output.push_str(&result.output);
+            assert_eq!(result.status, "open", "Codex exited during setup: {output}");
+            output.clone()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            let output = read();
+            if snapshot(&manager, id.clone(), 0, true).unwrap().input_ready == Some(true) { break; }
+            assert!(std::time::Instant::now() < deadline, "Codex startup did not finish: {output}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        read();
+        write_input(&manager, &id, prompt, true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            let output = read();
+            if received.is_file() { break; }
+            assert!(std::time::Instant::now() < deadline, "First pasted message never reached the local provider: {output}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let bodies = std::fs::read_to_string(&received).unwrap();
+        let requests: Vec<serde_json::Value> = bodies.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(requests.len(), 1, "Chat must issue one submission, not repeated Enter retries");
+        let sent = requests[0]["input"].as_array().unwrap().iter().any(|item| item["role"] == "user" && item["content"].as_array().map(|content| content.iter().any(|part| part["text"] == prompt)).unwrap_or(false));
+        assert!(sent, "The complete pasted prompt must reach the local provider unchanged");
+        println!("Installed Codex started without folder/hook/permission prompts; first {}-character paste submitted exactly once through real ConPTY.", prompt.chars().count());
+    }
     #[test]
     fn tui_config_preserves_inherited_jsonc_and_relative_plugins() {
         let root = std::env::temp_dir().join(format!("atris-tui-config-{}",std::process::id()));
