@@ -7,6 +7,7 @@ import type { ManualAgent, ManualMessage } from './manual-conversations';
 import { MANUAL_OPENCODE_TUI } from './manual-opencode-tui';
 import { readCodexManualHistory } from './manual-codex-history';
 import { codexPermissionArgs } from './manual-codex-permissions';
+import { codexManualProfile } from './manual-codex-startup';
 export { parseCodexManualTranscript } from './manual-codex-history';
 
 const MARKER = '// AtrisAgent managed manual session bridge v1';
@@ -301,10 +302,10 @@ export class ManualProviderBridge {
     const {command, commandWindows} = this.hookCommand(agent);
     const profile = `atris-manual-${agent.id}`;
     // Profile layers add hooks alongside existing hooks; neither user config nor credentials are copied.
-    const config = '# AtrisAgent managed manual session bridge v1\n' + ['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PostToolUse'].map(event => `\n[[hooks.${event}]]\n[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${JSON.stringify(command)}\ncommand_windows = ${JSON.stringify(commandWindows)}\ntimeout = 5\n`).join('');
-    writeManaged(path.join(root, `${profile}.config.toml`), config);
+    const profilePath = path.resolve(root, `${profile}.config.toml`);
+    writeManaged(profilePath, codexManualProfile(profilePath, fs.realpathSync.native(agent.cwd), command, commandWindows));
     const bound = this.codexBindings(agent, 'activity').at(-1);
-    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : []), ...codexPermissionArgs(agent.codexPermissionMode)];
+    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : []), ...codexPermissionArgs(agent.codexPermissionMode || 'ask-for-approval')];
   }
   prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});

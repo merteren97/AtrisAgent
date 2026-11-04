@@ -83,7 +83,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
             <label className="grid min-w-0 gap-2 text-xs font-medium sm:col-span-2">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => setCatalogId(e.target.value)} disabled={!options.length}>{!options.length && <option value="">No verified model available</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label>
           </div>
           <p className="mt-3 text-xs leading-5 text-muted-foreground">Conversation and terminal titles are created automatically from your first task, in Chat or Code.</p>
-          {runtime === 'codex' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Chat uses a session history hook. Review the AtrisAgent hook in the CLI's /hooks screen when prompted.</p>}
+          {runtime === 'codex' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Codex starts in the selected project with Ask for approval. Chat connects through an AtrisAgent-managed history hook. Change permissions beside Send.</p>}
           {runtime === 'antigravity' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Antigravity uses your existing CLI account. Chat reads this agent’s own transcript; approvals and live tool output remain in Code.</p>}
           {!options.length && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-muted/40 p-3"><p className="text-xs leading-5 text-muted-foreground">Connect or verify this provider to load its available models.</p><Button type="button" variant="outline" size="sm" onClick={() => { useSettingsStore.getState().setActiveView('accounts'); onClose(); }}>Open Accounts</Button></div>}
         </div>
@@ -121,6 +121,7 @@ export function ManualWorkspace() {
   const [autoApprove, setAutoApprove] = useState<OpenCodeAutoApprove>();
   const [routeStatus, setRouteStatus] = useState<{pending: boolean; error?: string}>();
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
+  const [inputReady, setInputReady] = useState<Record<string, boolean | null | undefined>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
   const [attachments, setAttachments] = useState<Record<string, File[]>>({});
   const [deleteTarget, setDeleteTarget] = useState<ManualAgent | null>(null);
@@ -165,13 +166,18 @@ export function ManualWorkspace() {
       const results = await Promise.allSettled(agentIds.split(',').map(async id => {
         const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after: 0, statusOnly: true });
         if (!disposed && snapshot.status === 'open') ensureManualTerminal(id);
-        return [id, snapshot.status] as const;
+        return [id, snapshot.status, snapshot.inputReady] as const;
       }));
       if (disposed) return;
       if (epoch !== lifecycleEpoch.current) { timer = setTimeout(poll, 1500); return; }
       setStatuses(previous => {
         const next = { ...previous };
         results.forEach((result, index) => { next[agentIds.split(',')[index]] = result.status === 'fulfilled' ? result.value[1] : 'disconnected'; });
+        return next;
+      });
+      setInputReady(previous => {
+        const next = {...previous};
+        results.forEach((result, index) => { next[agentIds.split(',')[index]] = result.status === 'fulfilled' ? result.value[2] : undefined; });
         return next;
       });
       timer = setTimeout(poll, 1500);
@@ -207,6 +213,7 @@ export function ManualWorkspace() {
     useManualStore.getState().hideAgent(target.id, false); markManualLaunch(target.id);
     ensureManualTerminal(target.id, true);
     setStatuses(previous => ({ ...previous, [target.id]: 'open' })); setGeneration(value => value + 1);
+    setInputReady(previous => ({...previous, [target.id]: target.runtimeType === 'codex' ? false : null}));
     // Let the user finish the CLI's own trust/login/permission prompts in its real terminal.
     if (showCode) setSurface(target.conversationId, 'code');
   };
@@ -297,6 +304,7 @@ export function ManualWorkspace() {
   };
   const send = () => agent && action('send', async () => {
     if (!live || !native) return;
+    if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) throw new Error('Codex is still starting. Your draft is kept; check CLI setup in Code.');
     const text = draft.trim(); if (!text && !files.length) return;
     const staged = await Promise.all(files.map(async file => ({ name: file.name, path: await invoke<string>('manual_stage_attachment', { id: agent.id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }) })));
     const references = staged.map(({ name, path }) => `- ${JSON.stringify(name)}: ${JSON.stringify(path)}`).join('\n');
@@ -317,7 +325,6 @@ export function ManualWorkspace() {
     <header className="flex min-h-14 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-2">
       <div className="flex min-w-0 items-center gap-3"><h1 className="truncate text-sm font-medium">{conversation?.title || 'Independent agents'}</h1><span className="text-xs text-muted-foreground">{openCount} open</span></div>
       <div className="flex items-center gap-2">
-        {agent?.runtimeType === 'codex' && <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} bound={bound} disabled={!native || Boolean(pending)} onApply={applyPermissions} onOpenCode={() => conversation && setSurface(conversation.id, 'code')} />}
         {conversation && <Button size="sm" variant="ghost" onClick={() => setMemory({})}><Brain className="mr-1.5 h-3.5 w-3.5"/>Memory</Button>}
         <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1" aria-label="Conversation view">{(['chat', 'code'] as const).map(view => <Button key={view} variant={surface === view ? 'secondary' : 'ghost'} size="sm" aria-pressed={surface === view} disabled={!conversation} onClick={() => conversation && setSurface(conversation.id, view)}>{view === 'chat' ? <MessageSquare className="mr-1.5 h-3.5 w-3.5" /> : <Code2 className="mr-1.5 h-3.5 w-3.5" />}{view === 'chat' ? 'Chat' : 'Code'}</Button>)}</div>
         {conversation && <Button size="sm" variant="ghost" disabled={Boolean(pending) || conversation.agents.length >= 30} onClick={() => setAdding(true)} title={conversation.agents.length >= 30 ? '30-agent limit reached' : 'Add independent agents'}><Plus className="mr-1 h-3.5 w-3.5" />Add agents</Button>}
@@ -335,7 +342,7 @@ export function ManualWorkspace() {
         <div ref={scroller} onScroll={() => { const node = scroller.current; if (node) following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100; }} className="min-h-0 flex-1 overflow-y-auto select-text">
           <div className="mx-auto w-full max-w-3xl space-y-7 px-6 py-8">
             {!supportsChat(agent.runtimeType) ? <div className="rounded-lg border border-border p-5"><h3 className="text-sm font-medium">Continue in Code</h3><p className="mt-2 text-sm leading-6 text-muted-foreground">This provider’s structured Chat history is not connected yet. Use its interactive terminal to continue this agent.</p><Button className="mt-3" variant="outline" onClick={() => setSurface(conversation.id, 'code')}>Open Code</Button></div> : <>
-              {!bound && <div role="status" className="flex items-start gap-3 rounded-xl bg-muted/40 px-4 py-3"><Code2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" /><p className="text-xs leading-5 text-muted-foreground">Connect this CLI’s history to see its replies here.{agent.runtimeType === 'codex' ? ' Review the AtrisAgent hook in /hooks.' : agent.runtimeType === 'antigravity' ? ' Reopen older agents once to enable their dedicated session link, then send a message.' : ' Complete CLI setup in Code and send your first message.'}<button className="ml-2 font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>Open terminal</button></p></div>}
+              {!bound && <div role="status" className="flex items-start gap-3 rounded-xl bg-muted/40 px-4 py-3"><Code2 className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" /><p className="text-xs leading-5 text-muted-foreground">Connect this CLI’s history to see its replies here.{agent.runtimeType === 'codex' ? ' Waiting for Codex startup. If an older CLI is waiting for hook review, reopen the agent to load the managed bridge.' : agent.runtimeType === 'antigravity' ? ' Reopen older agents once to enable their dedicated session link, then send a message.' : ' Complete CLI setup in Code and send your first message.'}<button className="ml-2 font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>Open terminal</button></p></div>}
               {truncated && <p className="text-xs text-muted-foreground">Showing recent messages from this long session.</p>}
               {historyLoading && <p role="status" className="text-xs text-muted-foreground">Syncing Codex history… Displayed messages remain available while records arrive.</p>}
               {!messages.length && <div className="py-8"><RuntimeBrandIcon runtimeId={agent.runtimeType} className="mb-4 h-9 w-9 text-foreground" /><h3 className="text-xl font-semibold tracking-tight">What would you like to work on?</h3><p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">Message {agent.name}, choose a model in the composer, or open Code for the live terminal. Each agent keeps its own conversation.</p><div className="mt-5 flex flex-wrap gap-2">{['Explore this project', 'Review recent changes', 'Help me plan a task'].map(prompt => <Button key={prompt} size="sm" variant="outline" className="rounded-full text-xs" onClick={() => setDraft(agent.id, prompt)}>{prompt}</Button>)}</div></div>}
@@ -347,7 +354,7 @@ export function ManualWorkspace() {
             <div ref={messageEnd} />
           </div>
         </div>
-        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
+        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} bound={bound} disabled={!native || Boolean(pending)} onApply={applyPermissions} onOpenCode={() => setSurface(conversation.id, 'code')} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
       </>}
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}

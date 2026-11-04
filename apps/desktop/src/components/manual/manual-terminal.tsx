@@ -10,6 +10,7 @@ export interface TerminalSnapshot {
   id: string; status: 'open' | 'closed' | 'exited' | 'disconnected'; sequence: number; output: string; reset: boolean;
   columns?: number; rows?: number;
   resizes?: { offset: number; columns: number; rows: number }[];
+  inputReady?: boolean | null;
 }
 
 // The emulator, including device/cursor replies, lives beyond any React view.
