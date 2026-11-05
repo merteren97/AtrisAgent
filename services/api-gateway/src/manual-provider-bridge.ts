@@ -297,7 +297,7 @@ export class ManualProviderBridge {
     }
     return [...records.values()];
   }
-  prepareCodex(agent: ManualAgent): string[] {
+  prepareCodex(agent: ManualAgent, managed = false): string[] {
     const root = this.codexRoot(agent); fs.mkdirSync(root, {recursive:true, mode:0o700});
     const {command, commandWindows} = this.hookCommand(agent);
     const profile = `atris-manual-${agent.id}`;
@@ -305,7 +305,18 @@ export class ManualProviderBridge {
     const profilePath = path.resolve(root, `${profile}.config.toml`);
     writeManaged(profilePath, codexManualProfile(profilePath, fs.realpathSync.native(agent.cwd), command, commandWindows));
     const bound = this.codexBindings(agent, 'activity').at(-1);
-    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : []), ...codexPermissionArgs(agent.codexPermissionMode || 'ask-for-approval')];
+    // Remote resume rejects TUI-side permission flags. The owning server and
+    // confirmed thread request supply the selected policy for managed sessions.
+    return [...(bound ? ['resume', bound.sessionId] : []), '--profile', profile, '--model', agent.model, ...(agent.reasoning ? ['-c', `model_reasoning_effort="${agent.reasoning}"`] : []), ...(managed ? [] : codexPermissionArgs(agent.codexPermissionMode || 'ask-for-approval'))];
+  }
+  bindCodexRuntime(agent: ManualAgent, sessionId: string, transcriptPath: string): void {
+    try {
+      const actual = fs.realpathSync(transcriptPath);
+      const relative = path.relative(fs.realpathSync(this.codexRoot(agent)), actual);
+      if (relative.startsWith('..') || path.isAbsolute(relative) || !codexIdentity(actual, sessionId)) return;
+      const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});
+      fs.appendFileSync(path.join(directory, 'bindings.jsonl'), JSON.stringify({sessionId, transcriptPath:actual, event:'SessionStart', at:new Date().toISOString()})+'\n', {mode:0o600});
+    } catch { /* The rollout may not exist until the first completed turn; retry on the next event. */ }
   }
   prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});

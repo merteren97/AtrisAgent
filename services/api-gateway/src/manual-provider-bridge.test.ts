@@ -54,6 +54,9 @@ try {
   assert.equal(bridge.read(agent).bound,true);
   assert.equal(bridge.read(agent).messages.length,2);
   assert.deepEqual(bridge.prepareCodex(agent).slice(0,2),['resume',agent.providerSessionId]);
+  const remoteArgs = bridge.prepareCodex({...agent,codexPermissionMode:'approve-for-me'},true);
+  assert.deepEqual(remoteArgs.slice(0,2),['resume',agent.providerSessionId]);
+  assert.ok(!remoteArgs.includes('--sandbox') && !remoteArgs.includes('--ask-for-approval') && !remoteArgs.some(arg=>arg.startsWith('approvals_reviewer=')), 'Remote TUI resume must not receive forbidden permission overrides; the owning server supplies them');
   assert.deepEqual(codexPermissionArgs(), [], 'Existing agents inherit CLI permissions until a mode is explicitly selected');
   for (const mode of CODEX_PERMISSION_MODES) {
     const modeArgs = bridge.prepareCodex({...agent,codexPermissionMode:mode});

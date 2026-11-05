@@ -492,7 +492,7 @@ const authService = new AtrisAuthService();
 const PORT = resolveGatewayPort();
 const server = http.createServer(app);
 const shutdownCoordinator = createRuntimeShutdownCoordinator({
-  stopRuntimeHost: () => runtimeHost.stopAll(),
+  stopRuntimeHost: async () => { await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); },
   closeServer: () => new Promise<void>((resolve) => {
     if (!server.listening) {
       resolve();

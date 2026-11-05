@@ -174,7 +174,7 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
             command.env("OPENCODE_CONFIG_CONTENT", serde_json::to_string(&config).map_err(|_| "Could not prepare OpenCode configuration")?);
             continue;
         }
-        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
+        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "ATRIS_CODEX_REMOTE_TOKEN"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
         command.env(key, value);
     }
     // Acquire handles before spawn so a handle error cannot orphan a newly started CLI.
@@ -607,6 +607,61 @@ mod tests {
         assert_eq!(std::fs::read_to_string(inherited).unwrap(),source);
         assert!(read_jsonc("{/* unclosed").is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_codex_live_permissions() {
+        let Ok(filename) = std::env::var("ATRIS_TEST_CODEX_LIVE_FIXTURE") else { return; };
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(filename).unwrap()).unwrap();
+        let request: Launch = serde_json::from_value(fixture["launch"].clone()).unwrap();
+        let id = request.id.clone();
+        let root = PathBuf::from(fixture["root"].as_str().unwrap());
+        let prompts = fixture["prompts"].as_array().unwrap();
+        let manager = ManualTerminals::default();
+        struct Cleanup(ManualTerminals);
+        impl Drop for Cleanup { fn drop(&mut self) { self.0.shutdown(); } }
+        let _cleanup = Cleanup(manager.clone());
+        start_with_cleanup(manager.clone(), request).unwrap();
+        let mut cursor_replied = false;
+        let mut fixture_trusted = false;
+        let mut output = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            let frame = snapshot(&manager, id.clone(), 0, false).unwrap();
+            output.clone_from(&frame.output);
+            if !cursor_replied && output.contains("\x1b[6n") {
+                write_input(&manager, &id, "\x1b[1;1R", false).unwrap(); cursor_replied = true;
+            }
+            // This test is opt-in and trusts only its disposable fixture directory.
+            if !fixture_trusted && output.contains("Trust and continue") {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                write_input(&manager, &id, "\r", false).unwrap(); fixture_trusted = true;
+            }
+            if frame.input_ready == Some(true) { break; }
+            if frame.status != "open" || std::time::Instant::now() >= deadline {
+                if fixture["allowDiagnosticCapture"] == true { std::fs::write(root.join("native-startup.txt"), &output).unwrap(); }
+                panic!("Codex fixture did not become input-ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::write(root.join("native-ready"), b"ready").unwrap();
+        for (index, prompt) in prompts.iter().enumerate() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            while !root.join(format!("send-{index}")).is_file() {
+                assert!(std::time::Instant::now() < deadline, "Controller did not request the next native turn");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            write_input(&manager, &id, prompt.as_str().unwrap(), true).unwrap();
+            std::fs::write(root.join(format!("sent-{index}")), b"sent").unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !root.join("finish").is_file() {
+            assert!(std::time::Instant::now() < deadline, "Controller did not finish acceptance");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        close_session(&manager, &id).unwrap();
+        assert!(!manager.has_live_sessions());
     }
 
     #[cfg(windows)]

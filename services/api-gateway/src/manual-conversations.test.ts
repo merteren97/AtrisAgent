@@ -61,7 +61,7 @@ const runtime = {
 } as unknown as RuntimeHost;
 const app = express(); app.use(express.json());
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-manual-api-'));
-installManualConversations(app, sqlite, runtime, temporary);
+const installedStore = installManualConversations(app, sqlite, runtime, temporary);
 const server = app.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => server.once('listening', resolve));
 const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/manual`;
@@ -137,6 +137,16 @@ try {
   }
   assert.equal((await permissions(codex.id,'approve-for-me',null)).status,409,'Stale preference cannot overwrite a newer choice');
   assert.equal(store.agent(agent.id).codexPermissionMode,undefined,'Permission choice is isolated to this agent');
+  assert.equal((await fetch(`${base}/agents/${agent.id}/permissions/live`)).status,400);
+  assert.equal((await (await fetch(`${base}/agents/${codex.id}/permissions/live`)).json()).available,false,'Legacy terminals are not claimed to have live control');
+  assert.equal((await post(`/agents/${codex.id}/permissions/live`,{mode:'ask-for-approval',expectedMode:null})).status,409,'Live requests retain preference CAS');
+  assert.equal((await post(`/agents/${codex.id}/permissions/live`,{mode:'ask-for-approval',expectedMode:'read-only'})).status,409,'No runtime does not silently start a new conversation');
+  const originalGet=installedStore.codexSessions.get.bind(installedStore.codexSessions);
+  let applied=0;
+  installedStore.codexSessions.get = ((id:string) => id===codex.id ? {apply:async()=>{applied++;return {available:true,mode:'ask-for-approval',threadId:'exact-thread'};}} : originalGet(id)) as typeof installedStore.codexSessions.get;
+  assert.equal((await post(`/agents/${codex.id}/permissions/live`,{mode:'ask-for-approval',expectedMode:'read-only'})).status,200);
+  assert.equal(applied,1); assert.equal(store.agent(codex.id).codexPermissionMode,'read-only','Live apply does not overwrite the next-open preference');
+  installedStore.codexSessions.get=originalGet;
   store.removeAgent(codex.id);
   store.syncTitles(agent.id,[{id:'custom',role:'user',text:'A new task title'}]);
   assert.equal(store.agent(agent.id).name,'Agent one','Existing explicit agent names are preserved');
