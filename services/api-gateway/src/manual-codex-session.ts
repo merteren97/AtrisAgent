@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'child_process';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
