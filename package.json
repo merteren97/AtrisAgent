@@ -17,6 +17,8 @@
     "start:landing": "node infra/scripts/start-agent-landing.mjs",
     "typecheck": "npx tsc -b --pretty false && npm run typecheck -w @atris-agent-code/desktop",
     "test": "npm run test --workspaces --if-present",
+    "test:codex-live": "tsx scripts/test-codex-live.mts",
+    "test:codex-sandbox": "tsx scripts/test-codex-sandbox.mts",
     "test:landing": "npm run test -w @atris-agent-code/public-server",
     "check": "npm run typecheck && npm test && npm run build",
     "tauri:dev": "npm run tauri:dev -w @atris-agent-code/desktop",

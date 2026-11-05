@@ -11,6 +11,7 @@ import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 import { manualContentTitle, manualProviderName } from './manual-titles';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import { isCodexPermissionMode } from './manual-codex-permissions';
+import { ManualCodexSessions } from './manual-codex-session';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
@@ -67,6 +68,7 @@ export function parseManualTranscript(source: string, sessionId: string): Manual
 }
 
 export class ManualConversationStore {
+  readonly codexSessions = new ManualCodexSessions();
   constructor(private sqlite: Database.Database, private dataDir = path.dirname(sqlite.name)) {
     sqlite.exec(`CREATE TABLE IF NOT EXISTS manual_conversations (
       id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -321,6 +323,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (!installation.installed || !installation.path) return fail('CLI executable could not be found.');
     if (!fs.statSync(agent.cwd).isDirectory()) return fail('Project directory is unavailable.');
     const env: Record<string, string> = {};
+    let codexRuntimeId: string | undefined;
     if (!agent.sharedProfile) {
       if (agent.runtimeType === 'claude_code') env.CLAUDE_CONFIG_DIR = agent.configDir;
       if (agent.runtimeType === 'codex') env.CODEX_HOME = agent.configDir;
@@ -341,16 +344,43 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (agent.runtimeType === 'codex') {
       const help = await runCommand(installation.path, ['--help'], {timeoutMs: 5000});
       if (!help.stdout.includes('.config.toml')) return fail('Update Codex to a version supporting layered CLI profiles before opening a manual Chat/Code session.');
-      args = bridge.prepareCodex(agent);
+      args = bridge.prepareCodex(agent, true);
+      const version = await runCommand(installation.path, ['--version'], {timeoutMs:5000});
+      if (!/codex-cli 0\.166\./.test(version.stdout)) return fail('Live permissions require Codex CLI 0.166.x. This experimental protocol version has not been verified with your installation.');
+      if (process.platform === 'win32' && !installation.path.toLowerCase().endsWith('.exe')) return fail('Live Codex sessions require the native Codex executable. Reconnect the Codex installation in Accounts.');
+      const endpoint = await store.codexSessions.create(agent.id, {executable:installation.path, cwd:agent.cwd, env, model:agent.model, reasoning:agent.reasoning,
+        mode:agent.codexPermissionMode || 'ask-for-approval', onThread:(threadId, filename) => bridge.bindCodexRuntime(agent, threadId, filename)});
+      args.push('--remote', endpoint.url, '--remote-auth-token-env', 'ATRIS_CODEX_REMOTE_TOKEN', '--cd', agent.cwd);
+      env.ATRIS_CODEX_REMOTE_TOKEN = endpoint.token;
+      codexRuntimeId = endpoint.runtimeId;
     }
     if (agent.runtimeType === 'opencode') {
       const prepared = bridge.prepareOpenCode(agent); args = prepared.args; Object.assign(env, prepared.env);
     }
-    res.json({ id: agent.id, executable: installation.path, args, cwd: agent.cwd, env });
+    res.json({ id: agent.id, executable: installation.path, args, cwd: agent.cwd, env, ...(codexRuntimeId ? {codexRuntimeId} : {}) });
   }));
   app.get('/api/manual/agents/:id/messages', route((req, res) => res.json(store.readMessages(idParam(req, 'id')))));
   app.patch('/api/manual/agents/:id/permissions', route((req, res) => {
     res.json(store.updateCodexPermissions(idParam(req, 'id'), req.body?.mode, req.body?.expectedMode, req.body?.fullAccessConfirmed));
+  }));
+  app.get('/api/manual/agents/:id/permissions/live', route((req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    if (agent.runtimeType !== 'codex') return fail('This agent does not use Codex.');
+    res.json(store.codexSessions.get(agent.id)?.status() || {available:false, reason:store.codexSessions.failure(agent.id) || 'Reopen this agent once to enable live permissions.'});
+  }));
+  app.post('/api/manual/agents/:id/permissions/live', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    if (agent.runtimeType !== 'codex') return fail('This agent does not use Codex.');
+    if ((agent.codexPermissionMode || null) !== req.body?.expectedMode) return fail('Permission preference changed elsewhere. Refresh before applying.', 409);
+    const session = store.codexSessions.get(agent.id);
+    if (!session) return fail('Reopen this agent once to enable live permissions.', 409);
+    res.json(await session.apply(req.body || {}));
+  }));
+  app.delete('/api/manual/agents/:id/codex-runtime', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const session = store.codexSessions.get(agent.id);
+    if (session && session.runtimeId !== req.body?.runtimeId) return fail('The Codex runtime changed.', 409);
+    await session?.close(); res.status(204).end();
   }));
   app.post('/api/manual/agents/:id/auto-approve', route((req, res) => {
     bridge.setAutoApprove(store.agent(idParam(req, 'id')), req.body.enabled);
@@ -364,7 +394,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     const id = idParam(req, 'id');
     // The shell polls every open terminal, including unselected Code panes.
     const naming = store.needsTitle(id) ? store.readMessages(id).naming : store.syncTitles(id, []);
-    res.json({ ...bridge.activity(store.agent(id)), naming });
+    res.json({ ...(store.codexSessions.get(id)?.activity() || bridge.activity(store.agent(id))), naming });
   }));
   app.patch('/api/manual/agents/:id/model', route(async (req, res) => {
     const agent = store.agent(idParam(req, 'id'));
