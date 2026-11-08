@@ -4,14 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
 import type { Application, Request, Response } from 'express';
-import type { RuntimeHost } from '@atris-agent-code/runtime-host';
-import { runCommand } from '@atris-agent-code/runtime-host';
+import type { AntigravityAdapter, RuntimeHost } from '@atris-agent-code/runtime-host';
 import { ManualProviderBridge, readTail } from './manual-provider-bridge';
 import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 import { manualContentTitle, manualProviderName } from './manual-titles';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import { isCodexPermissionMode } from './manual-codex-permissions';
 import { ManualCodexSessions } from './manual-codex-session';
+import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
@@ -334,20 +334,16 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       : ['--model', agent.model];
     // The active-route sentinel is app metadata, not a CLI model name. Never resume
     // the globally latest conversation: manual agents must remain independent.
-    if (agent.runtimeType === 'antigravity' && agent.model === 'antigravity-active-route') args = [];
-    if (agent.runtimeType === 'antigravity' && agent.model !== 'antigravity-active-route') {
-      const descriptor = await runtime.getModelCatalogService().resolveModelDescriptor(agent.catalogId);
-      const effort = agent.reasoning || descriptor?.defaultReasoning || (descriptor?.supportedReasoning?.includes('medium') ? 'medium' : descriptor?.supportedReasoning?.[0]);
-      if (effort && ['low', 'medium', 'high'].includes(effort)) args.push('--effort', effort);
+    if (agent.runtimeType === 'antigravity') {
+      // Older active-route records may contain a reasoning preference that the
+      // CLI never applied. Concrete catalog routes encode their own reasoning.
+      const selection = await (adapter as AntigravityAdapter).resolveModelCliRoute(agent.model,
+        agent.model === 'antigravity-active-route' ? undefined : agent.reasoning);
+      args = [...selection.args, ...new ManualAntigravityBridge(dataDir).prepare(agent)];
     }
-    if (agent.runtimeType === 'antigravity') args.push(...new ManualAntigravityBridge(dataDir).prepare(agent));
     if (agent.runtimeType === 'codex') {
-      const help = await runCommand(installation.path, ['--help'], {timeoutMs: 5000});
-      if (!help.stdout.includes('.config.toml')) return fail('Update Codex to a version supporting layered CLI profiles before opening a manual Chat/Code session.');
+      await verifyManualCodexCompatibility(installation.path);
       args = bridge.prepareCodex(agent, true);
-      const version = await runCommand(installation.path, ['--version'], {timeoutMs:5000});
-      if (!/codex-cli 0\.166\./.test(version.stdout)) return fail('Live permissions require Codex CLI 0.166.x. This experimental protocol version has not been verified with your installation.');
-      if (process.platform === 'win32' && !installation.path.toLowerCase().endsWith('.exe')) return fail('Live Codex sessions require the native Codex executable. Reconnect the Codex installation in Accounts.');
       const endpoint = await store.codexSessions.create(agent.id, {executable:installation.path, cwd:agent.cwd, env, model:agent.model, reasoning:agent.reasoning,
         mode:agent.codexPermissionMode || 'ask-for-approval', onThread:(threadId, filename) => bridge.bindCodexRuntime(agent, threadId, filename)});
       args.push('--remote', endpoint.url, '--remote-auth-token-env', 'ATRIS_CODEX_REMOTE_TOKEN', '--cd', agent.cwd);

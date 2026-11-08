@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 import { apiRequest } from '@/lib/api-client';
 import { invoke } from '@tauri-apps/api/core';
 import { isTauriRuntime } from '@/lib/secure-storage';
-import type { ManualConversation } from './manual-store';
+import { useManualStore, type ManualConversation } from './manual-store';
 
 export interface Workspace {
   id: string;
@@ -120,6 +120,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
             method: 'DELETE',
             body: JSON.stringify({ removeMemory }),
           });
+          useManualStore.getState().forgetWorkspace(id, manual);
           set((state) => {
             const workspaces = state.workspaces.filter((workspace) => workspace.id !== id);
             const { [id]: _removed, ...lastMissionByWorkspace } = state.lastMissionByWorkspace;

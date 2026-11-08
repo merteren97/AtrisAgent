@@ -220,23 +220,60 @@ export function parseAntigravityModelsOutput(stdout: string): AntigravityCliMode
 }
 
 export function resolveAntigravityModelRoute(
-  families: AntigravityCliModelFamily[],
+  families: readonly AntigravityCliModelFamily[],
   modelId: string,
   reasoning?: string,
 ): string {
-  const exactRoute = families.flatMap((family) => Object.values(family.routes))
-    .find((route) => route === modelId);
-  if (exactRoute) return exactRoute;
+  return resolveAntigravityCliRoute(families, modelId, reasoning).modelRoute || modelId;
+}
 
-  const family = families.find((candidate) => candidate.id === modelId);
-  if (!family) return modelId;
+export interface AntigravityCliRoute {
+  /** Undefined for the synthetic active route, which must not become a CLI model name. */
+  modelRoute?: string;
+  /** Complete model-selection arguments. Catalog reasoning is encoded by the route, not --effort. */
+  args: string[];
+}
 
+/** Resolve persisted family IDs or exact CLI routes using only the supplied live catalog.
+ * A catalog's Thinking/High labels describe route variants; they do not establish
+ * support for the CLI's separate --effort flag (including unsuffixed Sonnet Thinking).
+ */
+export function resolveAntigravityCliRoute(
+  families: readonly AntigravityCliModelFamily[],
+  modelId: string,
+  reasoning?: string,
+): AntigravityCliRoute {
+  if (modelId === 'antigravity-active-route') {
+    if (reasoning !== undefined) {
+      throw new Error('Antigravity active route does not expose reasoning control. Choose a concrete catalog model.');
+    }
+    return { args: [] };
+  }
   const normalizedReasoning = normalizeReasoning(reasoning);
-  if (normalizedReasoning && family.routes[normalizedReasoning]) {
-    return family.routes[normalizedReasoning]!;
+  if (reasoning !== undefined && !normalizedReasoning) {
+    throw new Error(`Invalid Antigravity reasoning level '${reasoning}'.`);
   }
-  if (family.defaultReasoning && family.routes[family.defaultReasoning]) {
-    return family.routes[family.defaultReasoning]!;
+
+  const matches = families.filter((family) => family.id === modelId
+    || family.defaultRoute === modelId
+    || Object.values(family.routes).includes(modelId));
+  if (matches.length !== 1) {
+    throw new Error(matches.length
+      ? `Antigravity model route '${modelId}' is ambiguous in the live model catalog.`
+      : `Antigravity model route '${modelId}' is not present in the live model catalog.`);
   }
-  return family.defaultRoute;
+  const family = matches[0];
+  let modelRoute = modelId;
+  if (modelId === family.id) {
+    if (normalizedReasoning) {
+      const route = family.routes[normalizedReasoning];
+      if (!route) throw new Error(`Antigravity model '${modelId}' does not support reasoning '${normalizedReasoning}'.`);
+      modelRoute = route;
+    } else {
+      modelRoute = family.defaultRoute;
+    }
+  } else if (normalizedReasoning && family.routes[normalizedReasoning] !== modelId) {
+    throw new Error(`Antigravity route '${modelId}' conflicts with reasoning '${normalizedReasoning}'.`);
+  }
+  return { modelRoute, args: ['--model', modelRoute] };
 }

@@ -43,7 +43,8 @@ export async function findAntigravityExecutable(options: {
 }
 import {
   parseAntigravityModelsOutput,
-  resolveAntigravityModelRoute,
+  resolveAntigravityCliRoute,
+  type AntigravityCliRoute,
   type AntigravityCliModelFamily,
 } from '../antigravity-model-catalog';
 import {
@@ -194,6 +195,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       getHelpText: typeof getHelpText;
       runCommand: typeof runCommand;
     } = { getHelpText, runCommand },
+    private readonly spawnProcess: typeof spawnHiddenChecked = spawnHiddenChecked,
   ) {
     super(eventBus);
   }
@@ -493,8 +495,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         displayName: family.displayName,
         description: 'Live model family reported by the installed `agy models` command.',
         supportedRoles: ALL_ROLES,
-        supportedReasoning: capabilities.reasoningControl ? family.efforts : [],
-        defaultReasoning: capabilities.reasoningControl ? family.defaultReasoning : undefined,
+        supportedReasoning: capabilities.modelSelection ? family.efforts : [],
+        defaultReasoning: capabilities.modelSelection ? family.defaultReasoning : undefined,
         inputModalities: ['text', 'image'],
         availability: 'available',
         source: 'discovered',
@@ -514,7 +516,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
           displayName: activeModel ? this.displayName(activeModel) : 'Antigravity Active Model',
           description: 'Uses the sticky model currently selected inside Antigravity when the CLI does not expose its active route in result metadata.',
           supportedRoles: ALL_ROLES,
-          supportedReasoning: capabilities.reasoningControl ? ['low', 'medium', 'high'] : [],
+          supportedReasoning: [],
           inputModalities: ['text', 'image'],
           availability: 'available',
           source: 'discovered',
@@ -538,7 +540,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       displayName: activeModel ? this.displayName(activeModel) : 'Antigravity Active Model',
       description: 'The sticky model currently selected inside Antigravity. Live model discovery was unavailable.',
       supportedRoles: ALL_ROLES,
-      supportedReasoning: capabilities.reasoningControl ? ['low', 'medium', 'high'] : [],
+      supportedReasoning: [],
       inputModalities: ['text', 'image'],
       availability: 'unknown',
       source: 'cached',
@@ -616,13 +618,19 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     throw new Error('Antigravity print-mode permission decisions are controlled by its persisted permissions policy; interactive approval bridging is not available yet.');
   }
 
-  private async resolveRequestedModelRoute(executable: string, model: string, reasoning?: string): Promise<string> {
-    if (model === 'antigravity-active-route') return model;
+  /** Shared launch preparation for interactive callers and background agents. Does not start a provider session. */
+  async resolveModelCliRoute(model: string, reasoning?: string): Promise<AntigravityCliRoute> {
+    if (model === 'antigravity-active-route') return resolveAntigravityCliRoute([], model, reasoning);
+    const install = await this.discoverInstallation();
+    if (!install.installed || !install.path) throw new Error(install.error || 'Antigravity CLI was not found.');
+    return this.resolveRequestedModelRoute(install.path, model, reasoning);
+  }
+
+  private async resolveRequestedModelRoute(executable: string, model: string, reasoning?: string): Promise<AntigravityCliRoute> {
+    if (model === 'antigravity-active-route') return resolveAntigravityCliRoute([], model, reasoning);
     let families = this.liveModelFamilies;
-    const normalizedModel = this.normalizeModelId(model);
     const hasRequestedRoute = families.some((family) =>
-      this.normalizeModelId(family.id) === normalizedModel
-      || Object.values(family.routes).some((route) => this.normalizeModelId(route) === normalizedModel),
+      family.id === model || family.defaultRoute === model || Object.values(family.routes).includes(model),
     );
     if (!hasRequestedRoute) {
       families = await this.discoverLiveModelFamilies(executable);
@@ -630,15 +638,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     if (!families.length) {
       throw new Error(`Antigravity model route '${model}' could not be verified because the live model catalog is unavailable. Refresh the catalog or choose the active route.`);
     }
-    const resolved = resolveAntigravityModelRoute(families, model, reasoning);
-    const resolvedFamily = families.some((family) =>
-      this.normalizeModelId(family.id) === this.normalizeModelId(model)
-      || Object.values(family.routes).some((route) => this.normalizeModelId(route) === this.normalizeModelId(model)),
-    );
-    if (!resolvedFamily) {
-      throw new Error(`Antigravity model route '${model}' is not present in the live model catalog.`);
-    }
-    return resolved;
+    return resolveAntigravityCliRoute(families, model, reasoning);
   }
 
   async spawnAgent(options: SpawnAgentOptions): Promise<AgentSession> {
@@ -652,6 +652,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) throw new Error(install.error || 'Antigravity CLI was not found.');
 
+    const model = options.model || 'antigravity-active-route';
+    if (model !== 'antigravity-active-route' && !capabilities.modelSelection) {
+      throw new Error('The installed Antigravity CLI does not support model selection.');
+    }
+    // Validate before allocating control-plane resources or starting a process.
+    const selection = await this.resolveRequestedModelRoute(install.path, model, options.reasoningLevel);
     const sessionId = options.sessionId || crypto.randomUUID();
     const workspaceCwd = options.worktreePath || options.cwd || process.cwd();
     const controlPlane = prepareControlPlaneSession(options, sessionId);
@@ -659,9 +665,6 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const cwd = overlay?.cwd || workspaceCwd;
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
     const printTimeout = resolveAntigravityPrintTimeout(options.env?.ATRIS_ANTIGRAVITY_PRINT_TIMEOUT);
-    const modelRoute = options.model && capabilities.modelSelection
-      ? await this.resolveRequestedModelRoute(install.path, options.model, options.reasoningLevel)
-      : options.model;
     const args = [
       '--print',
       prompt,
@@ -673,14 +676,12 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     ];
     if (this.cliOptions.supportsPrintTimeout) args.push('--print-timeout', printTimeout);
     if (overlay) args.push(...overlay.extraArgs);
-    if (modelRoute && modelRoute !== 'antigravity-active-route' && capabilities.modelSelection) args.push('--model', modelRoute);
-    const routeEncodesReasoning = Boolean(modelRoute && /-(?:minimal|low|medium|high|xhigh|max)$/i.test(modelRoute));
-    if (options.reasoningLevel && capabilities.reasoningControl && !routeEncodesReasoning) args.push('--effort', options.reasoningLevel);
+    args.push(...selection.args);
 
     const session: AgentSession = { id: sessionId, agentInstanceId: sessionId, runtimeSessionId: '', startedAt: new Date().toISOString(), endedAt: null };
     let child;
     try {
-      child = await spawnHiddenChecked(install.path, args, {
+      child = await this.spawnProcess(install.path, args, {
         cwd,
         env: {
           ...process.env,
@@ -712,7 +713,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       missionId: options.missionId,
       agentInstanceId: sessionId,
       role: String(options.role || 'builder'),
-      model: modelRoute || options.model || 'Antigravity active model',
+      model: selection.modelRoute || 'Antigravity active model',
       taskId: options.taskId,
       workspaceMode: options.isolated ? 'isolated_worktree' : options.role === 'orchestrator' ? 'shared' : 'read_only',
       timestamp: new Date().toISOString(),

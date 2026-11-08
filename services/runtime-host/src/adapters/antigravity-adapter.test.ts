@@ -1,7 +1,11 @@
+import nodeAssert from 'node:assert/strict';
+import type { ChildProcess } from 'child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { AntigravityAdapter, findAntigravityExecutable, resolveAntigravityExecutionMode } from './antigravity-adapter';
 
 async function runTests() {
-  console.log('--- Starting Antigravity Authentication Probe Tests ---');
+  console.log('--- Starting Antigravity Adapter Tests ---');
   let passed = 0;
   let failed = 0;
 
@@ -121,11 +125,80 @@ gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
   assert(failedFamilies.length === 0 && (discovery as any).liveModelFamilies.length === 0, 'failed model discovery clears the prior live route snapshot');
   let unresolvedRoute = '';
   try {
-    await (discovery as any).resolveRequestedModelRoute('agy.exe', 'gemini-3.8-flash', 'high');
+    await discovery.resolveModelCliRoute('gemini-3.8-flash', 'high');
   } catch (error: any) {
     unresolvedRoute = String(error?.message || error);
   }
   assert(unresolvedRoute.includes('live model catalog is unavailable'), 'stale model routes fail closed after live discovery failure');
+
+  let catalogOutput = modelRows + `
+claude-sonnet-4-6          Claude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking   Claude Opus 4.6 (Thinking)
+`;
+  let routeHelp = '--print --output-format stream-json --sandbox --mode --model --effort';
+  let catalogCalls = 0;
+  const spawned: Array<{ args: string[]; child: ChildProcess }> = [];
+  const routing = new AntigravityAdapter(undefined, {
+    getHelpText: async () => routeHelp,
+    runCommand: async (_command, args = []) => {
+      nodeAssert.deepEqual(args, ['models'], 'Model preparation only runs the passive catalog command');
+      catalogCalls++;
+      return { stdout: catalogOutput, stderr: '', exitCode: 0 };
+    },
+  }, async (_command, args) => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), exitCode: null, signalCode: null,
+    }) as unknown as ChildProcess;
+    spawned.push({ args: [...args], child });
+    return child;
+  });
+  routing.discoverInstallation = async () => ({ installed: true, path: 'agy.exe' });
+  routing.verifyAuthentication = async () => 'connected';
+  const routeCases = [
+    ['claude-opus-4-6', 'high', 'claude-opus-4-6-thinking'],
+    ['claude-sonnet-4-6', 'high', 'claude-sonnet-4-6'],
+    ['gemini-3.8-flash', 'low', 'gemini-3.8-flash-low'],
+    ['gemini-3.8-flash', 'medium', 'gemini-3.8-flash-medium'],
+    ['gemini-3.8-flash', 'high', 'gemini-3.8-flash-high'],
+  ] as const;
+  for (const [model, reasoning, expected] of routeCases) {
+    const prepared = await routing.resolveModelCliRoute(model, reasoning);
+    nodeAssert.deepEqual(prepared, { modelRoute: expected, args: ['--model', expected] });
+    const session = await routing.spawnAgent({
+      model, reasoningLevel: reasoning, missionId: 'fixture-mission', taskId: 'fixture-task',
+      prompt: 'Fixture only; no provider is launched.', enableCoordinationMcp: false,
+    });
+    const { args, child } = spawned[spawned.length - 1];
+    try {
+      nodeAssert.deepEqual(args.slice(-2), prepared.args, 'Background spawn uses the same route preparation as interactive callers');
+      nodeAssert.equal(args.includes('--effort'), false, 'Catalog-encoded reasoning never becomes an effort flag');
+      assert(Boolean(session.id), `${model} + ${reasoning} reaches the spawn boundary as ${expected} without --effort`);
+    } finally { child.emit('close', 0, null); }
+  }
+  assert(catalogCalls === 1, 'interactive preparation and background launches reuse the verified live family catalog');
+  const beforeRejectedSpawns = spawned.length;
+  await nodeAssert.rejects(routing.spawnAgent({ model: 'gemini-3.8-flash-low', reasoningLevel: 'high', missionId: 'fixture', taskId: 'fixture', prompt: 'unused', enableCoordinationMcp: false }), /conflicts with reasoning/);
+  await nodeAssert.rejects(routing.resolveModelCliRoute('claude-sonnet-4-6', 'low'), /does not support reasoning/);
+  await nodeAssert.rejects(routing.resolveModelCliRoute('missing-model'), /not present in the live model catalog/);
+  await nodeAssert.rejects(routing.spawnAgent({ reasoningLevel: 'high', missionId: 'fixture', taskId: 'fixture', prompt: 'unused', enableCoordinationMcp: false }), /does not expose reasoning control/);
+  await nodeAssert.rejects(routing.resolveModelCliRoute('antigravity-active-route', 'high'), /does not expose reasoning control/);
+  assert(spawned.length === beforeRejectedSpawns, 'contradictory, missing and synthetic-active reasoning selections cannot spawn a process');
+  nodeAssert.deepEqual(await routing.resolveModelCliRoute('antigravity-active-route'), { args: [] });
+  await routing.spawnAgent({ model: 'antigravity-active-route', missionId: 'fixture', taskId: 'fixture', prompt: 'unused', enableCoordinationMcp: false });
+  const activeSpawn = spawned[spawned.length - 1];
+  try {
+    assert(!activeSpawn.args.includes('--model') && !activeSpawn.args.includes('--effort'), 'the synthetic active route launches without fabricated model or effort flags');
+  } finally { activeSpawn.child.emit('close', 0, null); }
+
+  routeHelp = '--print --output-format stream-json --sandbox --mode --model';
+  const discoveredModels = await routing.discoverModels('fixture-profile');
+  const opus = discoveredModels.find(model => model.runtimeModelId === 'claude-opus-4-6');
+  assert(opus?.supportedReasoning[0] === 'high' && opus.defaultReasoning === 'high', 'route-based reasoning remains available without a global --effort capability');
+  assert(discoveredModels.find(model => model.runtimeModelId === 'antigravity-active-route')?.supportedReasoning.length === 0, 'live-catalog active route does not advertise unsupported reasoning');
+  catalogOutput = '';
+  const fallbackModels = await routing.discoverModels('fixture-profile');
+  assert(fallbackModels.find(model => model.runtimeModelId === 'antigravity-active-route')?.supportedReasoning.length === 0, 'fallback active route does not advertise unsupported reasoning');
+  await routing.shutdown();
 
   const noisyProbe = new AntigravityAdapter(undefined, {
     getHelpText: async () => 'Options:\n  --print, -p\n  --output-format json\n  --sandbox',
@@ -140,7 +213,7 @@ gemini-3.8-flash-low       Gemini 3.8 Flash (Low)
   const noisyMessage = String((noisyProbe as any).lastVerification?.message || '');
   assert(noisyMessage.length <= 1_500 && !noisyMessage.includes('secret-token'), 'authentication diagnostics are bounded and redact bearer credentials');
 
-  console.log(`\nAntigravity authentication probe tests: ${passed} passed, ${failed} failed`);
+  console.log(`\nAntigravity adapter tests: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
 

@@ -1,4 +1,5 @@
-import { parseAntigravityModelsOutput, resolveAntigravityModelRoute } from './antigravity-model-catalog';
+import nodeAssert from 'node:assert/strict';
+import { parseAntigravityModelsOutput, resolveAntigravityCliRoute, resolveAntigravityModelRoute } from './antigravity-model-catalog';
 
 const OUTPUT = `
 gemini-3.8-flash-high      Gemini 3.8 Flash (High)
@@ -40,3 +41,48 @@ assert(JSON.stringify(gemini37?.efforts) === JSON.stringify(['low', 'medium', 'h
 assert(resolveAntigravityModelRoute(families, 'gemini-3.7-flash', 'medium') === 'gemini-3.7-flash-medium', 'Gemini family + reasoning resolves to the exact CLI route');
 assert(claude?.provider === 'anthropic' && claude.efforts.includes('high'), 'Claude Thinking is normalized as an Anthropic high-reasoning route');
 assert(gpt?.provider === 'local' && gpt.efforts.includes('medium'), 'GPT-OSS medium route is normalized without hard-coded model metadata');
+
+const originalCatalog = JSON.stringify(families);
+const selections = [
+  ['claude-opus-4-6', 'high', 'claude-opus-4-6-thinking'],
+  ['claude-opus-4-6-thinking', 'high', 'claude-opus-4-6-thinking'],
+  ['claude-sonnet-4-6', 'high', 'claude-sonnet-4-6'],
+  ['gemini-3.8-flash', 'low', 'gemini-3.8-flash-low'],
+  ['gemini-3.8-flash', 'medium', 'gemini-3.8-flash-medium'],
+  ['gemini-3.8-flash', 'high', 'gemini-3.8-flash-high'],
+  ['gemini-3.8-flash-low', 'low', 'gemini-3.8-flash-low'],
+  ['gpt-oss-120b', 'medium', 'gpt-oss-120b-medium'],
+] as const;
+for (const [model, reasoning, route] of selections) {
+  nodeAssert.deepEqual(resolveAntigravityCliRoute(families, model, reasoning), {
+    modelRoute: route, args: ['--model', route],
+  }, `${model} + ${reasoning} selects the exact route without unsupported --effort`);
+}
+console.log('[PASS] Opus, unsuffixed Sonnet Thinking, Gemini variants and GPT-OSS produce exact model-only CLI arguments');
+nodeAssert.equal(resolveAntigravityModelRoute(families, 'claude-opus-4-6', 'high'), 'claude-opus-4-6-thinking');
+nodeAssert.equal(resolveAntigravityCliRoute(families, 'gemini-3.8-flash').modelRoute, 'gemini-3.8-flash-high');
+nodeAssert.equal(resolveAntigravityCliRoute(families, 'gemini-3.8-flash-low').modelRoute, 'gemini-3.8-flash-low', 'An explicit low route is not changed to the family default');
+nodeAssert.equal(resolveAntigravityCliRoute(families, 'claude-opus-4-6', 'Thinking').modelRoute, 'claude-opus-4-6-thinking');
+nodeAssert.equal(JSON.stringify(families), originalCatalog, 'Resolution preserves persisted family IDs and does not mutate the catalog');
+console.log('[PASS] Defaults, exact routes and Thinking aliases preserve family compatibility without catalog mutation');
+
+nodeAssert.throws(() => resolveAntigravityCliRoute(families, 'gemini-3.8-flash-low', 'high'), /conflicts with reasoning/);
+nodeAssert.throws(() => resolveAntigravityModelRoute(families, 'claude-opus-4-6-thinking', 'low'), /conflicts with reasoning/);
+nodeAssert.throws(() => resolveAntigravityCliRoute(families, 'claude-sonnet-4-6', 'low'), /does not support reasoning/);
+nodeAssert.throws(() => resolveAntigravityCliRoute(families, 'gemini-3.1-pro', 'medium'), /does not support reasoning/);
+nodeAssert.throws(() => resolveAntigravityCliRoute(families, 'gemini-3.8-flash', 'typo'), /Invalid Antigravity reasoning/);
+nodeAssert.throws(() => resolveAntigravityCliRoute(families, 'missing-model'), /not present in the live model catalog/);
+nodeAssert.throws(() => resolveAntigravityCliRoute([], 'claude-opus-4-6'), /not present in the live model catalog/);
+nodeAssert.throws(() => resolveAntigravityCliRoute([...families, { ...gemini38!, id: 'duplicate-family' }], 'gemini-3.8-flash-high'), /ambiguous/);
+console.log('[PASS] Contradictory exact routes, unsupported reasoning and unverifiable catalog selections fail explicitly');
+
+nodeAssert.deepEqual(resolveAntigravityCliRoute([], 'antigravity-active-route'), { args: [] });
+nodeAssert.throws(() => resolveAntigravityCliRoute(families, 'antigravity-active-route', 'high'), /does not expose reasoning control/);
+const plain = parseAntigravityModelsOutput('plain-model-1\tPlain Model');
+nodeAssert.deepEqual(resolveAntigravityCliRoute(plain, 'plain-model-1'), { modelRoute: 'plain-model-1', args: ['--model', 'plain-model-1'] });
+nodeAssert.throws(() => resolveAntigravityCliRoute(plain, 'plain-model-1', 'high'), /does not support reasoning/);
+const jsonCatalog = parseAntigravityModelsOutput(JSON.stringify({ models: [
+  { id: 'claude-sonnet-4-6', displayName: 'Claude Sonnet 4.6 (Thinking)' },
+] }));
+nodeAssert.deepEqual(resolveAntigravityCliRoute(jsonCatalog, 'claude-sonnet-4-6', 'high').args, ['--model', 'claude-sonnet-4-6']);
+console.log('[PASS] Synthetic active routes and unannotated models never invent effort support; JSON Thinking metadata also encodes the route');

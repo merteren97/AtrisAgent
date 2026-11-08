@@ -34,12 +34,17 @@ interface ManualState {
   hideAgent: (id: string, hidden: boolean) => void;
   setLayout: (conversationId: string, panes: number) => void;
   drafts: Record<string, string>;
+  // File objects survive workspace unmounts, but must never enter persisted navigation.
+  attachments: Record<string, File[]>;
   error: string | null;
   setMode: (mode: ManualMode) => void;
   select: (conversation: ManualConversation) => void;
   selectAgent: (conversationId: string, id: string) => void;
   setSurface: (conversationId: string, surface: 'chat' | 'code') => void;
   setDraft: (id: string, text: string) => void;
+  updateAttachments: (id: string, update: (files: File[]) => File[]) => void;
+  clearSentDraft: (id: string, draft: string, files: File[]) => void;
+  forgetWorkspace: (workspaceId: string, knownConversations?: ManualConversation[]) => void;
   refresh: (workspaceId: string) => Promise<void>;
   create: (workspaceId: string, title: string | undefined, id: string) => Promise<ManualConversation>;
   rename: (conversation: ManualConversation, title: string) => Promise<void>;
@@ -52,6 +57,12 @@ interface ManualState {
   addAgents: (conversationId: string, agents: Array<{id: string; name?: string; catalogId: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
+function withoutAgentDrafts(state: ManualState, ids: Set<string>) {
+  return {
+    drafts: Object.fromEntries(Object.entries(state.drafts).filter(([id]) => !ids.has(id))),
+    attachments: Object.fromEntries(Object.entries(state.attachments).filter(([id]) => !ids.has(id))),
+  };
+}
 export function migrateManualNavigation(persisted: unknown) {
   const previous = (persisted || {}) as Partial<ManualState>;
   return { mode: 'choose' as ManualMode, activeByWorkspace: previous.activeByWorkspace || {},
@@ -59,7 +70,7 @@ export function migrateManualNavigation(persisted: unknown) {
 }
 export const useManualStore = create<ManualState>()(persist((set, get) => ({
   creating: false, setCreating: creating => set({ creating }),
-  mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, error: null,
+  mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, attachments: {}, error: null,
   layoutByConversation: {},
   orderByConversation: {}, hiddenAgents: {}, acknowledgedActivity: {},
   acknowledgeActivity: (id, key) => set(state => state.acknowledgedActivity[id] === key ? {} : ({ acknowledgedActivity: { ...state.acknowledgedActivity, [id]: key } })),
@@ -81,6 +92,23 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   selectAgent: (conversationId, id) => set(state => ({ agentByConversation: { ...state.agentByConversation, [conversationId]: id } })),
   setSurface: (conversationId, surface) => set(state => ({ surfaceByConversation: { ...state.surfaceByConversation, [conversationId]: surface } })),
   setDraft: (id, text) => set(state => ({ drafts: { ...state.drafts, [id]: text } })),
+  updateAttachments: (id, update) => set(state => {
+    if (!Object.values(state.conversations).some(items => items.some(c => c.agents.some(agent => agent.id === id)))) return {};
+    // Validate against the latest draft; a thrown batch validation leaves state untouched.
+    const files = update(state.attachments[id] || []);
+    const { [id]: _previous, ...attachments } = state.attachments;
+    return { attachments: files.length ? { ...attachments, [id]: files } : attachments };
+  }),
+  clearSentDraft: (id, draft, sentFiles) => set(state => {
+    // Late send completion must not recreate drafts removed by deletion.
+    if (!Object.values(state.conversations).some(items => items.some(c => c.agents.some(agent => agent.id === id)))) return {};
+    const files = (state.attachments[id] || []).filter(file => !sentFiles.includes(file));
+    const { [id]: _previous, ...attachments } = state.attachments;
+    return {
+      drafts: state.drafts[id] === draft ? { ...state.drafts, [id]: '' } : state.drafts,
+      attachments: files.length ? { ...attachments, [id]: files } : attachments,
+    };
+  }),
   applyNaming: naming => {
     if (!naming) return;
     const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === naming.conversationId && c.agents.some(a => a.id === naming.agentId)));
@@ -95,12 +123,27 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       agents: c.agents.map(a => a.id === naming.agentId && naming.agentName ? { ...a, name: naming.agentName } : a),
     }) } }));
   },
+  forgetWorkspace: (workspaceId, knownConversations = []) => {
+    // Confirmed workspace deletion also invalidates older list requests.
+    fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
+    set(state => {
+      const ids = new Set([...(state.conversations[workspaceId] || []), ...knownConversations.filter(c => c.workspaceId === workspaceId)].flatMap(c => c.agents.map(agent => agent.id)));
+      const { [workspaceId]: _conversations, ...conversations } = state.conversations;
+      const { [workspaceId]: _active, ...activeByWorkspace } = state.activeByWorkspace;
+      return { conversations, activeByWorkspace, ...withoutAgentDrafts(state, ids) };
+    });
+  },
   refresh: async workspaceId => {
     const version = (fetchVersions.get(workspaceId) || 0) + 1; fetchVersions.set(workspaceId, version);
     try {
       const conversations = await apiRequest<ManualConversation[]>(`/manual/conversations?workspaceId=${encodeURIComponent(workspaceId)}`);
       if (fetchVersions.get(workspaceId) !== version) return;
-      set(state => ({ conversations: { ...state.conversations, [workspaceId]: conversations }, error: null }));
+      set(state => {
+        const retained = new Set(conversations.flatMap(c => c.agents.map(agent => agent.id)));
+        // Only this workspace's previously loaded agents can be declared orphaned.
+        const removed = new Set((state.conversations[workspaceId] || []).flatMap(c => c.agents.map(agent => agent.id)).filter(id => !retained.has(id)));
+        return { conversations: { ...state.conversations, [workspaceId]: conversations }, ...withoutAgentDrafts(state, removed), error: null };
+      });
     } catch (error) { if (fetchVersions.get(workspaceId) === version) set({ error: error instanceof Error ? error.message : 'Could not load manual conversations.' }); }
   },
   create: async (workspaceId, title, id) => {
@@ -147,7 +190,14 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
   removeAgent: async agent => {
     await apiRequest(`/manual/agents/${agent.id}`, { method: 'DELETE' });
     const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === agent.conversationId));
-    if (!workspaceId) return;
+    if (!workspaceId) {
+      set(state => {
+        const { [agent.id]: _draft, ...drafts } = state.drafts;
+        const { [agent.id]: _files, ...attachments } = state.attachments;
+        return { drafts, attachments };
+      });
+      return;
+    }
     fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
     set(state => {
       const current = state.conversations[workspaceId].find(c => c.id === agent.conversationId);
@@ -157,9 +207,10 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       const nextVisible = [...ordered.slice(index + 1), ...ordered.slice(0, index)].find(item => item.id !== agent.id && !state.hiddenAgents[item.id]);
       const conversations = state.conversations[workspaceId].map(c => c.id === agent.conversationId ? { ...c, agents: c.agents.filter(item => item.id !== agent.id) } : c);
       const { [agent.id]: _draft, ...drafts } = state.drafts;
+      const { [agent.id]: _files, ...attachments } = state.attachments;
       const { [agent.id]: _hidden, ...hiddenAgents } = state.hiddenAgents;
       const { [agent.id]: _ack, ...acknowledgedActivity } = state.acknowledgedActivity;
-      return { conversations: { ...state.conversations, [workspaceId]: conversations }, drafts, hiddenAgents, acknowledgedActivity,
+      return { conversations: { ...state.conversations, [workspaceId]: conversations }, drafts, attachments, hiddenAgents, acknowledgedActivity,
         terminalLayouts: { ...state.terminalLayouts, [agent.conversationId]: undefined },
         agentByConversation: { ...state.agentByConversation, [agent.conversationId]: state.agentByConversation[agent.conversationId] === agent.id ? nextVisible?.id || '' : state.agentByConversation[agent.conversationId] },
         orderByConversation: { ...state.orderByConversation, [agent.conversationId]: (state.orderByConversation[agent.conversationId] || []).filter(id => id !== agent.id) } };
@@ -170,7 +221,12 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     fetchVersions.set(conversation.workspaceId, (fetchVersions.get(conversation.workspaceId) || 0) + 1);
     set(state => {
       const { [conversation.workspaceId]: selected, ...others } = state.activeByWorkspace;
+      // Include agents added while the delete request was in flight.
+      const ids = new Set([...conversation.agents, ...(state.conversations[conversation.workspaceId]?.find(item => item.id === conversation.id)?.agents || [])].map(agent => agent.id));
+      const drafts = Object.fromEntries(Object.entries(state.drafts).filter(([id]) => !ids.has(id)));
+      const attachments = Object.fromEntries(Object.entries(state.attachments).filter(([id]) => !ids.has(id)));
       return { conversations: { ...state.conversations, [conversation.workspaceId]: (state.conversations[conversation.workspaceId] || []).filter(item => item.id !== conversation.id) },
+        drafts, attachments,
         activeByWorkspace: selected === conversation.id ? others : state.activeByWorkspace, mode: selected === conversation.id ? 'choose' : state.mode };
     });
   },
