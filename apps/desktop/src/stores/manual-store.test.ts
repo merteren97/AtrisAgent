@@ -1,9 +1,25 @@
 import assert from 'node:assert/strict';
-import { useManualStore, migrateManualNavigation, type ManualConversation } from './manual-store';
-import { useMissionStore } from './mission-store';
-import { activityNotice, conversationActivity, type AgentActivity } from '@/components/manual/manual-activity';
+import type { ManualConversation } from './manual-store';
+import type { AgentActivity } from '@/components/manual/manual-activity';
 import type { ManualAgent } from './manual-store';
 import { automaticLayout, layoutIds, moveInLayout, resizeLayout, reconcileLayout, minimumLayout, layoutRects, dropPlacement } from '@/components/manual/terminal-layout';
+
+const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+const persisted = new Map<string, string>();
+Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+  getItem: (key: string) => persisted.get(key) ?? null,
+  setItem: (key: string, value: string) => { persisted.set(key, value); },
+  removeItem: (key: string) => { persisted.delete(key); },
+} });
+// Zustand's browser persistence reads window.localStorage at store creation.
+Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: globalThis.localStorage } });
+const { useManualStore, migrateManualNavigation } = await import('./manual-store');
+if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+else Reflect.deleteProperty(globalThis, 'window');
+const { useMissionStore } = await import('./mission-store');
+const { activityNotice, conversationActivity } = await import('@/components/manual/manual-activity');
+const { addManualFiles } = await import('@/components/manual/manual-composer');
 
 const conversation: ManualConversation = { id: 'manual-a', workspaceId: 'project-a', title: 'Manual work', createdAt: '2026-09-08', agents: [] };
 const store = useManualStore;
@@ -46,6 +62,26 @@ assert.ok(store.getState().conversations['project-a'].some(c => c.id === 'manual
 globalThis.fetch = oldFetch;
 const agents = ['a','b','c'].map(id => ({id,conversationId:'manual-a'} as ManualAgent));
 store.setState({conversations:{'project-a':[{...conversation,agents}]}});
+const attachment = new File(['image'], 'draft.png', { type: 'image/png' });
+const added = new File(['notes'], 'notes.txt');
+const updateAttachments = store.getState().updateAttachments;
+updateAttachments('a', current => addManualFiles(current, [attachment]));
+updateAttachments('a', current => addManualFiles(current, [added]));
+updateAttachments('b', () => [added]);
+assert.deepEqual(store.getState().attachments.a, [attachment, added], 'Sequential callbacks use the latest external draft rather than a render snapshot');
+store.getState().selectAgent('manual-a','b');
+store.getState().setSurface('manual-a','chat');
+assert.deepEqual(store.getState().attachments.b,[added], 'Agents in the same conversation keep independent attachment drafts');
+assert.deepEqual(store.getState().attachments.a,[attachment,added], 'Switching agents and surfaces preserves the original File objects');
+store.getState().setSurface('manual-a','code');
+const beforeInvalidBatch = store.getState().attachments;
+assert.throws(() => updateAttachments('a', current => addManualFiles(current, [new File(['valid'], 'valid.txt'), new File([], 'empty.txt')])), /empty/);
+assert.equal(store.getState().attachments, beforeInvalidBatch, 'Invalid batches leave all attachments untouched');
+const navigation = JSON.parse(persisted.get('atris-manual-navigation')!);
+assert.equal('attachments' in navigation.state, false, 'File objects are excluded from serialized navigation');
+assert.equal('drafts' in navigation.state, false, 'Text and file drafts both remain session-local');
+await store.persist.rehydrate();
+assert.equal(store.getState().attachments.a[0], attachment, 'Navigation hydration preserves the in-memory File identity');
 const naming = {conversationId:'manual-a',agentId:'b',agentName:'Review checkout',conversationTitle:'Checkout improvements'};
 store.getState().applyNaming(naming);
 assert.equal(store.getState().conversations['project-a'][0].title,'Checkout improvements');
@@ -77,6 +113,12 @@ await store.getState().removeAgent(agents[0]);
 assert.deepEqual(store.getState().conversations['project-a'][0].agents.map(agent=>agent.id),['b','c']);
 assert.equal(store.getState().agentByConversation['manual-a'],'b');
 assert.equal(store.getState().drafts.a,undefined);
+assert.equal(store.getState().attachments.a,undefined, 'Explicit agent deletion releases its File references');
+assert.deepEqual(store.getState().attachments.b,[added], 'Deleting one agent preserves sibling attachment drafts');
+store.getState().clearSentDraft('a', 'Discard on explicit close', [attachment, added]);
+updateAttachments('a', () => [attachment]);
+assert.equal(store.getState().attachments.a,undefined, 'Late completion or file-picker callbacks cannot recreate a deleted agent draft');
+assert.equal(store.getState().drafts.a,undefined, 'Late success cannot recreate deleted text');
 assert.equal(store.getState().hiddenAgents.a,undefined);
 assert.equal(store.getState().acknowledgedActivity.a,undefined);
 assert.equal(store.getState().terminalLayouts['manual-a'],undefined,'Removal invalidates panes containing the deleted agent');
@@ -119,3 +161,77 @@ if(initial.type === 'split') {
   assert.equal(dropPlacement(5,150,500,300),'left');
   assert.equal(dropPlacement(250,150,500,300),'swap');
 }
+
+const otherAgent = {id:'other',conversationId:'manual-other'} as ManualAgent;
+const otherConversation = {...conversation,id:'manual-other',workspaceId:'project-other',agents:[otherAgent]};
+const deleting = {...conversation,agents:[agents[0]]};
+store.setState({conversations:{'project-a':[deleting],'project-other':[otherConversation]},attachments:{}});
+store.getState().setDraft('a', 'Delete this text');
+store.getState().setDraft('other', 'Keep this text');
+updateAttachments('a', () => [attachment]);
+updateAttachments('other', () => [added]);
+globalThis.fetch = (() => new Promise<Response>(resolve => { release = resolve; })) as typeof fetch;
+try {
+  const removal = store.getState().remove(deleting);
+  store.setState(state => ({conversations:{...state.conversations,'project-a':[{...deleting,agents:[agents[0],agents[1]]}]}}));
+  updateAttachments('b', () => [attachment]);
+  store.getState().setDraft('b', 'Added during deletion');
+  release(new Response(null,{status:204}));
+  await removal;
+  assert.deepEqual(store.getState().attachments,{other:[added]}, 'Conversation deletion cleans both captured and newly added agents, preserving other workspaces');
+  assert.equal(store.getState().drafts.a, undefined);
+  assert.equal(store.getState().drafts.b, undefined);
+  assert.equal(store.getState().drafts.other, 'Keep this text');
+  store.getState().clearSentDraft('a', 'Delete this text', [attachment]);
+  assert.deepEqual(store.getState().attachments,{other:[added]}, 'Late conversation send completion cannot restore deleted files');
+  // Cleanup still works if another refresh already removed the conversation from the list.
+  store.setState({attachments:{...store.getState().attachments,a:[attachment]},drafts:{...store.getState().drafts,a:'orphan'}});
+  globalThis.fetch = (async () => new Response(null,{status:204})) as typeof fetch;
+  await store.getState().removeAgent(agents[0]);
+  assert.equal(store.getState().attachments.a, undefined);
+  assert.equal(store.getState().drafts.a, undefined);
+
+  const removedConversation = {...conversation,id:'removed-conversation',agents:[{...agents[2],conversationId:'removed-conversation'}]};
+  const beforeRefresh = {...conversation,agents:[agents[0],agents[1]]};
+  store.setState({
+    conversations:{'project-a':[beforeRefresh,removedConversation],'project-other':[otherConversation]},
+    drafts:{a:'Keep sibling',b:'Removed agent',c:'Removed conversation',other:'Other project',unloaded:'Not yet loaded'},
+    attachments:{a:[attachment],b:[added],c:[attachment],other:[added],unloaded:[attachment]},
+  });
+  const beforeFailure = store.getState();
+  globalThis.fetch = (async () => new Response(JSON.stringify({error:'Unavailable'}),{status:503,headers:{'content-type':'application/json'}})) as typeof fetch;
+  await store.getState().refresh('project-a');
+  assert.equal(store.getState().conversations,beforeFailure.conversations,'Failed refresh retains the previously known agents');
+  assert.equal(store.getState().drafts,beforeFailure.drafts,'Failed refresh cannot discard text drafts');
+  assert.equal(store.getState().attachments,beforeFailure.attachments,'Failed refresh cannot discard Files');
+  await assert.rejects(() => store.getState().remove(beforeRefresh),/Unavailable/);
+  assert.equal(store.getState().drafts,beforeFailure.drafts,'Failed conversation deletion retains text drafts');
+  assert.equal(store.getState().attachments,beforeFailure.attachments,'Failed conversation deletion retains Files');
+
+  globalThis.fetch = (async () => new Response(JSON.stringify([{...beforeRefresh,agents:[agents[0]]}]),{status:200,headers:{'content-type':'application/json'}})) as typeof fetch;
+  await store.getState().refresh('project-a');
+  assert.deepEqual(store.getState().drafts,{a:'Keep sibling',other:'Other project',unloaded:'Not yet loaded'},'Authoritative refresh prunes only previously known IDs removed from this project');
+  assert.deepEqual(store.getState().attachments,{a:[attachment],other:[added],unloaded:[attachment]},'Removed agents and conversations release Files without touching siblings or unloaded projects');
+  assert.equal(store.getState().attachments.a[0],attachment,'Surviving File identity is preserved');
+
+  globalThis.fetch = (async () => new Response('[]',{status:200,headers:{'content-type':'application/json'}})) as typeof fetch;
+  await store.getState().refresh('not-yet-loaded-project');
+  assert.deepEqual(store.getState().drafts,{a:'Keep sibling',other:'Other project',unloaded:'Not yet loaded'},'Loading an empty project does not infer ownership of unrelated drafts');
+  assert.deepEqual(store.getState().attachments,{a:[attachment],other:[added],unloaded:[attachment]});
+
+  let releaseOldRefresh!: (response: Response) => void;
+  globalThis.fetch = (() => new Promise<Response>(resolve => { releaseOldRefresh = resolve; })) as typeof fetch;
+  const oldRefresh = store.getState().refresh('project-a');
+  globalThis.fetch = (async () => new Response(JSON.stringify([{...beforeRefresh,agents:[agents[0]]}]),{status:200,headers:{'content-type':'application/json'}})) as typeof fetch;
+  await store.getState().refresh('project-a');
+  releaseOldRefresh(new Response('[]',{status:200,headers:{'content-type':'application/json'}}));
+  await oldRefresh;
+  assert.equal(store.getState().drafts.a,'Keep sibling','Superseded refresh cannot prune a surviving draft');
+  assert.equal(store.getState().attachments.a[0],attachment,'Superseded refresh cannot prune surviving Files');
+} finally {
+  globalThis.fetch = oldFetch;
+  if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);
+  else Reflect.deleteProperty(globalThis, 'localStorage');
+}
+console.log('Manual attachment lifetime, atomic validation, persistence exclusion and deletion regressions passed.');
+console.log('Manual authoritative refresh draft pruning and failure isolation regressions passed.');

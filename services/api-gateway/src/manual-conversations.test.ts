@@ -7,9 +7,54 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
-import type { RuntimeHost } from '@atris-agent-code/runtime-host';
+import type { RuntimeHost, runCommand } from '@atris-agent-code/runtime-host';
 import { ManualConversationStore, installManualConversations, parseManualTranscript } from './manual-conversations';
 import { manualContentTitle } from './manual-titles';
+import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
+import { parseAntigravityModelsOutput, resolveAntigravityCliRoute } from '../../runtime-host/src/antigravity-model-catalog';
+
+// Keep compatibility coverage in the existing manual route test entry point.
+{
+  const help = '--profile <NAME> Layer <name>.config.toml\n--remote <ADDR>\n--remote-auth-token-env <ENV>\n--cd <DIR>';
+  const outputs = {'--help':help, 'app-server --help':'--stdio Use stdio transport'};
+  const calls: string[] = [];
+  let failure: string | undefined;
+  let exitCode = 0;
+  const command: typeof runCommand = async (executable, args, options) => {
+    assert.equal(executable, 'codex.exe');
+    assert.equal(options?.timeoutMs, 5000);
+    const key = args!.join(' '); calls.push(key);
+    assert.notEqual(key, '--version', 'Version output must never be required for launch compatibility');
+    if (key === failure) throw new Error('Fixture timeout');
+    return {stdout:outputs[key as keyof typeof outputs], stderr:'', exitCode};
+  };
+  const verify = () => verifyManualCodexCompatibility('codex.exe', command, 'win32');
+  for (const banner of ['codex-cli 0.167.0', 'codex-cli 0.168.0', 'codex-cli 1.0.0', 'codex-cli 99.0.0-nightly+dev', 'Custom Codex build', '']) {
+    outputs['--help'] = `${banner}\n${help}`; calls.length = 0;
+    await verify();
+    assert.deepEqual(calls, ['--help', 'app-server --help'], 'Required features, not a version/banner allowlist, govern launch');
+  }
+  outputs['--help'] = help;
+  calls.length = 0;
+  await assert.rejects(verifyManualCodexCompatibility('codex.cmd', command, 'win32'), /native Codex executable/);
+  assert.deepEqual(calls, [], 'Windows shims are rejected before execution');
+  for (const missing of ['--profile', '.config.toml', '--remote', '--remote-auth-token-env', '--cd']) {
+    outputs['--help'] = help.replace(missing, 'missing'); calls.length = 0;
+    await assert.rejects(verify(), /layered CLI profiles|remote terminal options/);
+    assert.deepEqual(calls, ['--help']);
+  }
+  outputs['--help'] = help;
+  outputs['app-server --help'] = '--listen <URL>';
+  await assert.rejects(verify(), /app-server --stdio/);
+  outputs['app-server --help'] = '--stdio Use stdio transport';
+  for (const key of Object.keys(outputs)) {
+    failure = key;
+    await assert.rejects(verify(), /Could not verify Codex CLI/);
+  }
+  failure = undefined; exitCode = 1;
+  await assert.rejects(verify(), /Could not verify Codex CLI --help/);
+  console.log('Codex compatibility: version-independent launch, future/development banners, native executable, required capabilities and failed probes passed.');
+}
 
 const sqlite = new Database(':memory:');
 sqlite.exec('PRAGMA foreign_keys = ON; CREATE TABLE workspaces (id TEXT PRIMARY KEY, path TEXT); CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT);');
@@ -54,10 +99,13 @@ assert.ok(Array.from(manualContentTitle('Uzun başlık için Türkçe içerik ve
 
 const profile = { id: 'account', runtimeType: 'claude_code', authStatus: 'connected', configDir: process.cwd(), profileMode: 'shared_cli' };
 const model = { catalogId: 'claude:model', runtimeModelId: 'test-model', accountProfileId: 'account', availability: 'available', supportedReasoning: [] as string[], defaultReasoning: undefined as string | undefined };
+let codexExecutable = process.execPath;
+const agyFamilies = parseAntigravityModelsOutput('gemini-test  Gemini Test\nclaude-opus-4-6-thinking  Claude Opus 4.6 (Thinking)\nclaude-sonnet-4-6  Claude Sonnet 4.6 (Thinking)\ngemini-3.8-flash-low  Gemini 3.8 Flash (Low)\ngemini-3.8-flash-high  Gemini 3.8 Flash (High)');
 const runtime = {
   getModelCatalogService: () => ({ resolveModelDescriptor: async (id: string) => id === model.catalogId ? model : undefined }),
   getAccountProfileManager: () => ({ getProfileById: async () => profile }),
-  getAdapter: () => ({ discoverInstallation: async () => ({ installed: true, path: process.execPath }) }),
+  getAdapter: (type: string) => ({ discoverInstallation: async () => ({ installed: true, path: type === 'codex' ? codexExecutable : process.execPath }),
+    resolveModelCliRoute: async (modelId: string, reasoning?: string) => resolveAntigravityCliRoute(agyFamilies, modelId, reasoning) }),
 } as unknown as RuntimeHost;
 const app = express(); app.use(express.json());
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-manual-api-'));
@@ -147,6 +195,63 @@ try {
   assert.equal((await post(`/agents/${codex.id}/permissions/live`,{mode:'ask-for-approval',expectedMode:'read-only'})).status,200);
   assert.equal(applied,1); assert.equal(store.agent(codex.id).codexPermissionMode,'read-only','Live apply does not overwrite the next-open preference');
   installedStore.codexSessions.get=originalGet;
+  const launchCodex = {...codex, id:randomUUID(), sharedProfile:false, configDir:path.join(temporary, 'codex-launch-home'), reasoning:'low', codexPermissionMode:'read-only' as const};
+  store.save(launchCodex);
+  const originalCreate = installedStore.codexSessions.create;
+  const fixtureRuntimeId = randomUUID();
+  let managedStarts = 0;
+  installedStore.codexSessions.create = async (id, options) => {
+    managedStarts++;
+    assert.equal(id, launchCodex.id);
+    assert.equal(options.executable, codexExecutable);
+    assert.equal(options.cwd, launchCodex.cwd);
+    assert.deepEqual(options.env, {CODEX_HOME:launchCodex.configDir});
+    assert.equal(options.model, launchCodex.model);
+    assert.equal(options.reasoning, 'low');
+    assert.equal(options.mode, 'read-only', 'Managed launch retains the saved permission policy');
+    return {url:'ws://127.0.0.1:12345', token:'fixture-token', runtimeId:fixtureRuntimeId};
+  };
+  const assertNoCodexPreparation = () => {
+    assert.equal(managedStarts, 0, 'Compatibility refusal cannot start a managed server');
+    assert.equal(fs.existsSync(launchCodex.configDir), false, 'Compatibility refusal cannot create a profile directory');
+    assert.equal(fs.existsSync(path.join(temporary, 'manual-sessions', launchCodex.id)), false, 'Compatibility refusal cannot write a hook helper');
+  };
+  try {
+    // Node is a real executable without the required Codex CLI features; no fake
+    // compatibility helper bypasses the HTTP launch route in this regression.
+    const refused = await post(`/agents/${launchCodex.id}/launch`, {});
+    assert.equal(refused.status, 400);
+    assert.match((await refused.json()).error, /layered CLI profiles/);
+    assertNoCodexPreparation();
+    if (process.platform === 'win32') {
+      codexExecutable = path.join(temporary, 'codex.cmd');
+      const shim = await post(`/agents/${launchCodex.id}/launch`, {});
+      assert.equal(shim.status, 400);
+      assert.match((await shim.json()).error, /native Codex executable/);
+      assertNoCodexPreparation();
+    }
+    if (process.env.ATRIS_TEST_CODEX_EXECUTABLE) {
+      codexExecutable = process.env.ATRIS_TEST_CODEX_EXECUTABLE;
+      const accepted = await post(`/agents/${launchCodex.id}/launch`, {});
+      const request = await accepted.json();
+      assert.equal(accepted.status, 200, JSON.stringify(request));
+      assert.equal(managedStarts, 1);
+      assert.equal(request.executable, codexExecutable);
+      assert.equal(request.cwd, launchCodex.cwd);
+      assert.equal(request.codexRuntimeId, fixtureRuntimeId);
+      assert.deepEqual(request.env, {CODEX_HOME:launchCodex.configDir, ATRIS_CODEX_REMOTE_TOKEN:'fixture-token'});
+      assert.deepEqual(request.args.slice(-6), ['--remote', 'ws://127.0.0.1:12345', '--remote-auth-token-env', 'ATRIS_CODEX_REMOTE_TOKEN', '--cd', launchCodex.cwd]);
+      assert.ok(request.args.includes('--profile'));
+      assert.ok(!request.args.includes('--sandbox') && !request.args.includes('--ask-for-approval'), 'Remote TUI policy is supplied by the owning server');
+      assert.ok(fs.existsSync(path.join(launchCodex.configDir, `atris-manual-${launchCodex.id}.config.toml`)));
+      assert.ok(!fs.existsSync(path.join(launchCodex.configDir, 'config.toml')), 'No shared configuration is written');
+      console.log('Installed Codex passed the actual HTTP launch route with managed permissions (server creation stubbed).');
+    }
+  } finally {
+    installedStore.codexSessions.create = originalCreate;
+    codexExecutable = process.execPath;
+    store.removeAgent(launchCodex.id);
+  }
   store.removeAgent(codex.id);
   store.syncTitles(agent.id,[{id:'custom',role:'user',text:'A new task title'}]);
   assert.equal(store.agent(agent.id).name,'Agent one','Existing explicit agent names are preserved');
@@ -199,6 +304,19 @@ try {
   const routedLaunch = await (await post(`/agents/${routed.id}/launch`, {})).json();
   assert.deepEqual(routedLaunch.args.slice(0,2), ['--model', 'gemini-test'], 'Concrete models are routed explicitly');
   assert.equal(routedLaunch.args[2],'--log-file');
+  for (const [family, reasoning, route] of [['claude-opus-4-6','high','claude-opus-4-6-thinking'], ['claude-sonnet-4-6','high','claude-sonnet-4-6'], ['gemini-3.8-flash','low','gemini-3.8-flash-low']]) {
+    model.runtimeModelId = family; model.supportedReasoning = [reasoning]; model.defaultReasoning = reasoning;
+    const changed = await fetch(`${base}/agents/${routed.id}/model`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({catalogId:model.catalogId,expectedCatalogId:model.catalogId,reasoning})});
+    assert.equal(changed.status, 200);
+    assert.equal((await changed.json()).providerSessionId, routed.providerSessionId);
+    const launched = await post(`/agents/${routed.id}/launch`, {});
+    const request = await launched.json();
+    assert.equal(launched.status, 200, JSON.stringify(request));
+    assert.deepEqual(request.args.slice(0,2), ['--model', route]);
+    assert.equal(request.args.includes('--effort'), false, 'Thinking and effort variants are exact routes, not adjustable CLI effort');
+    assert.equal(request.args[2], '--log-file', 'Dedicated transcript ownership survives model changes');
+  }
+  model.defaultReasoning = undefined;
   profile.runtimeType = 'opencode';
   model.catalogId = 'opencode:first'; model.runtimeModelId = 'provider/first'; model.supportedReasoning = ['low','high'];
   const openAgentResponse = await post(`/conversations/${conversationId}/agents`, {...input,id:randomUUID(),catalogId:model.catalogId});

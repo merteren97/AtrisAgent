@@ -16,6 +16,7 @@ import { markManualLaunch, markManualClosed, forgetManualActivity, useManualActi
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Trash2 } from 'lucide-react';
 import { ManualComposer, addManualFiles, type OpenCodeAutoApprove } from './manual-composer';
+import { sendManualDraft } from './manual-attachment-send';
 import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
 import { ManualChatContent } from './manual-chat-content';
@@ -104,7 +105,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
 
 export function ManualWorkspace() {
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
-  const { conversations, activeByWorkspace, agentByConversation, surfaceByConversation, creating, setCreating, selectAgent, setSurface, drafts, setDraft } = useManualStore();
+  const { conversations, activeByWorkspace, agentByConversation, surfaceByConversation, creating, setCreating, selectAgent, setSurface, drafts, setDraft, attachments, updateAttachments } = useManualStore();
   const conversation = (workspaceId ? conversations[workspaceId] || [] : []).find(c => c.id === activeByWorkspace[workspaceId!]);
   const surface = conversation ? surfaceByConversation[conversation.id] || 'chat' : 'chat';
   const [adding, setAdding] = useState(false); const [handoff, setHandoff] = useState<ManualAgent | null>(null);
@@ -123,7 +124,6 @@ export function ManualWorkspace() {
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [inputReady, setInputReady] = useState<Record<string, boolean | null | undefined>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
-  const [attachments, setAttachments] = useState<Record<string, File[]>>({});
   const [deleteTarget, setDeleteTarget] = useState<ManualAgent | null>(null);
   const observations = useManualActivity(state => state.agents);
   const [draggingFiles, setDraggingFiles] = useState(false);
@@ -250,7 +250,6 @@ export function ManualWorkspace() {
     markManualClosed(target.id); setStatuses(previous => ({ ...previous, [target.id]: 'closed' }));
     await useManualStore.getState().removeAgent(target);
     forgetManualActivity(target.id);
-    setAttachments(previous => { const { [target.id]: _removed, ...remaining } = previous; return remaining; });
     disposeManualTerminal(target.id);
     setDeleteTarget(null);
   });
@@ -298,21 +297,17 @@ export function ManualWorkspace() {
   const addFiles = (incoming: File[]) => {
     if (!agent || !incoming.length) return;
     try {
-      const next = addManualFiles(files, incoming);
-      setAttachments(previous => ({ ...previous, [agent.id]: next }));
+      updateAttachments(agent.id, current => addManualFiles(current, incoming));
       setError(null);
     } catch (e) { setError(errorText(e)); }
   };
   const send = () => agent && action('send', async () => {
     if (!live || !native) return;
     if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) throw new Error('Codex is still starting. Your draft is kept; check CLI setup in Code.');
-    const text = draft.trim(); if (!text && !files.length) return;
-    const staged = await Promise.all(files.map(async file => ({ name: file.name, path: await invoke<string>('manual_stage_attachment', { id: agent.id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }) })));
-    const references = staged.map(({ name, path }) => `- ${JSON.stringify(name)}: ${JSON.stringify(path)}`).join('\n');
-    const prompt = staged.length ? `${text}${text ? '\n\n' : ''}Attached files (read these local paths to inspect their contents, including images):\n${references}` : text;
-    await invoke('manual_terminal_write', { id: agent.id, data: prompt, paste: true });
-    if (useManualStore.getState().drafts[agent.id] === draft) setDraft(agent.id, '');
-    setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(file => !files.includes(file)) }));
+    await sendManualDraft(agent, {
+      stage: async (id, file) => invoke<string>('manual_stage_attachment', { id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }),
+      write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
+    });
   });
 
   if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
@@ -355,7 +350,7 @@ export function ManualWorkspace() {
             <div ref={messageEnd} />
           </div>
         </div>
-        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => setAttachments(previous => ({ ...previous, [agent.id]: (previous[agent.id] || []).filter(item => item !== file) }))} />}
+        {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
       </>}
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
