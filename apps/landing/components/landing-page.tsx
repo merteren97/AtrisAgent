@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import {
   ArrowDownToLine, ArrowRight, ArrowUpRight, Check, ChevronDown,
   CircleHelp, Code2, Download, FolderGit2, Globe2,
-  Laptop, Menu, Monitor, Moon, ShieldCheck, Sun, TerminalSquare,
+  Laptop, Menu, Monitor, Moon, ShieldCheck, Smartphone, Sun, TerminalSquare,
   Workflow, X,
 } from "lucide-react";
 import { useLandingTranslation } from "../lib/landing-i18n";
@@ -38,6 +38,7 @@ const copy = {
     windows: "Windows için indir", linux: "Linux için indir", appimage: "AppImage indir", deb: ".deb indir", available: "İndirmeye hazır", unavailable: "İndirmeler şu anda kapalı", soon: "Yakında", macNote: "macOS paketi hazırlanıyor.",
     linuxNote: "AppImage çoğu dağıtımda çalışır; Debian/Ubuntu için .deb seçin.",
     windowsNote: "64-bit Windows kurulum paketi (.exe)",
+    mobileLabel: "MOBİL UYGULAMA", mobileTitle: "Çalışmanız yanınızda.", mobileDescription: "Erken erişim mobil uygulaması. Masaüstü bağlantısı henüz geliştirme aşamasındadır.", androidNote: "Android arm64 için imzalı APK.", iosNote: "İmzasız IPA; uyumlu bir sideload aracı veya LiveContainer ile kullanım içindir.", androidDownload: "APK indir", iosDownload: "İmzasız IPA indir", mobilePreview: "Erken erişim", mobileVersion: "Sürüm",
     releaseLink: "Sürüm notlarını GitHub'da gör", footer: "Yerel çalışma alanınız. Sizin kontrolünüz.",
     theme: "Temayı değiştir", language: "Dil değiştir", menu: "Menüyü aç", closeMenu: "Menüyü kapat", top: "Başa dön",
   },
@@ -66,6 +67,7 @@ const copy = {
     windows: "Download for Windows", linux: "Download for Linux", appimage: "Download AppImage", deb: "Download .deb", available: "Ready to download", unavailable: "Downloads are currently disabled", soon: "Coming soon", macNote: "A macOS package is in preparation.",
     linuxNote: "AppImage works on most distributions; choose .deb for Debian/Ubuntu.",
     windowsNote: "64-bit Windows installer (.exe)",
+    mobileLabel: "MOBILE COMPANION", mobileTitle: "Your work, within reach.", mobileDescription: "Early-access mobile companion. Desktop connectivity is still in development.", androidNote: "Signed APK for Android arm64 devices.", iosNote: "Unsigned IPA for use with a compatible sideloading tool or LiveContainer.", androidDownload: "Download APK", iosDownload: "Download unsigned IPA", mobilePreview: "Early access", mobileVersion: "Version",
     releaseLink: "View release notes on GitHub", footer: "Your local workspace. Your control.",
     theme: "Change theme", language: "Change language", menu: "Open menu", closeMenu: "Close menu", top: "Back to top",
   },
@@ -77,6 +79,14 @@ export function LandingPage() {
   const downloadsDisabled = process.env.NEXT_PUBLIC_ATRIS_AGENT_DOWNLOADS_DISABLED === "true";
   const [theme, setTheme] = useState<Theme>("light");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [mobileRelease, setMobileRelease] = useState<{ version?: string; android?: boolean; ios?: boolean }>({});
+
+  useEffect(() => {
+    if (downloadsDisabled) return;
+    const controller = new AbortController();
+    void fetch('/api/agent-github/mobile', { signal: controller.signal }).then(response => response.ok ? response.json() : {}).then(setMobileRelease).catch(() => {});
+    return () => controller.abort();
+  }, [downloadsDisabled]);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("atris_theme");
@@ -180,6 +190,11 @@ export function LandingPage() {
             <article className="download-card muted-download"><div className="download-card-top"><Laptop aria-hidden="true" /><span>{c.soon}</span></div><h3>macOS</h3><p>{c.macNote}</p><span className="download-placeholder">{c.soon}<ChevronDown aria-hidden="true" /></span></article>
           </div>
           <a className="release-link" href="https://github.com/merteren97/AtrisAgent/releases/latest" target="_blank" rel="noopener noreferrer">{c.releaseLink}<ArrowUpRight aria-hidden="true" /></a>
+          <div className="mobile-downloads"><div className="section-intro"><div><p className="eyebrow">{c.mobileLabel}</p><h2>{c.mobileTitle}</h2></div><p>{c.mobileDescription}</p></div>
+            <div className="mobile-download-grid">
+              {(['android', 'ios'] as const).map(platform => <article className="download-card" key={platform}><div className="download-card-top"><Smartphone aria-hidden="true" /><span>{mobileRelease[platform] && !downloadsDisabled ? c.mobilePreview : c.soon}</span></div><h3>{platform === 'android' ? 'Android' : 'iOS'}</h3><p>{platform === 'android' ? c.androidNote : c.iosNote}{mobileRelease.version && mobileRelease[platform] ? ` · ${c.mobileVersion} ${mobileRelease.version}` : ''}</p>{mobileRelease[platform] && !downloadsDisabled ? <a className="download-action" href={`/api/agent-github/download/mobile-${platform}`}>{platform === 'android' ? c.androidDownload : c.iosDownload}<Download aria-hidden="true" /></a> : <span className="download-placeholder">{downloadsDisabled ? c.unavailable : c.soon}</span>}</article>)}
+            </div>
+          </div>
         </section>
       </main>
       <footer className="site-footer"><div className="wrap footer-inner"><div><a className="brand" href="#top"><img src="/logo.svg" alt="" /><span>Atris<span>Agent</span></span></a><p>{c.footer}</p></div><div className="footer-links"><a href="https://atrishub.com" target="_blank" rel="noopener noreferrer">AtrisHub <ArrowUpRight aria-hidden="true" /></a><a href="https://github.com/merteren97/AtrisAgent" target="_blank" rel="noopener noreferrer">GitHub <ArrowUpRight aria-hidden="true" /></a><a href="#top">{c.top} ↑</a></div></div><div className="wrap footer-bottom">© 2026 AtrisAgent <span>PART OF THE ATRIS ECOSYSTEM</span></div></footer>
