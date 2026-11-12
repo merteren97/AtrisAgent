@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Mobile version, e.g. 0.1.0"
+        description: "Mobile version, e.g. 0.1.0 or v0.1.0"
         required: true
         type: string
 
@@ -23,6 +23,8 @@ jobs:
   quality:
     if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -32,7 +34,9 @@ jobs:
           node-version: 22.23.1
           cache: npm
       - run: npm ci --include=dev --include=optional --no-audit --no-fund
-      - run: node .github/scripts/mobile-release-version.mjs
+      - run: node --test .github/scripts/mobile-release-version.test.mjs
+      - id: version
+        run: node .github/scripts/mobile-release-version.mjs
       - run: npm run build -w @atris-agent-code/mobile
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e -w @atris-agent-code/mobile
@@ -43,6 +47,7 @@ jobs:
     timeout-minutes: 60
     env:
       ANDROID_NDK_VERSION: 27.2.12479018
+      MOBILE_VERSION: ${{ needs.quality.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -99,6 +104,8 @@ jobs:
     needs: quality
     runs-on: macos-latest
     timeout-minutes: 60
+    env:
+      MOBILE_VERSION: ${{ needs.quality.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -140,8 +147,10 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [android, ios]
+    needs: [quality, android, ios]
     runs-on: ubuntu-22.04
+    env:
+      MOBILE_VERSION: ${{ needs.quality.outputs.version }}
     permissions:
       contents: write
     steps:
