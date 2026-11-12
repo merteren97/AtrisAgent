@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState, type ReactNode } from 'react';
 import { Check, Copy, ExternalLink } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { browserUrl, useBrowserStore } from '@/stores/browser-store';
 
 interface MarkdownContentProps {
   content: string;
@@ -43,12 +44,7 @@ function tableHeader(lines: string[], index: number): boolean {
 }
 
 function isSafeLink(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
+  return browserUrl(value) !== null;
 }
 
 function parseBlocks(source: string): Block[] {
@@ -151,7 +147,7 @@ function parseBlocks(source: string): Block[] {
 }
 
 function inlineNodes(text: string, keyPrefix: string, onLocalImageLink?: (path: string) => void): ReactNode[] {
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|!?\[[^\]]+\]\((?:https?:\/\/[^\s)]+|[^()\s]+\.(?:png|jpe?g|webp|gif))\))/gi;
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|!?\[[^\]]+\]\((?:https?:\/\/(?:[^\s()]|\([^\s()]*\))+|[^()\s]+\.(?:png|jpe?g|webp|gif))\)|https?:\/\/[^\s<>]+)/gi;
   const parts = text.split(pattern).filter((part) => part.length > 0);
 
   return parts.map((part, index) => {
@@ -165,13 +161,20 @@ function inlineNodes(text: string, keyPrefix: string, onLocalImageLink?: (path: 
     if ((part.startsWith('*') && part.endsWith('*')) || (part.startsWith('_') && part.endsWith('_'))) {
       return <em key={key}>{part.slice(1, -1)}</em>;
     }
-    const link = part.match(/^!?\[([^\]]+)\]\(([^\s)]+)\)$/);
+    const link = part.match(/^!?\[([^\]]+)\]\(([^\s]+)\)$/);
     if (link && isSafeLink(link[2])) {
       return (
-        <a key={key} href={link[2]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary">
+        <a key={key} href={link[2]} onClick={event => {event.preventDefault();useBrowserStore.getState().open(link[2]);}} className="inline-flex items-center gap-1 text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary">
           {link[1]} <ExternalLink className="h-3 w-3" />
         </a>
       );
+    }
+    if (/^https?:\/\//i.test(part)) {
+      const match = part.match(/^(.*?)([.,!?;:]*)$/);
+      let href = match?.[1] || part;
+      let suffix = match?.[2] || '';
+      while (href.endsWith(')') && (href.match(/\)/g)?.length || 0) > (href.match(/\(/g)?.length || 0)) { href = href.slice(0,-1); suffix = `)${suffix}`; }
+      if (isSafeLink(href)) return <Fragment key={key}><a href={href} onClick={event => {event.preventDefault();useBrowserStore.getState().open(href);}} className="text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary">{href}</a>{suffix}</Fragment>;
     }
     if (link && onLocalImageLink && /\.(?:png|jpe?g|webp|gif)$/i.test(link[2])) {
       return <button key={key} type="button" onClick={() => onLocalImageLink(link[2])} className="text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{link[1]}</button>;

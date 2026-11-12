@@ -1,4 +1,5 @@
 import { ReactNode } from 'react';
+import { LinkBrowser } from '@/components/browser/link-browser';
 
 interface AppShellProps {
   titlebar: ReactNode;
@@ -15,6 +16,7 @@ export function AppShell({ titlebar, sidebar, main, inspector }: AppShellProps) 
         {sidebar}
         {main}
         {inspector}
+        <LinkBrowser />
       </div>
     </div>
   );
