@@ -61,6 +61,11 @@ async function main() {
   const fetchImpl: typeof fetch = async (input) => {
     const url = String(input);
     if (url.endsWith("/releases/latest")) return Response.json(release);
+    if (url.endsWith('/releases?per_page=100')) return Response.json([
+      { tag_name: 'mobile-v0.2.0', draft: true, assets: [] },
+      { tag_name: 'mobile-v0.1.0', assets: [{ id: 301, name: 'AtrisAgent-Mobile_0.1.0_android_arm64.apk' }, { id: 302, name: 'AtrisAgent-Mobile_0.1.0_ios_unsigned.ipa' }, { id: 303, name: 'untrusted.apk' }] },
+      release,
+    ]);
     if (url.includes("/releases/assets/")) assetFetchCount += 1;
     if (url.endsWith("/releases/assets/101")) {
       return new Response(null, {
@@ -72,6 +77,7 @@ async function main() {
     if (url.endsWith("/releases/assets/201") || url.endsWith("/releases/assets/202")) {
       return new Response(null, { status: 302, headers: { Location: "https://release-assets.githubusercontent.com/atris-agent-linux" } });
     }
+    if (url.endsWith('/releases/assets/301') || url.endsWith('/releases/assets/302')) return new Response(null, { status: 302, headers: { Location: 'https://release-assets.githubusercontent.com/mobile' } });
     return new Response("not found", { status: 404 });
   };
 
@@ -96,12 +102,26 @@ async function main() {
     "/upstream-failure/api/agent-github",
     createAgentReleaseRouter({ cacheTtlMs: 0, fetchImpl: async () => new Response("unavailable", { status: 503 }) }),
   );
+  app.use('/no-mobile/api/agent-github', createAgentReleaseRouter({ cacheTtlMs: 0, fetchImpl: async () => Response.json([release]) }));
+  app.use('/mobile-latest/api/agent-github', createAgentReleaseRouter({ cacheTtlMs: 0, fetchImpl: async () => Response.json({ tag_name: 'mobile-v9.9.9', assets: release.assets }) }));
 
   const server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", resolve));
   const port = (server.address() as AddressInfo).port;
 
   try {
+    const mobileMetadata = await fetch(`http://127.0.0.1:${port}/api/agent-github/mobile`);
+    assertStrict.deepEqual(await mobileMetadata.json(), { version: '0.1.0', android: true, ios: true }, 'Mobile lookup uses the newest published mobile tag, not a draft or desktop release.');
+    const noMobileMetadata = await fetch(`http://127.0.0.1:${port}/no-mobile/api/agent-github/mobile`);
+    assertStrict.deepEqual(await noMobileMetadata.json(), { available: false }, 'Missing mobile release is a controlled unavailable state');
+    const mobileLatest = await fetch(`http://127.0.0.1:${port}/mobile-latest/api/agent-github/update/windows-x86_64/0.1.0`);
+    assert(mobileLatest.status === 204, 'A mobile latest release must never be served as a desktop update');
+    for (const platform of ['android', 'ios']) {
+      const result = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/mobile-${platform}`, { redirect: 'manual' });
+      assert(result.status === 302 && result.headers.get('location') === 'https://release-assets.githubusercontent.com/mobile', `${platform} should use its expected mobile artifact`);
+    }
+    const guessedMobile = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/303`);
+    assert(guessedMobile.status === 404, 'Mobile asset IDs cannot bypass desktop asset restrictions');
     const downloadResponse = await fetch(`http://127.0.0.1:${port}/api/agent-github/download/win`, { redirect: "manual" });
     assert(downloadResponse.status === 302, "Platform download should redirect to the GitHub asset.");
     assert(

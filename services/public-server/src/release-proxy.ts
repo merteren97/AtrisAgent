@@ -15,6 +15,7 @@ type GitHubRelease = {
   body?: string;
   published_at?: string;
   assets?: ReleaseAsset[];
+  draft?: boolean;
 };
 
 export type ReleasePlatform = "windows" | "darwin" | "linux";
@@ -213,6 +214,7 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
   const cacheTtlMs = options.cacheTtlMs ?? 300_000;
   const supportedPlatforms = configuredReleasePlatforms();
   let cachedRelease: CachedRelease | null = null;
+  let cachedMobileRelease: CachedRelease | null = null;
 
   const repoOwner = () => process.env.AGENT_RELEASE_REPO_OWNER || "merteren97";
   const repoName = () => process.env.AGENT_RELEASE_REPO_NAME || "AtrisAgent";
@@ -230,14 +232,43 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
     if (!response.ok) return { ok: false as const, status: response.status };
 
     const data = (await response.json()) as GitHubRelease;
+    if (!/^v\d+\.\d+\.\d+$/.test(data.tag_name || "")) return { ok: false as const, status: 404 };
     cachedRelease = { data, expiresAt: Date.now() + cacheTtlMs };
     return { ok: true as const, data };
   }
 
+  async function getMobileRelease() {
+    if (cachedMobileRelease && cachedMobileRelease.expiresAt > Date.now()) return { ok: true as const, data: cachedMobileRelease.data };
+    const response = await fetchImpl(`https://api.github.com/repos/${repoOwner()}/${repoName()}/releases?per_page=100`, { headers: githubHeaders("application/vnd.github+json") });
+    if (!response.ok) return { ok: false as const, status: response.status };
+    const releases = await response.json() as GitHubRelease[];
+    if (!Array.isArray(releases)) return { ok: false as const, status: 502 };
+    const release = releases.filter(item => !item.draft && /^mobile-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(item.tag_name || ""))
+      .sort((a, b) => semverCompare((b.tag_name || '').slice(7), (a.tag_name || '').slice(7)))[0];
+    if (!release) return { ok: false as const, status: 404 };
+    cachedMobileRelease = { data: release, expiresAt: Date.now() + cacheTtlMs };
+    return { ok: true as const, data: release };
+  }
+
+  function mobileAsset(release: GitHubRelease, platform: 'android' | 'ios') {
+    const version = release.tag_name?.slice('mobile-v'.length);
+    const expected = `AtrisAgent-Mobile_${version}_${platform === 'android' ? 'android_arm64.apk' : 'ios_unsigned.ipa'}`;
+    return (release.assets || []).find(asset => asset.name === expected && Number.isSafeInteger(asset.id) && asset.id > 0);
+  }
+
+  router.get('/mobile', async (_request, response) => {
+    try {
+      const release = await getMobileRelease();
+      if (!release.ok) return response.status(release.status === 404 ? 200 : 502).json({ available: false });
+      return response.json({ version: release.data.tag_name?.slice('mobile-v'.length), android: Boolean(mobileAsset(release.data, 'android')), ios: Boolean(mobileAsset(release.data, 'ios')) });
+    } catch { return response.status(502).json({ available: false }); }
+  });
+
   router.get("/download/:assetOrPlatform", async (request, response) => {
     try {
       const assetOrPlatform = request.params.assetOrPlatform;
-      const latestRelease = await getLatestRelease();
+      const mobilePlatform = assetOrPlatform === 'mobile-android' ? 'android' : assetOrPlatform === 'mobile-ios' ? 'ios' : null;
+      const latestRelease = mobilePlatform ? await getMobileRelease() : await getLatestRelease();
       if (!latestRelease.ok) {
         const status = latestRelease.status === 404 ? 404 : 502;
         return response.status(status).send(
@@ -251,7 +282,10 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
         isAllowedReleaseAsset(asset, supportedPlatforms),
       );
       let asset: ReleaseAsset | undefined;
-      if (isAssetId(assetOrPlatform)) {
+      if (mobilePlatform) {
+        asset = mobileAsset(latestRelease.data, mobilePlatform);
+        if (!asset) return response.status(404).send('Mobile release asset not available');
+      } else if (isAssetId(assetOrPlatform)) {
         asset = eligibleAssets.find((candidate) => String(candidate.id) === assetOrPlatform);
         if (!asset) {
           return response.status(404).send("AtrisAgent release asset was not found in the latest eligible release");

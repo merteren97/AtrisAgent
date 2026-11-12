@@ -1,0 +1,162 @@
+name: Release AtrisAgent Mobile
+run-name: Release AtrisAgent Mobile ${{ inputs.release_version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Mobile version, e.g. 0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atris-agent-mobile-release
+  cancel-in-progress: false
+
+env:
+  MOBILE_VERSION: ${{ inputs.release_version }}
+
+jobs:
+  quality:
+    if: ${{ github.repository == 'merteren97/AtrisAgent' && github.actor == 'merteren97' && github.triggering_actor == 'merteren97' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - run: npm ci --include=dev --include=optional --no-audit --no-fund
+      - run: node .github/scripts/mobile-release-version.mjs
+      - run: npm run build -w @atris-agent-code/mobile
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e -w @atris-agent-code/mobile
+
+  android:
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ANDROID_NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: aarch64-linux-android
+      - run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;${ANDROID_NDK_VERSION}"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+      - run: npm ci --include=dev --include=optional --no-audit --no-fund
+      - run: node .github/scripts/mobile-release-version.mjs
+      - run: npm run tauri -w @atris-agent-code/mobile -- android init --ci
+      - name: Configure release signing
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEY_BASE64" && test -n "$ANDROID_KEY_ALIAS" && test -n "$ANDROID_KEY_PASSWORD" && test -n "$ANDROID_KEYSTORE_PASSWORD"
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/mobile-release.jks"
+          chmod 600 "$RUNNER_TEMP/mobile-release.jks"
+          umask 077
+          printf 'keyAlias=%s\npassword=%s\nstorePassword=%s\nstoreFile=%s\n' "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" "$ANDROID_KEYSTORE_PASSWORD" "$RUNNER_TEMP/mobile-release.jks" > apps/mobile/src-tauri/gen/android/keystore.properties
+          node .github/scripts/configure-mobile-android-signing.mjs
+      - run: npm run tauri -w @atris-agent-code/mobile -- android build --ci --apk --target aarch64
+      - name: Verify and stage signed APK
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find apps/mobile/src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk')
+          test "${#apks[@]}" -eq 1
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "${apks[0]}"
+          mkdir -p mobile-artifacts
+          cp "${apks[0]}" "mobile-artifacts/AtrisAgent-Mobile_${MOBILE_VERSION}_android_arm64.apk"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mobile-android
+          path: mobile-artifacts/*.apk
+          if-no-files-found: error
+
+  ios:
+    needs: quality
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: aarch64-apple-ios
+      - run: npm ci --include=dev --include=optional --no-audit --no-fund
+      - run: node .github/scripts/mobile-release-version.mjs
+      - run: npm run tauri -w @atris-agent-code/mobile -- ios init --ci
+      - name: Stabilize Tauri Xcode temporary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/tauri-ios"
+          chmod 700 "$RUNNER_TEMP/tauri-ios"
+          echo "TMPDIR=$RUNNER_TEMP/tauri-ios" >> "$GITHUB_ENV"
+      - name: Build unsigned IPA
+        env:
+          CODE_SIGNING_ALLOWED: 'NO'
+          CODE_SIGNING_REQUIRED: 'NO'
+          CODE_SIGN_IDENTITY: ''
+        run: npm run tauri -w @atris-agent-code/mobile -- ios build --ci --no-sign --target aarch64
+      - name: Verify and stage unsigned IPA
+        run: |
+          set -euo pipefail
+          ipa="$(find apps/mobile/src-tauri/gen/apple/build/arm64 -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          test -n "$ipa"
+          unzip -l "$ipa" | grep -qE 'Payload/[^/]+\.app/Info\.plist'
+          if unzip -l "$ipa" | grep -qE 'Payload/[^/]+\.app/(_CodeSignature/|embedded\.mobileprovision)'; then exit 1; fi
+          mkdir -p mobile-artifacts
+          cp "$ipa" "mobile-artifacts/AtrisAgent-Mobile_${MOBILE_VERSION}_ios_unsigned.ipa"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mobile-ios
+          path: mobile-artifacts/*.ipa
+          if-no-files-found: error
+
+  publish:
+    needs: [android, ios]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: mobile-artifacts
+          merge-multiple: true
+      - name: Create independent mobile prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$MOBILE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          cd mobile-artifacts
+          test -f "AtrisAgent-Mobile_${MOBILE_VERSION}_android_arm64.apk"
+          test -f "AtrisAgent-Mobile_${MOBILE_VERSION}_ios_unsigned.ipa"
+          sha256sum *.apk *.ipa > SHA256SUMS.txt
+          gh release create "mobile-v${MOBILE_VERSION}" *.apk *.ipa SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "AtrisAgent Mobile ${MOBILE_VERSION}" --prerelease --latest=false --notes "Android APK is signed. iOS IPA is unsigned and requires a compatible sideloading method. Desktop connection is not yet implemented."
