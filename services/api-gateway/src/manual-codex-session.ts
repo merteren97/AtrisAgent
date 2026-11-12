@@ -38,6 +38,8 @@ interface Options {
   executable: string; cwd: string; env: Record<string, string>; mode: CodexPermissionMode;
   model?: string; reasoning?: string;
   onThread: (threadId: string, transcriptPath: string) => void;
+  coordination?: {endpoint:string; script:string; token:string; runtimeToken?:string};
+  onClosed?: () => void;
 }
 
 /** One owning app-server and one authenticated TUI connection per native terminal.
@@ -99,14 +101,27 @@ export class ManualCodexSession {
       // hooks, account and managed requirements continue to be loaded by Codex.
       const mode = this.options.mode;
       const sandbox = mode === 'full-access' ? 'danger-full-access' : mode === 'read-only' ? 'read-only' : 'workspace-write';
+      const coordination = this.options.coordination;
+      const coordinationEnv: Record<string,string> = coordination ? {
+        ATRIS_CONTROL_PLANE_URL: coordination.endpoint,
+        ATRIS_CONTROL_PLANE_TOKEN: coordination.token,
+        ATRIS_MANUAL_COORDINATION: '1',
+        ...(coordination.runtimeToken ? {ATRIS_RUNTIME_TOKEN:coordination.runtimeToken} : {}),
+      } : {};
       this.child = spawn(this.options.executable, ['app-server', '--stdio',
+        ...(coordination ? [
+          '-c', `mcp_servers.atris_workspace.command=${JSON.stringify(process.execPath)}`,
+          '-c', `mcp_servers.atris_workspace.args=${JSON.stringify([coordination.script])}`,
+          '-c', `mcp_servers.atris_workspace.env_vars=${JSON.stringify(Object.keys(coordinationEnv))}`,
+          '-c', 'mcp_servers.atris_workspace.startup_timeout_sec=10',
+        ] : []),
         ...(this.options.model ? ['-c', `model=${JSON.stringify(this.options.model)}`] : []),
         ...(this.options.reasoning ? ['-c', `model_reasoning_effort=${JSON.stringify(this.options.reasoning)}`] : []),
         '-c', `projects.${JSON.stringify(this.options.cwd)}.trust_level="trusted"`,
         '-c', `sandbox_mode=${JSON.stringify(sandbox)}`,
         '-c', `approval_policy=${JSON.stringify(mode === 'full-access' ? 'never' : 'on-request')}`,
         '-c', `approvals_reviewer=${JSON.stringify(mode === 'approve-for-me' ? 'auto_review' : 'user')}`],
-      {cwd:this.options.cwd, env:codexChildEnvironment(this.options.env), windowsHide:true, stdio:'pipe'});
+      {cwd:this.options.cwd, env:{...codexChildEnvironment(this.options.env), ...coordinationEnv}, windowsHide:true, stdio:'pipe'});
       let chunks: Buffer[] = [], buffered = 0;
       this.child.stdout.on('data', (data: Buffer) => {
         let start = 0, end: number;
@@ -310,6 +325,7 @@ export class ManualCodexSession {
         child.once('exit', done);
       });
     }
+    this.options.onClosed?.();
     this.onClosed?.(reason);
   }
 }

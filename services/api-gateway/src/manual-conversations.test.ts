@@ -11,6 +11,7 @@ import type { RuntimeHost, runCommand } from '@atris-agent-code/runtime-host';
 import { ManualConversationStore, installManualConversations, parseManualTranscript } from './manual-conversations';
 import { manualContentTitle } from './manual-titles';
 import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
+import { manualCoordination } from './manual-coordination';
 import { parseAntigravityModelsOutput, resolveAntigravityCliRoute } from '../../runtime-host/src/antigravity-model-catalog';
 
 // Keep compatibility coverage in the existing manual route test entry point.
@@ -299,6 +300,18 @@ try {
   assert.equal(agyLaunch.args[0], '--log-file', 'Active route uses a dedicated session log without invalid model or global continue flags');
   assert.equal(agyLaunch.args.length,2);
   assert.deepEqual(agyLaunch.env, {}, 'Antigravity credentials stay in the native keyring');
+  manualCoordination.configure({endpoint:'http://127.0.0.1:4321',script:'bridge.mjs'});
+  const coordinatedResponse = await post(`/agents/${agyAgent.id}/launch`, {});
+  const coordinated = await coordinatedResponse.json();
+  assert.equal(coordinatedResponse.status,200);
+  assert.equal(coordinated.cwd,agyAgent.cwd,'Coordination must not replace the project working directory');
+  assert.equal(coordinated.args[0],'--log-file','The dedicated transcript log remains in use');
+  const addDir = coordinated.args.indexOf('--add-dir');
+  assert(addDir >= 0,'Antigravity receives the separate MCP workspace');
+  assert.equal(coordinated.env.ATRIS_MANUAL_COORDINATION,'1');
+  const config = fs.readFileSync(path.join(coordinated.args[addDir+1],'.agents','mcp_config.json'),'utf8');
+  assert(!config.includes(coordinated.env.ATRIS_CONTROL_PLANE_TOKEN),'Agent grant remains outside the config file');
+  manualCoordination.configure(undefined);
   model.runtimeModelId = 'gemini-test';
   const routed = await (await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).json();
   const routedLaunch = await (await post(`/agents/${routed.id}/launch`, {})).json();

@@ -17,6 +17,7 @@ mod app_lifecycle;
 mod app_updater;
 mod runtime;
 mod manual_terminal;
+mod link_browser;
 #[cfg(windows)]
 mod session_store;
 
@@ -372,7 +373,13 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .manage(link_browser::BrowserState::default())
+        .invoke_handler(|invoke| {
+            if !link_browser::is_app_webview(invoke.message.webview_ref().label()) {
+                invoke.resolver.reject("Commands are unavailable in external web content.");
+                return true;
+            }
+            let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             greet,
             inspect_workspace_path,
             window_start_dragging,
@@ -394,8 +401,15 @@ pub fn run() {
             manual_terminal::manual_terminal_close,
             store_local_secret,
             read_local_secret,
-            delete_local_secret
-        ])
+            delete_local_secret,
+            link_browser::browser_open,
+            link_browser::browser_resize,
+            link_browser::browser_action,
+            link_browser::browser_visibility,
+            link_browser::browser_close
+        ];
+            handler(invoke)
+        })
         .build(tauri::generate_context!())
         .expect("error while building AtrisAgent");
     app.run(|app_handle, event| {
