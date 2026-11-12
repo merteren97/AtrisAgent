@@ -67,6 +67,16 @@ test("CodeQL skips private repositories until code scanning is enabled", () => {
   );
 });
 
+test("mobile Android release installs SDK command-line tools before invoking sdkmanager", () => {
+  const source = readWorkflow("mobile-release.yml");
+  const android = source.split(/\n  android:\s*\n/)[1]?.split(/\n  ios:\s*\n/)[0];
+  assert.ok(android, "mobile release must define an Android job");
+  const setup = android.indexOf("android-actions/setup-android@");
+  const install = android.indexOf('sdkmanager "platform-tools"');
+  assert.ok(setup >= 0 && install > setup, "setup-android must run before sdkmanager installs SDK packages");
+  assert.match(android, /test -n "\$\{ANDROID_HOME:-\}"/, "Android SDK root must be present before building");
+});
+
 test("release publishing stays owner-controlled and requires both desktop platforms", () => {
   const release = readWorkflow("release.yml");
 
