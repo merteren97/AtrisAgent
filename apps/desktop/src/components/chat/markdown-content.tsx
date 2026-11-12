@@ -9,12 +9,37 @@ interface MarkdownContentProps {
 }
 
 interface Block {
-  type: 'paragraph' | 'heading' | 'code' | 'quote' | 'list' | 'separator';
+  type: 'paragraph' | 'heading' | 'code' | 'quote' | 'list' | 'separator' | 'table';
   level?: number;
   language?: string;
   text?: string;
   items?: string[];
   ordered?: boolean;
+  headers?: string[];
+  rows?: string[][];
+  alignments?: Array<'left' | 'center' | 'right'>;
+}
+
+function tableCells(line: string): string[] {
+  const text = line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '');
+  const cells: string[] = [];
+  let cell = '';
+  let code = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === '\\' && text[i + 1] === '|') { cell += '|'; i += 1; continue; }
+    if (char === '`') code = !code;
+    if (char === '|' && !code) { cells.push(cell.trim()); cell = ''; } else cell += char;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function tableHeader(lines: string[], index: number): boolean {
+  if (!lines[index]?.includes('|') || !lines[index + 1]?.includes('|')) return false;
+  const headers = tableCells(lines[index]);
+  const separators = tableCells(lines[index + 1]);
+  return headers.length === separators.length && separators.every(cell => /^:?-{3,}:?$/.test(cell));
 }
 
 function isSafeLink(value: string): boolean {
@@ -35,6 +60,20 @@ function parseBlocks(source: string): Block[] {
     const line = lines[index];
     if (!line.trim()) {
       index += 1;
+      continue;
+    }
+
+    if (tableHeader(lines, index)) {
+      const headers = tableCells(line);
+      const alignments = tableCells(lines[index + 1]).map((cell): 'left' | 'center' | 'right' => cell.endsWith(':') ? (cell.startsWith(':') ? 'center' : 'right') : 'left');
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length && lines[index].trim() && lines[index].includes('|')) {
+        const cells = tableCells(lines[index]);
+        rows.push(headers.map((_, column) => cells[column] || ''));
+        index += 1;
+      }
+      blocks.push({ type: 'table', headers, rows, alignments });
       continue;
     }
 
@@ -95,6 +134,7 @@ function parseBlocks(source: string): Block[] {
     while (index < lines.length) {
       const next = lines[index];
       if (!next.trim()) break;
+      if (tableHeader(lines, index)) break;
       if (/^\s*```/.test(next)
         || /^\s*(#{1,6})\s+/.test(next)
         || /^\s*>\s?/.test(next)
@@ -183,6 +223,20 @@ export function MarkdownContent({ content, className, onLocalImageLink }: Markdo
     <div className={cn('min-w-0 space-y-2.5 break-words', className)}>
       {blocks.map((block, index) => {
         const key = `block-${index}`;
+        if (block.type === 'table') {
+          return (
+            <div key={key} className="my-3 max-w-full overflow-x-auto rounded-lg border border-border">
+              <table className="w-full min-w-max border-collapse text-sm">
+                <thead className="bg-muted/60"><tr>{(block.headers || []).map((cell, column) => (
+                  <th key={column} scope="col" style={{ textAlign: block.alignments?.[column] }} className="border-b border-border px-3 py-2 font-semibold"><InlineText text={cell} prefix={`${key}-head-${column}`} onLocalImageLink={onLocalImageLink} /></th>
+                ))}</tr></thead>
+                <tbody>{(block.rows || []).map((row, rowIndex) => <tr key={rowIndex} className="border-b border-border/60 last:border-0">{row.map((cell, column) => (
+                  <td key={column} style={{ textAlign: block.alignments?.[column] }} className="max-w-sm px-3 py-2 align-top"><InlineText text={cell} prefix={`${key}-${rowIndex}-${column}`} onLocalImageLink={onLocalImageLink} /></td>
+                ))}</tr>)}</tbody>
+              </table>
+            </div>
+          );
+        }
         if (block.type === 'code') return <CodeBlock key={key} language={block.language || 'text'} code={block.text || ''} />;
         if (block.type === 'separator') return <hr key={key} className="my-3 border-border/70" />;
         if (block.type === 'quote') {

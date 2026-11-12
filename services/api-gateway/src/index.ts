@@ -30,6 +30,7 @@ import type {
 } from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AtrisAuthService, extractBearerHeader, installAuthRoutes } from './auth';
+import { installManualCoordinationCallRoute } from './manual-coordination';
 import {
   authorizeRuntimeToken,
   createRuntimeTokenMiddleware,
@@ -481,6 +482,8 @@ app.use(cors({
     else callback(new Error(`Origin ${origin} is not allowed by the local AtrisAgent service.`));
   },
 }));
+// Agent-only grants provide a narrower boundary than the desktop runtime token.
+installManualCoordinationCallRoute(app, express.json({limit:'32kb'}));
 app.use(createRuntimeTokenMiddleware(RUNTIME_TOKEN));
 app.use('/api/attachments', express.json({ limit: '14mb' }));
 app.use(express.json({ limit: '2mb' }));

@@ -12,6 +12,8 @@ import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import { isCodexPermissionMode } from './manual-codex-permissions';
 import { ManualCodexSessions } from './manual-codex-session';
 import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
+import { manualCoordination } from './manual-coordination';
+import { prepareManualCoordination } from './manual-coordination-config';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
@@ -266,13 +268,25 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     res.json(store.rename(idParam(req, 'conversationId'), required(req.body?.title, 'title')));
   }));
   app.delete('/api/manual/conversations/:conversationId', route((req, res) => {
-    store.remove(idParam(req, 'conversationId'));
+    const id = idParam(req, 'conversationId');
+    try {
+      const conversation = store.conversation(id);
+      for (const agent of store.list(conversation.workspaceId).find(item => item.id === id)?.agents || []) manualCoordination.revoke(agent.id);
+    } catch (error: any) { if (error.status !== 404) throw error; }
+    store.remove(id);
     res.status(204).end();
   }));
   // The desktop closes its native process before removing the app-owned record.
   // Provider transcripts and curated memory are intentionally not deleted here.
   app.delete('/api/manual/agents/:agentId', route((req, res) => {
+    manualCoordination.revoke(idParam(req, 'agentId'));
     store.removeAgent(idParam(req, 'agentId'));
+    res.status(204).end();
+  }));
+  app.delete('/api/manual/agents/:agentId/coordination', route((req, res) => {
+    const id = idParam(req, 'agentId');
+    store.agent(id);
+    manualCoordination.revoke(id);
     res.status(204).end();
   }));
   app.post('/api/manual/conversations', route((req, res) => {
@@ -324,6 +338,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (!fs.statSync(agent.cwd).isDirectory()) return fail('Project directory is unavailable.');
     const env: Record<string, string> = {};
     let codexRuntimeId: string | undefined;
+    let launchCwd = agent.cwd;
     if (!agent.sharedProfile) {
       if (agent.runtimeType === 'claude_code') env.CLAUDE_CONFIG_DIR = agent.configDir;
       if (agent.runtimeType === 'codex') env.CODEX_HOME = agent.configDir;
@@ -344,8 +359,14 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (agent.runtimeType === 'codex') {
       await verifyManualCodexCompatibility(installation.path);
       args = bridge.prepareCodex(agent, true);
-      const endpoint = await store.codexSessions.create(agent.id, {executable:installation.path, cwd:agent.cwd, env, model:agent.model, reasoning:agent.reasoning,
-        mode:agent.codexPermissionMode || 'ask-for-approval', onThread:(threadId, filename) => bridge.bindCodexRuntime(agent, threadId, filename)});
+      if (store.codexSessions.get(agent.id)) return fail('A Codex terminal is already open or starting for this agent.', 409);
+      const coordination = manualCoordination.isConfigured() ? manualCoordination.issue(agent) : undefined;
+      let endpoint: Awaited<ReturnType<typeof store.codexSessions.create>>;
+      try {
+        endpoint = await store.codexSessions.create(agent.id, {executable:installation.path, cwd:agent.cwd, env, model:agent.model, reasoning:agent.reasoning, coordination,
+          onClosed: () => { if (coordination) manualCoordination.revokeToken(coordination.token); },
+          mode:agent.codexPermissionMode || 'ask-for-approval', onThread:(threadId, filename) => bridge.bindCodexRuntime(agent, threadId, filename)});
+      } catch (error) { if (coordination) manualCoordination.revokeToken(coordination.token); throw error; }
       args.push('--remote', endpoint.url, '--remote-auth-token-env', 'ATRIS_CODEX_REMOTE_TOKEN', '--cd', agent.cwd);
       env.ATRIS_CODEX_REMOTE_TOKEN = endpoint.token;
       codexRuntimeId = endpoint.runtimeId;
@@ -353,7 +374,14 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (agent.runtimeType === 'opencode') {
       const prepared = bridge.prepareOpenCode(agent); args = prepared.args; Object.assign(env, prepared.env);
     }
-    res.json({ id: agent.id, executable: installation.path, args, cwd: agent.cwd, env, ...(codexRuntimeId ? {codexRuntimeId} : {}) });
+    if (agent.runtimeType !== 'codex' && manualCoordination.isConfigured()) {
+      const grant = manualCoordination.issue(agent);
+      try {
+        const prepared = prepareManualCoordination(agent, dataDir, grant, installation.version);
+        args.push(...prepared.args); Object.assign(env, prepared.env); launchCwd = prepared.cwd || launchCwd;
+      } catch (error) { manualCoordination.revokeToken(grant.token); throw error; }
+    }
+    res.json({ id: agent.id, executable: installation.path, args, cwd: launchCwd, env, ...(codexRuntimeId ? {codexRuntimeId} : {}) });
   }));
   app.get('/api/manual/agents/:id/messages', route((req, res) => res.json(store.readMessages(idParam(req, 'id')))));
   app.patch('/api/manual/agents/:id/permissions', route((req, res) => {

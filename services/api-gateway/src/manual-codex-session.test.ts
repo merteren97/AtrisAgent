@@ -18,6 +18,7 @@ const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
 const settings=()=>({cwd:process.cwd(),approvalPolicy:mode===':danger-full-access'?'never':'on-request',approvalsReviewer:mode==='auto'?'auto_review':'user',sandboxPolicy:{type:mode===':danger-full-access'?'dangerFullAccess':mode===':read-only'?'readOnly':'workspaceWrite'}});
 readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);const p=m.params||{};
 if(m.method==='initialize')return send({id:m.id,result:{}});
+if(m.method==='fixture/startup')return send({id:m.id,result:{args:process.argv.slice(2),url:process.env.ATRIS_CONTROL_PLANE_URL,token:process.env.ATRIS_CONTROL_PLANE_TOKEN,manual:process.env.ATRIS_MANUAL_COORDINATION,runtimeToken:process.env.ATRIS_RUNTIME_TOKEN}});
 if(m.method==='thread/start'||m.method==='thread/resume') {if(!p.ephemeral)thread=p.threadId||'root';return send({id:m.id,result:{thread:{id:p.ephemeral?'title':thread},cwd:process.cwd(),approvalPolicy:'on-request',approvalsReviewer:'user',sandbox:{type:'workspaceWrite'}}});}
 if(m.method==='fixture/event'){send(p.event);return send({id:m.id,result:{}});}
 if(m.method==='fixture/fault'){fault=p.value;return send({id:m.id,result:{}});}
@@ -30,8 +31,8 @@ if(m.id!==undefined&&m.method)send({id:m.id,result:{}});
 const sessions = new ManualCodexSessions();
 const sockets: WebSocket[] = [];
 let next = 0;
-async function open(id: string) {
-  const endpoint = await sessions.create(id, {executable:process.execPath, cwd:root, env:{}, mode:'ask-for-approval', onThread:() => {}});
+async function open(id: string, coordination?: {endpoint:string;script:string;token:string}) {
+  const endpoint = await sessions.create(id, {executable:process.execPath, cwd:root, env:{}, mode:'ask-for-approval', onThread:() => {}, coordination});
   const socket = new WebSocket(endpoint.url, {headers:{Authorization:`Bearer ${endpoint.token}`}}); sockets.push(socket);
   await once(socket, 'open');
   const pending = new Map<number, (message: any) => void>();
@@ -46,6 +47,11 @@ async function open(id: string) {
 }
 try {
   const a=await open('a'), b=await open('b');
+  const coordinated = await open('coordinated',{endpoint:'http://127.0.0.1:3456',script:'bridge.mjs',token:'scoped-token'});
+  const startup = await coordinated.rpc('fixture/startup');
+  assert.equal(startup.token,'scoped-token'); assert.equal(startup.manual,'1'); assert.equal(startup.runtimeToken,undefined);
+  assert(startup.args.some((arg:string) => arg.includes('mcp_servers.atris_workspace.command')));
+  assert(!startup.args.some((arg:string) => arg.includes('scoped-token')),'Grant must not be placed in argv');
   const unauthorized = new WebSocket(a.endpoint.url); let rejected=false;
   unauthorized.on('error', () => {rejected=true;}); await new Promise(resolve => unauthorized.once('close',resolve)); assert.equal(rejected,true);
   const initial=a.session.status();

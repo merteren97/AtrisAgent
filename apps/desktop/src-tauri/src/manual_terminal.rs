@@ -156,6 +156,8 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     };
     command.cwd(&request.cwd);
     command.env("TERM", "xterm-256color");
+    let mut opencode_plugin: Option<String> = None;
+    let mut opencode_mcp: Option<String> = None;
     for (key, value) in request.env {
         if key == "ATRIS_MANUAL_OPENCODE_TUI_CONFIG" {
             let config_file = prepare_tui_config(&value, std::env::var("OPENCODE_TUI_CONFIG").ok().as_deref())?;
@@ -163,19 +165,37 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
             continue;
         }
         if key == "ATRIS_MANUAL_OPENCODE_PLUGIN" {
-            let mut config: serde_json::Value = match std::env::var("OPENCODE_CONFIG_CONTENT") {
-                Ok(value) => serde_json::from_str(&value).map_err(|_| "Inherited OpenCode configuration is not valid JSON")?,
-                Err(_) => serde_json::json!({}),
-            };
-            let object = config.as_object_mut().ok_or("Inherited OpenCode configuration must be an object")?;
-            let plugins = object.entry("plugin").or_insert_with(|| serde_json::json!([])).as_array_mut().ok_or("OpenCode plugin configuration must be an array")?;
-            let plugin = serde_json::Value::String(value);
-            if !plugins.contains(&plugin) { plugins.push(plugin); }
-            command.env("OPENCODE_CONFIG_CONTENT", serde_json::to_string(&config).map_err(|_| "Could not prepare OpenCode configuration")?);
+            opencode_plugin = Some(value);
             continue;
         }
-        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "ATRIS_CODEX_REMOTE_TOKEN"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
+        if key == "ATRIS_MANUAL_OPENCODE_MCP" {
+            opencode_mcp = Some(value);
+            continue;
+        }
+        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "ATRIS_CODEX_REMOTE_TOKEN", "ATRIS_CONTROL_PLANE_URL", "ATRIS_CONTROL_PLANE_TOKEN", "ATRIS_MANUAL_COORDINATION"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
         command.env(key, value);
+    }
+    if opencode_plugin.is_some() || opencode_mcp.is_some() {
+        let mut config: serde_json::Value = match std::env::var("OPENCODE_CONFIG_CONTENT") {
+            Ok(value) => serde_json::from_str(&value).map_err(|_| "Inherited OpenCode configuration is not valid JSON")?,
+            Err(_) => serde_json::json!({}),
+        };
+        let object = config.as_object_mut().ok_or("Inherited OpenCode configuration must be an object")?;
+        if let Some(plugin) = opencode_plugin {
+            let plugins = object.entry("plugin").or_insert_with(|| serde_json::json!([])).as_array_mut().ok_or("OpenCode plugin configuration must be an array")?;
+            let plugin = serde_json::Value::String(plugin);
+            if !plugins.contains(&plugin) { plugins.push(plugin); }
+        }
+        if let Some(mcp) = opencode_mcp {
+            let mut value: serde_json::Value = serde_json::from_str(&mcp).map_err(|_| "Invalid coordination configuration")?;
+            let major = value.get("major").and_then(|v| v.as_u64()).unwrap_or(1);
+            let server = value.get_mut("server").map(serde_json::Value::take).ok_or("Missing coordination server")?;
+            let mcp = object.entry("mcp").or_insert_with(|| serde_json::json!({})).as_object_mut().ok_or("OpenCode MCP configuration must be an object")?;
+            let servers = if major >= 2 { mcp.entry("servers").or_insert_with(|| serde_json::json!({})).as_object_mut().ok_or("OpenCode MCP servers must be an object")? } else { mcp };
+            if servers.contains_key("atris_workspace") { return Err("The atris_workspace MCP name is already in use".into()); }
+            servers.insert("atris_workspace".into(), server);
+        }
+        command.env("OPENCODE_CONFIG_CONTENT", serde_json::to_string(&config).map_err(|_| "Could not prepare OpenCode configuration")?);
     }
     // Acquire handles before spawn so a handle error cannot orphan a newly started CLI.
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;

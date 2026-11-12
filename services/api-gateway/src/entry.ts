@@ -5,6 +5,7 @@ import { ControlPlaneGrantRegistry } from './control-plane-grants';
 import { installControlPlaneRoutes } from './control-plane-router';
 import { installProjectMemoryRoutes } from './project-memory-routes';
 import { installManualMemoryRoutes } from './manual-memory-routes';
+import { installManualCoordinationRoutes, manualCoordination } from './manual-coordination';
 import {
   emitRuntimeReady,
   gatewayOrigin,
@@ -32,6 +33,7 @@ installControlPlaneRoutes(app, {
   workspaceManager,
   grants,
 });
+installManualCoordinationRoutes(app, manualConversationStore);
 
 const projectMemory = orchestrator.getProjectMemoryService();
 if (projectMemory) {
@@ -46,6 +48,7 @@ function configureBridgeForListeningServer(): string | undefined {
   const address = server.address();
   if (!address || typeof address === 'string') return undefined;
   const origin = gatewayOrigin(address.port);
+  manualCoordination.configure({ endpoint: origin, script: getControlPlaneBridgeScriptPath() });
   configureRuntimeControlPlaneBridge({
     endpoint: origin,
     bridgeScriptPath: getControlPlaneBridgeScriptPath(),
@@ -61,6 +64,7 @@ const clearControlPlane = () => {
   if (controlPlaneCleared) return;
   controlPlaneCleared = true;
   grants.clear();
+  manualCoordination.configure(undefined);
   configureRuntimeControlPlaneBridge(undefined);
 };
 shutdownCoordinator.addCleanup(clearControlPlane);

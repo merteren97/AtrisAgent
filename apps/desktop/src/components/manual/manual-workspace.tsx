@@ -211,6 +211,7 @@ export function ManualWorkspace() {
     try { await invoke('manual_terminal_start', { request }); }
     catch (error) {
       if (request.codexRuntimeId) await apiRequest(`/manual/agents/${target.id}/codex-runtime`, {method:'DELETE', body:JSON.stringify({runtimeId:request.codexRuntimeId})}).catch(() => {});
+      await apiRequest(`/manual/agents/${target.id}/coordination`, {method:'DELETE'}).catch(() => {});
       throw error;
     }
     lifecycleEpoch.current += 1;
@@ -255,6 +256,7 @@ export function ManualWorkspace() {
   });
   const restart = (target: ManualAgent) => void action('restart', async () => {
     await invoke('manual_terminal_close', { id: target.id }); lifecycleEpoch.current += 1; markManualClosed(target.id);
+    await apiRequest(`/manual/agents/${target.id}/coordination`, {method:'DELETE'});
     setStatuses(previous => ({ ...previous, [target.id]: 'closed' })); await launch(target);
   });
   const applyModel = (model: DiscoveredModel, independent: boolean, reasoning?: string): Promise<boolean> => {
@@ -267,6 +269,7 @@ export function ManualWorkspace() {
         await useManualStore.getState().updateModel(agent, model.catalogId, reasoning, Boolean(live));
       } else {
         await invoke('manual_terminal_close', { id: agent.id }); lifecycleEpoch.current += 1; markManualClosed(agent.id);
+        await apiRequest(`/manual/agents/${agent.id}/coordination`, {method:'DELETE'});
         setStatuses(previous => ({ ...previous, [agent.id]: 'closed' }));
         const updated = await useManualStore.getState().updateModel(agent, model.catalogId, reasoning);
         await launch(updated, false);
