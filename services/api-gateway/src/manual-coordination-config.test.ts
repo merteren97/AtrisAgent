@@ -13,6 +13,8 @@ try {
   assert.equal(claude.args[0],'--mcp-config');
   assert(!fs.readFileSync(claude.args[1],'utf8').includes(grant.token));
   assert.equal(claude.env.ATRIS_CONTROL_PLANE_TOKEN,grant.token);
+  const secondClaude = prepareManualCoordination(agent,root,grant);
+  assert.notEqual(secondClaude.args[1],claude.args[1],'Each launch gets its own config file');
   const open1 = prepareManualCoordination({...agent,runtimeType:'opencode'},root,grant,'1.2.3');
   const open2 = prepareManualCoordination({...agent,runtimeType:'opencode'},root,grant,'2.0.0');
   assert.equal(JSON.parse(open1.env.ATRIS_MANUAL_OPENCODE_MCP).server.enabled,true);
@@ -23,5 +25,7 @@ try {
   const config = fs.readFileSync(path.join(anti.args[1],'.agents','mcp_config.json'),'utf8');
   assert(!config.includes(grant.token),'The grant must not be saved in the MCP config');
   assert.deepEqual(JSON.parse(config).mcpServers.atris_workspace.args,[grant.script]);
+  const secondAnti = prepareManualCoordination({...agent,runtimeType:'antigravity'},root,grant);
+  assert.notEqual(secondAnti.args[1],anti.args[1],'Each launch gets its own config directory');
   console.log('Manual provider coordination config passed');
 } finally { fs.rmSync(root,{recursive:true,force:true}); }

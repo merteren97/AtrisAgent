@@ -19,6 +19,8 @@ try {
   assert(!JSON.stringify(call(a.token,'workspace_get_state')).includes('private message'),'Workspace state does not expose other agents’ messages');
   assert.match(JSON.stringify(call(b.token,'workspace_read_messages')),/private message/);
   assert.throws(() => call('invalid', 'workspace_get_state'), /Invalid or expired/);
+  assert.throws(() => coordination.call('Bearer ' + ' '.repeat(100_000) + a.token,'heartbeat',{}), /Invalid or expired/);
+  assert.throws(() => coordination.call(`Bearer ${a.token}extra`,'heartbeat',{}), /Invalid or expired/);
   assert.throws(() => coordination.issue({id:'a',cwd:root,name:'A',runtimeType:'codex'}), /already has an active/);
   const claimId = (snapshot.claims[0] as {id?:string}).id!;
   assert.equal(coordination.live.clear(root,claimId),true);

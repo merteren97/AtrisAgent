@@ -43,7 +43,7 @@ export class ManualCoordination {
   }
 
   call(header: string | undefined, tool: string, args: Record<string, any>): unknown {
-    const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const token = header?.length === 50 ? /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(header)?.[1] : undefined;
     const key = token ? hash(token) : '';
     const grant = this.grants.get(key);
     if (!grant || grant.expiresAt <= Date.now()) { this.grants.delete(key); throw Object.assign(new Error('Invalid or expired coordination grant.'), {status: 401}); }

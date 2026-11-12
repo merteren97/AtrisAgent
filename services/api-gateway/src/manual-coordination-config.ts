@@ -20,13 +20,10 @@ export function prepareManualCoordination(agent: ManualAgent, dataDir: string, g
     const stat = fs.lstatSync(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('Coordination directory must be an ordinary directory.');
   }
-  const write = (filename:string, contents:unknown) => {
-    if (fs.existsSync(filename) && fs.lstatSync(filename).isSymbolicLink()) throw new Error('Coordination config cannot be a symbolic link.');
-    fs.writeFileSync(filename,JSON.stringify(contents),{mode:0o600});
-  };
   if (agent.runtimeType === 'claude_code') {
-    const filename = path.join(directory,'claude-mcp.json');
-    write(filename,{mcpServers:{atris_workspace:server}});
+    const configDir = fs.mkdtempSync(path.join(directory,'claude-'));
+    const filename = path.join(configDir,'claude-mcp.json');
+    fs.writeFileSync(filename,JSON.stringify({mcpServers:{atris_workspace:server}}),{mode:0o600,flag:'wx'});
     return {env,args:['--mcp-config',filename]};
   }
   if (agent.runtimeType === 'opencode') {
@@ -35,14 +32,13 @@ export function prepareManualCoordination(agent: ManualAgent, dataDir: string, g
     return {env,args:[]};
   }
   if (agent.runtimeType === 'antigravity') {
-    const agents = path.join(directory,'.agents');
-    if (!fs.existsSync(agents)) fs.mkdirSync(agents,{mode:0o700});
-    const stat = fs.lstatSync(agents);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('Coordination config directory must be an ordinary directory.');
-    write(path.join(agents,'mcp_config.json'),{mcpServers:{atris_workspace:server}});
+    const configDir = fs.mkdtempSync(path.join(directory,'antigravity-'));
+    const agents = path.join(configDir,'.agents');
+    fs.mkdirSync(agents,{mode:0o700});
+    fs.writeFileSync(path.join(agents,'mcp_config.json'),JSON.stringify({mcpServers:{atris_workspace:server}}),{mode:0o600,flag:'wx'});
     // The actual CLI working directory remains the project. Antigravity loads
     // the additional workspace's MCP config without changing the project root.
-    return {env,args:['--add-dir',directory]};
+    return {env,args:['--add-dir',configDir]};
   }
   throw new Error('This provider does not support manual coordination.');
 }

@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawn, execFile} from 'node:child_process';
-import {once} from 'node:events';
 import express from 'express';
 import { installManualCoordinationCallRoute, manualCoordination } from './manual-coordination';
 import { prepareManualCoordination } from './manual-coordination-config';
@@ -19,7 +18,8 @@ async function run() {
   let requests = 0;
   const app = express(); app.use('/api/internal/manual-coordination/call',(_req,_res,next) => {requests += 1; next();});
   installManualCoordinationCallRoute(app,express.json({limit:'32kb'}));
-  const server = app.listen(0,'127.0.0.1'); await once(server,'listening');
+  let server!: ReturnType<typeof app.listen>;
+  await new Promise<void>((resolve,reject) => { server = app.listen(0,'127.0.0.1',error => error ? reject(error) : resolve()); });
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Missing listener address');
   const endpoint = `http://127.0.0.1:${address.port}`;

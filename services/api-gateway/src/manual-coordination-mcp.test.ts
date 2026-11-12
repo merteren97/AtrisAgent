@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { once } from 'node:events';
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -12,8 +11,8 @@ async function run() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(),'atris-mcp-integration-'));
   const app = express();
   installManualCoordinationCallRoute(app,express.json({limit:'32kb'}));
-  const server = app.listen(0,'127.0.0.1');
-  await once(server,'listening');
+  let server!: ReturnType<typeof app.listen>;
+  await new Promise<void>((resolve,reject) => { server = app.listen(0,'127.0.0.1',error => error ? reject(error) : resolve()); });
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Missing server address');
   const endpoint = `http://127.0.0.1:${address.port}`;
