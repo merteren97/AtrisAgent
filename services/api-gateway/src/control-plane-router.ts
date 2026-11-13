@@ -4,6 +4,8 @@ import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import type { CoordinationMCP } from '@atris-agent-code/coordination-mcp';
 import { ControlPlaneGrantRegistry, type ControlPlaneGrant } from './control-plane-grants';
+import { createHash } from 'node:crypto';
+import type { ManualIntegrationGateway } from './manual-integration-gateway';
 
 const VALID_ROLES = new Set<AgentRole>(['orchestrator', 'builder', 'reviewer', 'researcher', 'qa']);
 const MESSAGE_KINDS = new Set<NonNullable<AgentMessage['kind']>>(['message', 'handoff', 'review_request', 'summary']);
@@ -23,6 +25,7 @@ export interface ControlPlaneServices {
   eventBus: LocalEventBus;
   workspaceManager: WorkspaceManager;
   grants: ControlPlaneGrantRegistry;
+  integrations?: ManualIntegrationGateway;
 }
 
 interface AgentView {
@@ -334,6 +337,13 @@ export function installControlPlaneRoutes(app: Express, services: ControlPlaneSe
     try {
       const tool = String(req.body?.tool || '');
       const args = req.body?.arguments && typeof req.body.arguments === 'object' ? req.body.arguments : {};
+      if (tool === 'integration_list' || tool === 'integration_call') {
+        if (!services.integrations) return void res.status(503).json({ok:false,error:'Integration service unavailable.'});
+        const sessionKey = createHash('sha256').update(req.headers.authorization || '').digest('hex');
+        const identity = {agentId:grant.agentInstanceId,cwd:grant.missionId,sessionKey,expiresAt:Date.parse(grant.expiresAt)};
+        const result = tool === 'integration_list' ? await services.integrations.list(identity) : await services.integrations.call(identity,args.name,args.arguments);
+        return void res.json({ok:true,result});
+      }
       const result = await dispatchControlPlaneTool(services, grant, tool, args);
       res.json({ ok: true, result });
     } catch (error: any) {

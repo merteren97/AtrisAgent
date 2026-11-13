@@ -31,8 +31,8 @@ if(m.id!==undefined&&m.method)send({id:m.id,result:{}});
 const sessions = new ManualCodexSessions();
 const sockets: WebSocket[] = [];
 let next = 0;
-async function open(id: string, coordination?: {endpoint:string;script:string;token:string}) {
-  const endpoint = await sessions.create(id, {executable:process.execPath, cwd:root, env:{}, mode:'ask-for-approval', onThread:() => {}, coordination});
+async function open(id: string, coordination?: {endpoint:string;script:string;token:string}, playwright?: {command:string;args:string[]}) {
+  const endpoint = await sessions.create(id, {executable:process.execPath, cwd:root, env:{}, mode:'ask-for-approval', onThread:() => {}, coordination, playwright});
   const socket = new WebSocket(endpoint.url, {headers:{Authorization:`Bearer ${endpoint.token}`}}); sockets.push(socket);
   await once(socket, 'open');
   const pending = new Map<number, (message: any) => void>();
@@ -52,6 +52,11 @@ try {
   assert.equal(startup.token,'scoped-token'); assert.equal(startup.manual,'1'); assert.equal(startup.runtimeToken,undefined);
   assert(startup.args.some((arg:string) => arg.includes('mcp_servers.atris_workspace.command')));
   assert(!startup.args.some((arg:string) => arg.includes('scoped-token')),'Grant must not be placed in argv');
+  const browser = await open('browser',undefined,{command:process.execPath,args:['C:\\test path\\cli.js','--isolated']});
+  const browserStartup = await browser.rpc('fixture/startup');
+  assert(browserStartup.args.includes(`mcp_servers.atris_playwright.command=${JSON.stringify(process.execPath)}`));
+  assert(browserStartup.args.includes(`mcp_servers.atris_playwright.args=${JSON.stringify(['C:\\test path\\cli.js','--isolated'])}`));
+  assert(!startup.args.some((arg:string) => arg.includes('mcp_servers.atris_playwright')), 'Other sessions retain independent MCP configuration');
   const unauthorized = new WebSocket(a.endpoint.url); let rejected=false;
   unauthorized.on('error', () => {rejected=true;}); await new Promise(resolve => unauthorized.once('close',resolve)); assert.equal(rejected,true);
   const initial=a.session.status();

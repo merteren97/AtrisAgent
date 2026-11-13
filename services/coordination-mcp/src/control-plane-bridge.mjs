@@ -166,7 +166,16 @@ const manualTools = [
   {name:'workspace_send_message',description:'Send a brief message to an agent, or broadcast to the workspace.',inputSchema:{type:'object',properties:{toAgentId:{type:'string'},body:{type:'string'}},required:['body']}},
   {name:'workspace_read_messages',description:'Read unread coordination messages for your session.',inputSchema:{type:'object',properties:{}}},
 ];
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: manual ? manualTools : tools }));
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  try {
+    const response = await fetch(`${origin}${manual ? '/api/internal/manual-coordination/call' : '/api/internal/control-plane/call'}`, {
+      method:'POST', headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json',...(runtimeToken ? {'X-Atris-Runtime-Token':runtimeToken} : {})},
+      body:JSON.stringify({tool:'integration_list'}), signal:AbortSignal.timeout(8_000),
+    });
+    const payload = await response.json();
+    return { tools: [...(manual ? manualTools : tools), ...(response.ok && Array.isArray(payload?.result) ? payload.result : [])] };
+  } catch { return { tools: manual ? manualTools : tools }; }
+});
 
 async function manualHeartbeat() {
   try {
@@ -181,7 +190,7 @@ if (manual) {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
+  const timer = setTimeout(() => controller.abort(), request.params.name.startsWith('github__') ? 65_000 : 30_000);
   try {
     const response = await fetch(`${origin}${manual ? '/api/internal/manual-coordination/call' : '/api/internal/control-plane/call'}`, {
       method: 'POST',
@@ -190,10 +199,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         'Content-Type': 'application/json',
         ...(runtimeToken ? { 'X-Atris-Runtime-Token': runtimeToken } : {}),
       },
-      body: JSON.stringify({
-        tool: request.params.name,
-        arguments: request.params.arguments || {},
-      }),
+      body: JSON.stringify(request.params.name.startsWith('github__')
+        ? { tool:'integration_call', arguments:{name:request.params.name,arguments:request.params.arguments || {}} }
+        : { tool:request.params.name, arguments:request.params.arguments || {} }),
       signal: controller.signal,
     });
     const payload = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
@@ -203,6 +211,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{ type: 'text', text: JSON.stringify({ error: payload?.error || `HTTP ${response.status}` }) }],
       };
     }
+    if (request.params.name.startsWith('github__')) return payload.result;
     return {
       content: [{ type: 'text', text: JSON.stringify(payload.result ?? null, null, 2) }],
     };

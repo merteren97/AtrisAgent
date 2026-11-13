@@ -4,7 +4,7 @@ import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
 import { DEFAULT_TEAM_TEMPLATE_ID, normalizeStoredTeamTemplateId } from '@/lib/team-template-utils';
 import { normalizeColorPalette, type ColorPalette } from '@/lib/theme-palettes';
 
-export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts';
+export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts' | 'integrations';
 export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate';
 export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' | 'checks' | 'memory' | 'artifacts' | 'activity';
 export type CloseBehavior = 'quit' | 'tray';

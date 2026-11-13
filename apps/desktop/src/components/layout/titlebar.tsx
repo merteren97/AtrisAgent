@@ -57,6 +57,7 @@ export function Titlebar() {
   const viewTitle = activeView === 'dashboard' ? 'Command Center'
     : activeView === 'projects' ? 'Projects'
       : activeView === 'agents' ? 'Teams & specialists'
+        : activeView === 'integrations' ? 'Integrations'
         : activeView === 'accounts' ? 'Accounts'
           : activeView === 'settings' ? 'Settings'
             : manual.mode === 'choose' ? 'Workspace overview' : manual.mode === 'manual' ? 'Manual workspace' : activeMission?.title || 'New orchestrated conversation';

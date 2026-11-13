@@ -56,6 +56,10 @@ import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation }
 import { installManualConversations } from './manual-conversations';
 import { AttachmentStore, installAttachmentRoutes } from './attachments';
 import { registerOrchestratorInteractions } from './orchestrator-interactions';
+import { installIntegrationConnectionRoutes } from './integration-connections';
+import { installGithubConnectionRoutes } from './github-connection';
+import { installEditorMcpRoutes } from './editor-mcp-connections';
+import { installUnityCliRoutes } from './unity-cli-connection';
 
 import path from 'path';
 import fs from 'fs';
@@ -521,6 +525,10 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
 // boundary for every request.
 installRuntimeShutdownRoute(app, RUNTIME_TOKEN, shutdownCoordinator);
 installAuthRoutes(app, authService, RUNTIME_TOKEN);
+installIntegrationConnectionRoutes(app, sqlite);
+installEditorMcpRoutes(app, sqlite);
+installUnityCliRoutes(app, sqlite);
+installGithubConnectionRoutes(app);
 export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 installAttachmentRoutes(app, attachmentStore, (workspaceId) => isDeletionFenced('workspace', workspaceId));
 export const orchestratorInteractions = registerOrchestratorInteractions(app, { sqlite, eventBus, runtimeHost });

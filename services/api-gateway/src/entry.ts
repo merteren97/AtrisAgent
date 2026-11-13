@@ -6,6 +6,9 @@ import { installControlPlaneRoutes } from './control-plane-router';
 import { installProjectMemoryRoutes } from './project-memory-routes';
 import { installManualMemoryRoutes } from './manual-memory-routes';
 import { installManualCoordinationRoutes, manualCoordination } from './manual-coordination';
+import { IntegrationBroker } from './integration-broker';
+import { ManualIntegrationGateway } from './manual-integration-gateway';
+import { readGithubCliToken } from './github-connection';
 import {
   emitRuntimeReady,
   gatewayOrigin,
@@ -26,12 +29,16 @@ const coordination = new CoordinationMCP({
   workspacePath: process.cwd(),
 });
 const grants = new ControlPlaneGrantRegistry();
+const manualIntegrations = new ManualIntegrationGateway(new IntegrationBroker(async call => call.integrationId === 'github'), readGithubCliToken);
+const missionIntegrations = new ManualIntegrationGateway(new IntegrationBroker(async call => call.integrationId === 'github'), readGithubCliToken);
+manualCoordination.setIntegrationGateway(manualIntegrations);
 
 installControlPlaneRoutes(app, {
   coordination,
   eventBus,
   workspaceManager,
   grants,
+  integrations: missionIntegrations,
 });
 installManualCoordinationRoutes(app, manualConversationStore);
 
@@ -54,7 +61,7 @@ function configureBridgeForListeningServer(): string | undefined {
     bridgeScriptPath: getControlPlaneBridgeScriptPath(),
     runtimeToken,
     issueGrant: (context) => grants.issue(context),
-    revokeAgent: (agentInstanceId) => grants.revokeAgent(agentInstanceId),
+    revokeAgent: (agentInstanceId) => { grants.revokeAgent(agentInstanceId); void missionIntegrations.revokeAgent(agentInstanceId).catch(() => undefined); },
   });
   return origin;
 }
@@ -68,6 +75,8 @@ const clearControlPlane = () => {
   configureRuntimeControlPlaneBridge(undefined);
 };
 shutdownCoordinator.addCleanup(clearControlPlane);
+shutdownCoordinator.addCleanup(async () => { manualCoordination.setIntegrationGateway(undefined); await manualIntegrations.closeAll(); });
+shutdownCoordinator.addCleanup(async () => { await missionIntegrations.closeAll(); });
 
 const stopParentWatchdog = startParentWatchdog({
   onParentExit: () => { void shutdownCoordinator.shutdown('parent-exit'); },
