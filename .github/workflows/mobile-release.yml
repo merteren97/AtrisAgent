@@ -35,6 +35,7 @@ jobs:
           cache: npm
       - run: npm ci --include=dev --include=optional --no-audit --no-fund
       - run: node --test .github/scripts/mobile-release-version.test.mjs
+      - run: node --test .github/scripts/configure-mobile-android-signing.test.mjs
       - id: version
         run: node .github/scripts/mobile-release-version.mjs
       - run: npm run build -w @atris-agent-code/mobile
