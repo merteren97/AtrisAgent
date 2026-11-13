@@ -87,13 +87,10 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/mobile-release.jks
         run: |
           set -euo pipefail
-          test -n "$ANDROID_KEY_BASE64" && test -n "$ANDROID_KEY_ALIAS" && test -n "$ANDROID_KEY_PASSWORD" && test -n "$ANDROID_KEYSTORE_PASSWORD"
-          printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/mobile-release.jks"
-          chmod 600 "$RUNNER_TEMP/mobile-release.jks"
-          umask 077
-          printf 'keyAlias=%s\npassword=%s\nstorePassword=%s\nstoreFile=%s\n' "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" "$ANDROID_KEYSTORE_PASSWORD" "$RUNNER_TEMP/mobile-release.jks" > apps/mobile/src-tauri/gen/android/keystore.properties
+          node .github/scripts/prepare-mobile-android-signing.mjs
           node .github/scripts/configure-mobile-android-signing.mjs
       # Tauri creates tauri.settings.gradle and the Rust/Gradle bridge during
       # android build. Calling Gradle directly before this step is invalid.
