@@ -21,8 +21,10 @@ test('configures release signing without duplicating existing Gradle imports', a
         const result = await readFile(path.join(root, target), 'utf8');
         assert.equal((result.match(/^import java\.util\.Properties$/gm) || []).length, imports.includes('java.util.Properties') ? 1 : 0);
         assert.equal((result.match(/^import java\.io\.FileInputStream$/gm) || []).length, imports.includes('java.io.FileInputStream') ? 1 : 0);
-        assert.match(result, /val properties = java\.util\.Properties\(\)/);
-        assert.match(result, /properties\.load\(java\.io\.FileInputStream\(rootProject\.file\("keystore\.properties"\)\)\)/);
+        assert.match(result, /^import java\.util\.Properties as AtrisSigningProperties$/m);
+        assert.match(result, /^import java\.io\.FileInputStream as AtrisSigningFileInputStream$/m);
+        assert.match(result, /val properties = AtrisSigningProperties\(\)/);
+        assert.match(result, /properties\.load\(AtrisSigningFileInputStream\(rootProject\.file\("keystore\.properties"\)\)\)/);
         assert.equal((result.match(/signingConfig = signingConfigs\.getByName\("release"\)/g) || []).length, 1);
         assert.throws(() => execFileSync(process.execPath, [script], { cwd: root, stdio: 'pipe' }));
       }
