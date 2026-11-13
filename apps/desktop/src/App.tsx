@@ -34,6 +34,7 @@ const RUNTIME_HEALTH_INTERVAL_MS = 8_000;
 const AnalyticsDashboard = lazy(() => import('@/components/analytics/Dashboard').then((module) => ({ default: module.AnalyticsDashboard })));
 const SettingsView = lazy(() => import('@/components/settings/SettingsView').then((module) => ({ default: module.SettingsView })));
 const AccountsView = lazy(() => import('@/components/accounts/AccountsView').then((module) => ({ default: module.AccountsView })));
+const IntegrationsView = lazy(() => import('@/components/integrations/IntegrationsView').then((module) => ({ default: module.IntegrationsView })));
 const AgentsView = lazy(() => import('@/components/agents/AgentsView').then((module) => ({ default: module.AgentsView })));
 const ProjectsView = lazy(() => import('@/components/projects/ProjectsView').then((module) => ({ default: module.ProjectsView })));
 const DeveloperConsole = lazy(() => import('@/components/developer/DeveloperConsole').then((module) => ({ default: module.DeveloperConsole })));
@@ -175,8 +176,10 @@ function WorkspaceApp() {
                  <AnalyticsDashboard />
                ) : activeView === 'settings' ? (
                  <SettingsView />
-               ) : activeView === 'accounts' ? (
-                 <AccountsView />
+                ) : activeView === 'accounts' ? (
+                  <AccountsView />
+                ) : activeView === 'integrations' ? (
+                  <IntegrationsView />
                ) : activeView === 'agents' ? (
                  <AgentsView />
                ) : activeView === 'projects' ? (

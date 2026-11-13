@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { Express, Request, Response } from 'express';
 import { LiveWorkspaceCoordination } from './live-workspace-coordination';
 import type { ManualConversationStore } from './manual-conversations';
+import type { ManualIntegrationGateway, ManualIntegrationIdentity } from './manual-integration-gateway';
 
 type Grant = { agentId: string; session?: string; cwd: string; name: string; provider: string; expiresAt: number; windowStart: number; requests: number };
 type Configuration = { endpoint: string; script: string };
@@ -11,6 +12,10 @@ export class ManualCoordination {
   readonly live = new LiveWorkspaceCoordination();
   private grants = new Map<string, Grant>();
   private configuration?: Configuration;
+  private integrations?: ManualIntegrationGateway;
+
+  setIntegrationGateway(gateway?: ManualIntegrationGateway): void { this.integrations = gateway; }
+  integrationGateway(): ManualIntegrationGateway | undefined { return this.integrations; }
 
   configure(configuration?: Configuration): void { this.configuration = configuration; if (!configuration) { this.grants.clear(); this.live.clearState(); } }
   isConfigured(): boolean { return Boolean(this.configuration); }
@@ -31,6 +36,7 @@ export class ManualCoordination {
     for (const [key, grant] of this.grants) if (grant.agentId === agentId) {
       if (grant.session) try { this.live.leave(grant.agentId, grant.session); } catch { /* Already expired. */ }
       this.grants.delete(key);
+      void this.integrations?.revoke(key).catch(() => undefined);
     }
   }
 
@@ -40,9 +46,10 @@ export class ManualCoordination {
     if (!grant) return;
     if (grant.session) try { this.live.leave(grant.agentId, grant.session); } catch { /* Already expired. */ }
     this.grants.delete(key);
+    void this.integrations?.revoke(key).catch(() => undefined);
   }
 
-  call(header: string | undefined, tool: string, args: Record<string, any>): unknown {
+  private authorize(header: string | undefined): {key:string; grant:Grant} {
     const token = header?.length === 50 ? /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(header)?.[1] : undefined;
     const key = token ? hash(token) : '';
     const grant = this.grants.get(key);
@@ -50,6 +57,16 @@ export class ManualCoordination {
     const now = Date.now();
     if (now - grant.windowStart >= 60_000) { grant.windowStart = now; grant.requests = 0; }
     if (++grant.requests > 240) throw Object.assign(new Error('Coordination rate limit exceeded.'), {status: 429});
+    return {key,grant};
+  }
+
+  integrationIdentity(header: string | undefined): ManualIntegrationIdentity {
+    const {key,grant} = this.authorize(header);
+    return {agentId:grant.agentId,cwd:grant.cwd,sessionKey:key,expiresAt:grant.expiresAt};
+  }
+
+  call(header: string | undefined, tool: string, args: Record<string, any>): unknown {
+    const {grant} = this.authorize(header);
     const agentId = grant.agentId;
     if (!grant.session) grant.session = this.live.join(grant.cwd, agentId, grant.name, grant.provider);
     const session = grant.session;
@@ -75,10 +92,21 @@ const route = (fn: (req: Request, res: Response) => unknown) => (req: Request, r
 /** This endpoint accepts only an agent-scoped grant, not the desktop token. */
 export function installManualCoordinationCallRoute(app: Express, jsonParser: any): void {
   app.use('/api/internal/manual-coordination/call', jsonParser);
-  app.post('/api/internal/manual-coordination/call', route((req, res) => {
+  app.post('/api/internal/manual-coordination/call', async (req, res) => {
     if (req.headers.origin) return void res.status(403).json({error:'Browser requests are not accepted.'});
-    res.json({result: manualCoordination.call(req.headers.authorization, String(req.body?.tool || ''), req.body?.arguments || {})});
-  }));
+    try {
+      const tool = String(req.body?.tool || '');
+      if (tool === 'integration_list' || tool === 'integration_call') {
+        const identity = manualCoordination.integrationIdentity(req.headers.authorization);
+        const gateway = manualCoordination.integrationGateway();
+        if (!gateway) return void res.status(503).json({error:'Integration service unavailable.'});
+        const args = req.body?.arguments || {};
+        const result = tool === 'integration_list' ? await gateway.list(identity) : await gateway.call(identity,args.name,args.arguments);
+        return void res.json({result});
+      }
+      res.json({result: manualCoordination.call(req.headers.authorization, tool, req.body?.arguments || {})});
+    } catch (error:any) { res.status(error.status || 400).json({error:error.message || 'Coordination failed.'}); }
+  });
 }
 
 export function installManualCoordinationRoutes(app: Express, store: ManualConversationStore): void {

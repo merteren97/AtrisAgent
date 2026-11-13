@@ -187,7 +187,8 @@ export function createClaudeMcpConfig(session?: PreparedControlPlaneSession): { 
 }
 
 export function claudeAllowedMcpTools(): string[] {
-  return ATRIS_MCP_ALLOWED_TOOLS.map((tool) => `mcp__${ATRIS_MCP_SERVER_NAME}__${tool}`);
+  const readOnlyGithub = ['get_me','get_file_contents','search_repositories','search_code','search_issues','search_pull_requests','list_issues','issue_read','list_pull_requests','pull_request_read','list_branches','list_commits','get_commit','get_label','list_tags','get_tag','list_releases','get_latest_release','get_release_by_tag'];
+  return [...ATRIS_MCP_ALLOWED_TOOLS.map((tool) => `mcp__${ATRIS_MCP_SERVER_NAME}__${tool}`), ...readOnlyGithub.map(tool => `mcp__${ATRIS_MCP_SERVER_NAME}__github__${tool}`)];
 }
 
 export function opencodeControlPlaneConfig(session: PreparedControlPlaneSession | undefined, version?: string): string | undefined {

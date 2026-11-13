@@ -15,6 +15,7 @@ import { useAccountStore } from '@/stores/account-store';
 import { AGENT_ROLES, parseAgentDirective } from '@/lib/agent-directive';
 import { resolveOrchestratorRoute } from '@/lib/orchestrator-route';
 import { cn } from '@/lib/utils';
+import { IntegrationMentionOptions, matchingIntegrationMentions, useConnectedIntegrationMentions } from '@/components/integrations/integration-mentions';
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'blocked']);
 const COMMANDS = [{ id: 'plan', label: 'Plan without launching workers' }, { id: 'agent', label: 'Delegate a focused task' }, { id: 'review', label: 'Request a focused review' }, { id: 'summarize', label: 'Summarize the current work' }];
@@ -31,6 +32,8 @@ export function ChatComposer() {
   const [saveNotice, setSaveNotice] = useState('');
   const [delivery, setDelivery] = useState<TurnDelivery>('queue');
   const [picker, setPicker] = useState<'mention' | 'command' | null>(null);
+  const integrations = useConnectedIntegrationMentions(picker === 'mention');
+  const [integrationNotice, setIntegrationNotice] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const { missions, loading, pendingMissionStart, composerInput, setComposerInput, queuedTurns, error } = useMissionStore();
   const { discoveredModels, serviceOnline } = useAccountStore();
@@ -41,7 +44,7 @@ export function ChatComposer() {
   const route = useMemo(() => resolveOrchestratorRoute(directive, preferences, discoveredModels), [directive, preferences, discoveredModels]);
   const hasModel = discoveredModels.some(model => model.available && (!model.suitableRoles.length || model.suitableRoles.some(role => role.toLowerCase() === 'orchestrator')));
   const selectedSpecialists = Object.values(preferences.agentProfileIds).filter(Boolean).length;
-  const filter = message.match(/@(\w*)$/)?.[1]?.toLowerCase() || '';
+  const filter = message.match(/@([\w-]*)$/)?.[1]?.toLowerCase() || '';
   const commandFilter = message.match(/^\/(\w*)$/)?.[1]?.toLowerCase() || '';
   const queued = queuedTurns.filter(turn => turn.missionId === missionId).length;
   const resize = () => {
@@ -49,7 +52,7 @@ export function ChatComposer() {
     if (input) { input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 170)}px`; }
   };
   useEffect(() => { resize(); }, [message, scopeKey]);
-  useEffect(() => { setPicker(null); setLocalError(null); setSaveNotice(''); setDelivery('queue'); }, [scopeKey]);
+  useEffect(() => { setPicker(null); setLocalError(null); setSaveNotice(''); setDelivery('queue'); setIntegrationNotice(false); }, [scopeKey]);
   useEffect(() => {
     if (!composerInput) return;
     setMessage(composerInput); setComposerInput('');
@@ -87,18 +90,22 @@ export function ChatComposer() {
       if (prefStore.drafts[submittedKey] === submittedMessage) prefStore.setDraft(submittedKey, '');
       attachmentState.clearFiles();
       setPicker(null);
+      setIntegrationNotice(false);
     } catch (cause) {
       setLocalError(cause instanceof Error ? cause.message : 'Message could not be delivered. Your draft and attachments are retained.');
     } finally { setSending(false); }
   };
-  const chooseMention = (role: string) => { setMessage(message.replace(/@\w*$/, `@${role} `)); setPicker(null); textareaRef.current?.focus(); };
+  const chooseMention = (role: string) => { setMessage(message.replace(/@[\w-]*$/, `@${role} `)); setPicker(null); textareaRef.current?.focus(); };
+  const chooseIntegration = (mention: string) => { chooseMention(mention); setIntegrationNotice(mention !== 'github'); };
   const chooseCommand = (command: string) => { setMessage(message.replace(/^\/\w*$/, `/${command} `)); setPicker(null); textareaRef.current?.focus(); };
   const keyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Escape' && picker) { setPicker(null); return; }
     if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) return;
     event.preventDefault();
     const role = AGENT_ROLES.find(value => value.toLowerCase().includes(filter));
     const command = COMMANDS.find(value => value.id.includes(commandFilter));
     if (picker === 'mention' && role) chooseMention(role);
+    else if (picker === 'mention') { const match = matchingIntegrationMentions(integrations.items, filter)[0]; if (match) chooseIntegration(match.mention); }
     else if (picker === 'command' && command) chooseCommand(command.id);
     else void submit();
   };
@@ -110,10 +117,10 @@ export function ChatComposer() {
       <div className={cn('relative rounded-xl border bg-card px-3 pb-2 pt-3 transition-colors focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/10', dragging ? 'border-primary bg-primary/5' : 'border-border')} onDragOver={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); if (!locked) setDragging(true); } }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); if (!locked) attachmentState.addFiles(Array.from(event.dataTransfer.files)); }}>
         {dragging && <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-background/95 text-sm font-medium">Drop files into this conversation</div>}
         {picker && <div className="absolute bottom-full left-0 z-20 mb-2 w-[min(300px,calc(100vw-2rem))] rounded-lg border border-border bg-popover p-1 shadow-lg">
-          {picker === 'mention' ? AGENT_ROLES.filter(role => role.toLowerCase().includes(filter)).map(role => <button key={role} type="button" onClick={() => chooseMention(role)} className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-xs hover:bg-accent"><AtSign className="h-3.5 w-3.5" />{role}</button>) : COMMANDS.filter(command => command.id.includes(commandFilter)).map(command => <button key={command.id} type="button" onClick={() => chooseCommand(command.id)} className="block w-full rounded-md px-3 py-2 text-left hover:bg-accent"><span className="block text-xs font-medium">/{command.id}</span><span className="text-xs text-muted-foreground">{command.label}</span></button>)}
+          {picker === 'mention' ? <>{AGENT_ROLES.filter(role => role.toLowerCase().includes(filter)).map(role => <button key={role} type="button" onClick={() => chooseMention(role)} className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-xs hover:bg-accent"><AtSign className="h-3.5 w-3.5" />{role}</button>)}<IntegrationMentionOptions {...integrations} query={filter} onSelect={chooseIntegration} /></> : COMMANDS.filter(command => command.id.includes(commandFilter)).map(command => <button key={command.id} type="button" onClick={() => chooseCommand(command.id)} className="block w-full rounded-md px-3 py-2 text-left hover:bg-accent"><span className="block text-xs font-medium">/{command.id}</span><span className="text-xs text-muted-foreground">{command.label}</span></button>)}
         </div>}
         <OrchestratorAttachmentTray files={attachmentState.files} onRemove={attachmentState.removeFile} />
-        <textarea ref={textareaRef} aria-label="Mission message" rows={1} value={message} disabled={locked} placeholder={!workspaceId ? 'Open a project to begin…' : busy ? 'Add a follow-up or guide the current work…' : 'Describe your goal. AtrisAgent will assemble the right team…'} onChange={event => { const value = event.target.value; setMessage(value); setPicker(/@\w*$/.test(value) ? 'mention' : /^\/\w*$/.test(value) ? 'command' : null); setLocalError(null); }} onKeyDown={keyDown} onPaste={event => { const files = Array.from(event.clipboardData.files); if (files.length && !locked) { event.preventDefault(); attachmentState.addFiles(files); } }} className="block max-h-[170px] min-h-[48px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 outline-none placeholder:text-muted-foreground disabled:opacity-60" />
+        <textarea ref={textareaRef} aria-label="Mission message" rows={1} value={message} disabled={locked} placeholder={!workspaceId ? 'Open a project to begin…' : busy ? 'Add a follow-up or guide the current work…' : 'Describe your goal. AtrisAgent will assemble the right team…'} onChange={event => { const value = event.target.value; setMessage(value); setPicker(/(?:^|\s)@([\w-]*)$/.test(value) ? 'mention' : /^\/\w*$/.test(value) ? 'command' : null); setLocalError(null); }} onKeyDown={keyDown} onPaste={event => { const files = Array.from(event.clipboardData.files); if (files.length && !locked) { event.preventDefault(); attachmentState.addFiles(files); } }} className="block max-h-[170px] min-h-[48px] w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 outline-none placeholder:text-muted-foreground disabled:opacity-60" />
         <input ref={fileRef} type="file" multiple tabIndex={-1} className="hidden" aria-label="Attach files" onChange={event => { attachmentState.addFiles(Array.from(event.target.files || [])); event.target.value = ''; }} />
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-border pt-2">
           <div className="flex items-center gap-0.5"><Button type="button" variant="ghost" size="icon" aria-label="Attach files" className="h-8 w-8 text-muted-foreground" disabled={locked} onClick={() => fileRef.current?.click()}><Paperclip className="h-4 w-4" /></Button><Button variant="ghost" size="icon" aria-label="Target a specialist" className="h-8 w-8 text-muted-foreground" disabled={locked} onClick={() => { setMessage(`${message}${message ? ' ' : ''}@`); setPicker('mention'); textareaRef.current?.focus(); }}><AtSign className="h-4 w-4" /></Button><Button variant="ghost" size="icon" aria-label="Mission commands" className="hidden h-8 w-8 text-muted-foreground sm:flex" disabled={locked} onClick={() => { setMessage('/'); setPicker('command'); textareaRef.current?.focus(); }}><Terminal className="h-4 w-4" /></Button></div>
@@ -129,6 +136,7 @@ export function ChatComposer() {
         {busy ? <select aria-label="Message delivery" className="h-7 max-w-full rounded-md border border-input bg-background px-2 text-xs" value={delivery} onChange={event => setDelivery(event.target.value as TurnDelivery)}><option value="queue">Queue for next turn</option><option value="steer">Guide current work</option><option value="stop_and_replan">Stop and replan</option></select> : <span className="hidden text-[11px] text-muted-foreground sm:inline">Enter to send · Shift+Enter for a new line</span>}
       </div>
       {visibleError && <p role="alert" className="mt-2 break-words text-xs text-destructive">{visibleError}</p>}
+      {integrationNotice && <p role="status" className="mt-2 text-xs text-muted-foreground">Integration tool access is not yet available in chat; the mention is text only.</p>}
       {(!serviceOnline || !hasModel) && <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>{!serviceOnline ? 'Connecting to the local service…' : 'Connect a compatible model to start.'}</span><Button variant="link" size="sm" className="h-6 text-xs" onClick={() => useSettingsStore.getState().setActiveView('accounts')}>Connections</Button></div>}
       {busy && delivery === 'steer' && <p className="mt-1 text-[11px] text-muted-foreground">Guidance reaches the next safe boundary. Attachments start a new turn; other settings apply to queued work.</p>}
       {pendingMissionStart && <p role="status" className="mt-2 text-xs text-muted-foreground">Checking durable start acceptance before another request can be sent…</p>}

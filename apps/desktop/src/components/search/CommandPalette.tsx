@@ -4,7 +4,7 @@ import { useSettingsStore } from '@/stores/settings-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useMissionStore } from '@/stores/mission-store';
 import { useManualStore } from '@/stores/manual-store';
-import { Search, FolderGit2, Activity, Settings, Bot, Folder, File } from 'lucide-react';
+import { Search, FolderGit2, Activity, Settings, Bot, Folder, File, Plug } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
 export function CommandPalette() {
@@ -44,6 +44,7 @@ export function CommandPalette() {
       { id: 'view-projects', title: 'Go to Projects', icon: FolderGit2, type: 'View', onSelect: () => setActiveView('projects') },
       { id: 'view-agents', title: 'Go to Agents', icon: Bot, type: 'View', onSelect: () => setActiveView('agents') },
       { id: 'view-accounts', title: 'Go to Accounts & Models', icon: Settings, type: 'View', onSelect: () => setActiveView('accounts') },
+      { id: 'view-integrations', title: 'Go to Integrations', icon: Plug, type: 'View', onSelect: () => setActiveView('integrations') },
       { id: 'view-settings', title: 'Go to Settings', icon: Settings, type: 'View', onSelect: () => setActiveView('settings') },
     ],
     // Workspaces

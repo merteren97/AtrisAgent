@@ -14,6 +14,7 @@ import { ManualCodexSessions } from './manual-codex-session';
 import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
 import { manualCoordination } from './manual-coordination';
 import { prepareManualCoordination } from './manual-coordination-config';
+import { configuredPlaywrightCommand } from './integration-connections';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
@@ -363,7 +364,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       const coordination = manualCoordination.isConfigured() ? manualCoordination.issue(agent) : undefined;
       let endpoint: Awaited<ReturnType<typeof store.codexSessions.create>>;
       try {
-        endpoint = await store.codexSessions.create(agent.id, {executable:installation.path, cwd:agent.cwd, env, model:agent.model, reasoning:agent.reasoning, coordination,
+        endpoint = await store.codexSessions.create(agent.id, {executable:installation.path, cwd:agent.cwd, env, model:agent.model, reasoning:agent.reasoning, coordination, playwright:configuredPlaywrightCommand(sqlite),
           onClosed: () => { if (coordination) manualCoordination.revokeToken(coordination.token); },
           mode:agent.codexPermissionMode || 'ask-for-approval', onThread:(threadId, filename) => bridge.bindCodexRuntime(agent, threadId, filename)});
       } catch (error) { if (coordination) manualCoordination.revokeToken(coordination.token); throw error; }

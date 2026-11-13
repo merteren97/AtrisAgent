@@ -79,6 +79,7 @@ function runTests() {
     turnId: 'turn-route-prompt', userMessage: 'Use the frontend expert', conversationContext: '', workspaceContext: '', planningResources,
   });
   assert(routePrompt.includes('builder-model') && routePrompt.includes('frontend-builder'), 'supervisor prompt receives live routes and workspace-bound specialist choices');
+  assert(routePrompt.includes('@github') && routePrompt.includes('Never invent a tool result'), 'explicit GitHub requests are routed to a tool-capable worker without fabricating data');
   assert(routePrompt.includes('human routing checkpoint') && routePrompt.includes('Do not ask for approval for routine'),
     'supervisor only requests model-routing approval for unresolved material trade-offs');
 

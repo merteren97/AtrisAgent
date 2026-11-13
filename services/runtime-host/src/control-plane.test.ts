@@ -105,6 +105,8 @@ async function runTests() {
     assert(text.includes('mcpServers') && text.includes('control-plane-bridge.mjs'), 'Claude gets a session-local MCP config file');
     assert(!text.includes(secretToken), 'Claude MCP config does not persist the session bearer token');
     assert(claudeAllowedMcpTools().includes('mcp__atris__agent_spawn'), 'Claude explicitly allowlists Atris delegation tools');
+    assert(claudeAllowedMcpTools().includes('mcp__atris__github__list_issues'), 'Claude can invoke the read-only GitHub tools');
+    assert(!claudeAllowedMcpTools().includes('mcp__atris__github__delete_repository'), 'Claude does not bypass policy for GitHub write tools');
   } finally {
     claudeConfig.cleanup();
   }

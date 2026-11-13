@@ -39,6 +39,7 @@ interface Options {
   model?: string; reasoning?: string;
   onThread: (threadId: string, transcriptPath: string) => void;
   coordination?: {endpoint:string; script:string; token:string; runtimeToken?:string};
+  playwright?: {command:string; args:string[]};
   onClosed?: () => void;
 }
 
@@ -114,6 +115,11 @@ export class ManualCodexSession {
           '-c', `mcp_servers.atris_workspace.args=${JSON.stringify([coordination.script])}`,
           '-c', `mcp_servers.atris_workspace.env_vars=${JSON.stringify(Object.keys(coordinationEnv))}`,
           '-c', 'mcp_servers.atris_workspace.startup_timeout_sec=10',
+        ] : []),
+        ...(this.options.playwright ? [
+          '-c', `mcp_servers.atris_playwright.command=${JSON.stringify(this.options.playwright.command)}`,
+          '-c', `mcp_servers.atris_playwright.args=${JSON.stringify(this.options.playwright.args)}`,
+          '-c', 'mcp_servers.atris_playwright.startup_timeout_sec=30',
         ] : []),
         ...(this.options.model ? ['-c', `model=${JSON.stringify(this.options.model)}`] : []),
         ...(this.options.reasoning ? ['-c', `model_reasoning_effort=${JSON.stringify(this.options.reasoning)}`] : []),
