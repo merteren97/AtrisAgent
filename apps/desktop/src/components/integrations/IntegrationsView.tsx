@@ -2,17 +2,26 @@ import { useEffect, useState } from 'react';
 import { Box, Braces, Github, Globe, Layers3, Loader2, Plug, TerminalSquare, type LucideIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { apiRequest } from '@/lib/api-client';
+import { useBrowserStore } from '@/stores/browser-store';
 
-type PlaywrightConnection = { packagePath: string; version: string; verifiedAt: string; toolCount: number };
+type PlaywrightConnection = { packagePath: string; version: string; verifiedAt: string; toolCount: number; setupGuidance?:string };
 type GithubStatus = { status: 'not_installed' | 'connected' | 'unverified'; username?: string };
 type EditorId = 'unity-mcp' | 'blender' | 'godot';
-type EditorConnection = { command: string; args: string[]; verifiedAt: string; toolCount: number; serverName: string; serverVersion: string };
-type UnityConnection = { executable:string; version:string; verifiedAt:string };
+type EditorConnection = { command: string; args: string[]; verifiedAt: string; toolCount: number; serverName: string; serverVersion: string; setupGuidance?:string };
+type UnityConnection = { executable:string; version:string; verifiedAt:string; setupGuidance?:string };
 const isEditor = (id: string): id is EditorId => ['unity-mcp', 'blender', 'godot'].includes(id);
+const UNITY_PACKAGE_URL = 'https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#v10.3.0';
+const SETUP_DETAILS:Record<string,string> = {
+  github:'Detects GitHub CLI and, on Windows, installs it if needed. Sign-in continues in your browser.',
+  playwright:'Installs and verifies the Playwright MCP package in AtrisAgent’s local data folder.',
+  'unity-mcp':'Installs the Unity MCP server. You will then add the Unity package to your project.',
+  'unity-cli':'Finds an installed Unity Editor through Unity Hub and checks its version.',
+  blender:'Installs the Blender MCP server and attempts to install its Blender add-on.',
+  godot:'Installs and verifies the Godot MCP server in AtrisAgent’s local data folder.',
+};
+const INSTALL_GUIDES:Record<string,string> = {github:'https://cli.github.com/',playwright:'https://nodejs.org/',godot:'https://godotengine.org/download/', 'unity-cli':'https://unity.com/download', 'unity-mcp':'https://docs.astral.sh/uv/getting-started/installation/',blender:'https://docs.astral.sh/uv/getting-started/installation/'};
 
 type Integration = {
   id: string;
@@ -36,24 +45,41 @@ export function IntegrationsView() {
   const [connection, setConnection] = useState<PlaywrightConnection | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [open, setOpen] = useState(false);
-  const [packagePath, setPackagePath] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [github, setGithub] = useState<GithubStatus | null>(null);
   const [githubBusy, setGithubBusy] = useState(false);
   const [githubMessage, setGithubMessage] = useState<string | null>(null);
   const [editors, setEditors] = useState<Partial<Record<EditorId, EditorConnection>>>({});
   const [editorLoading, setEditorLoading] = useState(true);
-  const [editorId, setEditorId] = useState<EditorId | null>(null);
-  const [editorCommand, setEditorCommand] = useState('');
-  const [editorArgs, setEditorArgs] = useState('[]');
   const [editorError, setEditorError] = useState<string | null>(null);
   const [editorBusy, setEditorBusy] = useState(false);
   const [unity, setUnity] = useState<UnityConnection | null>(null);
-  const [unityOpen, setUnityOpen] = useState(false);
   const [unityBusy, setUnityBusy] = useState(false);
-  const [unityPath, setUnityPath] = useState('');
   const [unityError, setUnityError] = useState<string | null>(null);
+  const [setupId, setSetupId] = useState<string | null>(null);
+  const [setupBusy, setSetupBusy] = useState(false);
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [guidance, setGuidance] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  function openSetup(id:string) {
+    const saved = id === 'playwright' ? connection : id === 'unity-cli' ? unity : isEditor(id) ? editors[id] : null;
+    setSetupId(id); setSetupError(null); setGuidance(saved?.setupGuidance || null); setCopied(false);
+  }
+
+  async function autoSetup() {
+    if (!setupId) return;
+    setSetupBusy(true); setSetupError(null);
+    try {
+      const result = await apiRequest<{config?:unknown;guidance:string}>(`/integrations/${setupId}/auto-setup`,{method:'POST',timeoutMs:420_000});
+      if (setupId === 'playwright') { setConnection(result.config as PlaywrightConnection); setError(null); }
+      else if (setupId === 'unity-cli') { setUnity(result.config as UnityConnection); setUnityError(null); }
+      else if (isEditor(setupId)) { setEditors(current => ({...current,[setupId]:result.config as EditorConnection})); setEditorError(null); }
+      else if (setupId === 'github') await refreshGithub();
+      setGuidance(result.guidance);
+    } catch (cause) { setSetupError(cause instanceof Error ? cause.message : 'Setup failed.'); }
+    finally { setSetupBusy(false); }
+  }
 
   async function refreshGithub() {
     setGithubBusy(true); setGithubMessage(null);
@@ -87,12 +113,6 @@ export function IntegrationsView() {
     return () => { active = false; };
   }, []);
 
-  async function verifyUnity() {
-    setUnityBusy(true); setUnityError(null);
-    try { const result = await apiRequest<{connection:UnityConnection}>('/integrations/unity-cli/verify', {method:'POST',body:JSON.stringify({executable:unityPath}),timeoutMs:20_000}); setUnity(result.connection); setUnityOpen(false); }
-    catch (cause) { setUnityError(cause instanceof Error ? cause.message : 'Unity verification failed.'); }
-    finally { setUnityBusy(false); }
-  }
   async function removeUnity() {
     setUnityBusy(true); setUnityError(null);
     try { await apiRequest('/integrations/unity-cli',{method:'DELETE'}); setUnity(null); }
@@ -108,33 +128,11 @@ export function IntegrationsView() {
     return () => { active = false; };
   }, []);
 
-  async function verifyEditor() {
-    if (!editorId) return;
-    setEditorBusy(true); setEditorError(null);
-    try {
-      let args: unknown;
-      try { args = JSON.parse(editorArgs); } catch { throw new Error('Arguments must be a JSON array of strings.'); }
-      if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string')) throw new Error('Arguments must be a JSON array of strings.');
-      const result = await apiRequest<{connection:EditorConnection}>(`/integrations/editors/${editorId}/verify`, {method:'POST',body:JSON.stringify({command:editorCommand,args}),timeoutMs:35_000});
-      setEditors(current => ({...current,[editorId]:result.connection})); setEditorId(null);
-    } catch (cause) { setEditorError(cause instanceof Error ? cause.message : 'MCP verification failed.'); }
-    finally { setEditorBusy(false); }
-  }
-
   async function removeEditor(id: EditorId) {
     setEditorBusy(true); setEditorError(null);
     try { await apiRequest(`/integrations/editors/${id}`, {method:'DELETE'}); setEditors(current => { const next = {...current}; delete next[id]; return next; }); }
     catch (cause) { setEditorError(cause instanceof Error ? cause.message : 'Could not remove the connection.'); }
     finally { setEditorBusy(false); }
-  }
-
-  async function verify() {
-    setBusy(true); setError(null);
-    try {
-      const result = await apiRequest<{ connection: PlaywrightConnection }>('/integrations/playwright/verify', { method: 'POST', body: JSON.stringify({ packagePath }), timeoutMs: 35_000 });
-      setConnection(result.connection); setOpen(false);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Connection check failed.'); }
-    finally { setBusy(false); }
   }
 
   async function disconnect() {
@@ -154,8 +152,8 @@ export function IntegrationsView() {
         </header>
 
         <div role="status" className="mt-6 rounded-xl border border-border bg-muted/30 px-4 py-3">
-          <p className="text-sm font-medium">Integration setup is in development</p>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">Connect GitHub and verify installed MCP servers for your projects.</p>
+          <p className="text-sm font-medium">Automatic setup</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">Install and manage integration components with guided setup.</p>
         </div>
 
         <section aria-labelledby="integration-catalog" className="mt-7">
@@ -175,53 +173,40 @@ export function IntegrationsView() {
                 <p className="mt-4 border-t border-border pt-3 text-xs text-muted-foreground">Requires: {requirement}</p>
                 {id === 'github' && <div className="mt-3 space-y-3">
                   {github?.status === 'connected' && <p className="text-xs text-muted-foreground">GitHub CLI account: {github.username}</p>}
-                  {github?.status === 'not_installed' && <p className="text-xs leading-5 text-muted-foreground">Install GitHub CLI and restart AtrisAgent to connect an account.</p>}
+                  {github?.status === 'not_installed' && <p className="text-xs leading-5 text-muted-foreground">Set up GitHub CLI to connect an account.</p>}
                   {github?.status === 'unverified' && <p className="text-xs leading-5 text-muted-foreground">Sign in, or check your internet connection and existing GitHub CLI session.</p>}
                   {githubMessage && <p role="status" className="text-xs leading-5 text-muted-foreground">{githubMessage}</p>}
-                  <div className="flex flex-wrap gap-2">{github?.status !== 'connected' && github?.status !== 'not_installed' && <Button size="sm" variant="outline" disabled={githubBusy || !github} onClick={() => void startGithubLogin()}>Sign in with GitHub CLI</Button>}<Button size="sm" variant="ghost" disabled={githubBusy} onClick={() => void refreshGithub()}>Check connection</Button></div>
+                  <div className="flex flex-wrap gap-2">{github?.status === 'not_installed' ? <Button size="sm" variant="outline" onClick={() => openSetup('github')}>Set up</Button> : github?.status !== 'connected' && <Button size="sm" variant="outline" disabled={githubBusy || !github} onClick={() => void startGithubLogin()}>Sign in with GitHub CLI</Button>}<Button size="sm" variant="ghost" disabled={githubBusy} onClick={() => void refreshGithub()}>Check connection</Button></div>
                 </div>}
                 {id === 'playwright' && <div className="mt-3 space-y-3">
-                  {connection && <p className="break-all text-xs leading-5 text-muted-foreground">Version {connection.version} · {connection.toolCount} tools discovered<br />Last verified: {new Date(connection.verifiedAt).toLocaleString()}<br />{connection.packagePath}</p>}
-                  {error && !open && <p role="alert" className="text-xs text-destructive">{error}</p>}
-                  <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={loading || busy} onClick={() => { setPackagePath(connection?.packagePath || ''); setError(null); setOpen(true); }}>{connection ? 'Verify again' : 'Set up'}</Button>{connection && <Button size="sm" variant="ghost" disabled={busy} onClick={() => void disconnect()}>Remove</Button>}</div>
+                  {connection && <p className="text-xs leading-5 text-muted-foreground">Version {connection.version} · {connection.toolCount} tools discovered<br />Last verified: {new Date(connection.verifiedAt).toLocaleString()}</p>}
+                  {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+                  <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={loading || busy} onClick={() => openSetup('playwright')}>{connection ? 'Set up again' : 'Set up'}</Button>{connection && <Button size="sm" variant="ghost" disabled={busy} onClick={() => void disconnect()}>Remove</Button>}</div>
                 </div>}
                 {isEditor(id) && <div className="mt-3 space-y-3">
                   {editors[id] && <p className="break-all text-xs leading-5 text-muted-foreground">{editors[id]?.serverName} {editors[id]?.serverVersion} · {editors[id]?.toolCount} tools discovered<br />Server verified; editor connection not yet checked.</p>}
-                  {editorError && !editorId && <p role="alert" className="text-xs text-destructive">{editorError}</p>}
-                  <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={editorLoading || editorBusy} onClick={() => { setEditorId(id); setEditorCommand(editors[id]?.command || ''); setEditorArgs(JSON.stringify(editors[id]?.args || [])); setEditorError(null); }}>{editors[id] ? 'Verify again' : 'Set up server'}</Button>{editors[id] && <Button size="sm" variant="ghost" disabled={editorBusy} onClick={() => void removeEditor(id)}>Remove</Button>}</div>
+                  {editorError && <p role="alert" className="text-xs text-destructive">{editorError}</p>}
+                  <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={editorLoading || editorBusy} onClick={() => openSetup(id)}>{editors[id] ? 'Set up again' : 'Set up'}</Button>{editors[id] && <Button size="sm" variant="ghost" disabled={editorBusy} onClick={() => void removeEditor(id)}>Remove</Button>}</div>
                 </div>}
                 {id === 'unity-cli' && <div className="mt-3 space-y-3">
-                  {unity && <p className="break-all text-xs leading-5 text-muted-foreground">Unity {unity.version}<br />{unity.executable}</p>}
-                  {unityError && !unityOpen && <p role="alert" className="text-xs text-destructive">{unityError}</p>}
-                  <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={unityBusy} onClick={() => { setUnityPath(unity?.executable || ''); setUnityError(null); setUnityOpen(true); }}>{unity ? 'Verify again' : 'Set up'}</Button>{unity && <Button size="sm" variant="ghost" disabled={unityBusy} onClick={() => void removeUnity()}>Remove</Button>}</div>
+                  {unity && <p className="text-xs leading-5 text-muted-foreground">Unity {unity.version} detected</p>}
+                  {unityError && <p role="alert" className="text-xs text-destructive">{unityError}</p>}
+                  <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={unityBusy} onClick={() => openSetup('unity-cli')}>{unity ? 'Detect again' : 'Set up'}</Button>{unity && <Button size="sm" variant="ghost" disabled={unityBusy} onClick={() => void removeUnity()}>Remove</Button>}</div>
                 </div>}
               </article>
             ))}
           </div>
         </section>
-        <Dialog open={open} onOpenChange={value => { if (!busy) { setOpen(value); setError(null); } }}>
+        <Dialog open={setupId !== null} onOpenChange={value => { if (!value && !setupBusy) setSetupId(null); }}>
           <DialogContent>
-            <DialogHeader><DialogTitle>Set up Playwright MCP</DialogTitle><DialogDescription>Choose an existing local installation to check its MCP connection. This starts the selected package on your computer; only use a package you trust.</DialogDescription></DialogHeader>
-            <div className="space-y-2"><Label htmlFor="playwright-package">Installed package directory</Label><Input id="playwright-package" value={packagePath} onChange={event => setPackagePath(event.target.value)} placeholder="C:\\path\\to\\node_modules\\@playwright\\mcp" disabled={busy} /><p className="text-xs leading-5 text-muted-foreground">Select the directory containing the package's package.json and cli.js. AtrisAgent will not download or install it.</p></div>
-            {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
-            <DialogFooter><Button variant="outline" disabled={busy} onClick={() => setOpen(false)}>Cancel</Button><Button disabled={busy || !packagePath.trim()} onClick={() => void verify()}>{busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{busy ? 'Verifying…' : 'Verify connection'}</Button></DialogFooter>
-          </DialogContent>
-        </Dialog>
-        <Dialog open={editorId !== null} onOpenChange={value => { if (!value && !editorBusy) { setEditorId(null); setEditorError(null); } }}>
-          <DialogContent>
-            <DialogHeader><DialogTitle>Set up {INTEGRATIONS.find(item => item.id === editorId)?.name}</DialogTitle><DialogDescription>Start a trusted, already-installed local MCP server to discover its tools. This does not verify an editor or project connection.</DialogDescription></DialogHeader>
-            <div className="space-y-2"><Label htmlFor="editor-command">Server executable</Label><Input id="editor-command" value={editorCommand} onChange={event => setEditorCommand(event.target.value)} placeholder="Absolute executable path" disabled={editorBusy} /></div>
-            <div className="space-y-2"><Label htmlFor="editor-args">Arguments (JSON array)</Label><Input id="editor-args" value={editorArgs} onChange={event => setEditorArgs(event.target.value)} placeholder={'["argument"]'} disabled={editorBusy} /><p className="text-xs leading-5 text-muted-foreground">Arguments are saved locally. Do not include tokens, passwords or API keys. The server may require a separate editor add-on.</p></div>
-            {editorError && <p role="alert" className="text-xs text-destructive">{editorError}</p>}
-            <DialogFooter><Button variant="outline" disabled={editorBusy} onClick={() => setEditorId(null)}>Cancel</Button><Button disabled={editorBusy || !editorCommand.trim()} onClick={() => void verifyEditor()}>{editorBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{editorBusy ? 'Verifying…' : 'Verify server'}</Button></DialogFooter>
-          </DialogContent>
-        </Dialog>
-        <Dialog open={unityOpen} onOpenChange={value => { if (!unityBusy) { setUnityOpen(value); setUnityError(null); } }}>
-          <DialogContent>
-            <DialogHeader><DialogTitle>Set up Unity CLI</DialogTitle><DialogDescription>Verify an installed Unity Editor by checking its version. Build and project operations are not yet available.</DialogDescription></DialogHeader>
-            <div className="space-y-2"><Label htmlFor="unity-path">Unity Editor executable</Label><Input id="unity-path" value={unityPath} onChange={event => setUnityPath(event.target.value)} placeholder="C:\\Program Files\\Unity\\Hub\\Editor\\...\\Editor\\Unity.exe" disabled={unityBusy} /></div>
-            {unityError && <p role="alert" className="text-xs text-destructive">{unityError}</p>}
-            <DialogFooter><Button variant="outline" disabled={unityBusy} onClick={() => setUnityOpen(false)}>Cancel</Button><Button disabled={unityBusy || !unityPath.trim()} onClick={() => void verifyUnity()}>{unityBusy ? 'Verifying…' : 'Verify Unity'}</Button></DialogFooter>
+            <DialogHeader><DialogTitle>Set up {INTEGRATIONS.find(item => item.id === setupId)?.name}</DialogTitle><DialogDescription>AtrisAgent will find the required tools and install the integration components when needed.</DialogDescription></DialogHeader>
+            {!guidance && setupId && <p className="text-sm leading-6 text-muted-foreground">{SETUP_DETAILS[setupId]}</p>}
+            {setupBusy && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Preparing and verifying the integration…</p>}
+            {guidance && <p role="status" className="rounded-lg border border-border bg-muted/30 px-3 py-3 text-sm leading-6">{guidance}</p>}
+            {guidance && setupId === 'unity-mcp' && <Button variant="outline" size="sm" onClick={() => { void navigator.clipboard.writeText(UNITY_PACKAGE_URL).then(() => setCopied(true)).catch(() => setSetupError('Could not copy the package URL. Select it from the instructions above.')); }}>{copied ? 'Copied' : 'Copy Unity package URL'}</Button>}
+            {setupError && <p role="alert" className="text-sm text-destructive">{setupError}</p>}
+            {setupError && setupId && INSTALL_GUIDES[setupId] && <Button variant="ghost" size="sm" onClick={() => useBrowserStore.getState().open(setupError.includes('Node.js') ? 'https://nodejs.org/' : INSTALL_GUIDES[setupId])}>Open installation guide</Button>}
+            <DialogFooter><Button variant="outline" disabled={setupBusy} onClick={() => setSetupId(null)}>{guidance ? 'Done' : 'Cancel'}</Button>{guidance && setupId !== 'github' && <Button variant="outline" disabled={setupBusy} onClick={() => { setGuidance(null); void autoSetup(); }}>Check setup again</Button>}{!guidance && <Button disabled={setupBusy} onClick={() => void autoSetup()}>{setupBusy ? 'Setting up…' : setupError ? 'Retry' : 'Start setup'}</Button>}{guidance && setupId === 'github' && <Button disabled={githubBusy} onClick={() => { setSetupId(null); void startGithubLogin(); }}>Continue to sign in</Button>}</DialogFooter>
           </DialogContent>
         </Dialog>
       </div>

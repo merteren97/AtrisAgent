@@ -1,5 +1,7 @@
 import type { Application } from 'express';
 import { findExecutable, launchInteractiveTerminal, runCommand } from '@atris-agent-code/runtime-host';
+import fs from 'node:fs';
+import path from 'node:path';
 
 interface GithubCli {
   find: () => Promise<string | undefined>;
@@ -7,8 +9,16 @@ interface GithubCli {
   login: (executable: string) => Promise<void>;
 }
 
+async function findGithubCli(): Promise<string | undefined> {
+  const found = await findExecutable('gh');
+  if (found) return found;
+  if (process.platform !== 'win32') return undefined;
+  const candidate = path.join(process.env.ProgramFiles || 'C:\\Program Files','GitHub CLI','gh.exe');
+  try { return fs.statSync(candidate).isFile() ? candidate : undefined; } catch { return undefined; }
+}
+
 const githubCli: GithubCli = {
-  find: () => findExecutable('gh'),
+  find: findGithubCli,
   account: async executable => {
     const result = await runCommand(executable, ['api', '--hostname', 'github.com', 'user', '--jq', '.login'], { timeoutMs: 15_000, env: { GH_PROMPT_DISABLED: '1' }, maxOutputBytes: 64 * 1024 });
     if (result.exitCode !== 0 || !/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(result.stdout.trim())) throw new Error('GitHub account could not be verified.');
@@ -19,7 +29,7 @@ const githubCli: GithubCli = {
 
 /** Keep the CLI-owned token in memory; callers must not serialize or log it. */
 export async function readGithubCliToken(): Promise<string> {
-  const executable = await findExecutable('gh');
+  const executable = await findGithubCli();
   if (!executable) throw new Error('GitHub CLI is not installed.');
   try {
     const result = await runCommand(executable, ['auth', 'token', '--hostname', 'github.com'], { timeoutMs: 10_000, env: { GH_PROMPT_DISABLED: '1' }, maxOutputBytes: 16 * 1024 });

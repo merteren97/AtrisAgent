@@ -60,6 +60,7 @@ import { installIntegrationConnectionRoutes } from './integration-connections';
 import { installGithubConnectionRoutes } from './github-connection';
 import { installEditorMcpRoutes } from './editor-mcp-connections';
 import { installUnityCliRoutes } from './unity-cli-connection';
+import { installAutoSetupRoutes } from './integration-auto-setup';
 
 import path from 'path';
 import fs from 'fs';
@@ -529,6 +530,7 @@ installIntegrationConnectionRoutes(app, sqlite);
 installEditorMcpRoutes(app, sqlite);
 installUnityCliRoutes(app, sqlite);
 installGithubConnectionRoutes(app);
+installAutoSetupRoutes(app, sqlite, gatewayDataPath.dataDir);
 export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 installAttachmentRoutes(app, attachmentStore, (workspaceId) => isDeletionFenced('workspace', workspaceId));
 export const orchestratorInteractions = registerOrchestratorInteractions(app, { sqlite, eventBus, runtimeHost });
