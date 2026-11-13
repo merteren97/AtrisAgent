@@ -74,11 +74,13 @@ jobs:
           set -euo pipefail
           command -v sdkmanager
           test -n "${ANDROID_HOME:-}"
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;${ANDROID_NDK_VERSION}"
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;35.0.0" "ndk;${ANDROID_NDK_VERSION}"
           echo "NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
       - run: npm ci --include=dev --include=optional --no-audit --no-fund
       - run: node .github/scripts/mobile-release-version.mjs
       - run: npm run tauri -w @atris-agent-code/mobile -- android init --ci
+      - name: Apply AtrisAgent launcher icons after Android initialization
+        run: npm run tauri -w @atris-agent-code/mobile -- icon ../desktop/public/logo.svg --ios-color "#11151b"
       - name: Configure release signing
         env:
           ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
@@ -93,9 +95,8 @@ jobs:
           umask 077
           printf 'keyAlias=%s\npassword=%s\nstorePassword=%s\nstoreFile=%s\n' "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" "$ANDROID_KEYSTORE_PASSWORD" "$RUNNER_TEMP/mobile-release.jks" > apps/mobile/src-tauri/gen/android/keystore.properties
           node .github/scripts/configure-mobile-android-signing.mjs
-      - name: Validate generated Gradle signing configuration
-        working-directory: apps/mobile/src-tauri/gen/android
-        run: ./gradlew :app:help --no-daemon
+      # Tauri creates tauri.settings.gradle and the Rust/Gradle bridge during
+      # android build. Calling Gradle directly before this step is invalid.
       - run: npm run tauri -w @atris-agent-code/mobile -- android build --ci --apk --target aarch64
       - name: Verify and stage signed APK
         run: |
@@ -181,4 +182,4 @@ jobs:
           test -f "AtrisAgent-Mobile_${MOBILE_VERSION}_android_arm64.apk"
           test -f "AtrisAgent-Mobile_${MOBILE_VERSION}_ios_unsigned.ipa"
           sha256sum *.apk *.ipa > SHA256SUMS.txt
-          gh release create "mobile-v${MOBILE_VERSION}" *.apk *.ipa SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "AtrisAgent Mobile ${MOBILE_VERSION}" --prerelease --latest=false --notes "Android APK is signed. iOS IPA is unsigned and requires a compatible sideloading method. Desktop connection is not yet implemented."
+          gh release create "mobile-v${MOBILE_VERSION}" *.apk *.ipa SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "AtrisAgent Mobile ${MOBILE_VERSION}" --prerelease --latest=false --notes "Android APK is signed. iOS IPA is unsigned and requires a compatible sideloading method. Remote access requires the updated desktop app, the deployed AtrisAgent relay, the same AtrisHub account, and explicit desktop pairing approval. See apps/mobile/README.md for setup and limitations."

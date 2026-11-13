@@ -29,6 +29,7 @@ import { AccessGate } from '@/components/auth/access-gate';
 import { isTauriRuntime } from '@/lib/secure-storage';
 import { Loader2 } from 'lucide-react';
 import type { RuntimeBootstrap } from '@/lib/runtime-config';
+import { stopMobileHost } from '@/lib/mobile-host';
 
 const RUNTIME_HEALTH_INTERVAL_MS = 8_000;
 const AnalyticsDashboard = lazy(() => import('@/components/analytics/Dashboard').then((module) => ({ default: module.AnalyticsDashboard })));
@@ -69,6 +70,7 @@ function WorkspaceApp() {
   const [missionSurface, setMissionSurface] = useState<'chat' | 'processes'>('chat');
 
   useEffect(() => setMissionSurface('chat'), [activeMissionId]);
+  useEffect(() => () => stopMobileHost(), [shellState, session.token]);
 
   useEffect(() => {
     if (shellState !== 'workspace') return undefined;

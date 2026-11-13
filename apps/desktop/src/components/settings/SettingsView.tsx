@@ -8,6 +8,7 @@ import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { ThemePaletteSelector } from '@/components/theme-palette-selector';
 import { ExecutionPolicyEditor } from './ExecutionPolicyEditor';
+import { MobileConnection } from './MobileConnection';
 import { OrchestratorDefaults } from '@/components/orchestrator/orchestrator-defaults';
 import { Bell, Download, KeyRound, Loader2, Minimize2, MonitorCog, Palette, Power, RefreshCw, Rocket, ShieldCheck, Terminal } from 'lucide-react';
 
@@ -93,6 +94,8 @@ export function SettingsView() {
           <h1 className="text-2xl font-semibold tracking-tight">AtrisAgent preferences</h1>
           <p className="mt-1 text-sm text-muted-foreground">Control local privacy, application behavior, updates, approval posture and role-specific runtime routing. Runtime accounts remain managed through verified CLI flows.</p>
         </header>
+
+        <MobileConnection />
 
         <Card>
           <CardHeader><CardTitle className="flex items-center gap-2 text-base"><Palette className="h-4 w-4 text-primary" /> Appearance & themes</CardTitle><CardDescription>Choose the atmosphere that works best for your workspace.</CardDescription></CardHeader>

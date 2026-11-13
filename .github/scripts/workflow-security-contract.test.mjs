@@ -75,6 +75,10 @@ test("mobile Android release installs SDK command-line tools before invoking sdk
   const install = android.indexOf('sdkmanager "platform-tools"');
   assert.ok(setup >= 0 && install > setup, "setup-android must run before sdkmanager installs SDK packages");
   assert.match(android, /test -n "\$\{ANDROID_HOME:-\}"/, "Android SDK root must be present before building");
+  assert.doesNotMatch(android, /run:\s*\.\/gradlew/, "Gradle must not run before Tauri generates its bridge files");
+  const ci = readWorkflow('mobile-ci.yml');
+  assert.match(ci, /android build --ci --apk --target aarch64/, "PRs must exercise real Android packaging, not only string fixtures");
+  assert.match(ci, /configure-mobile-android-signing\.mjs/, "PR builds must exercise generated release signing with an ephemeral test key");
 });
 
 test("release publishing stays owner-controlled and requires both desktop platforms", () => {

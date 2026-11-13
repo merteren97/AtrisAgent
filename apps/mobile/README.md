@@ -1,23 +1,66 @@
 # AtrisAgent Mobile
 
-React/Vite mobile companion and Tauri 2 application shell.
+React/Tauri companion for existing desktop manual-agent conversations. Agents,
+CLI accounts and project files remain on the computer. Both devices sign in to
+the same AtrisHub account. They connect over the internet through a separately
+deployed relay, without exposing the desktop loopback gateway.
+
+## Required rollout
+
+1. Deploy the relay and WSS route through the private AtrisHub operations repo.
+   See `services/mobile-relay/README.md`. Updating only the landing site is not
+   enough. The production endpoint is `wss://agent.atrishub.com/remote/v1/ws`.
+2. Install the desktop build containing **Settings → Mobile access**.
+3. Install the new mobile build. Sign in to AtrisHub.
+4. Enable mobile access on desktop. Copy the private pairing code into the
+   phone's **Connect** panel, then approve the phone on desktop.
+
+Codes expire after 10 minutes. Desktop approval is required before reading or
+controlling agents. Approved connections last while both apps remain connected;
+restarting either app or changing the network may require pairing again. Disable
+access to immediately disconnect phones and invalidate the current code. Closing
+or signing out of desktop also disables access. Keep the desktop open (or use
+its tray option) and prevent the computer from sleeping during remote work.
+
+## Implemented
+
+- Workspace/manual-agent listing, current status and recent conversation history.
+- Sending messages into an existing open native terminal; duplicate command IDs
+  do not write twice within the desktop process. Uncertain delivery is never
+  retried automatically. Receipts are in memory, not a cross-restart guarantee.
+- Same-runtime/account model and reasoning changes. OpenCode updates live;
+  other CLIs restart only when not working/waiting, using desktop launch paths.
+- Runtime-supported questions, OpenCode auto-approve, live Codex permissions,
+  and reading conversation-scoped memory.
+- Hub token storage through native iOS Keychain/Android Keystore. Browser previews
+  stay memory-only. If native storage is unavailable (including some sideloading
+  setups), sign-in still works in memory and account settings report it.
+
+Cross-runtime/account agent creation, mobile attachments, Mission/Orchestrator
+controls, durable device registration and background push notifications are not
+implemented in this first remote-control increment. Native iOS/Android behavior
+and LiveContainer compatibility must still be checked on actual devices.
+
+## Development and verification
 
 ```sh
 npm install
-npm run dev -w @atris-agent-code/mobile
 npm run build -w @atris-agent-code/mobile
+npm test -w @atris-agent-code/remote
+npm test -w @atris-agent-code/mobile-relay
 npx playwright install chromium
 npm run test:e2e -w @atris-agent-code/mobile
 ```
 
-The Playwright tests use a mocked `/api/mobile` bridge; they do not connect to a real desktop or validate native iOS/Android behavior. They cover both iPhone- and Android-sized Chromium viewports.
+Playwright starts a real loopback WebSocket relay and encrypted host/client
+channels. Hub authentication and CLI behavior are injected test fixtures; these
+tests do not claim real provider or iPhone installation coverage. The production
+desktop adapter uses the existing local gateway and Tauri terminal commands.
 
-**Connection is not implemented yet.** The client contract in `src/api.ts` requires a separately authenticated mobile bridge, paired-device identity, secure transport, and integration with the desktop manual-agent host. The existing desktop loopback gateway must not be exposed to the network to make this client work. The native project is a starting shell; Android/iOS platform projects, signing, native pairing and real-device verification remain to be completed.
-
-The account screen authenticates directly against AtrisHub over HTTPS, keeping the token only in memory. Signing in does not pair or connect a desktop yet. A production remote connection requires authenticated device pairing, a relay/host protocol, and desktop integration; the existing AtrisWork relay protocol must not be assumed to support AtrisAgent commands.
-
-## Mobile prereleases
-
-The separate `Release AtrisAgent Mobile` workflow accepts a version such as `0.1.0` or `v0.1.0` and creates the independent `mobile-v0.1.0` GitHub prerelease. It runs mobile web and Playwright checks before building an Android arm64 APK and an unsigned iOS arm64 IPA. The iOS package must be signed or otherwise handled by a compatible sideloading environment before it can run; compatibility must be verified on a device.
-
-Android release signing requires repository secrets `ANDROID_KEY_BASE64` (base64-encoded keystore), `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, and `ANDROID_KEYSTORE_PASSWORD`. Preserve the same keystore for future updates. The workflow verifies the APK signature and checks that the IPA has no embedded signature or provisioning profile. It publishes only after both builds succeed. Native builds and device installation have not yet been validated for this project.
+The Android release build is also exercised on PRs with an ephemeral test signing
+key. The public mobile release workflow uses the configured production keystore
+and creates independent `mobile-v0.1.0` prereleases. Android secrets are
+`ANDROID_KEY_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, and
+`ANDROID_KEYSTORE_PASSWORD`. Preserve the keystore across updates. iOS is an
+unsigned IPA for a compatible sideloading setup; no App Store distribution is
+claimed. The release process checks signature/provisioning-profile absence.
