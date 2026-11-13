@@ -119,3 +119,16 @@ body { background: #090c12; }
   .offline-graphic { margin-bottom: 24px; }
   .offline-notice { margin-top: 22px; }
 }
+.header-actions{display:flex;align-items:center;gap:6px;min-width:0}
+.account-button{height:34px;max-width:112px;padding:0 9px;display:flex;align-items:center;gap:6px;border:1px solid #344153;border-radius:100px;background:#1b2634;color:#d3dced;font-size:11px;font-weight:700}
+.account-button span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.account-form{display:grid;gap:15px;margin-top:22px}
+.account-form label{display:grid;gap:7px;color:#c8d3e3;font-size:12px;font-weight:600}
+.account-form input{min-height:45px;padding:0 12px;border:1px solid #425064;border-radius:10px;background:#151b23;color:#f4f6fb;font-size:14px}
+.account-form .primary-button{margin-top:5px}
+.account-form .sheet-error{color:#efaaa5;font-size:12px;margin:0}
+.account-note{font-size:11px!important;line-height:1.6;color:#a9b6c7!important;margin-top:17px}
+.account-notice{display:flex;gap:10px;align-items:flex-start;border:1px solid #3c4c62;background:#202d3c;border-radius:12px;padding:14px;color:#c5d2e3;font-size:12px;line-height:1.6;margin:20px 0}
+.account-notice svg{flex-shrink:0;color:#adc7fa}
+.account-secondary{height:43px;width:100%;border:1px solid #455366;background:#252f3d;border-radius:10px;color:#dce5f2;font-size:13px;font-weight:700}
+@media(max-width:350px){.account-button span{display:none}.account-button{width:34px;justify-content:center;padding:0}.header-actions{gap:4px}}

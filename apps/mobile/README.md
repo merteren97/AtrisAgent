@@ -14,6 +14,8 @@ The Playwright tests use a mocked `/api/mobile` bridge; they do not connect to a
 
 **Connection is not implemented yet.** The client contract in `src/api.ts` requires a separately authenticated mobile bridge, paired-device identity, secure transport, and integration with the desktop manual-agent host. The existing desktop loopback gateway must not be exposed to the network to make this client work. The native project is a starting shell; Android/iOS platform projects, signing, native pairing and real-device verification remain to be completed.
 
+The account screen authenticates directly against AtrisHub over HTTPS, keeping the token only in memory. Signing in does not pair or connect a desktop yet. A production remote connection requires authenticated device pairing, a relay/host protocol, and desktop integration; the existing AtrisWork relay protocol must not be assumed to support AtrisAgent commands.
+
 ## Mobile prereleases
 
 The separate `Release AtrisAgent Mobile` workflow accepts a version such as `0.1.0` or `v0.1.0` and creates the independent `mobile-v0.1.0` GitHub prerelease. It runs mobile web and Playwright checks before building an Android arm64 APK and an unsigned iOS arm64 IPA. The iOS package must be signed or otherwise handled by a compatible sideloading environment before it can run; compatibility must be verified on a device.

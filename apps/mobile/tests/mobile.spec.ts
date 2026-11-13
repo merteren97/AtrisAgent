@@ -38,7 +38,7 @@ test('workspace and agent conversation: send and choose reasoning', async ({ pag
   await expect(page.getByRole('img', { name: 'AtrisAgent logo' })).toBeVisible();
   expect(await page.getByRole('img', { name: 'AtrisAgent logo' }).evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
   await page.getByRole('textbox', { name: 'Find a workspace' }).fill('Agent');
-  await expect(page.getByRole('button', { name: /AtrisHub/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /AtrisHub 0 agents/ })).toHaveCount(0);
   await page.getByRole('button', { name: /AtrisAgent.*agent/ }).click();
   await expect(page.getByText('Working')).toBeVisible();
   await page.getByRole('button', { name: /Builder/ }).click();
@@ -81,4 +81,36 @@ test('composer stays reachable on a short narrow screen', async ({ page }) => {
   expect(box).not.toBeNull();
   expect(box!.y + box!.height).toBeLessThanOrEqual(650);
   await expect(page.getByRole('button', { name: 'Send message' })).toBeInViewport();
+});
+
+test('AtrisHub sign-in does not claim the desktop is paired', async ({ page }) => {
+  await page.route('**/api/mobile/**', route => route.abort());
+  await page.route('https://atrishub.com/api/auth/login', async route => {
+    if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-allow-headers': 'content-type' } });
+    expect(route.request().postDataJSON()).toEqual({ email: 'user@example.com', password: 'example-password' });
+    return route.fulfill({ json: { token: 'test-session-token', user: { username: 'test-user', name: 'Test User' } }, headers: { 'access-control-allow-origin': '*' } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Sign in to AtrisHub' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Welcome back' });
+  await dialog.getByLabel('Email or username').fill('user@example.com');
+  await dialog.getByLabel('Password').fill('example-password');
+  await dialog.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Your account' })).toContainText('Signed in as Test User');
+  await expect(page.getByRole('dialog')).toContainText('does not connect your computer yet');
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('test-session-token');
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await expect(page.getByRole('dialog', { name: 'Welcome back' })).toBeVisible();
+});
+
+test('AtrisHub invalid credentials are shown without connecting', async ({ page }) => {
+  await page.route('**/api/mobile/**', route => route.abort());
+  await page.route('https://atrishub.com/api/auth/login', route => route.fulfill({ status: route.request().method() === 'OPTIONS' ? 204 : 401, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-allow-headers': 'content-type' } }));
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Sign in to AtrisHub' }).click();
+  await page.getByLabel('Email or username').fill('unknown@example.com');
+  await page.getByLabel('Password').fill('wrong');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('incorrect');
+  await expect(page.getByText('Desktop not connected')).toBeVisible();
 });
