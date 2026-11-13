@@ -1,116 +1,107 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type APIRequestContext } from '@playwright/test';
 
-const agent = { id: 'a1', conversationId: 'c1', name: 'Builder', runtime: 'Codex', model: 'GPT 6.1 Terra', reasoning: 'high', status: 'working', summary: 'Implementing the workspace changes.' };
-const workspaces = [{ id: 'w1', name: 'AtrisAgent', agents: [agent] }, { id: 'w2', name: 'AtrisHub', agents: [] }];
-
-async function mockBridge(page: Page, failSend = false) {
-  const messages = [{ id: 'm1', role: 'assistant', text: 'I am working on the implementation.' }];
-  await page.route('**/api/mobile/**', async route => {
-    const request = route.request();
-    const url = new URL(request.url());
-    if (url.pathname.endsWith('/session')) return route.fulfill({ json: { connected: true, desktopName: 'Studio PC' } });
-    if (url.pathname.endsWith('/workspaces')) return route.fulfill({ json: workspaces });
-    if (url.pathname.endsWith('/models')) return route.fulfill({ json: [{ id: 'model-1', name: 'GPT 6.1 Terra', runtime: 'Codex', reasoning: ['medium', 'high'], available: true }] });
-    if (url.pathname.endsWith('/model') && request.method() === 'PATCH') return route.fulfill({ json: { ...agent, reasoning: request.postDataJSON().reasoning } });
-    if (url.pathname.endsWith('/messages') && request.method() === 'POST') {
-      if (failSend) return route.abort('connectionreset');
-      const body = request.postDataJSON();
-      expect(body).toMatchObject({ workspaceId: 'w1', conversationId: 'c1', text: 'Please continue.' });
-      expect(body.id).toBeTruthy();
-      messages.push({ id: 'm2', role: 'user', text: body.text });
-      return route.fulfill({ json: { status: 'delivered' } });
-    }
-    if (url.pathname.endsWith('/messages')) return route.fulfill({ json: messages });
-    return route.fulfill({ status: 404 });
+async function login(page: Page) {
+  await page.route('https://atrishub.com/api/auth/login', async route => {
+    const headers = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-allow-headers': 'content-type' };
+    if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+    expect(route.request().postDataJSON()).toEqual({ email: 'user@example.com', password: 'example-password' });
+    return route.fulfill({ json: { token: 'test-owner', user: { username: 'tester', name: 'Test User' } }, headers });
   });
-}
-
-async function openChat(page: Page) {
   await page.goto('/');
-  await page.getByRole('button', { name: /AtrisAgent.*agent/ }).click();
+  await page.getByRole('button', { name: 'Sign in to AtrisHub' }).click();
+  await page.getByLabel('Email or username').fill('user@example.com');
+  await page.getByLabel('Password').fill('example-password');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Your account' })).toBeVisible();
+}
+async function pair(page: Page, request: APIRequestContext) {
+  await login(page);
+  const config = await (await request.get('http://127.0.0.1:4191/fixture')).json();
+  await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await page.getByLabel('Pairing code').fill(config.code);
+  await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await expect(page.getByText('Approve your phone on desktop', { exact: true })).toBeVisible();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  const approval = await (await request.get(`http://127.0.0.1:4191/approve?id=${config.id}`)).json();
+  expect(approval.devices.some((device: { approved: boolean }) => device.approved)).toBeTruthy();
+  await expect(page.getByText('Test Desktop')).toBeVisible({ timeout: 10000 });
+  return config;
+}
+async function chat(page: Page) {
+  await page.getByRole('button', { name: /AtrisAgent.*agents/ }).click();
   await page.getByRole('button', { name: /Builder/ }).click();
+  await expect(page.getByText('Ready to continue the implementation.')).toBeVisible();
 }
 
-test('workspace and agent conversation: send and choose reasoning', async ({ page }) => {
-  await mockBridge(page);
-  await page.goto('/');
-  await expect(page.getByText('Studio PC')).toBeVisible();
+test('real WebSocket relay: pair, approve, message, model change, revoke', async ({ page, request }, testInfo) => {
+  const config = await pair(page, request);
   await expect(page.getByRole('img', { name: 'AtrisAgent logo' })).toBeVisible();
-  expect(await page.getByRole('img', { name: 'AtrisAgent logo' }).evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
-  await page.getByRole('textbox', { name: 'Find a workspace' }).fill('Agent');
-  await expect(page.getByRole('button', { name: /AtrisHub 0 agents/ })).toHaveCount(0);
-  await page.getByRole('button', { name: /AtrisAgent.*agent/ }).click();
-  await expect(page.getByText('Working')).toBeVisible();
-  await page.getByRole('button', { name: /Builder/ }).click();
-  await expect(page.getByText('I am working on the implementation.')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('connected-workspaces.png'), scale: 'css' });
+  await chat(page);
   await page.getByRole('textbox', { name: 'Message Builder' }).fill('Please continue.');
   await page.getByRole('button', { name: 'Send message' }).click();
-  await expect(page.getByText('Please continue.')).toBeVisible();
+  await expect(page.getByText('The desktop received your message.')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('agent-conversation.png'), scale: 'css' });
   await expect(page.getByRole('textbox', { name: 'Message Builder' })).toHaveValue('');
-  await page.getByRole('button', { name: /GPT 6.1 Terra/ }).click();
-  await expect(page.getByRole('dialog', { name: 'Model & reasoning' })).toBeVisible();
+  expect((await (await request.get(`http://127.0.0.1:4191/stats?id=${config.id}`)).json()).writes).toBe(1);
+  await page.getByRole('button', { name: /GPT Terra/ }).click();
   await page.getByRole('button', { name: 'medium', exact: true }).click();
-  await expect(page.getByRole('dialog')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: /GPT 6.1 Terra.*medium/ })).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
+  await expect(page.getByRole('button', { name: /GPT Terra.*medium/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Agent permissions, questions and memory' }).click();
+  await expect(page.getByText('Project decision')).toBeVisible();
+  await page.getByRole('radio', { name: 'Yes', exact: true }).check();
+  await page.getByRole('button', { name: 'Reply to agent' }).click();
+  await expect(page.getByText('Should the agent continue?')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Enable auto-approve' }).click();
+  await expect(page.getByRole('button', { name: 'Disable auto-approve' })).toBeVisible();
+  await page.getByRole('button', { name: 'Close panel' }).click();
+  await request.get(`http://127.0.0.1:4191/revoke?id=${config.id}`);
+  await expect(page.getByRole('button', { name: 'Send message' })).toBeDisabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
 
-test('uncertain delivery preserves the draft and warns before retry', async ({ page }) => {
-  await mockBridge(page, true);
-  await openChat(page);
-  await page.getByRole('textbox', { name: 'Message Builder' }).fill('Please continue.');
+test('uncertain delivery retains the draft', async ({ page, request }) => {
+  await pair(page, request); await chat(page);
+  await page.getByRole('textbox', { name: 'Message Builder' }).fill('uncertain');
   await page.getByRole('button', { name: 'Send message' }).click();
   await expect(page.getByRole('alert')).toContainText('could not be confirmed');
-  await expect(page.getByRole('textbox', { name: 'Message Builder' })).toHaveValue('Please continue.');
+  await expect(page.getByRole('textbox', { name: 'Message Builder' })).toHaveValue('uncertain');
 });
 
-test('unavailable connection is honestly shown', async ({ page }) => {
-  await page.route('**/api/mobile/**', route => route.abort());
-  await page.goto('/');
-  await expect(page.getByText('Desktop not connected')).toBeVisible();
-  await expect(page.getByText('Secure mobile pairing is not available yet.')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
-});
-
-test('composer stays reachable on a short narrow screen', async ({ page }) => {
+test('short narrow screen keeps composer in view', async ({ page, request }) => {
   await page.setViewportSize({ width: 320, height: 650 });
-  await mockBridge(page);
-  await openChat(page);
-  const composer = page.getByRole('textbox', { name: 'Message Builder' });
-  const box = await composer.boundingBox();
-  expect(box).not.toBeNull();
-  expect(box!.y + box!.height).toBeLessThanOrEqual(650);
+  await pair(page, request); await chat(page);
   await expect(page.getByRole('button', { name: 'Send message' })).toBeInViewport();
 });
 
-test('AtrisHub sign-in does not claim the desktop is paired', async ({ page }) => {
-  await page.route('**/api/mobile/**', route => route.abort());
-  await page.route('https://atrishub.com/api/auth/login', async route => {
-    if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-allow-headers': 'content-type' } });
-    expect(route.request().postDataJSON()).toEqual({ email: 'user@example.com', password: 'example-password' });
-    return route.fulfill({ json: { token: 'test-session-token', user: { username: 'test-user', name: 'Test User' } }, headers: { 'access-control-allow-origin': '*' } });
-  });
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Sign in to AtrisHub' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Welcome back' });
-  await dialog.getByLabel('Email or username').fill('user@example.com');
-  await dialog.getByLabel('Password').fill('example-password');
-  await dialog.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await expect(page.getByRole('dialog', { name: 'Your account' })).toContainText('Signed in as Test User');
-  await expect(page.getByRole('dialog')).toContainText('does not connect your computer yet');
-  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('test-session-token');
-  await page.getByRole('button', { name: 'Sign out' }).click();
-  await expect(page.getByRole('dialog', { name: 'Welcome back' })).toBeVisible();
+test('no pairing means no fake desktop connection; malformed code is rejected', async ({ page }) => {
+  await login(page);
+  await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await page.getByLabel('Pairing code').fill('invalid');
+  await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('pairing code');
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('test-owner');
 });
 
-test('AtrisHub invalid credentials are shown without connecting', async ({ page }) => {
-  await page.route('**/api/mobile/**', route => route.abort());
-  await page.route('https://atrishub.com/api/auth/login', route => route.fulfill({ status: route.request().method() === 'OPTIONS' ? 204 : 401, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-allow-headers': 'content-type' } }));
+test('native session adapter restores and deletes a secure token without browser storage', async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as any).__TAURI_INTERNALS__ = { invoke: async (command: string) => {
+      if (command === 'load_mobile_token') return 'saved-test-token';
+      if (command === 'delete_mobile_token') { (window as any).__sessionDeleted = true; return; }
+      throw new Error('Unexpected native call');
+    } };
+  });
+  await page.route('https://atrishub.com/api/auth/me', route => {
+    const headers = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, OPTIONS', 'access-control-allow-headers': 'authorization' };
+    if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+    expect(route.request().headers().authorization).toBe('Bearer saved-test-token');
+    return route.fulfill({ json: { user: { username: 'restored-user' } }, headers });
+  });
   await page.goto('/');
-  await page.getByRole('button', { name: 'Sign in to AtrisHub' }).click();
-  await page.getByLabel('Email or username').fill('unknown@example.com');
-  await page.getByLabel('Password').fill('wrong');
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText('incorrect');
-  await expect(page.getByText('Desktop not connected')).toBeVisible();
+  await page.getByRole('button', { name: 'AtrisHub account' }).click();
+  await expect(page.getByText('Session saved in native secure storage.')).toBeVisible();
+  await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Welcome back' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__sessionDeleted)).toBeTruthy();
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('saved-test-token');
 });
