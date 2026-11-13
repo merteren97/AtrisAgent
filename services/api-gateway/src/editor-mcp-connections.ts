@@ -23,12 +23,12 @@ export function parseEditorCommand(body: unknown): { command: string; args: stri
   return { command: executable, args: [...args] as string[] };
 }
 
-export async function verifyEditorServer(body: unknown): Promise<EditorConnection> {
+export async function verifyEditorServer(body: unknown, options: { startupTimeoutMs?:number } = {}): Promise<EditorConnection> {
   const config = parseEditorCommand(body);
   const client = new Client({ name: 'atris-agent-integration-check', version: '0.2.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({ command: config.command, args: config.args, stderr: 'ignore', maxBufferSize: 2 * 1024 * 1024 });
   try {
-    await client.connect(transport, { timeout: 15_000 });
+    await client.connect(transport, { timeout: options.startupTimeoutMs || 15_000 });
     const result = await client.listTools(undefined, { timeout: 10_000 });
     if (!result.tools.length) throw new Error('The MCP server did not expose any tools.');
     const info = client.getServerVersion();
