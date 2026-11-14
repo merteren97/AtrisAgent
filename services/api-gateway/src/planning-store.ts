@@ -8,6 +8,10 @@ import { validateConversations, type PlanningConversation } from './planning-con
 export const MAX_PLANNING_DOCUMENT_BYTES = 4 * 1024 * 1024;
 export const MAX_PLANNING_ASSET_BYTES = 512 * 1024 * 1024;
 export const MAX_PLANNING_CHAT_REQUEST_BYTES = 1024 * 1024;
+export const MAX_PLANNING_BOARD_BYTES = 1024 * 1024;
+export const MAX_PLANNING_BOARD_BODY_BYTES = 256 * 1024;
+export const MAX_PLANNING_BOARD_DEPTH = 4;
+export const MAX_PLANNING_BOARD_NODES = 500;
 const CHAT_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Shared by store instances in this gateway; a cancelled turn may still be spawning.
 const activeChatRequests = new Set<string>();
@@ -36,6 +40,41 @@ export interface PlanningMessage {
   planningChat?: Record<string, unknown>;
 }
 export interface PlanningFile { path: string; byteSize: number; mimeType: string; }
+export type PlanningBoardKind = 'section' | 'gallery' | 'comparison' | 'checklist' | 'research' | 'note';
+export type PlanningBoardStatus = 'idea' | 'in-progress' | 'review' | 'done' | 'blocked';
+export type PlanningBoardCompareMode = 'slider' | 'side-by-side';
+export interface PlanningBoardMedia { path: string; alt?: string; label?: string; }
+export interface PlanningBoardCompare { mode: PlanningBoardCompareMode; before: string; after: string; }
+export interface PlanningBoardItem {
+  id: string; title: string; status?: PlanningBoardStatus; body?: string;
+  media?: PlanningBoardMedia[]; compare?: PlanningBoardCompare; prompt?: string; source?: string;
+}
+export interface PlanningBoardSection {
+  id: string; title: string; kind: PlanningBoardKind; status?: PlanningBoardStatus;
+  summary?: string; cover?: string; body?: string;
+  children?: PlanningBoardSection[]; items?: PlanningBoardItem[];
+}
+export interface PlanningBoard {
+  schemaVersion: 1; planId: string; updatedAt: string; sections: PlanningBoardSection[];
+}
+export interface PlanningBoardVersion { board: PlanningBoard; revision: string; }
+export interface PlanningBoardOutlineSection { id: string; title: string; level: 2 | 3; body: string; }
+export interface PlanningBoardOutline { sourceDocument: 'plan.md'; revision: string; sections: PlanningBoardOutlineSection[]; }
+interface StoredBoardMedia extends PlanningBoardMedia {}
+interface StoredBoardCompare extends PlanningBoardCompare {}
+interface StoredBoardItem {
+  id: string; title: string; status?: PlanningBoardStatus; bodyPath: string;
+  media?: StoredBoardMedia[]; compare?: StoredBoardCompare; prompt?: string; source?: string;
+}
+interface StoredBoardSection {
+  id: string; title: string; kind: PlanningBoardKind; status?: PlanningBoardStatus;
+  summary?: string; cover?: string; bodyPath: string;
+  children?: StoredBoardSection[]; items?: StoredBoardItem[];
+}
+interface StoredBoard { schemaVersion: 1; planId: string; updatedAt: string; sections: StoredBoardSection[]; }
+const BOARD_KINDS: PlanningBoardKind[] = ['section', 'gallery', 'comparison', 'checklist', 'research', 'note'];
+const BOARD_STATUSES: PlanningBoardStatus[] = ['idea', 'in-progress', 'review', 'done', 'blocked'];
+const BOARD_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/;
 export interface PlanningExecution {
   schemaVersion: 1;
   id: string;
@@ -45,6 +84,7 @@ export interface PlanningExecution {
   createdAt: string;
   status: 'prepared' | 'linked';
   targetId?: string;
+  boardRevision?: string;
   files: Array<PlanningFile & { sha256: string }>;
 }
 export class PlanningError extends Error {
@@ -186,6 +226,213 @@ function validateMime(sample: Buffer, mime: string): void {
   };
   if (mime in checks && !checks[mime]) fail('File bytes do not match the declared MIME type.');
 }
+const BOARD_CONTENT_PREFIX = 'board/content/';
+const boardBodyPath = (id: string) => `${BOARD_CONTENT_PREFIX}${id}.md`;
+function boardId(value: unknown): string {
+  if (typeof value !== 'string' || !BOARD_ID.test(value)) fail('Board node IDs must be 1-80 letters, digits, hyphens or underscores.');
+  return value;
+}
+function boardTitle(value: unknown, field = 'Board node title'): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 200 || /[\x00-\x1f\x7f]/.test(value)) fail(`${field} must be 1-200 characters.`);
+  return value.trim();
+}
+function boardKind(value: unknown): PlanningBoardKind {
+  if (value === undefined) return 'section';
+  if (typeof value !== 'string' || !BOARD_KINDS.includes(value as PlanningBoardKind)) fail('Invalid board section kind.');
+  return value as PlanningBoardKind;
+}
+function boardStatus(value: unknown): PlanningBoardStatus | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !BOARD_STATUSES.includes(value as PlanningBoardStatus)) fail('Invalid board status.');
+  return value as PlanningBoardStatus;
+}
+function boardText(value: unknown, field: string, maximum = MAX_PLANNING_BOARD_BODY_BYTES): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') fail(`${field} must be text.`);
+  if (Buffer.byteLength(value) > maximum) fail(`${field} exceeds the size limit.`, 413);
+  if (text(Buffer.from(value)) !== value) fail(`${field} must be valid UTF-8 text.`);
+  return value;
+}
+function boardAsset(value: unknown, field: string): string {
+  if (typeof value !== 'string') fail(`${field} must be an assets/ path.`);
+  const relative = validatePlanningPath(value);
+  if (!relative.startsWith('assets/')) fail(`${field} must be an assets/ path.`);
+  return relative;
+}
+function boardMedia(value: unknown): StoredBoardMedia[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 24) fail('Board media must be an array of at most 24 entries.');
+  return value.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail('Invalid board media entry.');
+    const media = entry as Record<string, unknown>;
+    return {
+      path: boardAsset(media.path, 'Media path'),
+      ...(media.alt === undefined ? {} : { alt: boardText(media.alt, 'Media alt text', 300) }),
+      ...(media.label === undefined ? {} : { label: boardText(media.label, 'Media label', 100) }),
+    };
+  });
+}
+function boardCompare(value: unknown): StoredBoardCompare | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('Invalid board comparison.');
+  const compare = value as Record<string, unknown>;
+  if (compare.mode !== 'slider' && compare.mode !== 'side-by-side') fail('Comparison mode must be slider or side-by-side.');
+  return { mode: compare.mode, before: boardAsset(compare.before, 'Comparison before image'), after: boardAsset(compare.after, 'Comparison after image') };
+}
+function boardSource(value: unknown): string | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || value.length > 2048) fail('Board source must be an absolute URL.');
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { fail('Board source must be an absolute URL.'); }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') fail('Board source must use http or https.');
+  return value;
+}
+function normalizeBoard(value: unknown, planId: string): { manifest: StoredBoard; bodies: Map<string, string> } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('Expected a board object.');
+  const input = value as Record<string, unknown>;
+  if (input.schemaVersion !== 1) fail('Unsupported board schema version.');
+  if (input.planId !== planId) fail('Board planId does not match this plan.');
+  if (!Array.isArray(input.sections)) fail('Board sections must be an array.');
+  const ids = new Set<string>();
+  const bodies = new Map<string, string>();
+  let nodes = 0;
+  const uniqueId = (value: unknown) => {
+    const id = boardId(value);
+    if (ids.has(id)) fail('Board node IDs must be unique.');
+    ids.add(id);
+    return id;
+  };
+  const items = (value: unknown, where: string): StoredBoardItem[] | undefined => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.length > 200) fail(`${where} items must be an array of at most 200.`);
+    return value.map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail('Invalid board item.');
+      if (++nodes > MAX_PLANNING_BOARD_NODES) fail('Board exceeds the node limit.', 413);
+      const item = entry as Record<string, unknown>;
+      const id = uniqueId(item.id);
+      const body = boardText(item.body, 'Item body') ?? '';
+      if (Buffer.byteLength(body) > MAX_PLANNING_BOARD_BODY_BYTES) fail('Item body exceeds the size limit.', 413);
+      bodies.set(id, body);
+      return {
+        id, title: boardTitle(item.title, 'Item title'), bodyPath: boardBodyPath(id),
+        ...(boardStatus(item.status) === undefined ? {} : { status: boardStatus(item.status)! }),
+        ...(boardMedia(item.media) === undefined ? {} : { media: boardMedia(item.media)! }),
+        ...(boardCompare(item.compare) === undefined ? {} : { compare: boardCompare(item.compare)! }),
+        ...(boardText(item.prompt, 'Item prompt', 20_000) === undefined ? {} : { prompt: boardText(item.prompt, 'Item prompt', 20_000)! }),
+        ...(boardSource(item.source) === undefined ? {} : { source: boardSource(item.source)! }),
+      };
+    });
+  };
+  const sections = (value: unknown, depth: number, where: string): StoredBoardSection[] => {
+    if (!Array.isArray(value) || value.length > 200) fail(`${where} must be an array of at most 200 sections.`);
+    if (depth > MAX_PLANNING_BOARD_DEPTH) fail(`Board sections cannot be nested deeper than ${MAX_PLANNING_BOARD_DEPTH} levels.`);
+    return value.map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail('Invalid board section.');
+      if (++nodes > MAX_PLANNING_BOARD_NODES) fail('Board exceeds the node limit.', 413);
+      const section = entry as Record<string, unknown>;
+      const id = uniqueId(section.id);
+      const body = boardText(section.body, 'Section body') ?? '';
+      if (Buffer.byteLength(body) > MAX_PLANNING_BOARD_BODY_BYTES) fail('Section body exceeds the size limit.', 413);
+      bodies.set(id, body);
+      const children = section.children === undefined ? undefined : sections(section.children, depth + 1, 'Section children');
+      const sectionItems = items(section.items, 'Section');
+      return {
+        id, title: boardTitle(section.title, 'Section title'), kind: boardKind(section.kind), bodyPath: boardBodyPath(id),
+        ...(boardStatus(section.status) === undefined ? {} : { status: boardStatus(section.status)! }),
+        ...(boardText(section.summary, 'Section summary', 2000) === undefined ? {} : { summary: boardText(section.summary, 'Section summary', 2000)! }),
+        ...(section.cover === undefined ? {} : { cover: boardAsset(section.cover, 'Section cover') }),
+        ...(children === undefined ? {} : { children }),
+        ...(sectionItems === undefined ? {} : { items: sectionItems }),
+      };
+    });
+  };
+  const normalizedSections = sections(input.sections, 1, 'Board sections');
+  const manifest: StoredBoard = { schemaVersion: 1, planId, updatedAt: now(), sections: normalizedSections };
+  let total = Buffer.byteLength(JSON.stringify(manifest));
+  for (const body of bodies.values()) total += Buffer.byteLength(body);
+  if (total > MAX_PLANNING_BOARD_BYTES) fail('Board exceeds the 1 MiB limit.', 413);
+  return { manifest, bodies };
+}
+function hydrateBoard(raw: unknown, root: string, planId: string): PlanningBoard {
+  if (!raw || typeof raw !== 'object' || (raw as StoredBoard).schemaVersion !== 1 || (raw as StoredBoard).planId !== planId || !Array.isArray((raw as StoredBoard).sections)) {
+    fail('Invalid planning board.', 409, 'INVALID_PLANNING_DATA');
+  }
+  const readBody = (id: string, storedPath: unknown): string => {
+    boardId(id);
+    const legacyPath = boardBodyPath(id);
+    const relative = storedPath === undefined ? legacyPath : storedPath;
+    if (typeof relative !== 'string' || (relative !== legacyPath && !new RegExp(`^${BOARD_CONTENT_PREFIX}${id}-[a-f0-9]{64}\\.md$`).test(relative))) fail('Invalid board body path.', 409, 'INVALID_PLANNING_DATA');
+    const filename = contained(root, relative);
+    if (!fs.existsSync(filename)) {
+      if (relative === legacyPath) return '';
+      fail('Board body is missing.', 409, 'INVALID_PLANNING_DATA');
+    }
+    return text(readBytes(root, relative, MAX_PLANNING_BOARD_BODY_BYTES));
+  };
+  const walk = (entries: unknown, depth: number): PlanningBoardSection[] => {
+    if (!Array.isArray(entries) || depth > MAX_PLANNING_BOARD_DEPTH) fail('Invalid planning board.', 409, 'INVALID_PLANNING_DATA');
+    return entries.map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail('Invalid planning board.', 409, 'INVALID_PLANNING_DATA');
+      const section = entry as Record<string, unknown>;
+      if (typeof section.id !== 'string') fail('Invalid planning board.', 409, 'INVALID_PLANNING_DATA');
+      const children = section.children === undefined ? undefined : walk(section.children, depth + 1);
+      const items = section.items === undefined ? undefined : (section.items as unknown[]);
+      if (items !== undefined && !Array.isArray(items)) fail('Invalid planning board.', 409, 'INVALID_PLANNING_DATA');
+      return {
+        ...section,
+        body: readBody(section.id, section.bodyPath),
+        ...(children === undefined ? {} : { children }),
+        ...(items === undefined ? {} : { items: items.map((item) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item) || typeof (item as Record<string, unknown>).id !== 'string') fail('Invalid planning board.', 409, 'INVALID_PLANNING_DATA');
+          const node = item as Record<string, unknown>;
+          return { ...node, body: readBody(node.id as string, node.bodyPath) } as unknown as PlanningBoardItem;
+        }) }),
+      } as unknown as PlanningBoardSection;
+    });
+  };
+  return { schemaVersion: 1, planId, updatedAt: (raw as StoredBoard).updatedAt, sections: walk((raw as StoredBoard).sections, 1) };
+}
+function boardDigest(manifest: StoredBoard, bodies: Map<string, string>): string {
+  const digest = createHash('sha256');
+  digest.update(JSON.stringify(manifest));
+  const walk = (entries: StoredBoardSection[]) => {
+    for (const section of entries) {
+      digest.update(`\0${section.id}\0`).update(bodies.get(section.id) ?? '');
+      if (section.children) walk(section.children);
+      for (const item of section.items ?? []) digest.update(`\0${item.id}\0`).update(bodies.get(item.id) ?? '');
+    }
+  };
+  walk(manifest.sections);
+  return digest.digest('hex');
+}
+function expectedBoardRevision(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) fail('expectedRevision is required (null for a new board).');
+  return value;
+}
+function outlineFromMarkdown(content: string): PlanningBoardOutlineSection[] {
+  const result: Array<{ title: string; level: 2 | 3; lines: string[] }> = [];
+  let current: { title: string; level: 2 | 3; lines: string[] } | null = null;
+  let fenced = false;
+  const flush = () => { if (current) result.push(current); };
+  for (const line of content.split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+    const match = fenced ? null : /^(#{2,3})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (match) {
+      flush();
+      current = { title: match[2].trim(), level: match[1].length === 2 ? 2 : 3, lines: [] };
+    } else if (current) current.lines.push(line);
+  }
+  flush();
+  const used = new Set<string>();
+  return result.map((entry) => {
+    const base = entry.title.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'section';
+    let id = base; let suffix = 2;
+    while (used.has(id)) id = `${base.slice(0, 70)}-${suffix++}`;
+    used.add(id);
+    return { id, title: entry.title.slice(0, 200), level: entry.level, body: entry.lines.join('\n').trim() };
+  });
+}
 
 export class PlanningStore {
   readonly maxAssetBytes: number;
@@ -253,10 +500,11 @@ export class PlanningStore {
     if (fs.existsSync(destination)) fail('Plan directory already exists.', 409);
     const staging = directory(root, `.create-${randomUUID()}`);
     const metadata: PlanningDocument = { schemaVersion: 1, id, workspaceId, title, createdAt: now(), updatedAt: now(), status: 'draft', pinned: false, archivedAt: null };
-    for (const dir of ['research', 'assets', 'chat', '.history', 'runs']) directory(staging, dir);
-    atomic(staging, 'plan.md', input.content ?? `# ${title}\n\n## Purpose\n\n## Scope\n\n## Current state\n\n## Requirements\n\n## Decisions\n\n## Open questions\n\n## Implementation phases\n\n## Validation and completion criteria\n`);
+    for (const dir of ['research', 'assets', 'chat', '.history', 'runs', 'board', 'board/content']) directory(staging, dir);
+    atomic(staging, 'plan.md', input.content ?? `# ${title}\n\n`);
     atomic(staging, 'chat/messages.jsonl', '');
     writeJson(staging, 'chat/conversations.json', { schemaVersion: 1, conversations: [] });
+    writeJson(staging, 'board/board.json', { schemaVersion: 1, planId: id, updatedAt: now(), sections: [] } satisfies StoredBoard);
     writeJson(staging, 'plan.json', metadata);
     fs.renameSync(staging, destination);
     return metadata;
@@ -278,6 +526,69 @@ export class PlanningStore {
     metadata.updatedAt = now();
     writeJson(root, 'plan.json', metadata);
     return metadata;
+  }
+  readBoard(workspaceId: string, planId: string): PlanningBoardVersion | null {
+    const { root } = this.plan(workspaceId, planId);
+    const manifestPath = contained(root, 'board/board.json');
+    if (!fs.existsSync(manifestPath)) return null;
+    const raw = json<StoredBoard>(root, 'board/board.json', MAX_PLANNING_BOARD_BYTES);
+    const board = hydrateBoard(raw, root, planId);
+    const { manifest, bodies } = normalizeBoard(board, planId);
+    manifest.updatedAt = raw.updatedAt ?? manifest.updatedAt;
+    return { board: { ...board, updatedAt: manifest.updatedAt }, revision: boardDigest(manifest, bodies) };
+  }
+  writeBoard(workspaceId: string, planId: string, input: { board: unknown; expectedRevision: unknown }): PlanningBoardVersion {
+    const { root } = this.plan(workspaceId, planId);
+    const expected = expectedBoardRevision(input.expectedRevision);
+    const existing = this.readBoard(workspaceId, planId);
+    if (existing ? existing.revision !== expected : expected !== null) fail('Board changed on disk. Reload and merge the draft.', 409, 'REVISION_CONFLICT');
+    const { manifest, bodies } = normalizeBoard(input.board, planId);
+    directory(root, 'board/content');
+    if (existing) {
+      const history = directory(root, '.history');
+      atomic(history, `board-${Date.now()}-${randomUUID()}.json`, readBytes(root, 'board/board.json', MAX_PLANNING_BOARD_BYTES));
+      for (const name of fs.readdirSync(history).filter((entry) => entry.startsWith('board-')).sort().slice(0, -20)) {
+        try { fs.unlinkSync(contained(history, name)); } catch { /* Board history pruning is best-effort. */ }
+      }
+    }
+    // Content-addressed bodies never replace the files referenced by the current
+    // manifest. A failed or interrupted manifest publish therefore leaves the
+    // previously committed board readable in full.
+    const bodyPath = (id: string) => `${BOARD_CONTENT_PREFIX}${id}-${hash(bodies.get(id) ?? '')}.md`;
+    const assignPaths = (sections: StoredBoardSection[]) => {
+      for (const section of sections) {
+        section.bodyPath = bodyPath(section.id);
+        for (const item of section.items ?? []) item.bodyPath = bodyPath(item.id);
+        if (section.children) assignPaths(section.children);
+      }
+    };
+    assignPaths(manifest.sections);
+    for (const [id, body] of bodies) atomic(root, bodyPath(id), body);
+    writeJson(root, 'board/board.json', manifest);
+    this.update(workspaceId, planId, {});
+    return this.readBoard(workspaceId, planId)!;
+  }
+  deriveOutline(workspaceId: string, planId: string): PlanningBoardOutline {
+    const document = this.readDocument(workspaceId, planId, 'plan.md');
+    return { sourceDocument: 'plan.md', revision: document.revision, sections: outlineFromMarkdown(document.content) };
+  }
+  convertBoard(workspaceId: string, planId: string, expectedRevision: unknown = null): PlanningBoardVersion {
+    const existing = this.readBoard(workspaceId, planId);
+    if (existing && existing.board.sections.length) fail('This plan already has a board.', 409, 'PLANNING_EXISTS');
+    const outline = this.deriveOutline(workspaceId, planId);
+    const sections: PlanningBoardSection[] = [];
+    let current: PlanningBoardSection | null = null;
+    for (const entry of outline.sections) {
+      const section: PlanningBoardSection = { id: entry.id, title: entry.title, kind: 'section', body: entry.body };
+      if (entry.level === 2) { sections.push(section); current = section; }
+      else if (current) (current.children ??= []).push(section);
+      else sections.push(section);
+    }
+    if (!sections.length) {
+      const document = this.readDocument(workspaceId, planId, 'plan.md');
+      sections.push({ id: 'plan', title: this.plan(workspaceId, planId).metadata.title, kind: 'section', body: document.content.replace(/^#\s+.*\n?/, '').trim() });
+    }
+    return this.writeBoard(workspaceId, planId, { board: { schemaVersion: 1, planId, updatedAt: now(), sections }, expectedRevision: existing ? existing.revision : expectedRevision });
   }
   readDocument(workspaceId: string, planId: string, relative: string): { path: string; content: string; revision: string } {
     validatePlanningPath(relative, true);
@@ -526,7 +837,7 @@ export class PlanningStore {
     const destination = contained(runs, input.id);
     if (fs.existsSync(destination)) {
       const existing = this.getExecution(workspaceId, planId, input.id);
-      if (existing.target !== input.target || JSON.stringify(existing.files.map((file) => file.path).sort()) !== JSON.stringify(selected)) fail('Execution ID already has a different request.', 409, 'EXECUTION_CONFLICT');
+      if (existing.target !== input.target || JSON.stringify(existing.files.filter((file) => !file.path.startsWith('board/')).map((file) => file.path).sort()) !== JSON.stringify(selected)) fail('Execution ID already has a different request.', 409, 'EXECUTION_CONFLICT');
       return existing;
     }
     const staging = directory(runs, `.prepare-${input.id}-${randomUUID()}`);
@@ -559,7 +870,28 @@ export class PlanningStore {
       } finally { fs.closeSync(sourceFd); fs.closeSync(outputFd); }
       files.push({ path: relative, mimeType: source.mimeType, byteSize: copied, sha256: digest.digest('hex') });
     }
-    const receipt: PlanningExecution = { schemaVersion: 1, id: input.id, workspaceId, planId, target: input.target, createdAt: now(), status: 'prepared', files };
+    // Materialize a self-contained board from one hydrated revision. Its manifest
+    // uses snapshot-local body paths, independent of future board writes.
+    const board = this.readBoard(workspaceId, planId);
+    if (board && board.board.sections.length) {
+      const { manifest, bodies } = normalizeBoard(board.board, planId);
+      manifest.updatedAt = board.board.updatedAt;
+      const snapshotFiles: Array<[string, string]> = [
+        ['board/board.json', `${JSON.stringify(manifest, null, 2)}\n`],
+        ...[...bodies].map(([id, body]): [string, string] => [boardBodyPath(id), body]),
+      ];
+      if (files.length + snapshotFiles.length > MAX_FILES) fail('Snapshot selection exceeds the file limit.', 413);
+      for (const [relative, content] of snapshotFiles) {
+        const bytes = Buffer.from(content, 'utf8');
+        total += bytes.length;
+        if (total > MAX_SNAPSHOT_BYTES) fail('Execution snapshot exceeds 1 GiB.', 413);
+        const output = contained(staging, relative, true);
+        const fd = fs.openSync(output, 'wx', 0o400);
+        try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        files.push({ path: relative, mimeType: relative.endsWith('.json') ? 'application/json' : 'text/markdown', byteSize: bytes.length, sha256: hash(bytes) });
+      }
+    }
+    const receipt: PlanningExecution = { schemaVersion: 1, id: input.id, workspaceId, planId, target: input.target, createdAt: now(), status: 'prepared', files, ...(board?.board.sections.length ? { boardRevision: board.revision } : {}) };
     writeJson(staging, 'request.json', receipt); // Manifest last; incomplete staging directories are never executions.
     contained(root, `runs/${input.id}`);
     fs.renameSync(staging, destination);
@@ -573,10 +905,11 @@ export class PlanningStore {
     const receipt = json<PlanningExecution>(snapshotPath, 'request.json');
     if (receipt.schemaVersion !== 1 || receipt.id !== executionId || receipt.planId !== planId || !['manual', 'orchestrator'].includes(receipt.target)
       || !['prepared', 'linked'].includes(receipt.status) || !Array.isArray(receipt.files) || receipt.files.length > MAX_FILES
-      || !receipt.files.some((file) => file.path === 'plan.md') || new Set(receipt.files.map((file) => file.path)).size !== receipt.files.length) fail('Invalid execution receipt.', 409);
+      || !receipt.files.some((file) => file.path === 'plan.md') || new Set(receipt.files.map((file) => file.path)).size !== receipt.files.length
+      || (receipt.boardRevision !== undefined && (!/^[a-f0-9]{64}$/.test(receipt.boardRevision) || !receipt.files.some((file) => file.path === 'board/board.json')))) fail('Invalid execution receipt.', 409);
     let total = 0;
     for (const file of receipt.files) {
-      validatePlanningPath(file.path);
+      if (file.path !== 'board/board.json' && !/^board\/content\/[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}\.md$/.test(file.path)) validatePlanningPath(file.path);
       if (!/^[a-f0-9]{64}$/.test(file.sha256) || !Number.isSafeInteger(file.byteSize) || file.byteSize < 0) fail('Invalid execution manifest.', 409);
       total += file.byteSize;
       if (total > MAX_SNAPSHOT_BYTES) fail('Execution manifest exceeds the size limit.', 413);

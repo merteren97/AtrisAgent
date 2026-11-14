@@ -177,6 +177,37 @@ test('execution routes prepare immutable snapshots and persist an idempotent tar
   assert.equal((await (await request(`${base}/executions/execution-one`)).json() as any).status, 'linked');
 });
 
+test('board routes persist Markdown bodies and reject stale revisions', async (t) => {
+  const { base, request } = await fixture(t);
+  const empty = await (await request(`${base}/board`)).json() as any;
+  assert.deepEqual(empty.board.sections, []);
+  const board = { schemaVersion: 1, planId: 'plan-one', updatedAt: '', sections: [{ id: 'scope', title: 'Scope', kind: 'section', body: 'Keep it focused.', items: [{ id: 'item-one', title: 'First', body: 'One next step.' }] }] };
+  const saved = await request(`${base}/board`, { ...jsonBody({ board, expectedRevision: empty.revision }), method: 'PUT' });
+  assert.equal(saved.status, 200);
+  const savedBody = await saved.json() as any;
+  assert.equal(savedBody.board.sections[0].body, 'Keep it focused.');
+  assert.equal(savedBody.board.sections[0].items[0].body, 'One next step.');
+  const stale = await request(`${base}/board`, { ...jsonBody({ board, expectedRevision: empty.revision }), method: 'PUT' });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json() as any).code, 'REVISION_CONFLICT');
+  const outline = await (await request(`${base}/outline`)).json() as any;
+  assert.equal(outline.sourceDocument, 'plan.md');
+  const malformed = { ...board, sections: [{ id: 'x', title: 'X', kind: 'section', items: [{ id: 'i', title: 'I', media: [{ path: 'research/note.md' }] }] }] };
+  assert.equal((await request(`${base}/board`, { ...jsonBody({ board: malformed, expectedRevision: savedBody.revision }), method: 'PUT' })).status, 400);
+  assert.equal((await request(`${base}/board`, { ...jsonBody({ board, expectedRevision: savedBody.revision }), method: 'PUT' })).status, 200);
+});
+
+test('Markdown boards can be converted once from an outline', async (t) => {
+  const { base, request } = await fixture(t);
+  const document = await (await request(`${base}/document?path=plan.md`)).json() as any;
+  await request(`${base}/document?path=plan.md`, { ...jsonBody({ content: '# Plan\n\n## Alpha\n\nFirst.\n\n## Beta\n\nSecond.\n', expectedRevision: document.revision }), method: 'PUT' });
+  const converted = await request(`${base}/board/convert`, jsonBody({}));
+  assert.equal(converted.status, 201);
+  const result = await converted.json() as any;
+  assert.deepEqual(result.board.sections.map((section: any) => [section.id, section.body]), [['alpha', 'First.'], ['beta', 'Second.']]);
+  assert.equal((await request(`${base}/board/convert`, jsonBody({}))).status, 409);
+});
+
 test('range parser rejects invalid and unsafe integers', () => {
   assert.deepEqual(planningByteRange('bytes=8-', 10), { start: 8, end: 9 });
   assert.deepEqual(planningByteRange('bytes=-100', 10), { start: 0, end: 9 });

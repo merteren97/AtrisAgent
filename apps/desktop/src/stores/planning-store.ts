@@ -10,6 +10,23 @@ export interface PlanningFile { path: string; byteSize: number; mimeType: string
 export interface DocumentVersion { path: string; content: string; revision: string }
 export interface PlanningDraft { content: string; baseContent: string; baseRevision: string }
 export interface PlanningSource { workspaceId: string; planId: string; executionId: string; snapshotPath: string }
+export type PlanningBoardKind = 'section' | 'gallery' | 'comparison' | 'checklist' | 'research' | 'note';
+export type PlanningBoardStatus = 'idea' | 'in-progress' | 'review' | 'done' | 'blocked';
+export type PlanningBoardCompareMode = 'slider' | 'side-by-side';
+export interface PlanningBoardMedia { path: string; alt?: string; label?: string }
+export interface PlanningBoardCompare { mode: PlanningBoardCompareMode; before: string; after: string }
+export interface PlanningBoardItem {
+  id: string; title: string; status?: PlanningBoardStatus; body?: string;
+  media?: PlanningBoardMedia[]; compare?: PlanningBoardCompare; prompt?: string; source?: string;
+}
+export interface PlanningBoardSection {
+  id: string; title: string; kind: PlanningBoardKind; status?: PlanningBoardStatus;
+  summary?: string; cover?: string; body?: string;
+  children?: PlanningBoardSection[]; items?: PlanningBoardItem[];
+}
+export interface PlanningBoard { schemaVersion: 1; planId: string; updatedAt: string; sections: PlanningBoardSection[] }
+export interface PlanningBoardVersion { board: PlanningBoard; revision: string }
+export const boardApi = (workspaceId: string, planId: string) => `${planApi(workspaceId, planId)}/board`;
 export const planApi = (workspaceId: string, planId?: string) => `/workspaces/${encodeURIComponent(workspaceId)}/plans${planId ? `/${encodeURIComponent(planId)}` : ''}`;
 export const documentKey = (workspaceId: string, planId: string, path: string) => JSON.stringify([workspaceId, planId, path]);
 interface PlanningState {
