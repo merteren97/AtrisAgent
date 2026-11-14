@@ -82,6 +82,7 @@ const DEFAULT_IGNORED_DIRS = new Set([
   '.git',
   '.atris-worktrees',
   '.atris-checkpoints',
+  '.atris-plans',
   'dist',
   '.next',
   'build',

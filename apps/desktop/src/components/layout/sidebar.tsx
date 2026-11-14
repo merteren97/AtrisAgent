@@ -30,6 +30,8 @@ import {
   TerminalSquare,
   Workflow,
   Plug,
+  BookOpen,
+  FileText,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
@@ -47,7 +49,8 @@ import { useManualStore } from '@/stores/manual-store';
 import { NavigationDeleteDialog, type NavigationDeleteTarget } from './navigation-delete-dialog';
 import { ConversationRenameDialog, type ConversationRenameTarget } from './conversation-rename-dialog';
 import { ManualConversationRow } from '@/components/manual/manual-conversation-row';
-import { useManualActivityMonitor } from '@/components/manual/manual-activity';
+import { useManualActivityMonitor, useManualActivity } from '@/components/manual/manual-activity';
+import { usePlanningStore } from '@/stores/planning-store';
 import { useAccountStore } from '../../stores/account-store';
 import { CreateWorkspaceDialog } from '../workspace/create-workspace-dialog';
 import { useTheme } from 'next-themes';
@@ -193,6 +196,8 @@ function SidebarAgentTree({
 
 export function Sidebar() {
   const manual = useManualStore();
+  const planning = usePlanningStore();
+  const manualActivity = useManualActivity(state => state.agents);
   const { theme, resolvedTheme, setTheme } = useTheme();
   useManualActivityMonitor();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
@@ -224,7 +229,9 @@ export function Sidebar() {
   useEffect(() => {
     if (sidebarCollapsed) return;
     const dismissOverlay = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || !window.matchMedia('(max-width: 1180px)').matches) return;
+      if (event.key !== 'Escape' || event.defaultPrevented || !window.matchMedia('(max-width: 1180px)').matches) return;
+      if (document.querySelector('[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]')) return;
+      if ((event.target as HTMLElement | null)?.closest('[aria-label="Planning assistant panel"]')) return;
       toggleSidebar();
       requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('button[aria-label="Workspaces"]')?.focus());
     };
@@ -234,6 +241,7 @@ export function Sidebar() {
 
   useEffect(() => {
     if (activeWorkspaceId) void useManualStore.getState().refresh(activeWorkspaceId);
+    if (activeWorkspaceId) void usePlanningStore.getState().refresh(activeWorkspaceId);
   }, [activeWorkspaceId]);
 
   useEffect(() => {
@@ -493,16 +501,19 @@ export function Sidebar() {
               {!sidebarCollapsed && isActiveWorkspace && (
                 <div className="ml-3 mb-3 pl-2">
                   <div className="mb-1 mt-2 flex h-7 items-center justify-between px-2">
-                     <span className="navigation-section-title"><TerminalSquare className="h-3.5 w-3.5 text-primary" />Manual <span className="font-normal tabular-nums">{(manual.conversations[workspace.id] || []).length}</span></span>
+                     <button type="button" aria-expanded={!planning.groups[`${workspace.id}:manual`]} aria-controls={`manual-group-${workspace.id}`} onClick={() => planning.toggleGroup(workspace.id, 'manual')} className="navigation-section-title rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"><ChevronRight className={`h-3 w-3 transition-transform ${planning.groups[`${workspace.id}:manual`] ? '' : 'rotate-90'}`} /><TerminalSquare className="h-3.5 w-3.5 text-primary" />Manual <span className="font-normal tabular-nums">{(manual.conversations[workspace.id] || []).length}</span>{(manual.conversations[workspace.id] || []).some(conversation => conversation.agents.some(agent => manualActivity[agent.id]?.state === 'attention')) && <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-label="Agent needs attention" />}</button>
                     <button type="button" aria-label="New manual conversation" className="rounded p-1 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { manual.setMode('manual'); manual.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
                   </div>
+                  <div id={`manual-group-${workspace.id}`} hidden={Boolean(planning.groups[`${workspace.id}:manual`])}>
                   {(manual.conversations[workspace.id] || []).map(conversation => <ManualConversationRow key={conversation.id} conversation={conversation} onRename={() => setConversationRename({kind:'manual',conversation})} onDelete={() => setNavigationDelete({kind:'manual',conversation})} active={manual.mode === 'manual' && manual.activeByWorkspace[workspace.id] === conversation.id} onSelect={() => { manual.select(conversation); setActiveView('chat'); }} />)}
+                  </div>
                   {manual.error && <button className="px-2 py-1 text-left text-xs text-destructive" onClick={() => void manual.refresh(workspace.id)}>Manual history unavailable · Retry</button>}
                   <div className="mb-1 mt-3 flex h-7 items-center justify-between px-2">
-                     <span className="navigation-section-title"><Workflow className="h-3.5 w-3.5 text-primary" />Orchestrator <span className="font-normal tabular-nums">{workspaceMissions.length}</span></span>
+                     <button type="button" aria-expanded={!planning.groups[`${workspace.id}:orchestrator`]} aria-controls={`orchestrator-group-${workspace.id}`} onClick={() => planning.toggleGroup(workspace.id, 'orchestrator')} className="navigation-section-title rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"><ChevronRight className={`h-3 w-3 transition-transform ${planning.groups[`${workspace.id}:orchestrator`] ? '' : 'rotate-90'}`} /><Workflow className="h-3.5 w-3.5 text-primary" />Orchestrator <span className="font-normal tabular-nums">{workspaceMissions.length}</span>{workspaceMissions.some(mission => needsMissionAttention(mission.status)) && <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-label="Mission needs attention" />}</button>
                     <button type="button" aria-label="New orchestrated conversation" className="rounded p-1 text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground" onClick={() => { handleNewChat(workspace.id); manual.setMode('orchestrator'); }}><Plus className="h-3 w-3" /></button>
                   </div>
 
+                  <div id={`orchestrator-group-${workspace.id}`} hidden={Boolean(planning.groups[`${workspace.id}:orchestrator`])}>
                   {workspaceMissions.length === 0 ? (
                     <button
                       type="button"
@@ -566,6 +577,16 @@ export function Sidebar() {
                       </div>
                     );
                   })}
+                  </div>
+                  <div className="mb-1 mt-3 flex h-7 items-center justify-between px-2">
+                    <div className="flex min-w-0 items-center gap-1"><button type="button" aria-label="Toggle planning group" aria-expanded={!planning.groups[`${workspace.id}:planning`]} aria-controls={`planning-group-${workspace.id}`} className="rounded p-0.5 text-sidebar-muted focus-visible:ring-2 focus-visible:ring-ring" onClick={() => planning.toggleGroup(workspace.id, 'planning')}><ChevronRight className={`h-3 w-3 transition-transform ${planning.groups[`${workspace.id}:planning`] ? '' : 'rotate-90'}`} /></button><button type="button" className="navigation-section-title rounded focus-visible:ring-2 focus-visible:ring-ring" onClick={() => { planning.select(workspace.id, null); manual.setMode('planning'); setActiveView('chat'); }}><BookOpen className="h-3.5 w-3.5 text-primary" />Planning <span className="font-normal tabular-nums">{(planning.plans[workspace.id] || []).filter(plan => !plan.archivedAt).length}</span></button></div>
+                    <button type="button" aria-label="New plan" className="rounded p-1 text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground" onClick={() => { manual.setMode('planning'); planning.setCreating(true); setActiveView('chat'); }}><Plus className="h-3 w-3" /></button>
+                  </div>
+                  <div id={`planning-group-${workspace.id}`} hidden={Boolean(planning.groups[`${workspace.id}:planning`])}>
+                    {(planning.plans[workspace.id] || []).filter(plan => !plan.archivedAt).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt)).slice(0, 8).map(plan => <button type="button" key={plan.id} aria-current={manual.mode === 'planning' && planning.activeByWorkspace[workspace.id] === plan.id ? 'page' : undefined} className={`mb-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs transition-colors hover:bg-sidebar-accent ${manual.mode === 'planning' && planning.activeByWorkspace[workspace.id] === plan.id ? 'bg-primary/10 text-sidebar-foreground' : 'text-sidebar-muted'}`} onClick={() => { planning.select(workspace.id, plan.id); manual.setMode('planning'); setActiveView('chat'); }}><FileText className="h-3.5 w-3.5 shrink-0" /><span className="min-w-0 flex-1 truncate text-left">{plan.title}</span>{plan.status === 'ready' && <Check className="h-3 w-3 shrink-0 text-primary" />}</button>)}
+                    <button type="button" className="w-full rounded-md px-3 py-2 text-left text-[11px] text-sidebar-muted hover:text-sidebar-foreground" onClick={() => { planning.select(workspace.id, null); manual.setMode('planning'); setActiveView('chat'); }}>All plans…</button>
+                    {planning.errors[workspace.id] && <button className="px-3 py-1 text-left text-[11px] text-destructive" onClick={() => void planning.refresh(workspace.id)}>Plans unavailable · Retry</button>}
+                  </div>
                 </div>
               )}
             </div>

@@ -54,6 +54,10 @@ import { ApplyVerificationOperationStore, executeApplyVerificationOperation } fr
 import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-sibling';
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 import { installManualConversations } from './manual-conversations';
+import { PlanningStore } from './planning-store';
+import { createPlanningMediaAccess, installPlanningRoutes } from './planning-routes';
+import { installPlanningChatRoutes } from './planning-chat';
+import { findPlanningHandoffSource, installPlanningHandoffRoutes } from './planning-handoff';
 import { AttachmentStore, installAttachmentRoutes } from './attachments';
 import { registerOrchestratorInteractions } from './orchestrator-interactions';
 import { installIntegrationConnectionRoutes } from './integration-connections';
@@ -469,6 +473,9 @@ eventBus.on('*', (event: AgentEvent) => {
 
 // 3. Express App & HTTP Server
 const app = express();
+export const planningStore = new PlanningStore((id) => sqlite.prepare('SELECT id, path FROM workspaces WHERE id = ?').get(id) as { id: string; path: string } | undefined);
+const planningFence = (id: string) => isDeletionFenced('workspace', id);
+const planningMedia = createPlanningMediaAccess(planningStore, { fenced: planningFence, ttlMs: 300_000 });
 const allowedOrigins = new Set([
   'http://127.0.0.1:1420',
   'http://localhost:1420',
@@ -489,8 +496,10 @@ app.use(cors({
 }));
 // Agent-only grants provide a narrower boundary than the desktop runtime token.
 installManualCoordinationCallRoute(app, express.json({limit:'32kb'}));
+app.use(planningMedia.middleware);
 app.use(createRuntimeTokenMiddleware(RUNTIME_TOKEN));
 app.use('/api/attachments', express.json({ limit: '14mb' }));
+app.use('/api/workspaces/:workspaceId/plans', express.json({ limit: '6mb' }));
 app.use(express.json({ limit: '2mb' }));
 
 // AtrisHub remains the authoritative identity and Premium entitlement service.
@@ -500,7 +509,7 @@ const authService = new AtrisAuthService();
 const PORT = resolveGatewayPort();
 const server = http.createServer(app);
 const shutdownCoordinator = createRuntimeShutdownCoordinator({
-  stopRuntimeHost: async () => { await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); },
+  stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); },
   closeServer: () => new Promise<void>((resolve) => {
     if (!server.listening) {
       resolve();
@@ -532,6 +541,26 @@ installUnityCliRoutes(app, sqlite);
 installGithubConnectionRoutes(app);
 installAutoSetupRoutes(app, sqlite, gatewayDataPath.dataDir);
 export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
+installPlanningRoutes(app, planningStore, { fenced: planningFence, mediaAccess: planningMedia });
+export const planningChat = installPlanningChatRoutes(app, { store: planningStore, runtimeHost });
+installPlanningHandoffRoutes(app, {
+  store: planningStore, manualStore: manualConversationStore, runtimeHost, sqlite, fenced: planningFence,
+  startOrchestrator: async ({ workspaceId, request, options, idempotencyKey }) => {
+    const automationPolicy = normalizeAutomationPolicy(options);
+    const startOptions: Record<string, any> = { ...resolveTurnAttachments(normalizeMissionStartOptions(options, automationPolicy), workspaceId),
+      executionMode: executionModeForNewMission(options, automationPolicy), workspaceId };
+    await validateAgentProfileIds(startOptions.agentProfileIds, undefined);
+    const result = await createQueuedMissionStart({ workspaceId, promptText: request, automationPolicy,
+      teamTemplate: typeof options.teamTemplate === 'string' ? options.teamTemplate : 'default-core-dev-team',
+      options: startOptions, idempotencyKey: missionStartIdempotencyKey(idempotencyKey) });
+    return result as { missionId: string; [key: string]: unknown };
+  },
+});
+app.get('/api/planning-source/:target/:targetId', (req, res) => {
+  const target = String(req.params.target);
+  if (target !== 'manual' && target !== 'orchestrator') return void res.status(400).json({ error: 'Invalid execution target.' });
+  res.json(findPlanningHandoffSource(sqlite, target, String(req.params.targetId)));
+});
 installAttachmentRoutes(app, attachmentStore, (workspaceId) => isDeletionFenced('workspace', workspaceId));
 export const orchestratorInteractions = registerOrchestratorInteractions(app, { sqlite, eventBus, runtimeHost });
 

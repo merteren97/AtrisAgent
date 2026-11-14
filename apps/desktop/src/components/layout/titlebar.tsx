@@ -60,7 +60,7 @@ export function Titlebar() {
         : activeView === 'integrations' ? 'Integrations'
         : activeView === 'accounts' ? 'Accounts'
           : activeView === 'settings' ? 'Settings'
-            : manual.mode === 'choose' ? 'Workspace overview' : manual.mode === 'manual' ? 'Manual workspace' : activeMission?.title || 'New orchestrated conversation';
+            : manual.mode === 'choose' ? 'Workspace overview' : manual.mode === 'manual' ? 'Manual workspace' : manual.mode === 'planning' ? 'Planning workspace' : activeMission?.title || 'New orchestrated conversation';
 
   const reportWindowError = (action: WindowAction, error: unknown) => {
     const details = getErrorMessage(error);
