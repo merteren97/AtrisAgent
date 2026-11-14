@@ -30,6 +30,7 @@ import { isTauriRuntime } from '@/lib/secure-storage';
 import { Loader2 } from 'lucide-react';
 import type { RuntimeBootstrap } from '@/lib/runtime-config';
 import { stopMobileHost } from '@/lib/mobile-host';
+import { PlanningSourceBanner } from '@/components/planning/planning-source';
 
 const RUNTIME_HEALTH_INTERVAL_MS = 8_000;
 const AnalyticsDashboard = lazy(() => import('@/components/analytics/Dashboard').then((module) => ({ default: module.AnalyticsDashboard })));
@@ -41,6 +42,7 @@ const ProjectsView = lazy(() => import('@/components/projects/ProjectsView').the
 const DeveloperConsole = lazy(() => import('@/components/developer/DeveloperConsole').then((module) => ({ default: module.DeveloperConsole })));
 const ManualWorkspace = lazy(() => import('@/components/manual/manual-workspace').then(module => ({ default: module.ManualWorkspace })));
 const ConversationChoice = lazy(() => import('@/components/layout/workspace-home').then(module => ({ default: module.ConversationChoice })));
+const PlanningWorkspace = lazy(() => import('@/components/planning/planning-workspace').then(module => ({ default: module.PlanningWorkspace })));
 
 function ViewLoading() {
   return <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground" role="status" aria-live="polite"><Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />Loading view…</div>;
@@ -163,7 +165,8 @@ function WorkspaceApp() {
         main={
            <main className="flex min-h-0 min-w-0 flex-1 flex-col">
              {session.appAccess?.announcement && <p role="status" className="shrink-0 border-b border-border bg-muted/40 px-4 py-2 text-xs">{session.appAccess.announcement}</p>}
-             <CommandPalette />
+              <CommandPalette />
+              {activeView === 'chat' && (conversationMode === 'manual' || orchestrated) ? <PlanningSourceBanner /> : null}
              {activeView === 'chat' && orchestrated && activeMissionId ? (
                <Tabs value={missionSurface} onValueChange={(value) => setMissionSurface(value as 'chat' | 'processes')} className="shrink-0 gap-0 border-b border-border bg-background px-3">
                  <TabsList variant="line" className="h-9">
@@ -186,7 +189,9 @@ function WorkspaceApp() {
                  <AgentsView />
                ) : activeView === 'projects' ? (
                  <ProjectsView />
-               ) : conversationMode === 'manual' ? (
+                ) : conversationMode === 'planning' ? (
+                  <PlanningWorkspace />
+                ) : conversationMode === 'manual' ? (
                  <ManualWorkspace />
                ) : conversationMode === 'choose' ? (
                  <ConversationChoice />

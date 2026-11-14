@@ -14,7 +14,7 @@ export interface ManualConversation { id: string; workspaceId: string; title: st
 export interface ManualQuestion { id: string; questions: Array<{ header: string; question: string; options: Array<{ label: string; description?: string }>; multiple?: boolean; custom?: boolean }>; deliveryError?: string }
 export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean; question?: ManualQuestion }
 export interface ManualNamingUpdate { conversationId: string; agentId: string; agentName?: string; conversationTitle?: string }
-export type ManualMode = 'choose' | 'manual' | 'orchestrator';
+export type ManualMode = 'choose' | 'manual' | 'orchestrator' | 'planning';
 interface ManualState {
   creating: boolean;
   setCreating: (creating: boolean) => void;
