@@ -2,6 +2,7 @@ import type { ChildProcess } from 'child_process';
 import readline from 'readline';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
+import { CODEX_PERMISSION_MODES } from '@atris-agent-code/domain';
 import type {
   RuntimeType,
   AgentSession,
@@ -18,6 +19,7 @@ import type {
   AuthInitiationResult,
   AuthPollResult,
   CanonicalReasoning,
+  CodexPermissionMode,
 } from '@atris-agent-code/domain';
 import { BaseRuntimeAdapter, isReadOnlyAgentRole, type SpawnAgentOptions } from './base-adapter';
 import {
@@ -349,9 +351,13 @@ export class CodexAdapter extends BaseRuntimeAdapter {
   }
 
   async spawnAgent(options: SpawnAgentOptions): Promise<AgentSession> {
+    const permissionMode = planningPermissionMode(options);
     const capabilities = await this.probeCapabilities(options.profileId);
     if (!capabilities.structuredEventStreaming) {
       throw new Error('Installed Codex CLI does not expose `codex exec --json`; update Codex before running a background agent.');
+    }
+    if (permissionMode !== undefined) {
+      await this.assertPlanningPermissionsSupported(permissionMode, options.profileId);
     }
 
     const sessionId = options.sessionId || crypto.randomUUID();
@@ -429,6 +435,18 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       this.clearSessionCancellation(sessionId);
     });
     return session;
+  }
+
+  private async assertPlanningPermissionsSupported(mode: CodexPermissionMode, profileId?: string): Promise<void> {
+    const help = await this.commandHelp(['exec', '--help'], profileId);
+    if (!/--sandbox\b/.test(help) || !/--config\b/.test(help)) {
+      throw new Error('Installed Codex exec does not expose --sandbox and --config required for planning permissions.');
+    }
+    // The native automatic-review option is capability evidence for auto_review;
+    // do not infer its availability from a CLI version or silently use user/never.
+    if (mode === 'approve-for-me' && !/--approve-for-me\b/.test(help)) {
+      throw new Error('Installed Codex exec does not expose --approve-for-me required for automatic planning approval review.');
+    }
   }
 
   private handleJsonLine(sessionId: string, line: string): void {
@@ -544,18 +562,26 @@ export class CodexAdapter extends BaseRuntimeAdapter {
 }
 
 export function buildCodexExecArgs(
-  options: Pick<SpawnAgentOptions, 'accessMode' | 'model' | 'reasoningLevel' | 'role'>,
+  options: Pick<SpawnAgentOptions, 'accessMode' | 'model' | 'reasoningLevel' | 'role' | 'planningControls'>,
   prompt: string,
   controlPlaneArgs: string[] = [],
 ): string[] {
-  const accessMode = options.accessMode || (isReadOnlyAgentRole(options.role) ? 'read-only' : 'workspace-write');
+  const mode = planningPermissionMode(options);
+  // Planning's explicit sandbox preference overrides the role-derived default;
+  // the researcher's read-only content instructions remain in the prompt.
+  const accessMode = mode === undefined
+    ? options.accessMode || (isReadOnlyAgentRole(options.role) ? 'read-only' : 'workspace-write')
+    : mode === 'read-only' ? 'read-only' : mode === 'full-access' ? 'danger-full-access' : 'workspace-write';
   const args = [
     'exec',
     '--json',
     '--sandbox',
     accessMode,
     '-c',
-    'approval_policy="never"',
+    `approval_policy="${mode === undefined || mode === 'full-access' ? 'never' : 'on-request'}"`,
+    // exec has no --ask-for-approval flag. Match Manual through config overrides.
+    // Requests needing a human cannot be answered in exec; never auto-bypass them.
+    ...(mode === undefined ? [] : ['-c', `approvals_reviewer="${mode === 'approve-for-me' ? 'auto_review' : 'user'}"`]),
     '--skip-git-repo-check',
     ...controlPlaneArgs,
   ];
@@ -563,6 +589,14 @@ export function buildCodexExecArgs(
   if (options.reasoningLevel) args.push('-c', `model_reasoning_effort="${options.reasoningLevel}"`);
   args.push(prompt);
   return args;
+}
+
+function planningPermissionMode(options: Pick<SpawnAgentOptions, 'planningControls'>): CodexPermissionMode | undefined {
+  const mode = options.planningControls?.codexPermissionMode;
+  if (mode !== undefined && !CODEX_PERMISSION_MODES.includes(mode)) {
+    throw new Error('Invalid Codex permission mode.');
+  }
+  return mode;
 }
 
 function identifierValue(...values: unknown[]): string | undefined {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { validateConversations, type PlanningConversation } from './planning-conversations';
 
 export const MAX_PLANNING_DOCUMENT_BYTES = 4 * 1024 * 1024;
 export const MAX_PLANNING_ASSET_BYTES = 512 * 1024 * 1024;
@@ -255,6 +256,7 @@ export class PlanningStore {
     for (const dir of ['research', 'assets', 'chat', '.history', 'runs']) directory(staging, dir);
     atomic(staging, 'plan.md', input.content ?? `# ${title}\n\n## Purpose\n\n## Scope\n\n## Current state\n\n## Requirements\n\n## Decisions\n\n## Open questions\n\n## Implementation phases\n\n## Validation and completion criteria\n`);
     atomic(staging, 'chat/messages.jsonl', '');
+    writeJson(staging, 'chat/conversations.json', { schemaVersion: 1, conversations: [] });
     writeJson(staging, 'plan.json', metadata);
     fs.renameSync(staging, destination);
     return metadata;
@@ -403,6 +405,20 @@ export class PlanningStore {
       for (const message of result) { this.validateMessage(message); if (ids.has(message.id)) fail('Duplicate chat message ID.', 409); ids.add(message.id); }
       return result;
     } catch (error) { if (error instanceof SyntaxError) fail('Chat log is invalid; existing history was preserved.', 409, 'INVALID_PLANNING_DATA'); throw error; }
+  }
+  readConversations(workspaceId: string, planId: string): PlanningConversation[] {
+    const { root } = this.plan(workspaceId, planId);
+    if (!fs.existsSync(contained(root, 'chat/conversations.json'))) return [];
+    const registry = json<{ schemaVersion: number; conversations: unknown }>(root, 'chat/conversations.json');
+    if (registry?.schemaVersion !== 1) fail('Invalid conversation registry version.', 409);
+    return validateConversations(registry.conversations, workspaceId, planId);
+  }
+  writeConversations(workspaceId: string, planId: string, conversations: PlanningConversation[]): void {
+    validateConversations(conversations, workspaceId, planId);
+    const serialized = JSON.stringify({ schemaVersion: 1, conversations });
+    if (Buffer.byteLength(serialized) > 1024 * 1024) fail('Conversation registry exceeds 1 MiB.', 413);
+    const { root } = this.plan(workspaceId, planId);
+    atomic(root, 'chat/conversations.json', `${serialized}\n`);
   }
   /** Publish the entire bounded task atomically and exclusively, outside public file APIs. */
   prepareChatPrompt(workspaceId: string, planId: string, turnId: string, prompt: string): string {

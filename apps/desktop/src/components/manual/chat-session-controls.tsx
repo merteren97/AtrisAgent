@@ -8,8 +8,9 @@ import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import type { ManualAgent } from '@/stores/manual-store';
 
 const defaultEffort = (model?: DiscoveredModel) => model?.defaultReasoning || model?.supportedReasoning?.[0];
+export type ChatControlAgent = Pick<ManualAgent, 'id' | 'catalogId' | 'runtimeType' | 'accountProfileId' | 'model' | 'reasoning'>;
 
-export function ChatSessionControls({ agent, agents, pending, onApply }: { agent: ManualAgent; agents: ManualAgent[]; pending: boolean; onApply: (model: DiscoveredModel, independent: boolean, reasoning?: string) => Promise<boolean> }) {
+export function ChatSessionControls({ agent, agents, pending, onApply }: { agent: ChatControlAgent; agents: readonly unknown[]; pending: boolean; onApply: (model: DiscoveredModel, independent: boolean, reasoning?: string) => Promise<boolean> }) {
   const models = useAccountStore(state => state.discoveredModels);
   const current = models.find(model => model.catalogId === agent.catalogId);
   const [expanded, setExpanded] = useState(false);

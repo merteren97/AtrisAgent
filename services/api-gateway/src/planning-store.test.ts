@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { test, type TestContext } from 'node:test';
 import { MAX_PLANNING_CHAT_REQUEST_BYTES, PlanningStore, type PlanningMessage } from './planning-store';
+import type { PlanningConversation } from './planning-conversations';
 
 function fixture(t: TestContext, maxAssetBytes?: number) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-planning-store-'));
@@ -18,6 +19,33 @@ function fixture(t: TestContext, maxAssetBytes?: number) {
   return { root, store, resolve, planRoot };
 }
 const status = (expected: number, code?: string) => (error: any) => error.statusCode === expected && (code === undefined || error.code === code);
+
+test('conversation registry is versioned, scoped, atomic, restart durable and rejects duplicate or corrupt metadata', t => {
+  const { store, resolve, planRoot } = fixture(t);
+  const filename = path.join(planRoot, 'chat', 'conversations.json');
+  assert.deepEqual(store.readConversations('one', 'plan-one'), []);
+  const now = new Date().toISOString();
+  const conversation: PlanningConversation = { id: randomUUID(), title: 'Independent', workspaceId: 'one', planId: 'plan-one', runtimeType: 'codex',
+    catalogId: 'verified', model: 'model', accountProfileId: 'account', createdAt: now, updatedAt: now, closedAt: null,
+    codexPermissionMode: 'read-only', openCodeAutoApprove: false };
+  store.writeConversations('one', 'plan-one', [conversation]);
+  assert.deepEqual(new PlanningStore(resolve).readConversations('one', 'plan-one'), [conversation]);
+  const original = fs.readFileSync(filename, 'utf8');
+  assert.equal(JSON.parse(original).schemaVersion, 1);
+  for (const entries of [[conversation, conversation], [{ ...conversation, id: 'not-a-uuid' }], [{ ...conversation, planId: 'elsewhere' }], [{ ...conversation, workspaceId: 'two' }]]) {
+    assert.throws(() => store.writeConversations('one', 'plan-one', entries), status(409));
+    assert.equal(fs.readFileSync(filename, 'utf8'), original);
+  }
+  const rename = fs.renameSync;
+  fs.renameSync = (source, destination) => { if (String(destination) === filename) throw new Error('injected registry publish failure'); rename(source, destination); };
+  try { assert.throws(() => store.writeConversations('one', 'plan-one', [{ ...conversation, title: 'Unpublished' }]), /publish failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(filename, 'utf8'), original);
+  assert(!fs.readdirSync(path.dirname(filename)).some(name => name.includes('.tmp-')));
+  fs.writeFileSync(filename, '{corrupt');
+  assert.throws(() => store.readConversations('one', 'plan-one'), status(409));
+  assert.equal(fs.readFileSync(filename, 'utf8'), '{corrupt');
+});
 
 test('portable plans persist, remain workspace scoped, and metadata edits preserve folder identity', (t) => {
   const { store, resolve, planRoot } = fixture(t);
