@@ -13,8 +13,13 @@ import {
   type PlanningChatAdapter, type PlanningChatOptions, type PlanningChatRecord, type PlanningChatState, type PlanningChatStorage,
 } from './planning-chat';
 import { PlanningStore } from './planning-store';
+import type { PlanningConversation } from './planning-conversations';
+import { isLocalDataRequest } from './local-data-access';
 
 class Storage implements PlanningChatStorage {
+  conversations = new Map<string, PlanningConversation[]>();
+  readConversations(w: string, p: string) { this.get(w, p); return structuredClone(this.conversations.get(JSON.stringify([w, p])) || []); }
+  writeConversations(w: string, p: string, entries: PlanningConversation[]) { this.get(w, p); this.conversations.set(JSON.stringify([w, p]), structuredClone(entries)); }
   journals = new Map<string, PlanningChatRecord[]>();
   documents = new Map<string, { content: string; revision: string }>();
   writes = 0;
@@ -569,4 +574,223 @@ for (const runtime of ['codex', 'claude_code', 'opencode', 'antigravity'] as con
   }
 }
 
-console.log('Planning chat: async HTTP lifecycle, durable restart, CAS proposals, cancellation fences, idempotency, model validation, native interaction rejection and plan/session isolation passed. No provider processes launched.');
+// The exact tab HTTP contract and entitlement allowlist: only reads bypass Hub auth.
+{
+  const f = fixture(); const app = express(); app.use(express.json());
+  const controller = installPlanningChatRoutes(app, f.options);
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const root = '/api/planning/w/plans/p/chat/conversations';
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}${root}`;
+  const id = '40000000-0000-4000-8000-000000000001';
+  const call = (suffix = '', method = 'GET', body?: unknown) => fetch(base + suffix, { method, headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  try {
+    assert.deepEqual(await (await call()).json(), []);
+    const created = await call('', 'POST', { id, catalogId: 'catalog-route', reasoning: 'high' });
+    assert.equal(created.status, 200);
+    assert.equal((await created.json()).creationFingerprint, undefined, 'Internal idempotency metadata is not public config');
+    assert.equal((await call(`/${id}`, 'PATCH', { title: 'Renamed tab' })).status, 200);
+    assert.equal((await (await call(`/${id}`)).json()).conversation.title, 'Renamed tab');
+    assert.equal((await call(`/${id}/messages`, 'POST', input())).status, 202);
+    assert.equal((await call(`/${id}`, 'PATCH', { closed: true })).status, 409);
+    assert.equal((await call(`/${id}/approvals/stale/reply`, 'POST', { decision: 'deny', turnId: 'old' })).status, 409);
+    assert.equal((await call(`/${id}/stop`, 'POST', {})).status, 200);
+    assert.equal((await call(`/${id}/updates/missing/apply`, 'POST', { expectedRevision: null })).status, 404);
+    assert.equal((await call(`/${id}`, 'PATCH', { closed: true })).status, 200);
+    assert.equal((await call(`/${id}`, 'PATCH', { closed: false })).status, 200);
+    for (const method of ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE']) {
+      for (const suffix of ['', `/${id}`, `/${id}/messages`, `/${id}/stop`, `/${id}/approvals/x/reply`]) {
+        const allowed = isLocalDataRequest({ method, originalUrl: root + suffix, headers: { 'x-atris-runtime-token': 'local-fixture' } } as any, 'local-fixture');
+        assert.equal(allowed, ['GET', 'HEAD'].includes(method) && ['', `/${id}`].includes(suffix));
+      }
+    }
+  } finally { await controller.close(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+}
+
+// Same-plan conversations share documents, never histories, locks, proposals, or native sessions.
+{
+  const f = fixture();
+  const a = '10000000-0000-4000-8000-000000000001';
+  const b = '10000000-0000-4000-8000-000000000002';
+  const create = (id: string) => ({ id, title: 'Independent', catalogId: 'catalog-route', reasoning: 'high' });
+  try {
+    assert.deepEqual(await f.controller.listConversations('w', 'p'), []);
+    const [first, duplicate] = await Promise.all([f.controller.createConversation('w', 'p', create(a)), f.controller.createConversation('w', 'p', create(a))]);
+    assert.deepEqual(first, duplicate);
+    await assert.rejects(f.controller.createConversation('w', 'p', { ...create(a), title: 'Different' }), /different create/);
+    await f.controller.createConversation('w', 'p', create(b));
+    assert.throws(() => f.controller.conversation('w', 'other-plan', a), /not found/);
+    assert.throws(() => f.controller.conversation('w', 'p', '../../unsafe'), /Invalid/);
+    const one = f.controller.conversation('w', 'p', a); const two = f.controller.conversation('w', 'p', b);
+    const [turnOne, turnTwo] = await Promise.all([one.send('w', 'p', { ...input(), text: 'Secret first topic' }), two.send('w', 'p', { ...input(), text: 'Unrelated second topic' })]);
+    assert.notEqual(turnOne.turnId, turnTwo.turnId);
+    await until(() => f.adapters.length === 2 && f.adapters.every(adapter => Boolean(adapter.options)));
+    assert(!f.adapters[0].options!.prompt.includes('Unrelated second topic'));
+    assert(!f.adapters[1].options!.prompt.includes('Secret first topic'));
+    await assert.rejects(f.controller.updateConversation('w', 'p', a, { closed: true }), /Stop the active/);
+    await f.controller.updateConversation('w', 'p', a, { codexPermissionMode: 'full-access', fullAccessConfirmed: true });
+    assert.equal(one.get('w', 'p').conversation?.codexPermissionMode, 'full-access', 'Preference saves for next turn');
+    assert.equal(f.adapters[0].options!.planningControls?.codexPermissionMode, 'read-only');
+    f.adapters[0].emit('task_completed', { result: 'First answer' + update('plan.md', '# First proposal') });
+    f.adapters[1].emit('task_completed', { result: 'Second answer' + update('plan.md', '# Second proposal') });
+    assert.equal(one.get('w', 'p').proposals[0].status, 'applied');
+    assert.equal(two.get('w', 'p').proposals[0].status, 'conflict');
+    assert.throws(() => one.apply('w', 'p', two.get('w', 'p').proposals[0].id, null), /not found/);
+    assert(!two.get('w', 'p').messages.some(message => message.content.includes('Secret first topic')));
+    assert.equal(f.controller.get('w', 'p').messages.length, 0, 'Legacy endpoint does not expose new tab histories');
+    await f.controller.updateConversation('w', 'p', a, { closed: true });
+    assert(one.get('w', 'p').conversation?.closedAt);
+    await assert.rejects(one.send('w', 'p', input('closed')), /Reopen/);
+    await f.controller.updateConversation('w', 'p', a, { closed: false, title: 'Reopened' });
+    assert.equal(one.get('w', 'p').conversation?.closedAt, null);
+    await assert.rejects(f.controller.updateConversation('w', 'p', a, { codexPermissionMode: 'full-access' }), /Confirm Full Access/);
+    assert.equal((await f.controller.updateConversation('w', 'p', a, { codexPermissionMode: 'ask-for-approval' })).codexPermissionMode, 'ask-for-approval');
+    await assert.rejects(f.controller.updateConversation('w', 'p', a, { openCodeAutoApprove: true }), /OpenCode/);
+    await f.controller.updateConversation('w', 'p', a, { codexPermissionMode: 'full-access', fullAccessConfirmed: true });
+    await one.send('w', 'p', input('full-access'));
+    await until(() => Boolean(f.adapters[2]?.options));
+    assert.equal(f.adapters[2].options!.planningControls?.codexPermissionMode, 'full-access');
+    one.stop('w', 'p'); assert.equal(two.get('w', 'p').status, 'complete');
+    f.model.runtimeModelId = 'updated-same-account-model';
+    assert.equal((await f.controller.updateConversation('w', 'p', a, { catalogId: 'catalog-route' })).model, 'updated-same-account-model');
+    f.profile.runtimeType = 'opencode'; f.model.runtimeId = 'opencode';
+    await assert.rejects(f.controller.updateConversation('w', 'p', a, { catalogId: 'catalog-route' }), /independent session/);
+    await assert.rejects(one.send('w', 'p', input('provider-change')), /independent session/);
+  } finally { await f.controller.close(); }
+}
+
+// Real native approval replies: off waits visibly, deny stays native, retries deliver once, stale turns never route to a replacement.
+for (const autoApprove of [false, true]) {
+  const f = fixture('opencode'); const id = '20000000-0000-4000-8000-000000000001';
+  const replies: Array<[string, string]> = [];
+  const delivery = deferred();
+  f.configure(adapter => {
+    (adapter as PlanningChatAdapter).respondToApproval = async (id, decision) => { replies.push([id, decision]); await delivery.promise; };
+  });
+  try {
+    await f.controller.createConversation('w', 'p', { id, catalogId: 'catalog-route', reasoning: 'high' });
+    await f.controller.updateConversation('w', 'p', id, { openCodeAutoApprove: autoApprove });
+    const engine = f.controller.conversation('w', 'p', id);
+    const turn = await engine.send('w', 'p', input());
+    await until(() => Boolean(f.adapters[0]?.options));
+    f.adapters[0].emit('approval_requested', { approvalId: 'native-permission', toolName: 'read', description: 'Read local directory' });
+    if (autoApprove) {
+      await until(() => replies.length === 1); assert.deepEqual(replies[0], ['native-permission', 'approved']);
+      delivery.resolve(); await delay();
+    } else {
+      assert.equal(replies.length, 0);
+      assert.equal(engine.get('w', 'p').approvals?.[0].id, 'native-permission');
+      await assert.rejects(engine.replyApproval('w', 'p', 'native-permission', { decision: 'allow', turnId: 'stale' }), /stale/);
+      const first = engine.replyApproval('w', 'p', 'native-permission', { decision: 'deny', turnId: turn.turnId });
+      const retry = engine.replyApproval('w', 'p', 'native-permission', { decision: 'deny', turnId: turn.turnId });
+      await until(() => replies.length === 1);
+      await assert.rejects(engine.replyApproval('w', 'p', 'native-permission', { decision: 'allow', turnId: turn.turnId }), /different decision/);
+      delivery.resolve(); await Promise.all([first, retry]);
+      assert.deepEqual(replies, [['native-permission', 'rejected']]);
+    }
+    engine.stop('w', 'p');
+    await engine.send('w', 'p', input('replacement'));
+    await assert.rejects(engine.replyApproval('w', 'p', 'native-permission', { decision: 'deny', turnId: turn.turnId }), /stale/);
+    assert.equal(replies.length, 1);
+  } finally { delivery.resolve(); await f.controller.close(); }
+}
+
+// Changing the OpenCode approval preference handles real pending requests and disabling it fences future requests.
+{
+  const f = fixture('opencode'); const id = '50000000-0000-4000-8000-000000000001';
+  const replies: Array<[string, string]> = [];
+  f.configure(adapter => { (adapter as PlanningChatAdapter).respondToApproval = async (id, decision) => { replies.push([id, decision]); }; });
+  try {
+    await f.controller.createConversation('w', 'p', { id, catalogId: 'catalog-route', reasoning: 'high' });
+    const engine = f.controller.conversation('w', 'p', id);
+    const turn = await engine.send('w', 'p', input()); await until(() => Boolean(f.adapters[0]?.options));
+    f.adapters[0].emit('approval_requested', { approvalId: 'pending-before-enable', description: 'Read' });
+    assert.equal(engine.get('w', 'p').approvals?.length, 1);
+    await f.controller.updateConversation('w', 'p', id, { openCodeAutoApprove: true });
+    await until(() => replies.length === 1);
+    assert.deepEqual(replies[0], ['pending-before-enable', 'approved']);
+    await f.controller.updateConversation('w', 'p', id, { openCodeAutoApprove: false });
+    f.adapters[0].emit('approval_requested', { approvalId: 'pending-after-disable', description: 'Read' });
+    await delay(); assert.equal(replies.length, 1);
+    assert(engine.get('w', 'p').approvals?.some(approval => approval.id === 'pending-after-disable'));
+    await engine.replyApproval('w', 'p', 'pending-after-disable', { decision: 'deny', turnId: turn.turnId });
+    assert.deepEqual(replies[1], ['pending-after-disable', 'rejected']);
+  } finally { await f.controller.close(); }
+}
+
+// Approval replies already in flight stay bound to their originating turn during stop/replacement.
+{
+  const f = fixture('opencode'); const gate = deferred(); const delivered: string[] = [];
+  f.configure(adapter => { (adapter as PlanningChatAdapter).respondToApproval = async id => { delivered.push(adapter.options!.sessionId! + ':' + id); await gate.promise; }; });
+  try {
+    const turn = await f.controller.send('w', 'p', input());
+    await until(() => Boolean(f.adapters[0]?.options));
+    f.adapters[0].emit('approval_requested', { approvalId: 'racing', toolName: 'read', description: 'Read' });
+    const replying = f.controller.replyApproval('w', 'p', 'racing', { turnId: turn.turnId, decision: 'allow' });
+    const result = assert.rejects(replying, /ended while replying/);
+    await until(() => delivered.length === 1);
+    f.controller.stop('w', 'p');
+    await f.controller.send('w', 'p', input('replacement'));
+    gate.resolve(); await result;
+    assert.equal(delivered.length, 1);
+    assert(delivered[0].startsWith('planning-' + turn.turnId));
+    assert.deepEqual(f.controller.get('w', 'p').approvals, []);
+  } finally { gate.resolve(); await f.controller.close(); }
+}
+{
+  const f = fixture('opencode');
+  try {
+    await f.controller.send('w', 'p', input()); await until(() => Boolean(f.adapters[0]?.options));
+    f.adapters[0].emit('approval_requested', { approvalId: 'unsupported', description: 'Read' });
+    assert.equal(f.controller.get('w', 'p').status, 'failed');
+    assert.match(f.controller.get('w', 'p').error!, /cannot reply to native approvals/);
+  } finally { await f.controller.close(); }
+}
+
+// Portable registry, legacy migration, attachment validation/fingerprints and restart recovery use real disk paths.
+{
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-conversations-'));
+  const store = new PlanningStore(id => id === 'w' ? { id, path: temporary } : undefined);
+  store.create('w', { id: 'p', title: 'Threads' });
+  const f = fixture(); const controller = new PlanningChatController({ ...f.options, store });
+  const id = '30000000-0000-4000-8000-000000000001';
+  try {
+    assert.deepEqual(await controller.listConversations('w', 'p'), []);
+    await controller.send('w', 'p', input());
+    controller.stop('w', 'p');
+    const legacy = (await controller.listConversations('w', 'p'))[0];
+    assert.equal(legacy.id, 'default'); assert.equal(legacy.catalogId, 'catalog-route'); assert.equal(legacy.accountProfileId, 'account');
+    await controller.createConversation('w', 'p', { id, catalogId: 'catalog-route', reasoning: 'high' });
+    const engine = controller.conversation('w', 'p', id);
+    const { Readable } = await import('node:stream');
+    const asset = await store.importAsset('w', 'p', { filename: 'reference.txt', mimeType: 'text/plain', stream: Readable.from('Local reference') });
+    for (const attachmentPaths of [['plan.md'], ['assets/../plan.md'], Array(11).fill(asset.path), ['assets/missing.txt']]) {
+      await assert.rejects(engine.send('w', 'p', { ...input('bad-asset'), attachmentPaths }));
+    }
+    const oversized = Buffer.alloc(26 * 1024 * 1024); Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(oversized);
+    const largeAsset = await store.importAsset('w', 'p', { filename: 'oversized.png', mimeType: 'image/png', stream: Readable.from(oversized) });
+    await assert.rejects(engine.send('w', 'p', { ...input('oversized'), attachmentPaths: [largeAsset.path] }), /25 MiB/);
+    const sent = await engine.send('w', 'p', { ...input(), attachmentPaths: [asset.path] });
+    await until(() => Boolean(f.adapters[0]?.options));
+    const wrapper = f.adapters[0].options!.prompt;
+    const filename = JSON.parse(wrapper.split('\n')[0].split('JSON quoted): ')[1]);
+    assert(fs.readFileSync(filename, 'utf8').includes(JSON.stringify(store.resolveFile('w', 'p', asset.path).absolutePath)));
+    assert.deepEqual(sent.messages[0].attachmentPaths, [asset.path]);
+    await assert.rejects(engine.send('w', 'p', input()), /different input/);
+    const registryFile = path.join(temporary, '.atris-plans', fs.readdirSync(path.join(temporary, '.atris-plans'))[0], 'chat', 'conversations.json');
+    assert.equal(JSON.parse(fs.readFileSync(registryFile, 'utf8')).schemaVersion, 1);
+    assert(store.readMessages('w', 'p').every(record => typeof record.planningChat?.conversationId === 'string'));
+    await controller.close();
+    const reopened = new PlanningChatController({ ...f.options, store: new PlanningStore(key => key === 'w' ? { id: key, path: temporary } : undefined) });
+    try {
+      assert.equal((await reopened.listConversations('w', 'p')).length, 2);
+      const restored = reopened.conversation('w', 'p', id).get('w', 'p');
+      assert.equal(restored.status, 'interrupted'); assert.equal(restored.turnId, sent.turnId);
+      assert.deepEqual(restored.messages[0].attachmentPaths, [asset.path]);
+      assert.equal(reopened.get('w', 'p').messages.length, 1);
+    } finally { await reopened.close(); }
+    assert.throws(() => store.writeConversations('w', 'p', [...store.readConversations('w', 'p'), { ...legacy, workspaceId: 'other-workspace' }]), /Invalid/);
+  } finally { await controller.close(); fs.rmSync(temporary, { recursive: true, force: true }); }
+}
+
+console.log('Planning chat: HTTP lifecycle, restart, CAS proposals, cancellation, model validation, independent conversations, archive/reopen, controls, native approval replies and portable attachments passed. No provider processes launched.');

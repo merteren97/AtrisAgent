@@ -33,6 +33,7 @@ export function isLocalDataRequest(req: Request, runtimeToken?: string): boolean
     ['GET', /^\/api\/workspaces\/[^/]+\/plans\/[^/]+\/(files|content)$/],
     ['POST', /^\/api\/workspaces\/[^/]+\/plans\/[^/]+\/(import|assets|media-grant)$/],
     ['GET', /^\/api\/planning\/[^/]+\/plans\/[^/]+\/chat$/],
+    ['GET', /^\/api\/planning\/[^/]+\/plans\/[^/]+\/chat\/conversations(?:\/[^/]+)?$/],
     ['GET', /^\/api\/planning-source\/(manual|orchestrator)\/[^/]+$/],
     ['GET', /^\/api\/workspaces\/[^/]+\/plans\/[^/]+\/executions\/[^/]+$/],
     ['GET|DELETE', /^\/api\/(workspaces|missions)\/[^/]+$/],

@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { CONVERSATION_UUID, type PlanningConversation } from './planning-conversations';
+export type { PlanningConversation } from './planning-conversations';
 import type { Application, Request, Response } from 'express';
 import type { AccountProfile, ModelDescriptor, RuntimeType } from '@atris-agent-code/domain';
 import { LocalEventBus, redactSensitiveValue } from '@atris-agent-code/event-bus';
@@ -21,16 +23,19 @@ export interface PlanningChatStorage {
   writeDocument(workspaceId: string, planId: string, input: { path: string; content: string; expectedRevision: string | null }): { revision: string };
   readMessages(workspaceId: string, planId: string): PlanningChatRecord[];
   appendMessage(workspaceId: string, planId: string, record: PlanningChatRecord): unknown;
+  readConversations?(workspaceId: string, planId: string): PlanningConversation[];
+  writeConversations?(workspaceId: string, planId: string, conversations: PlanningConversation[]): void;
 }
 export interface PlanningChatRecord {
   id: string; role: 'user' | 'assistant' | 'system'; text: string; createdAt: string;
+  catalogId?: string;
   planningChat?: Record<string, unknown>;
 }
 
 export type PlanningChatStatus = 'idle' | 'running' | 'complete' | 'failed' | 'cancelled' | 'interrupted';
 export interface PlanningChatMessage {
   id: string; role: 'user' | 'assistant' | 'system'; content: string; turnId: string; createdAt: string;
-  clientMessageId?: string; partial?: boolean;
+  clientMessageId?: string; partial?: boolean; attachmentPaths?: string[];
 }
 export interface PlanningChatProposal {
   id: string; turnId: string; path: string; content: string; baseRevision: string | null;
@@ -40,16 +45,21 @@ export interface PlanningChatState {
   messages: PlanningChatMessage[]; status: PlanningChatStatus; turnId: string | null;
   revision: number; proposals: PlanningChatProposal[]; error?: string; activity?: string;
   catalogId?: string; reasoning?: string; sessionId?: string; updatedAt?: string;
+  conversation?: PlanningConversation;
+  approvals?: PlanningChatApproval[];
 }
-export interface PlanningChatInput { id: string; text: string; catalogId: string; reasoning?: string }
+export interface PlanningChatApproval { id: string; turnId: string; toolName?: string; description: string; path?: string; command?: string; status?: 'pending' | 'replying' | 'failed'; error?: string }
+export interface PlanningChatInput { id: string; text: string; catalogId: string; reasoning?: string; attachmentPaths?: string[] }
 export interface PlanningChatAdapter extends Pick<BaseRuntimeAdapter,
-  'configureProfile' | 'probeCapabilities' | 'spawnAgent' | 'cancel' | 'shutdown'> {}
+  'configureProfile' | 'probeCapabilities' | 'spawnAgent' | 'cancel' | 'shutdown'>, Partial<Pick<BaseRuntimeAdapter, 'respondToApproval'>> {}
 export interface PlanningChatOptions {
   store: PlanningChatStorage;
   runtimeHost: Pick<RuntimeHost, 'getModelCatalogService' | 'getAccountProfileManager'>;
   /** A new adapter on the supplied PRIVATE bus; never return RuntimeHost's shared adapter. */
   createAdapter?: (runtime: RuntimeType, bus: LocalEventBus) => PlanningChatAdapter;
   timeoutMs?: number;
+  /** Internal scope for an independent conversation engine. */
+  conversationId?: string;
 }
 
 const MAX_OUTPUT = 128_000;
@@ -62,9 +72,15 @@ interface ActiveTurn {
   turnId: string; sessionId: string; adapter?: PlanningChatAdapter; closed: boolean;
   unsubscribe?: () => void; timer?: ReturnType<typeof setTimeout>; launchTimer?: ReturnType<typeof setTimeout>;
   run?: Promise<void>; promptPrepared?: boolean;
+  conversation?: PlanningConversation;
+  approvals?: Map<string, { approval: PlanningChatApproval; decision?: 'allow' | 'deny'; reply?: Promise<void>; delivered?: boolean }>;
 }
 
 function fail(message: string, status = 400): never { throw Object.assign(new Error(message), { status }); }
+function publicConversation(value: PlanningConversation): PlanningConversation {
+  const { creationFingerprint: _internal, ...conversation } = value;
+  return conversation;
+}
 function required(value: unknown, name: string, max = 512): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) return fail(`Invalid ${name}.`);
   return value.trim();
@@ -132,23 +148,162 @@ export class PlanningChatController {
   private cleanups = new Set<Promise<void>>();
   private closed = false;
   private closing?: Promise<void>;
+  private conversations = new Map<string, PlanningChatController>();
   constructor(private options: PlanningChatOptions) {}
-  private key(w: string, p: string): string { return JSON.stringify([w, p]); }
+  private registry(w: string, p: string): PlanningConversation[] {
+    this.options.store.get(w, p);
+    return this.options.store.readConversations?.(w, p) || [];
+  }
+  private persist(w: string, p: string, conversation: PlanningConversation): void {
+    if (!this.options.store.writeConversations) return fail('Conversation registry storage is unavailable.', 503);
+    const entries = this.registry(w, p);
+    this.options.store.writeConversations(w, p, [...entries.filter(item => item.id !== conversation.id), conversation]);
+  }
+  async listConversations(w: string, p: string): Promise<PlanningConversation[]> {
+    if (this.closed) return fail('Planning chat is shutting down.', 503);
+    return this.locked(JSON.stringify(['registry', w, p]), async () => {
+      const entries = this.registry(w, p);
+      if (!entries.some(item => item.id === 'default')) {
+        const history = this.options.store.readMessages(w, p).filter(record => !record.planningChat?.conversationId || record.planningChat.conversationId === 'default');
+        if (history.length) {
+          const start = [...history].reverse().find(record => record.planningChat?.kind === 'start');
+          const catalogId = String(start?.planningChat?.catalogId || history.at(-1)?.catalogId || '');
+          const reasoning = typeof start?.planningChat?.reasoning === 'string' ? start.planningChat.reasoning : undefined;
+          let resolved: Awaited<ReturnType<PlanningChatController['resolveModel']>> | undefined;
+          try { resolved = await this.resolveModel(catalogId, reasoning); } catch { /* Offline legacy history remains readable. */ }
+          let descriptor = resolved?.descriptor;
+          if (!descriptor) {
+            try { descriptor = await this.options.runtimeHost.getModelCatalogService().resolveModelDescriptor(catalogId); }
+            catch { /* The portable journal is sufficient to display legacy history. */ }
+          }
+          const runtimeType = resolved?.profile.runtimeType || descriptor?.runtimeId || start?.planningChat?.runtimeType;
+          const legacy: PlanningConversation = { id: 'default', title: 'Planning chat', workspaceId: w, planId: p,
+            runtimeType: ['codex', 'opencode', 'claude_code', 'antigravity'].includes(String(runtimeType)) ? runtimeType as RuntimeType : 'codex',
+            catalogId, model: descriptor?.runtimeModelId || String(start?.planningChat?.model || ''),
+            accountProfileId: resolved?.profile.id || descriptor?.accountProfileId || String(start?.planningChat?.accountProfileId || ''), reasoning,
+            createdAt: history[0].createdAt, updatedAt: history.at(-1)!.createdAt,
+            closedAt: null, codexPermissionMode: 'read-only', openCodeAutoApprove: false };
+          this.persist(w, p, legacy); entries.push(legacy);
+        }
+      }
+      return entries.map(publicConversation);
+    });
+  }
+  async createConversation(w: string, p: string, body: { id: string; title?: string; catalogId: string; reasoning?: string }): Promise<PlanningConversation> {
+    if (this.closed) return fail('Planning chat is shutting down.', 503);
+    if (!body || typeof body.id !== 'string' || !CONVERSATION_UUID.test(body.id)) return fail('Conversation ID must be a UUID.');
+    if (Object.keys(body).some(key => !['id', 'title', 'catalogId', 'reasoning'].includes(key))) return fail('Unsupported conversation create field.');
+    const id = body.id.toLowerCase();
+    const title = body.title === undefined ? 'New chat' : required(body.title, 'title', 200);
+    const catalogId = required(body.catalogId, 'model');
+    const reasoning = body.reasoning === undefined ? undefined : required(body.reasoning, 'reasoning', 32);
+    const fingerprint = JSON.stringify({ title, catalogId, reasoning });
+    return this.locked(JSON.stringify(['registry', w, p]), async () => {
+      const existing = this.registry(w, p).find(item => item.id === id);
+      if (existing) {
+        if (existing.creationFingerprint !== fingerprint) return fail('Conversation ID already has a different create request.', 409);
+        return publicConversation(existing);
+      }
+      const { descriptor, profile, resolvedReasoning } = await this.resolveModel(catalogId, reasoning);
+      if (this.closed) return fail('Planning chat is shutting down.', 503);
+      const now = new Date().toISOString();
+      const conversation: PlanningConversation = { id, title, workspaceId: w, planId: p, runtimeType: profile.runtimeType,
+        catalogId, model: descriptor.runtimeModelId, accountProfileId: profile.id, reasoning: resolvedReasoning,
+        createdAt: now, updatedAt: now, closedAt: null, codexPermissionMode: 'read-only', openCodeAutoApprove: false, creationFingerprint: fingerprint };
+      this.persist(w, p, conversation);
+      return publicConversation(conversation);
+    });
+  }
+  conversation(w: string, p: string, id: string): PlanningChatController {
+    id = id.toLowerCase();
+    if (this.closed) return fail('Planning chat is shutting down.', 503);
+    if (id !== 'default' && !CONVERSATION_UUID.test(id)) return fail('Invalid conversation ID.');
+    if (!this.registry(w, p).some(item => item.id === id)) return fail('Conversation not found in this plan.', 404);
+    if (id === 'default') return this;
+    const key = JSON.stringify([w, p, id]);
+    let engine = this.conversations.get(key);
+    if (!engine) { engine = new PlanningChatController({ ...this.options, conversationId: id }); this.conversations.set(key, engine); }
+    return engine;
+  }
+  async updateConversation(w: string, p: string, id: string, body: Record<string, unknown>): Promise<PlanningConversation> {
+    id = id.toLowerCase();
+    const engine = this.conversation(w, p, id);
+    return engine.locked(engine.key(w, p), () => this.locked(JSON.stringify(['registry', w, p]), async () => {
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return fail('Expected conversation settings.');
+      const allowed = ['title', 'catalogId', 'reasoning', 'closed', 'codexPermissionMode', 'fullAccessConfirmed', 'openCodeAutoApprove'];
+      if (Object.keys(body).some(key => !allowed.includes(key))) return fail('Unsupported conversation setting.');
+      const current = this.registry(w, p).find(item => item.id === id)!;
+      // Model/Codex preferences are snapshotted at acceptance and only affect the next turn.
+      if (body.closed === true && engine.active.has(engine.key(w, p))) return fail('Stop the active turn before closing this conversation.', 409);
+      const next = { ...current };
+      if (body.title !== undefined) next.title = required(body.title, 'title', 200);
+      if (body.catalogId !== undefined || body.reasoning !== undefined) {
+        const catalogId = body.catalogId === undefined ? current.catalogId : required(body.catalogId, 'model');
+        const reasoning = body.reasoning === undefined ? catalogId === current.catalogId ? current.reasoning : undefined : required(body.reasoning, 'reasoning', 32);
+        const resolved = await this.resolveModel(catalogId, reasoning);
+        if (resolved.profile.runtimeType !== current.runtimeType || resolved.profile.id !== current.accountProfileId) return fail('An independent session is required for a different provider or account.', 409);
+        next.catalogId = catalogId; next.model = resolved.descriptor.runtimeModelId; next.reasoning = resolved.resolvedReasoning;
+      }
+      if (body.closed !== undefined) {
+        if (typeof body.closed !== 'boolean') return fail('closed must be boolean.');
+        next.closedAt = body.closed ? current.closedAt || new Date().toISOString() : null;
+      }
+      if (body.codexPermissionMode !== undefined || body.fullAccessConfirmed !== undefined) {
+        if (current.runtimeType !== 'codex') return fail('Codex permissions only apply to Codex conversations.');
+        if (!['read-only', 'ask-for-approval', 'approve-for-me', 'full-access'].includes(String(body.codexPermissionMode))) return fail('Invalid Codex permission mode.');
+        if (body.codexPermissionMode === 'full-access' && body.fullAccessConfirmed !== true) return fail('Confirm Full Access before saving this mode.');
+        next.codexPermissionMode = body.codexPermissionMode as PlanningConversation['codexPermissionMode'];
+      }
+      if (body.openCodeAutoApprove !== undefined) {
+        if (current.runtimeType !== 'opencode' || typeof body.openCodeAutoApprove !== 'boolean') return fail('OpenCode auto-approve must be a boolean on an OpenCode conversation.');
+        next.openCodeAutoApprove = body.openCodeAutoApprove;
+      }
+      if (this.closed) return fail('Planning chat is shutting down.', 503);
+      next.updatedAt = new Date().toISOString(); this.persist(w, p, next);
+      if (body.openCodeAutoApprove === true) {
+        const active = engine.active.get(engine.key(w, p));
+        for (const [approvalId, entry] of active?.approvals || []) {
+          if (entry.decision) continue;
+          void engine.replyApproval(w, p, approvalId, { decision: 'allow', turnId: active!.turnId }).catch(error => {
+            if (!active!.closed) engine.finish(w, p, active!, 'failed', diagnostic(error));
+          });
+        }
+      }
+      return publicConversation(next);
+    }));
+  }
+  private key(w: string, p: string): string { return JSON.stringify([w, p, this.options.conversationId || 'default']); }
+  private records(w: string, p: string): PlanningChatRecord[] {
+    return this.options.store.readMessages(w, p).filter(record => (record.planningChat?.conversationId || 'default') === (this.options.conversationId || 'default'));
+  }
+  private config(w: string, p: string): PlanningConversation | undefined {
+    return this.options.store.readConversations?.(w, p).find(item => item.id === (this.options.conversationId || 'default'));
+  }
 
   private append(w: string, p: string, meta: Journal, content = '', role: PlanningChatRecord['role'] = 'system', id = randomUUID()): void {
     this.options.store.appendMessage(w, p, {
-      id, role, text: content, createdAt: new Date().toISOString(), planningChat: { version: 1, ...meta },
+      id, role, text: content, createdAt: new Date().toISOString(), planningChat: { version: 1, ...meta, conversationId: this.options.conversationId || 'default' },
     });
+    if (meta.kind === 'start' || (meta.kind === 'state' && meta.status)) {
+      const conversation = this.config(w, p);
+      if (conversation) this.persist(w, p, { ...conversation, updatedAt: new Date().toISOString() });
+    }
   }
 
   private read(w: string, p: string): PlanningChatState {
     this.options.store.get(w, p);
     const state: PlanningChatState = { messages: [], status: 'idle', turnId: null, revision: 0, proposals: [] };
+    const config = this.config(w, p);
+    state.conversation = config && publicConversation(config);
+    state.approvals = [...(this.active.get(this.key(w, p))?.approvals?.values() || [])].filter(item => !item.delivered).map(item => ({ ...item.approval }));
     const messages = new Map<string, PlanningChatMessage>();
     const proposals = new Map<string, PlanningChatProposal>();
-    for (const record of this.options.store.readMessages(w, p)) {
+    for (const record of this.records(w, p)) {
       const meta = record.planningChat as Journal & { version?: number } | undefined;
-      if (meta?.version !== 1 || typeof meta.turnId !== 'string') continue;
+      if (meta?.version !== 1 || typeof meta.turnId !== 'string') {
+        if (!meta) messages.set(record.id, { id: record.id, role: record.role, content: record.text, turnId: '', createdAt: record.createdAt });
+        continue;
+      }
       state.revision += 1;
       state.updatedAt = String(record.createdAt);
       const content = record.text;
@@ -159,7 +314,7 @@ export class PlanningChatController {
         state.reasoning = typeof meta.reasoning === 'string' ? meta.reasoning : undefined;
         state.sessionId = String(meta.sessionId);
         messages.set(String(record.id), { id: String(record.id), role: 'user', content, turnId,
-          clientMessageId: String(meta.clientMessageId), createdAt: String(record.createdAt) });
+          clientMessageId: String(meta.clientMessageId), createdAt: String(record.createdAt), attachmentPaths: meta.attachmentPaths as string[] | undefined });
       } else if (meta.kind === 'delta' || meta.kind === 'answer') {
         const id = `assistant:${turnId}`;
         const previous = messages.get(id);
@@ -200,31 +355,49 @@ export class PlanningChatController {
     try { return await next; } finally { if (this.locks.get(key) === next) this.locks.delete(key); }
   }
 
-  async send(w: string, p: string, input: PlanningChatInput): Promise<PlanningChatState> {
+  async send(w: string, p: string, input: PlanningChatInput, enforceConfig = Boolean(this.options.conversationId)): Promise<PlanningChatState> {
     if (this.closed) return fail('Planning chat is shutting down.', 503);
     const id = required(input?.id, 'client message ID', 128);
-    const text = required(input?.text, 'message', 16_000);
+    const text = required(input?.text, 'message', 32_000);
     const catalogId = required(input?.catalogId, 'model');
     const reasoning = input.reasoning === undefined ? undefined : required(input.reasoning, 'reasoning', 32);
+    const attachmentPaths = input.attachmentPaths ?? [];
+    if (!Array.isArray(attachmentPaths) || attachmentPaths.length > 10 || new Set(attachmentPaths).size !== attachmentPaths.length) return fail('Select at most 10 unique attachments.');
     return this.locked(this.key(w, p), async () => {
       if (this.closed) return fail('Planning chat is shutting down.', 503);
       const state = this.get(w, p);
       const duplicate = state.messages.find(message => message.clientMessageId === id);
       if (duplicate) {
-        const start = this.options.store.readMessages(w, p).find(record => (record.planningChat as Journal | undefined)?.clientMessageId === id);
+        const start = this.records(w, p).find(record => (record.planningChat as Journal | undefined)?.clientMessageId === id);
         const meta = start?.planningChat as Journal;
-        if (duplicate.content !== text || meta.catalogId !== catalogId || meta.requestedReasoning !== reasoning) return fail('This client message ID was already used with different input.', 409);
+        if (duplicate.content !== text || meta.catalogId !== catalogId || meta.requestedReasoning !== reasoning || JSON.stringify(meta.attachmentPaths || []) !== JSON.stringify(attachmentPaths)) return fail('This client message ID was already used with different input.', 409);
         return state;
       }
       if (this.active.has(this.key(w, p))) return fail('A planning turn is already running for this plan.', 409);
-      const { descriptor, profile, resolvedReasoning } = await this.resolveModel(catalogId, reasoning);
+      const conversation = this.config(w, p);
+      if (conversation?.closedAt) return fail('Reopen this conversation before sending a message.', 409);
+      if (enforceConfig && conversation && (conversation.catalogId !== catalogId || (reasoning !== undefined && conversation.reasoning !== reasoning))) return fail('Conversation settings changed. Refresh and save the desired model/reasoning before sending.', 409);
+      const { descriptor, profile, resolvedReasoning } = await this.resolveModel(catalogId, reasoning ?? (enforceConfig ? conversation?.reasoning : undefined));
+      if (enforceConfig && conversation && (conversation.runtimeType !== profile.runtimeType || conversation.accountProfileId !== profile.id)) return fail('An independent session is required for a different provider or account.', 409);
+      if (enforceConfig && conversation && conversation.model !== descriptor.runtimeModelId) return fail('The verified model route changed. Refresh and save conversation settings before sending.', 409);
       if (this.closed) return fail('Planning chat is shutting down.', 503);
       const cwd = fs.realpathSync(this.options.store.workspace(w).path);
       const context = this.context(w, p);
       const turnId = randomUUID();
       const sessionId = `planning-${turnId}`;
-      const active: ActiveTurn = { turnId, sessionId, closed: false };
-      const fullPrompt = this.prompt(state, text, context.text);
+      const active: ActiveTurn = { turnId, sessionId, closed: false, conversation, approvals: new Map() };
+      let total = 0;
+      const attachments = attachmentPaths.map(relative => {
+        if (typeof relative !== 'string' || !relative.startsWith('assets/') || relative.length > 512 || relative.split('/').some(part => !part || part.startsWith('.') || /[\\:\x00-\x1f]/.test(part))) return fail('Attachments must be validated assets/ paths.');
+        if (!this.options.store.resolveFile) return fail('Attachment storage is unavailable.', 422);
+        const file = this.options.store.resolveFile(w, p, relative);
+        const stat = fs.statSync(file.absolutePath);
+        if (!stat.isFile()) return fail('Attachment is not a file.');
+        total += stat.size;
+        if (total > 25 * 1024 * 1024) return fail('Attachments exceed 25 MiB.', 413);
+        return { path: relative, absolutePath: file.absolutePath };
+      });
+      const fullPrompt = this.prompt(state, text, context.text) + (attachments.length ? `\n\nUser attachments (local files; inspect using native CLI tools):\n${JSON.stringify(attachments)}` : '');
       let prompt = fullPrompt;
       try {
         if (this.options.store.prepareChatPrompt) {
@@ -238,7 +411,8 @@ export class PlanningChatController {
         }
         if (prompt.length > MAX_ARGV_PROMPT) return fail('Planning prompt exceeds the safe command-line limit. Configure file-backed planning prompt storage.', 413);
         this.append(w, p, { kind: 'start', turnId, sessionId, clientMessageId: id, catalogId,
-          reasoning: resolvedReasoning, requestedReasoning: reasoning }, text, 'user');
+          runtimeType: profile.runtimeType, model: descriptor.runtimeModelId, accountProfileId: profile.id,
+          reasoning: resolvedReasoning, requestedReasoning: reasoning, attachmentPaths }, text, 'user');
       } catch (error) {
         if (active.promptPrepared) this.options.store.releaseChatPrompt?.(w, p, turnId);
         throw error;
@@ -343,6 +517,42 @@ export class PlanningChatController {
     return this.read(w, p);
   }
 
+  async replyApproval(w: string, p: string, approvalId: string, body: { decision?: unknown; turnId?: unknown }): Promise<PlanningChatState> {
+    const active = this.active.get(this.key(w, p));
+    if (!active || active.closed || body?.turnId !== active.turnId) return fail('This approval belongs to a stale planning turn.', 409);
+    if (body.decision !== 'allow' && body.decision !== 'deny') return fail('Approval decision must be allow or deny.');
+    const entry = active.approvals?.get(approvalId);
+    const adapter = active.adapter;
+    if (!entry || !adapter) return fail('This approval request is stale or unknown.', 409);
+    if (!adapter.respondToApproval) return fail('This provider adapter cannot reply to native approvals.', 422);
+    if (entry.decision && entry.decision !== body.decision) return fail('This approval already has a different decision.', 409);
+    if (!entry.reply) {
+      entry.decision = body.decision;
+      entry.approval.status = 'replying';
+      // Capture the originating adapter/turn before yielding. Never resolve via a newer session.
+      entry.reply = Promise.resolve().then(() => {
+        if (active.closed || this.active.get(this.key(w, p)) !== active) return fail('This approval belongs to a stale planning turn.', 409);
+        return adapter.respondToApproval!(approvalId, body.decision === 'allow' ? 'approved' : 'rejected');
+      }).then(() => {
+        entry.delivered = true;
+        if (!active.closed && this.active.get(this.key(w, p)) === active) {
+          this.append(w, p, { kind: 'state', turnId: active.turnId, approvalId, decision: entry.decision,
+            activity: [...active.approvals!.values()].some(item => !item.delivered) ? 'Waiting for approval' : 'Thinking' });
+        }
+      }, error => {
+        entry.approval.status = 'failed';
+        entry.approval.error = `Approval delivery failed: ${diagnostic(error)}. Stop this turn before retrying in a new turn.`;
+        if (!active.closed && this.active.get(this.key(w, p)) === active) {
+          this.append(w, p, { kind: 'state', turnId: active.turnId, activity: 'Approval delivery failed', error: entry.approval.error });
+        }
+        throw error;
+      });
+    }
+    await entry.reply;
+    if (active.closed || this.active.get(this.key(w, p)) !== active) return fail('The planning turn ended while replying to approval.', 409);
+    return this.read(w, p);
+  }
+
   private async run(w: string, p: string, active: ActiveTurn, descriptor: ModelDescriptor, profile: AccountProfile,
     reasoning: string | undefined, cwd: string, prompt: string, revisions: Map<string, string>): Promise<void> {
     let output = '';
@@ -393,6 +603,18 @@ export class PlanningChatController {
             this.finish(w, p, active, 'complete');
           } else if (event.type === 'task_failed') {
             this.finish(w, p, active, 'failed', diagnostic(event.error));
+          } else if (event.type === 'approval_requested' && profile.runtimeType === 'opencode') {
+            if (!adapter.respondToApproval) return this.finish(w, p, active, 'failed', 'This OpenCode adapter cannot reply to native approvals. Update the installed runtime.');
+            if (!active.approvals!.has(event.approvalId)) {
+              active.approvals!.set(event.approvalId, { approval: { id: event.approvalId, turnId: active.turnId,
+                toolName: event.toolName, description: diagnostic(event.description), path: event.path, command: event.command, status: 'pending' } });
+              this.append(w, p, { kind: 'state', turnId: active.turnId, activity: 'Waiting for approval' });
+              if (this.config(w, p)?.openCodeAutoApprove) {
+                void this.replyApproval(w, p, event.approvalId, { decision: 'allow', turnId: active.turnId }).catch(error => {
+                  if (current()) this.finish(w, p, active, 'failed', diagnostic(error));
+                });
+              }
+            }
           } else if (event.type === 'approval_requested' || event.type === 'question_asked') {
             const description = event.type === 'question_asked'
               ? 'The provider requested a native question. Ask the planner to put its question directly in chat.'
@@ -414,6 +636,7 @@ export class PlanningChatController {
         role: 'researcher', accessMode: 'read-only', prompt, model: descriptor.runtimeModelId,
         reasoningLevel: reasoning, profileId: profile.id, cwd, isolated: false,
         enableCoordinationMcp: false, preserveProviderSession: false,
+        ...(profile.runtimeType === 'codex' ? { planningControls: { codexPermissionMode: active.conversation?.codexPermissionMode || 'read-only' } } : {}),
         ...this.profileEnvironment(profile),
       };
       await adapter.spawnAgent(options);
@@ -477,6 +700,9 @@ export class PlanningChatController {
 
   private async drain(): Promise<void> {
     const errors: unknown[] = [];
+    for (const result of await Promise.allSettled([...this.conversations.values()].map(engine => engine.close()))) {
+      if (result.status === 'rejected') errors.push(result.reason);
+    }
     for (const [key, active] of this.active) {
       const [w, p] = JSON.parse(key);
       try { this.finish(w, p, active, 'interrupted', 'The gateway stopped before this planning turn completed.'); }
@@ -498,6 +724,16 @@ export function installPlanningChatRoutes(app: Application, options: PlanningCha
       .catch(error => res.status(error.status || error.statusCode || 500).json({ error: diagnostic(error), ...(error.state ? { state: error.state } : {}) }));
   };
   app.get(ROOT, route((_req, res, w, p) => res.json(controller.get(w, p))));
+  app.get(`${ROOT}/conversations`, route(async (_req, res, w, p) => res.json(await controller.listConversations(w, p))));
+  app.post(`${ROOT}/conversations`, route(async (req, res, w, p) => res.json(await controller.createConversation(w, p, req.body))));
+  const conversation = (req: Request, w: string, p: string) => controller.conversation(w, p, required(req.params.conversationId, 'conversation ID'));
+  const thread = `${ROOT}/conversations/:conversationId`;
+  app.get(thread, route((req, res, w, p) => res.json(conversation(req, w, p).get(w, p))));
+  app.patch(thread, route(async (req, res, w, p) => res.json(await controller.updateConversation(w, p, required(req.params.conversationId, 'conversation ID'), req.body))));
+  app.post(`${thread}/messages`, route(async (req, res, w, p) => res.status(202).json(await conversation(req, w, p).send(w, p, req.body, true))));
+  app.post(`${thread}/stop`, route((req, res, w, p) => res.json(conversation(req, w, p).stop(w, p, req.body?.turnId === undefined ? undefined : required(req.body.turnId, 'turn ID')))));
+  app.post(`${thread}/updates/:proposalId/apply`, route((req, res, w, p) => res.json(conversation(req, w, p).apply(w, p, required(req.params.proposalId, 'proposal ID'), req.body?.expectedRevision))));
+  app.post(`${thread}/approvals/:approvalId/reply`, route(async (req, res, w, p) => res.json(await conversation(req, w, p).replyApproval(w, p, required(req.params.approvalId, 'approval ID'), req.body))));
   app.post(`${ROOT}/messages`, route(async (req, res, w, p) => res.status(202).json(await controller.send(w, p, req.body))));
   app.post(`${ROOT}/stop`, route((req, res, w, p) => res.json(controller.stop(w, p, req.body?.turnId === undefined ? undefined : required(req.body.turnId, 'turn ID')))));
   app.post(`${ROOT}/updates/:proposalId/apply`, route((req, res, w, p) => res.json(controller.apply(w, p, required(req.params.proposalId, 'proposal ID'), req.body?.expectedRevision))));

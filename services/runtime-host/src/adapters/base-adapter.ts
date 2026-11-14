@@ -18,6 +18,7 @@ import type {
   AuthMethodDescriptor,
   AuthInitiationResult,
   AuthPollResult,
+  CodexPermissionMode,
 } from '@atris-agent-code/domain';
 import { terminateProcessTree } from '../runtime-utils';
 
@@ -30,6 +31,8 @@ export interface SpawnAgentOptions {
   prompt: string;
   role?: AgentRole | string;
   accessMode?: 'read-only' | 'workspace-write';
+  /** Opt-in planning preferences, applied when spawning the next turn. */
+  planningControls?: { codexPermissionMode?: CodexPermissionMode };
   model?: string;
   reasoningLevel?: string;
   isolated?: boolean;

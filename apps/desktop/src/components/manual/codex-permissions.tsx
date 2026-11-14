@@ -19,7 +19,7 @@ const modes: {id: CodexPermissionMode; label: string; description: string}[] = [
 ];
 
 export function CodexPermissions({agent, live, disabled, onApply}: {
-  agent: ManualAgent; live: boolean; disabled: boolean;
+  agent: Pick<ManualAgent, 'id' | 'name' | 'codexPermissionMode'>; live: boolean; disabled: boolean;
   onApply: (mode: CodexPermissionMode, now: boolean, fullAccessConfirmed: boolean, target?: CodexLivePermissions) => Promise<boolean>;
 }) {
   const [open, setOpen] = useState(false);
