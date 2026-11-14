@@ -105,3 +105,26 @@ test('native session adapter restores and deletes a secure token without browser
   expect(await page.evaluate(() => (window as any).__sessionDeleted)).toBeTruthy();
   expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('saved-test-token');
 });
+
+test('mobile scale is locked during pinch, double tap and input focus', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('meta[name="viewport"]')).toHaveAttribute('content', /maximum-scale=1.*user-scalable=no/);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Input.synthesizePinchGesture', { x: 180, y: 300, scaleFactor: 2, gestureSourceType: 'touch' });
+  expect(await page.evaluate(() => window.visualViewport?.scale)).toBe(1);
+  for (let tap = 0; tap < 2; tap++) {
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 180, y: 300 }] });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  }
+  expect(await page.evaluate(() => window.visualViewport?.scale)).toBe(1);
+  await page.getByRole('button', { name: 'Sign in to AtrisHub' }).click();
+  const input = page.getByLabel('Email or username');
+  await input.focus();
+  expect(await input.evaluate(element => Number.parseFloat(getComputedStyle(element).fontSize))).toBeGreaterThanOrEqual(16);
+  expect(await page.evaluate(() => window.visualViewport?.scale)).toBe(1);
+  expect(await page.evaluate(() => {
+    const event = new Event('gesturechange', { bubbles: true, cancelable: true });
+    document.dispatchEvent(event);
+    return event.defaultPrevented;
+  })).toBeTruthy();
+});

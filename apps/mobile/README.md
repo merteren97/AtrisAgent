@@ -64,3 +64,33 @@ and creates independent `mobile-v0.1.0` prereleases. Android secrets are
 `ANDROID_KEYSTORE_PASSWORD`. Preserve the keystore across updates. iOS is an
 unsigned IPA for a compatible sideloading setup; no App Store distribution is
 claimed. The release process checks signature/provisioning-profile absence.
+
+## Android release credentials
+
+`ANDROID_KEY_BASE64` must be the Base64 of an actual binary Android JKS/PKCS12
+keystore, not a Tauri updater key, PEM, ZIP or Base64-encoded text file. Before
+compilation, the release workflow opens the container and recovers the configured
+private key with the same JDK used for Gradle. It reports missing alias, unreadable
+store and unreadable private key separately, without printing credentials.
+Signing properties are escaped for Java's Properties parser, including literal
+backslashes, significant whitespace and Unicode passwords.
+
+For a new signing identity, configure JDK 17 and run from the repository root:
+
+```sh
+node .github/scripts/create-local-mobile-keystore.mjs
+```
+
+This creates a verified PKCS12 file and secret bundles under the Git-ignored
+`.docs/android-signing/` directory. It refuses to overwrite an existing identity
+and never uploads secrets. Keep the complete bundle backed up for future app
+updates. An authorized operator can import the four secrets without copying
+them into a command line or a public issue:
+
+```sh
+gh secret set --repo merteren97/AtrisAgent --env-file .docs/android-signing/github-secrets.env
+```
+
+The mobile viewport intentionally disables pinch/double-tap zoom. Editable
+controls use at least 16 CSS pixels to avoid iOS focus zoom. Native-device
+behavior still needs verification after installing the updated package.

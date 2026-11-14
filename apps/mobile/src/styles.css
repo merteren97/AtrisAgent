@@ -127,6 +127,10 @@ body { background: #090c12; }
 .account-form input{min-height:45px;padding:0 12px;border:1px solid #425064;border-radius:10px;background:#151b23;color:#f4f6fb;font-size:14px}
 .account-form textarea{min-height:110px;resize:vertical;padding:12px;border:1px solid #425064;border-radius:10px;background:#151b23;color:#f4f6fb;font-family:monospace;font-size:12px;overflow-wrap:anywhere}
 .account-secondary{margin-top:14px}
+html,body,.app-shell,.app-shell *{touch-action:pan-x pan-y}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+/* iOS zooms focused controls with font sizes below 16 CSS pixels. */
+.app-shell input,.app-shell textarea,.app-shell select{font-size:16px}
 .remote-controls section{padding:18px 0;border-bottom:1px solid #344153}.remote-controls h3{font-size:14px;margin:0 0 12px}.remote-controls p{font-size:12px;color:#b1bece;line-height:1.6}.remote-controls select{display:block;width:100%;min-height:44px;background:#151b23;color:#f3f6fb;border:1px solid #425064;border-radius:8px;padding:8px;margin-top:8px}.remote-controls label{font-size:12px}.permission-confirm,.question-form label{display:flex;gap:9px;align-items:flex-start;margin:12px 0;line-height:1.6}.question-form fieldset{border:0;padding:8px 0}.question-form legend{font-size:13px;font-weight:600}.question-form small{display:block;font-size:11px;color:#9cacc1}.memory-note{border:1px solid #3a4758;background:#19232f;border-radius:9px;padding:12px;margin-top:10px}.memory-note strong{font-size:12px}.memory-note p{white-space:pre-wrap;overflow-wrap:anywhere}.sheet-error{color:#efaaa5;font-size:12px}
 .account-form .primary-button{margin-top:5px}
 .account-form .sheet-error{color:#efaaa5;font-size:12px;margin:0}

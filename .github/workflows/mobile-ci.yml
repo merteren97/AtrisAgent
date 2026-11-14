@@ -38,12 +38,19 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-36" "build-tools;35.0.0" "ndk;$ANDROID_NDK_VERSION"
           echo "NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
       - run: npm ci --include=dev --include=optional --no-audit --no-fund
+      - run: node --test .github/scripts/prepare-mobile-android-signing.test.mjs
       - run: npm run tauri -w @atris-agent-code/mobile -- android init --ci
       - name: Test generated release signing without production secrets
+        env:
+          ANDROID_KEY_ALIAS: ci-test
+          ANDROID_KEY_PASSWORD: ci-test-only
+          ANDROID_KEYSTORE_PASSWORD: ci-test-only
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/ci-decoded.jks
         run: |
           set -euo pipefail
           keytool -genkeypair -keystore "$RUNNER_TEMP/test.jks" -storepass ci-test-only -keypass ci-test-only -alias ci-test -dname "CN=CI Test Only" -keyalg RSA -validity 2
-          printf 'keyAlias=ci-test\npassword=ci-test-only\nstorePassword=ci-test-only\nstoreFile=%s\n' "$RUNNER_TEMP/test.jks" > apps/mobile/src-tauri/gen/android/keystore.properties
+          export ANDROID_KEY_BASE64="$(base64 -w 0 "$RUNNER_TEMP/test.jks")"
+          node .github/scripts/prepare-mobile-android-signing.mjs
           node .github/scripts/configure-mobile-android-signing.mjs
       - run: npm run tauri -w @atris-agent-code/mobile -- android build --ci --apk --target aarch64
       - name: Verify the built APK
