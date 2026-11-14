@@ -141,6 +141,19 @@ test('Manual prepares real durable records, immutable Markdown/assets and source
   assert.equal(f.calls.length, 0);
 });
 
+test('handoff includes the frozen board revision, manifest and body context', async t => {
+  const f = await fixture(t);
+  const initial = f.store.readBoard('workspace', 'plan')!;
+  const board = f.store.writeBoard('workspace', 'plan', { expectedRevision: initial.revision, board: { ...initial.board, sections: [{ id: 'design', title: 'Design', kind: 'section', body: 'Board-only implementation detail.' }] } });
+  const result = await (await f.listen())(manual());
+  assert.equal(result.status, 201);
+  assert.equal(result.body.execution.boardRevision, board.revision);
+  assert(result.body.prompt.includes(`Board revision: ${board.revision}`));
+  assert(result.body.prompt.includes('Board-only implementation detail.'));
+  assert(result.body.execution.files.some((file: { path: string }) => file.path === 'board/board.json'));
+  assert.equal(fs.readFileSync(path.join(result.body.execution.snapshotPath, 'board', 'content', 'design.md'), 'utf8'), 'Board-only implementation detail.');
+});
+
 test('operation ID rejects different model, reasoning, target or options and accepts reordered option keys', async t => {
   const f = await fixture(t);
   const post = await f.listen();

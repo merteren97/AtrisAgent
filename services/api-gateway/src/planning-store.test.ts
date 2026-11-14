@@ -316,3 +316,123 @@ test('incomplete execution staging is never mistaken for a committed operation',
   assert.equal(retry.status, 'prepared');
   assert.equal(retry.files[0].sha256, store.readDocument('one', 'plan-one', 'plan.md').revision);
 });
+
+test('new plans avoid fixed headings and start with an empty editable board', (t) => {
+  const { store, planRoot } = fixture(t);
+  assert.equal(store.readDocument('one', 'plan-one', 'plan.md').content, '# Portable research\n\n');
+  const board = store.readBoard('one', 'plan-one');
+  assert(board);
+  assert.deepEqual(board!.board.sections, []);
+  assert(fs.existsSync(path.join(planRoot, 'board', 'board.json')));
+});
+
+test('board writes per-section Markdown, enforces revision and validates the tree', (t) => {
+  const { store, planRoot } = fixture(t);
+  const empty = store.readBoard('one', 'plan-one')!;
+  const sections = [{
+    id: 'character', title: 'Character', kind: 'gallery', status: 'review', summary: 'Shape language', cover: 'assets/cover.png',
+    body: 'Main direction',
+    children: [{ id: 'silhouette', title: 'Silhouette', kind: 'comparison', body: 'Readable at gameplay size.' }],
+    items: [{ id: 'v1-v2', title: 'V1 vs V2', body: 'Reduce belt noise.', status: 'done',
+      media: [{ path: 'assets/v1.png', alt: 'Version 1', label: 'Before' }, { path: 'assets/v2.png', alt: 'Version 2', label: 'After' }],
+      compare: { mode: 'slider', before: 'assets/v1.png', after: 'assets/v2.png' }, prompt: 'Keep the silhouette', source: 'https://example.com/reference' }],
+  }];
+  const saved = store.writeBoard('one', 'plan-one', { expectedRevision: empty.revision, board: { schemaVersion: 1, planId: 'plan-one', updatedAt: '', sections } });
+  const manifest = JSON.parse(fs.readFileSync(path.join(planRoot, 'board', 'board.json'), 'utf8'));
+  assert.equal(saved.board.sections[0].body, 'Main direction');
+  assert.equal(saved.board.sections[0].children![0].body, 'Readable at gameplay size.');
+  assert.equal(saved.board.sections[0].items![0].body, 'Reduce belt noise.');
+  assert.equal(fs.readFileSync(path.join(planRoot, manifest.sections[0].bodyPath), 'utf8'), 'Main direction');
+  assert.equal(fs.readFileSync(path.join(planRoot, manifest.sections[0].items[0].bodyPath), 'utf8'), 'Reduce belt noise.');
+  assert.notEqual(saved.revision, empty.revision);
+  const restarted = new PlanningStore((id) => id === 'one' ? { id, path: path.dirname(path.dirname(planRoot)) } : undefined);
+  assert.deepEqual(restarted.readBoard('one', 'plan-one')!.board, saved.board);
+  assert.throws(() => store.writeBoard('one', 'plan-one', { expectedRevision: empty.revision, board: saved.board }), status(409, 'REVISION_CONFLICT'));
+  const deep = { id: 'one', title: 'One', kind: 'section', children: [{ id: 'two', title: 'Two', kind: 'section', children: [{ id: 'three', title: 'Three', kind: 'section', children: [{ id: 'four', title: 'Four', kind: 'section', children: [{ id: 'five', title: 'Five', kind: 'section' }] }] }] }] };
+  for (const invalid of [
+    { ...saved.board, sections: [{ id: 'x', title: 'X', kind: 'section' }, { id: 'x', title: 'Duplicate', kind: 'section' }] },
+    { ...saved.board, sections: [deep] },
+    { ...saved.board, sections: [{ id: 'x', title: 'X', kind: 'section', cover: 'research/x.png' }] },
+    { ...saved.board, sections: [{ id: 'x', title: 'X', kind: 'section', items: [{ id: 'i', title: 'I', media: [{ path: '../x.png' }] }] }] },
+    { ...saved.board, sections: [{ id: 'x', title: 'X', kind: 'section', items: [{ id: 'i', title: 'I', compare: { mode: 'overlay', before: 'assets/a.png', after: 'assets/b.png' } }] }] },
+    { ...saved.board, sections: [{ id: 'x', title: 'X', kind: 'section', items: [{ id: 'i', title: 'I', source: 'javascript:alert(1)' }] }] },
+    { ...saved.board, planId: 'other-plan' },
+  ]) assert.throws(() => store.writeBoard('one', 'plan-one', { expectedRevision: saved.revision, board: invalid }), status(400));
+  assert.equal(store.readBoard('one', 'plan-one')!.revision, saved.revision);
+  assert.equal(fs.readFileSync(path.join(planRoot, manifest.sections[0].bodyPath), 'utf8'), 'Main direction');
+});
+
+test('interrupted board publication preserves the entire previous revision', (t) => {
+  const { store, planRoot } = fixture(t);
+  const empty = store.readBoard('one', 'plan-one')!;
+  const saved = store.writeBoard('one', 'plan-one', { expectedRevision: empty.revision, board: { ...empty.board, sections: [{ id: 'a', title: 'A', kind: 'section', body: 'old', items: [{ id: 'b', title: 'B', body: 'old item' }] }] } });
+  const changed = structuredClone(saved.board);
+  changed.sections[0].body = 'new';
+  changed.sections[0].items![0].body = 'new item';
+  const destination = path.join(planRoot, 'board', 'board.json');
+  const rename = fs.renameSync;
+  fs.renameSync = (source, target) => { if (String(target) === destination) throw new Error('injected manifest failure'); rename(source, target); };
+  try { assert.throws(() => store.writeBoard('one', 'plan-one', { expectedRevision: saved.revision, board: changed }), /injected manifest failure/); }
+  finally { fs.renameSync = rename; }
+  assert.deepEqual(store.readBoard('one', 'plan-one'), saved);
+});
+
+test('legacy board bodies remain readable and manifest paths stay confined to their node', (t) => {
+  const { store, planRoot } = fixture(t);
+  const manifestPath = path.join(planRoot, 'board', 'board.json');
+  const legacyPath = path.join(planRoot, 'board', 'content', 'legacy.md');
+  fs.writeFileSync(legacyPath, 'legacy content');
+  const manifest = { schemaVersion: 1, planId: 'plan-one', updatedAt: new Date().toISOString(), sections: [{ id: 'legacy', title: 'Legacy', kind: 'section', bodyPath: 'board/content/legacy.md' }] };
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  const board = store.readBoard('one', 'plan-one')!;
+  assert.equal(board.board.sections[0].body, 'legacy content');
+  const saved = store.writeBoard('one', 'plan-one', { expectedRevision: board.revision, board: board.board });
+  assert.equal(saved.board.sections[0].body, 'legacy content');
+  manifest.sections[0].bodyPath = 'board/content/../plan.md';
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  assert.throws(() => store.readBoard('one', 'plan-one'), status(409, 'INVALID_PLANNING_DATA'));
+});
+
+test('execution snapshots freeze board content and retain idempotent retries', (t) => {
+  const { store } = fixture(t);
+  const empty = store.readBoard('one', 'plan-one')!;
+  const saved = store.writeBoard('one', 'plan-one', { expectedRevision: empty.revision, board: { ...empty.board, sections: [{ id: 'feature', title: 'Feature', kind: 'section', body: 'original board body', items: [{ id: 'detail', title: 'Detail', body: 'original item' }] }] } });
+  const snapshot = store.createExecution('one', 'plan-one', { id: 'board-snapshot', target: 'manual' });
+  assert.equal(snapshot.boardRevision, saved.revision);
+  const manifest = JSON.parse(fs.readFileSync(path.join(snapshot.snapshotPath, 'board', 'board.json'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(snapshot.snapshotPath, manifest.sections[0].bodyPath), 'utf8'), 'original board body');
+  assert.equal(fs.readFileSync(path.join(snapshot.snapshotPath, manifest.sections[0].items[0].bodyPath), 'utf8'), 'original item');
+  const edited = structuredClone(saved.board); edited.sections[0].body = 'later edit';
+  store.writeBoard('one', 'plan-one', { expectedRevision: saved.revision, board: edited });
+  const retry = store.createExecution('one', 'plan-one', { id: 'board-snapshot', target: 'manual' });
+  assert.equal(retry.boardRevision, saved.revision);
+  assert.equal(fs.readFileSync(path.join(retry.snapshotPath, manifest.sections[0].bodyPath), 'utf8'), 'original board body');
+  const snapshotBody = path.join(retry.snapshotPath, manifest.sections[0].bodyPath);
+  fs.chmodSync(snapshotBody, 0o600);
+  fs.writeFileSync(snapshotBody, 'tampered');
+  assert.throws(() => store.getExecution('one', 'plan-one', 'board-snapshot'), status(409, 'EXECUTION_CHANGED'));
+});
+
+test('Markdown outline derivation is read-only and explicit conversion preserves headings', (t) => {
+  const { store, planRoot } = fixture(t);
+  const document = store.readDocument('one', 'plan-one', 'plan.md');
+  store.writeDocument('one', 'plan-one', { path: 'plan.md', content: [
+    '# Product plan', '', 'Intro line.', '', '## Problem', '', 'Users lose context.', '', '### Evidence', '', 'Five interviews.', '', '```md', '## not a heading', '```', '', '## Scope', '', 'Ship a board.', '',
+  ].join('\n'), expectedRevision: document.revision });
+  assert.equal(store.readBoard('one', 'plan-one')!.board.sections.length, 0);
+  const outline = store.deriveOutline('one', 'plan-one');
+  assert.deepEqual(outline.sections.map(({ id, title, level, body }) => ({ id, title, level, body })), [
+    { id: 'problem', title: 'Problem', level: 2, body: 'Users lose context.' },
+    { id: 'evidence', title: 'Evidence', level: 3, body: 'Five interviews.\n\n```md\n## not a heading\n```' },
+    { id: 'scope', title: 'Scope', level: 2, body: 'Ship a board.' },
+  ]);
+  assert.equal(store.readBoard('one', 'plan-one')!.board.sections.length, 0);
+  const converted = store.convertBoard('one', 'plan-one');
+  assert.deepEqual(converted.board.sections.map((section) => ({ id: section.id, body: section.body, children: section.children?.map((child) => ({ id: child.id, body: child.body })) })), [
+    { id: 'problem', body: 'Users lose context.', children: [{ id: 'evidence', body: 'Five interviews.\n\n```md\n## not a heading\n```' }] },
+    { id: 'scope', body: 'Ship a board.', children: undefined },
+  ]);
+  const manifest = JSON.parse(fs.readFileSync(path.join(planRoot, 'board', 'board.json'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(planRoot, manifest.sections[0].children[0].bodyPath), 'utf8'), 'Five interviews.\n\n```md\n## not a heading\n```');
+  assert.throws(() => store.convertBoard('one', 'plan-one'), status(409, 'PLANNING_EXISTS'));
+});

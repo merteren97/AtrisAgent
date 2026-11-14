@@ -114,6 +114,7 @@ function buildPrompt(execution: Execution, source: PlanningHandoffSource): strin
     `Source IDs: ${JSON.stringify({ workspaceId: source.workspaceId, planId: source.planId, executionId: source.executionId })}`,
     `Read-only snapshot directory (absolute, accessible from isolated worktrees): ${JSON.stringify(execution.snapshotPath)}`,
     `Complete file manifest with SHA-256 hashes: ${JSON.stringify(path.join(execution.snapshotPath, 'request.json'))}`,
+    ...(execution.boardRevision ? [`Board revision: ${execution.boardRevision}. Read board/board.json and its referenced Markdown bodies from the snapshot.`] : []),
     'Use only these snapshot inputs, not the mutable original plan/research/assets. Do not edit the snapshot. Read omitted/truncated contents from their absolute paths as needed.',
     '\n## Snapshot files (absolute paths)',
   ];
@@ -125,7 +126,7 @@ function buildPrompt(execution: Execution, source: PlanningHandoffSource): strin
   }
   lines.push('\n## Snapshot Markdown contents');
   let remaining = 48_000;
-  const markdown = execution.files.filter(file => file.path === 'plan.md' || /^research\/.*\.md$/i.test(file.path));
+  const markdown = execution.files.filter(file => file.path === 'plan.md' || /^research\/.*\.md$/i.test(file.path) || /^board\/content\/.*\.md$/i.test(file.path));
   markdown.sort((a, b) => Number(b.path === 'plan.md') - Number(a.path === 'plan.md') || a.path.localeCompare(b.path));
   for (const file of markdown) {
     if (remaining <= 0) break;

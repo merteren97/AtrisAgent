@@ -120,6 +120,10 @@ export function installPlanningRoutes(app: Express, store: PlanningStore, option
   }));
   app.get(`${BASE}/:planId`, route((_req, res, workspaceId, planId) => res.json(store.get(workspaceId, planId))));
   app.patch(`${BASE}/:planId`, route((req, res, workspaceId, planId) => res.json(store.update(workspaceId, planId, req.body || {}))));
+  app.get(`${BASE}/:planId/board`, route((_req, res, workspaceId, planId) => res.set('Cache-Control', 'no-store').json(store.readBoard(workspaceId, planId))));
+  app.put(`${BASE}/:planId/board`, route((req, res, workspaceId, planId) => res.json(store.writeBoard(workspaceId, planId, { board: req.body?.board, expectedRevision: req.body?.expectedRevision }))));
+  app.get(`${BASE}/:planId/outline`, route((_req, res, workspaceId, planId) => res.set('Cache-Control', 'no-store').json(store.deriveOutline(workspaceId, planId))));
+  app.post(`${BASE}/:planId/board/convert`, route((req, res, workspaceId, planId) => res.status(201).json(store.convertBoard(workspaceId, planId, req.body?.expectedRevision ?? null))));
   app.get(`${BASE}/:planId/document`, route((req, res, workspaceId, planId) => {
     res.set('Cache-Control', 'no-store').json(store.readDocument(workspaceId, planId, queryPath(req)));
   }));
