@@ -3,23 +3,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { FileText, ImageIcon, Loader2 } from 'lucide-react';
 import { MarkdownContent } from '@/components/chat/markdown-content';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { extractChatImages, normalizeImagePath } from '@/components/chat/chat-image-preview';
 
 interface Attachment { name: string; path: string }
 interface ProjectImage { name: string; path: string }
 
 export function assistantProjectImages(text: string): ProjectImage[] {
-  const matches = text.matchAll(/!?\[([^\]\n]{1,120})\]\(([^)\n]{1,2048})\)/g);
-  const images: ProjectImage[] = [];
-  const seen = new Set<string>();
-  for (const match of matches) {
-    const path = match[2].trim();
-    const external = /^(?:[a-z][\w+.-]*:|\/\/)/i.test(path) && !/^[a-z]:[\\/]/i.test(path);
-    if (path.length > 1024 || external || !/\.(?:png|jpe?g|webp|gif)$/i.test(path) || seen.has(path)) continue;
-    images.push({ name: match[1], path });
-    seen.add(path);
-    if (images.length === 12) break;
-  }
-  return images;
+  return extractChatImages(text);
 }
 
 function ProjectImagePreview({ image, cwd, open, onOpenChange }: { image: ProjectImage; cwd: string; open: boolean; onOpenChange: (open: boolean) => void }) {
@@ -93,6 +83,10 @@ export function ManualChatContent({ text, agentId, cwd, user }: { text: string; 
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const content = user ? displayManualPrompt(text) : { text, attachments: [] };
   const images = user ? [] : assistantProjectImages(text);
-  const openImage = (path: string) => { if (images.some(image => image.path === path)) setSelectedPath(path); };
+  const openImage = (path: string) => {
+    const clean = normalizeImagePath(path);
+    const target = images.find(image => image.path === path || image.path === clean || normalizeImagePath(image.path) === clean);
+    if (target) setSelectedPath(target.path);
+  };
   return <>{content.text && <MarkdownContent content={content.text} onLocalImageLink={images.length ? openImage : undefined} />}{content.attachments.length > 0 && <div aria-label="Sent attachments" className="mt-2 flex flex-wrap gap-2">{content.attachments.map((attachment, index) => <SentAttachment key={`${attachment.path}:${index}`} attachment={attachment} agentId={agentId} />)}</div>}{images.length > 0 && <div aria-label="Generated image previews" className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{images.map(image => <ProjectImagePreview key={image.path} image={image} cwd={cwd} open={selectedPath === image.path} onOpenChange={open => setSelectedPath(open ? image.path : null)} />)}</div>}</>;
 }

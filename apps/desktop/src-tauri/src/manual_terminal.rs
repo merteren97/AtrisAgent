@@ -466,10 +466,20 @@ fn read_project_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> {
     if reference.is_empty() || reference.len() > 2048 || reference.chars().any(char::is_control) { return Err("Invalid image path".into()); }
     let root = std::fs::canonicalize(root).map_err(|_| "Project is unavailable")?;
     if !root.is_dir() { return Err("Project is unavailable".into()); }
-    let supplied = Path::new(reference);
+    let clean = reference.trim();
+    let stripped = if clean.to_ascii_lowercase().starts_with("file:///") {
+        &clean[8..]
+    } else if clean.to_ascii_lowercase().starts_with("file://") {
+        &clean[7..]
+    } else {
+        clean
+    };
+    let supplied = Path::new(stripped);
     let candidate = std::fs::canonicalize(if supplied.is_absolute() { supplied.to_path_buf() } else { root.join(supplied) })
         .map_err(|_| "Image is unavailable")?;
-    if !candidate.starts_with(&root) { return Err("Image is outside this project".into()); }
+    let in_project = candidate.starts_with(&root);
+    let in_temp = std::fs::canonicalize(std::env::temp_dir()).map(|t| candidate.starts_with(t)).unwrap_or(false);
+    if !in_project && !in_temp { return Err("Image is outside this project".into()); }
     let extension = candidate.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     if !["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.as_str()) { return Err("Not a supported image".into()); }
     let metadata = std::fs::metadata(&candidate).map_err(|_| "Image is unavailable")?;

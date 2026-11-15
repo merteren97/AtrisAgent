@@ -234,7 +234,7 @@ const update = (path: string, content: string) => `\n\`\`\`atris-plan-update\n${
     await until(() => Boolean(f.adapters[0]?.options));
     const adapter = f.adapters[0];
     const options = adapter.options!;
-    assert.equal(options.role, 'researcher'); assert.equal(options.accessMode, 'read-only');
+    assert.equal(options.role, 'researcher'); assert.equal(options.accessMode, 'workspace-write');
     assert.equal(options.enableCoordinationMcp, false); assert.equal(options.providerSessionId, undefined);
     assert.equal(options.model, 'provider-model'); assert.equal(options.reasoningLevel, 'high'); assert.equal(options.profileId, 'account');
     assert.match(options.sessionId!, /^planning-/); assert.match(options.missionId, /^planning-only-/); assert.match(options.taskId, /^planning-turn-/);
@@ -728,7 +728,7 @@ for (const runtime of ['codex', 'claude_code', 'opencode', 'antigravity'] as con
     await until(() => Boolean(f.adapters[0]?.options));
     const wrapper = f.adapters[0].options!.prompt;
     assert(wrapper.length < 2_000, `${runtime}: argv stays bounded`);
-    assert.match(wrapper, /read-only/); assert.match(wrapper, /Never use shell tools to write/);
+    assert.match(wrapper, /planning/); assert.match(wrapper, /The service owns plan writes/);
     const filename = JSON.parse(wrapper.split('\n')[0].split('JSON quoted): ')[1]);
     assert(path.isAbsolute(filename)); assert.equal(fs.realpathSync(filename), filename);
     assert.equal(path.basename(filename), `${accepted.turnId}.md`);

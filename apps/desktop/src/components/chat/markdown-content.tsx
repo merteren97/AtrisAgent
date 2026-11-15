@@ -176,8 +176,11 @@ function inlineNodes(text: string, keyPrefix: string, onLocalImageLink?: (path: 
       while (href.endsWith(')') && (href.match(/\)/g)?.length || 0) > (href.match(/\(/g)?.length || 0)) { href = href.slice(0,-1); suffix = `)${suffix}`; }
       if (isSafeLink(href)) return <Fragment key={key}><a href={href} onClick={event => {event.preventDefault();useBrowserStore.getState().open(href);}} className="text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary">{href}</a>{suffix}</Fragment>;
     }
-    if (link && onLocalImageLink && /\.(?:png|jpe?g|webp|gif)$/i.test(link[2])) {
-      return <button key={key} type="button" onClick={() => onLocalImageLink(link[2])} className="text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{link[1]}</button>;
+    if (link && /\.(?:png|jpe?g|webp|gif)$/i.test(link[2])) {
+      if (onLocalImageLink) {
+        return <button key={key} type="button" onClick={() => onLocalImageLink(link[2])} className="text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{link[1]}</button>;
+      }
+      return <span key={key} className="inline-flex items-center gap-1 font-medium text-primary underline decoration-primary/40 underline-offset-2">{link[1]}</span>;
     }
     return <Fragment key={key}>{part}</Fragment>;
   });
