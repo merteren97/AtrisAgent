@@ -196,10 +196,14 @@ function WorkspaceApp() {
                ) : conversationMode === 'choose' ? (
                  <ConversationChoice />
                ) : (
-                  missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : <>
-                    <ChatTimeline />
-                    <ChatComposer />
-                  </>
+                  missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : (
+                    <div className="flex min-h-0 min-w-0 flex-1 flex-col p-2 sm:p-2.5">
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card/60 shadow-sm">
+                        <ChatTimeline />
+                        <ChatComposer />
+                      </div>
+                    </div>
+                  )
                )}
              </Suspense>
              {devMode ? <Suspense fallback={null}><DeveloperConsole /></Suspense> : null}

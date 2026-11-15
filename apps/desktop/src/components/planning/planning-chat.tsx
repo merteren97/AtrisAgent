@@ -13,6 +13,7 @@ import { getAuthToken } from '@/lib/token-provider';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { PlanningCliSetup, planningCliName } from './planning-cli-setup';
 import { PlanningMedia } from './planning-media';
+import { extractChatImages, ChatImageGallery } from '@/components/chat/chat-image-preview';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import {
   EMPTY_PLANNING_CHAT, planningChatDisplayText, planningChatKey, usePlanningChatStore,
@@ -75,8 +76,8 @@ function PlanningChatTabs({ workspaceId, planId, onDocumentChange, onClose, onEx
     const id = usePlanningChatStore.getState().prepareCreation(fingerprint);
     const conversation = await apiRequest<PlanningConversation>(base, { method: 'POST', body: JSON.stringify({ id, catalogId: model.catalogId, ...(reasoning ? { reasoning } : {}), title: `${planningCliName(model.runtimeType)} chat` }) });
     if (!alive.current) return;
-    const draft = usePlanningChatStore.getState().plans[planKey]?.draft;
-    if (!selected && draft) usePlanningChatStore.getState().update(planningChatKey(workspaceId, planId, conversation.id), { draft });
+    const initial = usePlanningChatStore.getState().plans[planKey];
+    if (!selected && initial?.draft) usePlanningChatStore.getState().update(planningChatKey(workspaceId, planId, conversation.id), { draft: initial.draft, editContext: initial.editContext });
     merge(conversation); usePlanningChatStore.getState().select(planKey, conversation.id); usePlanningChatStore.getState().acknowledgeCreation(fingerprint, id); setAdding(false);
   };
   const patch = async (conversation: PlanningConversation, values: Record<string, unknown>) => {
@@ -530,7 +531,10 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
           const proposals = chat.proposals.filter(proposal => proposal.turnId === message.turnId);
           return <article key={message.id} className="min-w-0 space-y-2">
             <p className="text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Assistant' : 'Activity'}{message.partial && running && message.turnId === chat.turnId ? ' · Writing' : ''}</p>
-            {text && (message.role === 'assistant' ? <div className="min-w-0 text-sm leading-relaxed [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto"><MarkdownContent content={text} /></div> : <p className={`whitespace-pre-wrap [overflow-wrap:anywhere] ${message.role === 'user' ? 'rounded-xl bg-muted/60 px-3 py-2 text-sm leading-relaxed' : 'text-xs leading-relaxed text-muted-foreground'}`}>{text}</p>)}
+            {text && (message.role === 'assistant' ? <div className="min-w-0 text-sm leading-relaxed [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
+              <MarkdownContent content={text} />
+              {extractChatImages(text).length > 0 && <ChatImageGallery images={extractChatImages(text)} workspaceId={workspaceId} planId={planId} />}
+            </div> : <p className={`whitespace-pre-wrap [overflow-wrap:anywhere] ${message.role === 'user' ? 'rounded-xl bg-muted/60 px-3 py-2 text-sm leading-relaxed' : 'text-xs leading-relaxed text-muted-foreground'}`}>{text}</p>)}
             {!!message.attachmentPaths?.length && <div aria-label="Sent attachments" className="flex flex-wrap gap-2">{message.attachmentPaths.map(path => <button type="button" key={path} onClick={() => setAttachmentPreview(path)} className="flex max-w-full items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"><FileText className="h-3 w-3 shrink-0" /><span className="truncate">{path.split('/').pop()}</span></button>)}</div>}
             {message.role === 'assistant' && !text && message.partial && running && <p className="text-xs text-muted-foreground">Preparing document update…</p>}
             {message.role === 'assistant' && proposals.map(proposal => <div key={proposal.id} className="min-w-0 rounded-lg border border-border bg-card p-3">

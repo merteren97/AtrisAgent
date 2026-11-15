@@ -1,4 +1,5 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { extractChatImages, ChatImageGallery } from './chat-image-preview';
 import { Check, Copy, FileText, Loader2, Sparkles, User } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownContent } from './markdown-content';
@@ -91,6 +92,7 @@ export const MessageCard = memo(function MessageCard({ role, content, timestamp,
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
   const resetCopyStateTimer = useRef<number | null>(null);
   const attachments = messageAttachments(metadata, workspaceId);
+  const chatImages = useMemo(() => isUser ? [] : extractChatImages(content), [isUser, content]);
 
   useEffect(() => () => {
     if (resetCopyStateTimer.current !== null) window.clearTimeout(resetCopyStateTimer.current);
@@ -152,7 +154,10 @@ export const MessageCard = memo(function MessageCard({ role, content, timestamp,
             )}>
               {isUser
                 ? <div className="whitespace-pre-wrap break-words">{content}</div>
-                : <MarkdownContent content={content} />}
+                : <>
+                    <MarkdownContent content={content} />
+                    {chatImages.length > 0 && <ChatImageGallery images={chatImages} />}
+                  </>}
               {attachments.length > 0 && <div aria-label="Sent attachments" className="mt-2 flex flex-wrap gap-2">
                 {attachments.map((attachment) => <SentAttachment key={`${attachment.workspaceId}:${attachment.id}`} {...attachment} />)}
               </div>}

@@ -43,6 +43,15 @@ const next = store.prepare(first, send.text, 'catalog', 'high');
 assert.notEqual(next.id, send.id, 'acknowledged text may be sent as a new turn');
 store.acknowledge(first, next);
 assert.equal(usePlanningChatStore.getState().plans[first].draft, '');
+store.update(first, { draft: 'Keep my unsent request' });
+store.setEditContext(first, 'Section A\n\n');
+store.setEditContext(first, 'Section B\n\n');
+store.setEditContext(first, 'Section B\n\n');
+assert.equal(usePlanningChatStore.getState().plans[first].draft, 'Section B\n\nKeep my unsent request', 'switching AI targets replaces only generated context and never duplicates or erases user typing');
+store.update(first, { draft: 'User rewrote the entire instruction' });
+store.setEditContext(first, 'Section C\n\n');
+assert.equal(usePlanningChatStore.getState().plans[first].draft, 'Section C\n\nUser rewrote the entire instruction', 'user-edited context is preserved as user text');
+assert.equal(usePlanningChatStore.getState().plans[other].draft, 'Keep another plan draft');
 
 const codexKey = planningChatKey('workspace', 'plan', 'codex-chat');
 const openCodeKey = planningChatKey('workspace', 'plan', 'opencode-chat');

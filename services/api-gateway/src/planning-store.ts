@@ -54,8 +54,10 @@ export interface PlanningBoardSection {
   summary?: string; cover?: string; body?: string;
   children?: PlanningBoardSection[]; items?: PlanningBoardItem[];
 }
+export interface PlanningAppearance { font: 'sans' | 'editorial' | 'mono'; accent: 'default' | 'blue' | 'sage' | 'amber' | 'rose'; density: 'comfortable' | 'compact'; }
 export interface PlanningBoard {
   schemaVersion: 1; planId: string; updatedAt: string; sections: PlanningBoardSection[];
+  summary?: string; cover?: string; appearance?: PlanningAppearance;
 }
 export interface PlanningBoardVersion { board: PlanningBoard; revision: string; }
 export interface PlanningBoardOutlineSection { id: string; title: string; level: 2 | 3; body: string; }
@@ -71,7 +73,7 @@ interface StoredBoardSection {
   summary?: string; cover?: string; bodyPath: string;
   children?: StoredBoardSection[]; items?: StoredBoardItem[];
 }
-interface StoredBoard { schemaVersion: 1; planId: string; updatedAt: string; sections: StoredBoardSection[]; }
+interface StoredBoard { schemaVersion: 1; planId: string; updatedAt: string; sections: StoredBoardSection[]; summary?: string; cover?: string; appearance?: PlanningAppearance; }
 const BOARD_KINDS: PlanningBoardKind[] = ['section', 'gallery', 'comparison', 'checklist', 'research', 'note'];
 const BOARD_STATUSES: PlanningBoardStatus[] = ['idea', 'in-progress', 'review', 'done', 'blocked'];
 const BOARD_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/;
@@ -288,6 +290,15 @@ function boardSource(value: unknown): string | undefined {
   return value;
 }
 export function validatePlanningBoard(value: unknown, planId: string): void { normalizeBoard(value, planId); }
+function boardAppearance(value: unknown): PlanningAppearance | undefined {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('Invalid board appearance.');
+  const appearance = value as Record<string, unknown>;
+  if (!['sans', 'editorial', 'mono'].includes(appearance.font as string)
+    || !['default', 'blue', 'sage', 'amber', 'rose'].includes(appearance.accent as string)
+    || !['comfortable', 'compact'].includes(appearance.density as string)) fail('Invalid board appearance.');
+  return { font: appearance.font, accent: appearance.accent, density: appearance.density } as PlanningAppearance;
+}
 function normalizeBoard(value: unknown, planId: string): { manifest: StoredBoard; bodies: Map<string, string> } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('Expected a board object.');
   const input = value as Record<string, unknown>;
@@ -348,7 +359,12 @@ function normalizeBoard(value: unknown, planId: string): { manifest: StoredBoard
     });
   };
   const normalizedSections = sections(input.sections, 1, 'Board sections');
-  const manifest: StoredBoard = { schemaVersion: 1, planId, updatedAt: now(), sections: normalizedSections };
+  const manifest: StoredBoard = {
+    schemaVersion: 1, planId, updatedAt: now(), sections: normalizedSections,
+    ...(input.summary === undefined ? {} : { summary: boardText(input.summary, 'Plan summary', 4000)! }),
+    ...(input.cover === undefined ? {} : { cover: boardAsset(input.cover, 'Plan cover') }),
+    ...(input.appearance === undefined ? {} : { appearance: boardAppearance(input.appearance)! }),
+  };
   let total = Buffer.byteLength(JSON.stringify(manifest));
   for (const body of bodies.values()) total += Buffer.byteLength(body);
   if (total > MAX_PLANNING_BOARD_BYTES) fail('Board exceeds the 1 MiB limit.', 413);
@@ -391,7 +407,11 @@ function hydrateBoard(raw: unknown, root: string, planId: string): PlanningBoard
       } as unknown as PlanningBoardSection;
     });
   };
-  return { schemaVersion: 1, planId, updatedAt: (raw as StoredBoard).updatedAt, sections: walk((raw as StoredBoard).sections, 1) };
+  const stored = raw as StoredBoard;
+  return { schemaVersion: 1, planId, updatedAt: stored.updatedAt, sections: walk(stored.sections, 1),
+    ...(stored.summary === undefined ? {} : { summary: stored.summary }), ...(stored.cover === undefined ? {} : { cover: stored.cover }),
+    ...(stored.appearance === undefined ? {} : { appearance: stored.appearance }),
+  };
 }
 function boardDigest(manifest: StoredBoard, bodies: Map<string, string>): string {
   const digest = createHash('sha256');

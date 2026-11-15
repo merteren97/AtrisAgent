@@ -13,6 +13,11 @@ try {
   assert.equal(usePlanningStore.getState().groups['one:planning'], undefined);
   assert.equal(usePlanningStore.getState().groups['two:manual'], undefined);
   state.select('one', 'p'); state.select('two', 'q');
+  const locationKey = documentKey('one', 'p', 'location');
+  state.setLocation(locationKey, { path: ['design', 'screens'], itemId: 'onboarding', query: 'source', appearance: { font: 'editorial', accent: 'sage', density: 'compact' } });
+  state.setLocation(locationKey, { view: 'document', documentPath: 'research/notes.md' });
+  assert.deepEqual(usePlanningStore.getState().locations[locationKey].path, ['design', 'screens'], 'changing document view preserves board location');
+  assert.equal(usePlanningStore.getState().locations[documentKey('two', 'q', 'location')], undefined, 'location is isolated by workspace and plan');
   const handoff = state.prepareHandoff('one:p:manual');
   const otherHandoff = state.prepareHandoff('two:q:manual');
   assert.equal(state.prepareHandoff('one:p:manual'), handoff, 'ambiguous retries retain their request identity across other plans');
@@ -36,6 +41,8 @@ try {
   assert.equal(usePlanningStore.getState().plans.one[0].id, 'p', 'temporary gateway failure preserves last known navigation');
   assert.equal(usePlanningStore.getState().activeByWorkspace.two, 'q');
   await usePlanningStore.persist.rehydrate();
+  assert.equal(usePlanningStore.getState().locations[locationKey].itemId, 'onboarding');
+  assert.equal(usePlanningStore.getState().locations[locationKey].appearance?.font, 'editorial', 'plan appearance survives hydration');
   assert.equal(usePlanningStore.getState().groups['one:manual'], true, 'collapse preferences survive rehydration');
   assert.equal(usePlanningStore.getState().drafts[documentKey('one', 'p', 'plan.md')].content, 'new draft', 'base revision and draft survive rehydration');
   console.log('Planning navigation, stale hydration and draft retention tests passed.');

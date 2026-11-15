@@ -377,6 +377,31 @@ test('interrupted board publication preserves the entire previous revision', (t)
   assert.deepEqual(store.readBoard('one', 'plan-one'), saved);
 });
 
+test('overview and constrained appearance survive reload, snapshots and rejected updates', (t) => {
+  const { store, planRoot } = fixture(t);
+  const original = store.readBoard('one', 'plan-one')!;
+  const appearance = { font: 'editorial', accent: 'sage', density: 'compact' };
+  const saved = store.writeBoard('one', 'plan-one', { expectedRevision: original.revision, board: { ...original.board,
+    summary: 'A concise project overview.', cover: 'assets/cover.png', appearance,
+    sections: [{ id: 'direction', title: 'Direction', kind: 'note', body: 'Keep the content simple.' }],
+  } });
+  assert.deepEqual(saved.board.appearance, appearance);
+  const restarted = new PlanningStore(id => id === 'one' ? { id, path: path.dirname(path.dirname(planRoot)) } : undefined);
+  assert.deepEqual(restarted.readBoard('one', 'plan-one'), saved);
+  const snapshot = store.createExecution('one', 'plan-one', { id: 'appearance-snapshot', target: 'manual' });
+  const manifest = JSON.parse(fs.readFileSync(path.join(snapshot.snapshotPath, 'board', 'board.json'), 'utf8'));
+  assert.deepEqual(manifest.appearance, appearance);
+  assert.equal(manifest.summary, saved.board.summary);
+  for (const patch of [
+    { appearance: { ...appearance, font: 'url(https://external/font)' } },
+    { appearance: { ...appearance, accent: 'custom-css' } },
+    { appearance: { ...appearance, density: 'unknown' } }, { appearance: [] },
+    { cover: '../private.png' },
+  ]) assert.throws(() => store.writeBoard('one', 'plan-one', { expectedRevision: saved.revision, board: { ...saved.board, ...patch } }), status(400));
+  assert.throws(() => store.writeBoard('one', 'plan-one', { expectedRevision: saved.revision, board: { ...saved.board, summary: 'x'.repeat(4001) } }), status(413));
+  assert.deepEqual(store.readBoard('one', 'plan-one'), saved, 'invalid appearance must not partially replace content');
+});
+
 test('legacy board bodies remain readable and manifest paths stay confined to their node', (t) => {
   const { store, planRoot } = fixture(t);
   const manifestPath = path.join(planRoot, 'board', 'board.json');
