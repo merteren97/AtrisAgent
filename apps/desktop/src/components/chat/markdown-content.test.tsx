@@ -19,6 +19,8 @@ assert.match(links, /href="https:\/\/example\.com\/review"/);
 assert.match(links, /href="https:\/\/example\.com\/docs"/);
 assert.match(render('[Article](https://example.com/wiki/Title_(test))'), /href="https:\/\/example\.com\/wiki\/Title_\(test\)"/);
 assert.match(render('(https://example.com/path).'), /href="https:\/\/example\.com\/path"/);
+assert.match(render('Uygulama hazır: **[http://localhost:1420/](http://localhost:1420/)**'), /<strong[^>]*><a[^>]*href="http:\/\/localhost:1420\/"/);
+assert.match(render('*https://example.com/docs*'), /<em><a[^>]*href="https:\/\/example\.com\/docs"/);
 assert.doesNotMatch(render('`https://example.com`'), /<a /);
 for (const unsafe of ['javascript:alert(1)','file:///tmp/secret','https://user:pass@example.com']) assert.equal(browserUrl(unsafe),null);
 useBrowserStore.getState().open('https://example.com');
