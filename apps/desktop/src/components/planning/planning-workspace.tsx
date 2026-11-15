@@ -90,7 +90,15 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
     actionBusy.current = true; setPending(true); setError('');
     try { await work(); } catch (cause) { setError(message(cause)); } finally { actionBusy.current = false; setPending(false); }
   };
-  const openDocument = useCallback((path: string) => { setDocumentPath(path); setSelectedAsset(null); setView('document'); setRefreshKey(value => value + 1); void refreshFiles(); }, [refreshFiles]);
+  const openDocument = useCallback((path: string) => { if (path === 'board.json') { setView('board'); setSelectedAsset(null); } else { setDocumentPath(path); setSelectedAsset(null); setView('document'); } setRefreshKey(value => value + 1); void refreshFiles(); }, [refreshFiles]);
+  const askBoardAssistant = () => {
+    if (!planId) return;
+    const chatStore = usePlanningChatStore.getState();
+    const key = planningChatKey(workspaceId, planId);
+    chatStore.update(planningChatKey(workspaceId, planId, chatStore.activeByPlan[key]), { draft: 'Create or update this plan’s board using plan.md, research and project context. Organize useful categories and actionable tasks automatically; preserve existing work and statuses.' });
+    store.setChatHidden(workspaceId, false);
+    if (browserOpen && narrow) useBrowserStore.getState().close();
+  };
   const openPlan = (id: string | null) => store.select(workspaceId, id);
   const create = () => { setTitle(''); store.setCreating(true); };
   const submitTitle = () => void action(async () => {
@@ -135,6 +143,7 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
     const drafts = Object.entries(usePlanningStore.getState().drafts).filter(([key]) => { const ids = JSON.parse(key); return ids[0] === workspaceId && ids[1] === planId; });
     for (const [key, draft] of drafts) {
       const path = JSON.parse(key)[2];
+      if (path === 'board.json') throw new Error('Save or resolve the preserved board draft before starting work.');
       const endpoint = `${planApi(workspaceId, planId)}/document?path=${encodeURIComponent(path)}`;
       const disk = await apiRequest<DocumentVersion>(endpoint);
       if (disk.content !== draft.content) await apiRequest(endpoint, { method: 'PUT', body: JSON.stringify({ content: draft.content, expectedRevision: draft.baseRevision }) });
@@ -200,7 +209,7 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
         <div className="flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border px-4"><nav className="flex items-center gap-4" aria-label="Plan views">{([{ id: 'board', label: 'Board', icon: LayoutGrid }, { id: 'document', label: 'Document', icon: FileText }] as const).map(tab => <button key={tab.id} onClick={() => { setView(tab.id); setSelectedAsset(null); if (tab.id === 'document') setDocumentPath('plan.md'); }} aria-current={view === tab.id ? 'page' : undefined} className={`flex h-11 items-center gap-1.5 border-b-2 text-xs font-medium transition-colors ${view === tab.id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}><tab.icon className="h-3.5 w-3.5" />{tab.label}</button>)}</nav><div className="flex items-center gap-1"><Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={pending} onClick={() => uploadInput.current?.click()}><Upload className="mr-1 h-3.5 w-3.5" />Add files</Button><Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={pending} onClick={() => { setTitle(''); setDialog('note'); }}><FilePlus2 className="mr-1 h-3.5 w-3.5" />New note</Button></div></div>
         {runs.length > 0 && <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border/60 bg-muted/20 px-5 py-2 text-[11px] text-muted-foreground"><Workflow className="h-3 w-3 shrink-0" /><span className="shrink-0">Linked work</span>{runs.map(([key]) => <button key={key} onClick={() => void openRun(key)} className="shrink-0 rounded-md border border-border bg-background px-2 py-1 hover:text-primary">{key.startsWith('manual:') ? 'Manual agent' : 'Orchestrator mission'} ↗</button>)}</div>}
 
-        <div className={view === 'board' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}><PlanningBoardView key={`${plan.id}:board`} workspaceId={workspaceId} planId={plan.id} files={files} refreshKey={0} onOpenFiles={() => { setSelectedAsset(null); setFilesOpen(true); }} onStatus={setBoardStatus} /></div>
+        <div className={view === 'board' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}><PlanningBoardView key={`${plan.id}:board`} workspaceId={workspaceId} planId={plan.id} files={files} refreshKey={refreshKey} onAskAI={askBoardAssistant} onOpenFiles={() => { setSelectedAsset(null); setFilesOpen(true); }} onStatus={setBoardStatus} /></div>
         {view === 'document' && <PlanningDocumentEditor key={`${plan.id}:${documentPath}`} workspaceId={workspaceId} planId={plan.id} path={documentPath} refreshKey={refreshKey} onStatus={setSaveStatus} onOpen={openDocument} />}
       </div>
       </section>

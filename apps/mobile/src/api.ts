@@ -1,7 +1,10 @@
 import { decodePairing, RemoteClient } from '@atris-agent-code/remote';
 import { hubToken } from './hub-auth';
 export type AgentStatus = 'working' | 'waiting' | 'idle' | 'offline' | 'error' | 'unknown';
-export interface Workspace { id: string; name: string; path?: string; agents: Agent[] }
+export interface Workspace { id: string; name: string; path?: string; agents: Agent[]; plans?: WorkspaceItem[] | null; missions?: WorkspaceItem[] | null }
+export interface WorkspaceItem { id: string; title: string; status: string }
+export interface PlanDetail { content: string; truncated: boolean }
+export interface MissionDetail { description: string; tasks: Array<{ id: string; title: string; status: string; description: string }> }
 export interface Agent { id: string; conversationId: string; name: string; model: string; modelId?: string; reasoning?: string; runtime: string; status: AgentStatus; summary?: string }
 export interface Message { id: string; role: 'user' | 'assistant' | 'tool'; text: string; time?: string }
 export interface Model { id: string; name: string; runtime: string; reasoning: string[]; available: boolean; selected?: boolean }
@@ -26,6 +29,8 @@ export function disconnectDesktop(): void { paired = false; client.close(); }
 export const api = {
   session: () => paired ? client.request<Session>('session') : Promise.resolve<Session>({ connected: false }),
   workspaces: () => client.request<Workspace[]>('workspaces'),
+  planDetail: (workspaceId: string, planId: string) => client.request<PlanDetail>('planDetail', { workspaceId, planId }),
+  missionDetail: (workspaceId: string, missionId: string) => client.request<MissionDetail>('missionDetail', { workspaceId, missionId }),
   messages: (id: string) => client.request<Message[]>('messages', { agentId: id }),
   models: (id: string) => client.request<Model[]>('models', { agentId: id }),
   controls: (id: string) => client.request<AgentControls>('controls', { agentId: id }),

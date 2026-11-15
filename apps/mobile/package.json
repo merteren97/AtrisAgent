@@ -13,6 +13,7 @@
   "dependencies": {
     "@atris-agent-code/remote": "*",
     "@tauri-apps/api": "^2.5.0",
+    "jsqr": "^1.4.0",
     "lucide-react": "^0.515.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

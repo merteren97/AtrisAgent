@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { ArrowLeft, ArrowUp, Check, ChevronDown, ChevronRight, CircleAlert, Clock3, FolderOpen, Layers3, LoaderCircle, Monitor, Plus, RefreshCw, Shield, Sparkles, UserRound, WifiOff, X } from 'lucide-react';
-import { api, connectDesktop, disconnectDesktop, type Agent, type Message, type Model, type Session, type Workspace } from './api';
+import { api, connectDesktop, disconnectDesktop, type Agent, type Message, type Model, type Session, type Workspace, type WorkspaceItem, type PlanDetail, type MissionDetail } from './api';
 import { clearHubSession, loginHub, restoreHubSession, type HubAccount } from './hub-auth';
 import logo from '../../desktop/public/logo.svg';
 import { AgentControls } from './agent-controls';
+import jsQR from 'jsqr';
 
 const statusLabel: Record<Agent['status'], string> = { working: 'Working', waiting: 'Needs input', idle: 'Ready', offline: 'Offline', error: 'Needs attention', unknown: 'Open · status unavailable' };
 function Brand() { return <div className="brand"><span className="brand-mark"><img src={logo} alt="AtrisAgent logo" /></span><span>Atris<span>Agent</span></span></div>; }
@@ -13,7 +14,7 @@ function Sheet({ title, close, children }: { title: string; close(): void; child
   const ref = useRef<HTMLElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
-    const focusable = () => Array.from(ref.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input,textarea') || []);
+    const focusable = () => Array.from(ref.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),textarea,summary') || []).filter(element => element.getClientRects().length > 0);
     focusable()[0]?.focus();
     const key = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.preventDefault(); close(); }
@@ -41,7 +42,8 @@ export function App() {
   const [modelBusy, setModelBusy] = useState(false);
   const [modelError, setModelError] = useState('');
   const [account, setAccount] = useState<HubAccount | null>(null);
-  const [panel, setPanel] = useState<'account' | 'connect' | 'models' | 'controls' | null>(null);
+  const [panel, setPanel] = useState<'account' | 'connect' | 'models' | 'controls' | 'detail' | null>(null);
+  const [detail, setDetail] = useState<{ item: WorkspaceItem; kind: 'plan' | 'mission'; data?: PlanDetail | MissionDetail; error?: string } | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [accountBusy, setAccountBusy] = useState(false);
@@ -102,13 +104,32 @@ export function App() {
 
   const openAgent = (item: Agent, project = workspaceId) => { setWorkspaceId(project); setAgentId(item.id); setMessages([]); follow.current = true; setScreen('chat'); };
   const beginPair = () => { setConnectError(''); setPanel(account ? 'connect' : 'account'); };
-  const pair = async () => {
+  const pair = async (pairingCode = code) => {
     connectionEpoch.current++;
     setSession({ connected: false });
     setConnectBusy(true); setConnectError('');
-    try { await connectDesktop(code); await refresh(); setCode(''); setPanel(null); setScreen('home'); }
+    try { await connectDesktop(pairingCode); await refresh(); setCode(''); setPanel(null); setScreen('home'); }
     catch (cause) { setConnectError(cause instanceof Error ? cause.message : 'Connection failed.'); }
     finally { setConnectBusy(false); }
+  };
+  const scanImage = async (file: File | undefined) => {
+    if (!file || connectBusy) return;
+    setConnectError('');
+    try {
+      const url = URL.createObjectURL(file);
+      try {
+        const image = new Image(); image.src = url;
+        await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error('Could not open this image.')); });
+        const scale = Math.min(1, 2000 / Math.max(image.naturalWidth, image.naturalHeight));
+        const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(image.naturalWidth * scale)); canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext('2d', { willReadFrequently: true }); if (!context) throw new Error('Could not read the image.');
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+        const result = jsQR(pixels.data, pixels.width, pixels.height);
+        if (!result) throw new Error('No QR code found. Try again with the whole code in view.');
+        await pair(result.data);
+      } finally { URL.revokeObjectURL(url); }
+    } catch (cause) { setConnectError(cause instanceof Error ? cause.message : 'Could not scan the QR code.'); }
   };
   const signIn = async () => {
     if (restoringAccount || accountBusy) return;
@@ -141,7 +162,14 @@ export function App() {
     catch (cause) { setModelError(cause instanceof Error ? cause.message : 'Could not change the model.'); }
     finally { setModelBusy(false); }
   };
-  const agents = (project: Workspace) => <div className="agent-list">{project.agents.map(item => <button className="agent-card" key={item.id} onClick={() => openAgent(item, project.id)}><div className="agent-card-top"><Avatar name={item.name} /><div className="agent-title"><strong>{item.name}</strong><span>{item.runtime} · {item.model}</span></div><ChevronRight size={18} /></div><p>{item.summary || 'Open this conversation to continue your work.'}</p><div className="agent-card-bottom"><Status status={item.status} /><span>Open conversation</span></div></button>)}{!project.agents.length && <p className="empty-state">No agents in this workspace yet. Open an agent on desktop.</p>}</div>;
+  const openDetail = async (project: Workspace, item: WorkspaceItem, kind: 'plan' | 'mission') => {
+    setDetail({ item, kind }); setPanel('detail');
+    try {
+      const data = kind === 'plan' ? await api.planDetail(project.id, item.id) : await api.missionDetail(project.id, item.id);
+      setDetail(current => current?.item.id === item.id && current.kind === kind ? { item, kind, data } : current);
+    } catch (cause) { setDetail(current => current?.item.id === item.id && current.kind === kind ? { item, kind, error: cause instanceof Error ? cause.message : 'Could not load details.' } : current); }
+  };
+  const agents = (project: Workspace) => <><div className="agent-list">{project.agents.map(item => <button className="agent-card" key={item.id} onClick={() => openAgent(item, project.id)}><div className="agent-card-top"><Avatar name={item.name} /><div className="agent-title"><strong>{item.name}</strong><span>{item.runtime} · {item.model}</span></div><ChevronRight size={18} /></div><p>{item.summary || 'Open this conversation to continue your work.'}</p><div className="agent-card-bottom"><Status status={item.status} /><span>Open conversation</span></div></button>)}{!project.agents.length && <p className="empty-state">No agents in this workspace yet. Open an agent on desktop.</p>}</div>{screen === 'workspace' && <div className="workspace-extra">{([['Orchestrator', project.missions], ['Planning', project.plans]] as const).map(([title, items]) => <section key={title}><div className="section-heading"><h2>{title} <span>{items?.length ?? ''}</span></h2></div>{items == null ? <p className="empty-state">Unavailable from this desktop.</p> : items.length ? <div className="workspace-items">{items.map(item => <button className="workspace-item" key={item.id} onClick={() => void openDetail(project, item, title === 'Planning' ? 'plan' : 'mission')}><strong>{item.title}</strong><span>{item.status.replaceAll('_', ' ')}</span><ChevronRight size={16} /></button>)}</div> : <p className="empty-state">No {title.toLowerCase()} items yet.</p>}</section>)}</div>}</>;
 
   return <main className={`app-shell ${screen === 'chat' && agent ? 'chat-shell' : ''}`}>
     {screen === 'chat' && agent && workspace ? <>
@@ -154,7 +182,7 @@ export function App() {
       <div className="composer-wrap">{delivery && <p role="alert" className="inline-error">{delivery}</p>}<div className="composer"><textarea aria-label={`Message ${agent.name}`} value={draft} maxLength={32000} placeholder="Send a message…" onChange={event => setDrafts(current => ({ ...current, [agent.id]: event.target.value }))} /><div className="composer-actions"><button className="model-button" onClick={() => void openModels()} disabled={!session.connected}><span className="model-dot" /><span>{agent.model}</span><small>· {agent.reasoning || 'default'}</small><ChevronDown size={14} /></button><button className="icon-button" aria-label="Agent permissions, questions and memory" disabled={!session.connected} onClick={() => setPanel('controls')}><Shield size={18} /></button><button className="send-button" aria-label="Send message" disabled={!draft.trim() || sending || !session.connected || agent.status === 'offline'} onClick={() => void send()}>{sending ? <LoaderCircle className="spin" size={18} /> : <ArrowUp size={20} />}</button></div></div><p className="composer-hint"><Shield size={11} /> Encrypted connection · Runs on your desktop</p></div>
     </> : <>
       <header className="topbar"><Brand /><div className="header-actions"><button className="account-button" aria-label={account ? 'AtrisHub account' : 'Sign in to AtrisHub'} onClick={() => setPanel('account')}><UserRound size={17} /><span>{account?.username || 'Sign in'}</span></button><button className="desktop-pill" aria-label="Refresh desktop connection" onClick={() => void refresh()}><i className={session.connected ? 'online' : ''} />{session.connected ? 'Connected' : session.pendingApproval ? 'Approval' : 'Offline'}</button></div></header>
-      {!session.connected ? <div className="offline-state"><div className="offline-graphic"><Monitor size={30} /><span><WifiOff size={18} /></span></div><span className="eyebrow">YOUR WORKSPACE, WHEREVER YOU ARE</span><h1>Stay close to<br />your work.</h1><p>Connect to your desktop to follow agents and continue conversations, even on a different network.</p><div className="offline-notice"><CircleAlert size={18} /><div><strong>{session.pendingApproval ? 'Approve your phone on desktop' : 'Desktop not connected'}</strong><p>{session.pendingApproval ? 'In desktop Settings → Mobile access, choose Approve phone.' : error || 'Sign in, then paste a pairing code from desktop Settings → Mobile access.'}</p></div></div><button className="primary-button" onClick={beginPair}>{account ? 'Connect desktop' : 'Sign in to get started'}</button><p className="offline-caption">Both devices must use the same AtrisHub account.</p></div> : <section className="page">
+      {!session.connected ? <div className="offline-state"><div className="offline-graphic"><Monitor size={30} /><span><WifiOff size={18} /></span></div><span className="eyebrow">YOUR WORKSPACE, WHEREVER YOU ARE</span><h1>Stay close to<br />your work.</h1><p>Connect to your desktop to follow agents and continue conversations, even on a different network.</p><div className="offline-notice"><CircleAlert size={18} /><div><strong>{session.pendingApproval ? 'Approve your phone on desktop' : 'Desktop not connected'}</strong><p>{session.pendingApproval ? 'In desktop Settings → Mobile access, choose Approve phone.' : error || 'Sign in, then scan the QR code in desktop Settings → Mobile access.'}</p></div></div><button className="primary-button" onClick={beginPair}>{account ? 'Connect desktop' : 'Sign in to get started'}</button><p className="offline-caption">Both devices must use the same AtrisHub account.</p></div> : <section className="page">
         {screen === 'home' ? <><div className="page-heading"><span className="eyebrow">YOUR DESKTOP, IN YOUR POCKET</span><h1>Your workspaces<span className="accent">.</span></h1><p>Pick up where you left off.</p></div><div className="connection-card"><span className="connection-icon"><Monitor size={20} /></span><div><strong>{session.desktopName || 'Your desktop'}</strong><p><i /> Connected and ready</p></div></div><div className="section-heading"><h2>Workspaces <span>{workspaces.length}</span></h2><button className="icon-button" aria-label="Refresh workspaces" onClick={() => void refresh()}><RefreshCw size={17} /></button></div><label className="search"><Sparkles size={17} /><input aria-label="Find a workspace" placeholder="Find a workspace" value={query} onChange={event => setQuery(event.target.value)} /></label><div className="workspace-list">{workspaces.filter(item => item.name.toLowerCase().includes(query.toLowerCase())).map(item => <button className="workspace-card" key={item.id} onClick={() => { setWorkspaceId(item.id); setScreen('workspace'); }}><span className="workspace-icon"><FolderOpen size={20} /></span><span className="workspace-info"><strong>{item.name}</strong><small>{item.agents.length} agents</small></span><ChevronRight size={18} /></button>)}</div></> : screen === 'activity' ? <><div className="page-heading"><h1>Your agents</h1><p>Live conversations across your desktop workspaces.</p></div>{workspaces.map(project => <section key={project.id}><div className="section-heading"><h2>{project.name}</h2></div>{agents(project)}</section>)}</> : workspace && <><button className="back-link" onClick={() => setScreen('home')}><ArrowLeft size={16} />All workspaces</button><div className="workspace-hero"><span className="workspace-icon hero-icon"><FolderOpen size={24} /></span><div><span className="eyebrow">WORKSPACE</span><h1>{workspace.name}</h1><p>Continue a conversation with your agents.</p></div></div><div className="section-heading"><h2>Agents <span>{workspace.agents.length}</span></h2></div>{agents(workspace)}</>}
       </section>}
       <nav className="bottom-nav" aria-label="Main navigation"><button className={screen === 'home' || screen === 'workspace' ? 'nav-active' : ''} onClick={() => setScreen('home')}><Layers3 size={20} /><span>Workspaces</span></button><button onClick={() => setScreen('activity')} disabled={!session.connected}><Clock3 size={20} /><span>Activity</span></button><button onClick={beginPair}><Plus size={20} /><span>Connect</span></button></nav>
@@ -178,8 +206,9 @@ export function App() {
         <p className="account-note">Credentials are sent only to AtrisHub over HTTPS.</p>
       </>}
     </Sheet>}
-    {panel === 'connect' && <Sheet title="Connect your desktop" close={closePanel}><p>On your computer, open Settings → Mobile access. Enable access and paste its private pairing code here.</p><form className="account-form" onSubmit={event => { event.preventDefault(); void pair(); }}><label>Pairing code<textarea required value={code} spellCheck={false} onChange={event => setCode(event.target.value)} /></label>{connectError && <p role="alert" className="sheet-error">{connectError}</p>}<button className="primary-button" disabled={connectBusy || !code.trim()}>{connectBusy ? 'Connecting…' : 'Connect desktop'}</button></form><p className="account-note">Approve your phone on desktop after connecting. Your computer must remain open and online.</p><button className="account-secondary" onClick={unpair}>Disconnect desktop</button></Sheet>}
+    {panel === 'connect' && <Sheet title="Connect your desktop" close={closePanel}><p>On your computer, open Settings → Mobile access and enable access. Photograph the QR code shown there.</p><label className="primary-button scan-button">{connectBusy ? 'Connecting…' : 'Scan QR code'}<input aria-label="Scan QR code" type="file" accept="image/*" capture="environment" disabled={connectBusy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; void scanImage(file); }} /></label>{connectError && <p role="alert" className="sheet-error">{connectError}</p>}<details><summary className="manual-summary">Enter pairing code manually</summary><form className="account-form" onSubmit={event => { event.preventDefault(); void pair(); }}><label>Pairing code<textarea required value={code} spellCheck={false} onChange={event => setCode(event.target.value)} /></label><button className="primary-button" disabled={connectBusy || !code.trim()}>{connectBusy ? 'Connecting…' : 'Connect desktop'}</button></form></details><p className="account-note">Approve your phone on desktop after connecting. Your computer must remain open and online.</p><button className="account-secondary" onClick={unpair}>Disconnect desktop</button></Sheet>}
     {panel === 'controls' && agent && <Sheet title="Agent controls" close={closePanel}><AgentControls agentId={agent.id} /></Sheet>}
+    {panel === 'detail' && detail && <Sheet title={detail.item.title} close={closePanel}><p className="detail-status">{detail.kind === 'plan' ? 'Planning' : 'Orchestrator'} · {detail.item.status.replaceAll('_', ' ')}</p>{detail.error ? <p role="alert" className="sheet-error">{detail.error}</p> : !detail.data ? <p>Loading details…</p> : detail.kind === 'plan' ? <><div className="detail-text">{(detail.data as PlanDetail).content || 'This plan is empty.'}</div>{(detail.data as PlanDetail).truncated && <p>Earlier content is shown; open the desktop to see the full document.</p>}</> : <><div className="detail-text">{(detail.data as MissionDetail).description || 'No description.'}</div><h3>Tasks</h3>{(detail.data as MissionDetail).tasks.length ? (detail.data as MissionDetail).tasks.map(task => <div className="detail-task" key={task.id}><strong>{task.title}</strong><span>{task.status.replaceAll('_', ' ')}</span>{task.description && <p>{task.description}</p>}</div>) : <p>No tasks yet.</p>}</>}<p className="account-note">Changes and controls are available on desktop.</p></Sheet>}
     {panel === 'models' && agent && <Sheet title="Model & reasoning" close={closePanel}><p>Available models on this agent's desktop account. Non-OpenCode sessions restart when idle; an active turn cannot be interrupted here.</p>{modelError && <p role="alert" className="sheet-error">{modelError}</p>}<div className="model-list">{models.map(model => <div className="model-item" key={model.id}><button disabled={!model.available || modelBusy} onClick={() => void selectModel(model, model.reasoning[0])}><span className="model-icon"><Sparkles size={16} /></span><span><strong>{model.name}</strong><small>{model.runtime}</small></span>{model.selected && <Check size={17} />}</button>{model.selected && <div className="reasoning"><span>REASONING</span><div>{model.reasoning.map(level => <button disabled={modelBusy} key={level} className={agent.reasoning === level ? 'selected' : ''} onClick={() => void selectModel(model, level)}>{level}</button>)}</div></div>}</div>)}{!models.length && !modelError && <p className="empty-state">Loading models…</p>}</div></Sheet>}
   </main>;
 }

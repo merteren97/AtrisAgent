@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, ArrowLeft, ChevronRight, FolderOpen, GripVertical, ImageIcon, Layers, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ChevronRight, FolderOpen, GripVertical, ImageIcon, Layers, Loader2, MoreHorizontal, Plus, RefreshCw, Sparkles, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -10,6 +10,7 @@ import { ApiError, apiRequest } from '@/lib/api-client';
 import { boardApi, type PlanningBoard, type PlanningBoardItem, type PlanningBoardKind, type PlanningBoardSection, type PlanningBoardStatus, type PlanningBoardVersion, type PlanningFile } from '@/stores/planning-store';
 import { PlanningMedia, usePlanningMediaUrl } from './planning-media';
 import { PlanningCompare } from './planning-compare';
+import { documentKey, usePlanningStore } from '@/stores/planning-store';
 
 const kinds: Array<{ id: PlanningBoardKind; label: string }> = [
   { id: 'section', label: 'Section' }, { id: 'gallery', label: 'Gallery' }, { id: 'comparison', label: 'Comparison' },
@@ -58,14 +59,17 @@ function CategoryCover({ workspaceId, planId, path }: { workspaceId: string; pla
   return <img src={url} alt="" loading="lazy" className="mb-3 h-32 w-full rounded-lg bg-muted object-cover" />;
 }
 
-export function PlanningBoardView({ workspaceId, planId, files, refreshKey, onOpenFiles, onStatus }: {
+export function PlanningBoardView({ workspaceId, planId, files, refreshKey, onOpenFiles, onStatus, onAskAI }: {
   workspaceId: string; planId: string; files: PlanningFile[]; refreshKey: number; onOpenFiles: () => void;
   onStatus: (status: string) => void;
+  onAskAI?: () => void;
 }) {
   const [version, setVersion] = useState<PlanningBoardVersion | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [conflict, setConflict] = useState(false);
+  const [review, setReview] = useState<{ latest: PlanningBoardVersion | null; draft: PlanningBoard } | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
   const [path, setPath] = useState<string[]>([]);
   const [activeItem, setActiveItem] = useState<string | null>(null);
   const [compareDraft, setCompareDraft] = useState({ before: '', after: '' });
@@ -75,48 +79,66 @@ export function PlanningBoardView({ workspaceId, planId, files, refreshKey, onOp
   const saving = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragged = useRef<{ kind: 'section' | 'item'; path: string[]; itemId?: string } | null>(null);
+  const draftKey = documentKey(workspaceId, planId, 'board.json');
+  const generation = useRef(0);
+  const blocked = useRef(false);
 
   const load = useCallback(async () => {
+    if (saving.current || pending.current) return;
+    const request = ++generation.current;
     setLoading(true); setError('');
     try {
       const result = await apiRequest<PlanningBoardVersion | null>(boardApi(workspaceId, planId));
+      if (request !== generation.current || pending.current || saving.current) return;
+      const draft = usePlanningStore.getState().drafts[draftKey];
       revision.current = result?.revision ?? null;
-      setVersion(result);
-      setConflict(false);
-      onStatus(result ? 'Saved locally' : 'No board yet');
+      blocked.current = Boolean(draft);
+      if (draft) {
+        setVersion({ board: JSON.parse(draft.content) as PlanningBoard, revision: draft.baseRevision });
+        setError('A local board draft is preserved. Review it against the latest saved board before continuing.');
+      } else setVersion(result);
+      setConflict(Boolean(draft));
+      onStatus(draft ? 'Unsaved changes' : result ? 'Saved locally' : 'No board yet');
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not load the board.'); onStatus('Save needs attention'); }
     finally { setLoading(false); }
-  }, [workspaceId, planId, onStatus]);
-  useEffect(() => { setVersion(null); setPath([]); setActiveItem(null); setConflict(false); pending.current = null; void load(); }, [load, refreshKey]);
+  }, [workspaceId, planId, onStatus, draftKey]);
+  useEffect(() => { void load(); }, [load, refreshKey]);
+  useEffect(() => { const tick = () => { if (document.visibilityState === 'visible') void load(); }; const timer = setInterval(tick, 8_000); return () => { clearInterval(timer); generation.current++; }; }, [load]);
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
 
   const flush = useCallback(async () => {
-    if (saving.current || !pending.current) return;
+    if (saving.current || !pending.current || blocked.current) return;
     const board = pending.current; pending.current = null; saving.current = true; onStatus('Saving...');
     try {
       const saved = await apiRequest<PlanningBoardVersion>(boardApi(workspaceId, planId), { method: 'PUT', body: JSON.stringify({ board, expectedRevision: revision.current }) });
       revision.current = saved.revision; setConflict(false); setError('');
+      usePlanningStore.getState().clearDraft(draftKey, JSON.stringify(board));
       if (!pending.current) setVersion(saved); else setVersion(current => current ? { ...current, revision: saved.revision } : current);
       onStatus(pending.current ? 'Unsaved changes' : 'Saved locally');
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 409) { setConflict(true); setError('This board changed on disk. Reload to compare before saving again.'); }
+      blocked.current = true;
+      setConflict(true);
+      if (cause instanceof ApiError && cause.status === 409) { setConflict(true); setError('This board changed on disk. Your local draft is preserved. Reload to compare before saving again.'); }
       else setError(cause instanceof Error ? cause.message : 'Could not save the board.');
       onStatus('Save needs attention');
     } finally {
       saving.current = false;
-      if (pending.current) timer.current = setTimeout(() => void flush(), 300);
+      if (pending.current && !blocked.current) timer.current = setTimeout(() => void flush(), 300);
     }
-  }, [workspaceId, planId, onStatus]);
+  }, [workspaceId, planId, onStatus, draftKey]);
   const schedule = useCallback(() => {
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => void flush(), 700);
   }, [flush]);
   const mutate = useCallback((change: (board: PlanningBoard) => void) => {
-    if (!version) return;
+    if (!version || blocked.current) return;
     const next = structuredClone(version.board); change(next);
+    generation.current++;
+    const previous = usePlanningStore.getState().drafts[draftKey];
+    usePlanningStore.getState().setDraft(draftKey, { content: JSON.stringify(next), baseContent: previous?.baseContent ?? JSON.stringify(version.board), baseRevision: previous?.baseRevision ?? version.revision });
     setVersion(current => current ? { ...current, board: next } : current);
     pending.current = next; onStatus('Unsaved changes'); schedule();
-  }, [version, onStatus, schedule]);
+  }, [version, onStatus, schedule, draftKey]);
 
   const current = version ? locate(version.board.sections, path)?.section : null;
   const parentPath = path.slice(0, -1);
@@ -179,20 +201,38 @@ export function PlanningBoardView({ workspaceId, planId, files, refreshKey, onOp
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not build the board from Markdown.'); }
   })();
   const selectSection = (sectionPath: string[]) => { setPath(sectionPath); setActiveItem(null); };
+  const reviewDraft = async () => {
+    try {
+      const latest = await apiRequest<PlanningBoardVersion | null>(boardApi(workspaceId, planId));
+      const draft = usePlanningStore.getState().drafts[draftKey];
+      if (draft) setReview({ latest, draft: JSON.parse(draft.content) as PlanningBoard });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not compare the board.'); }
+  };
+  const resolveDraft = async (apply: boolean) => {
+    if (!review || reviewBusy) return;
+    setReviewBusy(true);
+    try {
+      const result = apply ? await apiRequest<PlanningBoardVersion>(boardApi(workspaceId, planId), { method: 'PUT', body: JSON.stringify({ board: review.draft, expectedRevision: review.latest?.revision ?? null }) }) : review.latest;
+      usePlanningStore.getState().clearDraft(draftKey, JSON.stringify(review.draft));
+      pending.current = null; blocked.current = false; revision.current = result?.revision ?? null;
+      setVersion(result); setConflict(false); setError(''); setReview(null); onStatus(result ? 'Saved locally' : 'No board yet');
+    } catch (cause) { setReview(null); setError(cause instanceof Error ? cause.message : 'Could not save the board. Compare again before retrying.'); }
+    finally { setReviewBusy(false); }
+  };
 
   if (loading && !version) return <div role="status" className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Loading board...</div>;
-  if (!version) return <div className="flex flex-1 flex-col items-center justify-center px-6 text-center"><Layers className="mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-base font-semibold">This plan has no board.</h2><p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">Build one from the Markdown headings, or start with a blank category.</p><div className="mt-5 flex gap-2"><Button size="sm" variant="outline" onClick={convert}><RefreshCw className="mr-2 h-3.5 w-3.5" />Build from Markdown</Button><Button size="sm" onClick={() => void load()}><Plus className="mr-2 h-4 w-4" />Retry</Button></div>{error && <p role="alert" className="mt-4 text-xs text-destructive">{error}</p>}</div>;
+  if (!version) return <div className="flex flex-1 flex-col items-center justify-center px-6 text-center"><Layers className="mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-base font-semibold">Let AI organize this plan.</h2><p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">The assistant can turn your idea, plan and research into categories and actionable tasks.</p><div className="mt-5 flex flex-wrap justify-center gap-2">{onAskAI && <Button size="sm" onClick={onAskAI}><Sparkles className="mr-2 h-3.5 w-3.5" />Organize with AI</Button>}<Button size="sm" variant="outline" onClick={convert}><RefreshCw className="mr-2 h-3.5 w-3.5" />Build from Markdown</Button></div>{error && <p role="alert" className="mt-4 text-xs text-destructive">{error}</p>}</div>;
 
   return <div className="flex min-h-0 flex-1 flex-col">
     <header className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2.5">
       <nav aria-label="Board breadcrumb" className="flex min-w-0 items-center gap-1 text-xs">{<button className="shrink-0 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => selectSection([])}>Board</button>}{path.map((id, index) => <span key={id} className="flex min-w-0 items-center gap-1"><ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" /><button className="max-w-[16rem] truncate rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => selectSection(path.slice(0, index + 1))}>{locate(version.board.sections, path.slice(0, index + 1))?.section.title || id}</button></span>)}</nav>
-      <div className="flex items-center gap-2"><Button size="sm" variant="outline" className="h-8 text-xs" onClick={onOpenFiles}><FolderOpen className="mr-1.5 h-3.5 w-3.5" />Files & research</Button>{!section && <Button size="sm" className="h-8 text-xs" onClick={() => addSection([])}><Plus className="mr-1.5 h-3.5 w-3.5" />Add category</Button>}</div>
+      <div className="flex flex-wrap items-center gap-2">{onAskAI && <Button size="sm" variant="outline" className="h-8 text-xs" onClick={onAskAI}><Sparkles className="mr-1.5 h-3.5 w-3.5" />Organize with AI</Button>}<Button size="sm" variant="outline" className="h-8 text-xs" onClick={onOpenFiles}><FolderOpen className="mr-1.5 h-3.5 w-3.5" />Files & research</Button>{!section && <Button size="sm" className="h-8 text-xs" onClick={() => addSection([])}><Plus className="mr-1.5 h-3.5 w-3.5" />Add category</Button>}</div>
     </header>
-    {conflict && <div role="alert" className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-300"><span className="flex items-center gap-2"><AlertTriangle className="h-3.5 w-3.5" />{error}</span><Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => void load()}><RefreshCw className="mr-1.5 h-3 w-3" />Reload board</Button></div>}
+    {conflict && <div role="alert" className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-300"><span className="flex items-center gap-2"><AlertTriangle className="h-3.5 w-3.5" />{error}</span><Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => void reviewDraft()}><RefreshCw className="mr-1.5 h-3 w-3" />Compare saved board</Button></div>}
     {!conflict && error && <div role="alert" className="shrink-0 border-b border-border bg-destructive/5 px-4 py-2 text-xs text-destructive">{error}</div>}
     <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
       {!section ? <div className="mx-auto max-w-6xl">
-        {version.board.sections.length === 0 ? <div className="flex min-h-64 flex-col items-center justify-center rounded-xl border border-dashed border-border px-6 py-10 text-center"><Layers className="mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-base font-semibold">Shape the plan around the work.</h2><p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">Add categories for the parts of the plan, then break each one into subcategories and items. Nothing is fixed in code.</p><div className="mt-5 flex flex-wrap justify-center gap-2"><Button size="sm" variant="outline" onClick={convert}><RefreshCw className="mr-2 h-3.5 w-3.5" />Build from Markdown</Button><Button size="sm" onClick={() => addSection([])}><Plus className="mr-2 h-4 w-4" />Add first category</Button></div></div>
+        {version.board.sections.length === 0 ? <div className="flex min-h-64 flex-col items-center justify-center rounded-xl border border-dashed border-border px-6 py-10 text-center"><Layers className="mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-base font-semibold">An AI-organized workspace for this plan.</h2><p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">Describe what you want in the assistant. It can create and refine categories, tasks and research as the plan evolves.</p><div className="mt-5 flex flex-wrap justify-center gap-2">{onAskAI && <Button size="sm" onClick={onAskAI}><Sparkles className="mr-2 h-3.5 w-3.5" />Organize with AI</Button>}<Button size="sm" variant="outline" onClick={convert}><RefreshCw className="mr-2 h-3.5 w-3.5" />Build from Markdown</Button></div></div>
           : <div className="grid gap-3 @min-[720px]:grid-cols-2 @min-[1100px]:grid-cols-3">{version.board.sections.map(entry => <article key={entry.id} draggable onDragStart={() => { dragged.current = { kind: 'section', path: [entry.id] }; }} onDragOver={event => event.preventDefault()} onDrop={() => { if (dragged.current?.kind === 'section' && dragged.current.path.length === 1) moveSection(dragged.current.path[0], entry.id); dragged.current = null; }} className="group flex min-w-0 flex-col rounded-xl border border-border bg-card p-4">
             {entry.cover && <CategoryCover workspaceId={workspaceId} planId={planId} path={entry.cover} />}
             <div className="flex items-start justify-between gap-2"><button onClick={() => selectSection([entry.id])} className="min-w-0 flex-1 text-left"><span className="flex items-center gap-2"><GripVertical className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50" /><span className="truncate text-sm font-semibold">{entry.title}</span></span><span className="mt-1 block text-[11px] text-muted-foreground">{kindLabel(entry.kind)} · {countLabel(itemsIn(entry), 'item')} · {countLabel(entry.children?.length || 0, 'subcategory', 'subcategories')}</span></button><DropdownMenu><DropdownMenuTrigger asChild><Button size="icon" variant="ghost" className="h-7 w-7" aria-label={`Actions for ${entry.title}`}><MoreHorizontal className="h-4 w-4" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onSelect={() => selectSection([entry.id])}>Open</DropdownMenuItem><DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={() => setDeleting({ kind: 'section', path: [entry.id], title: entry.title })}><Trash2 className="h-4 w-4" />Delete category</DropdownMenuItem></DropdownMenuContent></DropdownMenu></div>
@@ -228,5 +268,6 @@ export function PlanningBoardView({ workspaceId, planId, files, refreshKey, onOp
       </div>}
     </div>
     <Dialog open={Boolean(deleting)} onOpenChange={open => { if (!open) setDeleting(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete {deleting?.kind === 'item' ? 'item' : 'category'}?</DialogTitle><DialogDescription>{deleting ? `"${deleting.title}" will be removed from the board. Markdown bodies and media files stay in the plan folder.` : ''}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setDeleting(null)}>Cancel</Button><Button variant="destructive" onClick={confirmDelete}><Trash2 className="mr-2 h-4 w-4" />Delete</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={Boolean(review)} onOpenChange={open => { if (!open && !reviewBusy) setReview(null); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>Review local board draft</DialogTitle><DialogDescription>Compare the latest saved board and your preserved draft. Applying replaces only the revision shown here.</DialogDescription></DialogHeader><div className="grid min-w-0 gap-3 sm:grid-cols-2">{[{ title: 'Latest saved board', board: review?.latest?.board }, { title: 'Your local draft', board: review?.draft }].map(entry => <section key={entry.title} className="min-w-0"><h3 className="mb-2 text-xs font-semibold">{entry.title}</h3><pre className="max-h-[45vh] overflow-auto whitespace-pre-wrap rounded-lg border border-border p-3 text-xs [overflow-wrap:anywhere]">{JSON.stringify(entry.board ?? null, null, 2)}</pre></section>)}</div><DialogFooter><Button variant="ghost" disabled={reviewBusy} onClick={() => setReview(null)}>Cancel</Button><Button variant="outline" disabled={reviewBusy} onClick={() => void resolveDraft(false)}>Use saved board</Button><Button disabled={reviewBusy} onClick={() => void resolveDraft(true)}>Apply my draft</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }

@@ -23,7 +23,9 @@ const server = http.createServer((req, res) => {
       const commands = new RemoteAgentCommands({ deliver: async command => { state.writes++; if (command.text === 'uncertain') throw new Error('Lost acknowledgment'); messages.push({ id: command.id, role: 'user', text: command.text }); messages.push({ id: `${command.id}-reply`, role: 'assistant', text: 'The desktop received your message.' }); return 'delivered'; } });
       const host = new RemoteHost(pairing, async (method, params) => {
         if (method === 'session') return { connected: true, desktopName: 'Test Desktop' };
-        if (method === 'workspaces') return [{ id: 'w1', name: 'AtrisAgent', agents: [agent] }];
+        if (method === 'workspaces') return [{ id: 'w1', name: 'AtrisAgent', agents: [agent], plans: [{ id: 'p1', title: 'Release plan', status: 'draft' }], missions: [{ id: 'o1', title: 'Build project', status: 'running' }] }];
+        if (method === 'planDetail') return { content: '# Release plan\nShip the mobile update.', truncated: false };
+        if (method === 'missionDetail') return { description: 'Build the project.', tasks: [{ id: 't1', title: 'Run tests', status: 'running', description: 'Verify changes.' }] };
         if (method === 'messages') return messages;
         if (method === 'send') return commands.send({ id: params.id, workspaceId: params.workspaceId, conversationId: params.conversationId, agentId: params.agentId, text: params.text });
         if (method === 'models') return [{ id: 'model-1', name: 'GPT Terra', runtime: 'opencode', available: true, selected: true, reasoning: ['medium', 'high'] }];
