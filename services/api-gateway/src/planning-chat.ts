@@ -564,7 +564,7 @@ export class PlanningChatController {
       active.adapter = adapter;
       active.timer = setTimeout(() => {
         if (current()) this.finish(w, p, active, 'failed', 'The headless planning turn timed out. Check Accounts or send a new message to retry.');
-      }, this.options.timeoutMs ?? 180_000);
+      }, this.options.timeoutMs ?? 300_000);
       adapter.configureProfile(profile);
       const capabilities = await adapter.probeCapabilities(profile.id);
       if (!current()) return;

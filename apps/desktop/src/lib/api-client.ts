@@ -4,7 +4,7 @@ import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 const configuredBase = import.meta.env?.VITE_ATRIS_API_URL as string | undefined;
 let apiOrigin = normalizeApiOrigin(configuredBase);
 let runtimeTransportToken: string | null = null;
-const API_REQUEST_TIMEOUT_MS = 30_000;
+const API_REQUEST_TIMEOUT_MS = 60_000;
 const HEALTH_REQUEST_TIMEOUT_MS = 5_000;
 
 export interface ApiRuntimeConfig {

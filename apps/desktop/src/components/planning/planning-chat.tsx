@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowDown, Check, FileText, History, Loader2, Maximize2, Minimize2, MoreHorizontal, Plus, RefreshCw, Sparkles, Square, X } from 'lucide-react';
+import { ArrowDown, Check, FileText, History, Loader2, Maximize2, Minimize2, MoreHorizontal, Plus, RefreshCw, RotateCcw, Sparkles, Square, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { MarkdownContent } from '@/components/chat/markdown-content';
@@ -99,9 +99,186 @@ function PlanningChatTabs({ workspaceId, planId, onDocumentChange, onClose, onEx
       {onExpand && <Button variant="ghost" size="icon" className="h-7 w-7" aria-label={expanded ? 'Collapse assistant' : 'Expand assistant'} onClick={onExpand}>{expanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}</Button>}
       {onClose && <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Close assistant" onClick={onClose}><X className="h-3.5 w-3.5" /></Button>}
     </header>
-    {open.length > 0 && <div className="flex shrink-0 items-end gap-1 border-b border-border bg-muted/35 px-2 pt-2"><div role="tablist" aria-label="Planning chats" className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto">{open.map((conversation, index) => <div key={conversation.id} className={`group relative flex min-w-24 max-w-44 shrink-0 items-center rounded-t-xl border border-b-0 ${selected?.id === conversation.id ? 'border-border bg-background text-foreground' : 'border-transparent text-muted-foreground hover:bg-muted/70'}`}><button type="button" role="tab" id={`planning-tab-${conversation.id}`} aria-selected={selected?.id === conversation.id} aria-controls={`planning-chat-${conversation.id}`} tabIndex={selected?.id === conversation.id ? 0 : -1} title={`${conversation.title} · ${planningCliName(conversation.runtimeType)} · Double click to rename`} className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-tl-xl pl-3 pr-1 text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring" onClick={() => usePlanningChatStore.getState().select(planKey, conversation.id)} onDoubleClick={() => { setRenaming(conversation); setTitle(conversation.title); }} onKeyDown={event => { if (event.key === 'ArrowRight' || event.key === 'ArrowLeft' || event.key === 'Home' || event.key === 'End') { event.preventDefault(); const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? open.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + open.length) % open.length; usePlanningChatStore.getState().select(planKey, open[nextIndex].id); document.getElementById(`planning-tab-${open[nextIndex].id}`)?.focus(); } }}><RuntimeBrandIcon runtimeId={conversation.runtimeType} className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{conversation.title}</span>{statuses[conversation.id] === 'running' && <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" />}</button><button type="button" aria-label={`Close ${conversation.title}`} disabled={pending} title="Close tab · history is kept" className="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md opacity-60 transition-opacity hover:bg-accent hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring" onClick={() => void close(conversation)}><X className="h-3 w-3" /></button></div>)}</div><Button type="button" size="icon" variant="ghost" className="mb-0.5 h-8 w-8 shrink-0 rounded-lg" aria-label="New planning chat" title="New chat · choose a CLI" onClick={() => setAdding(true)}><Plus className="h-4 w-4" /></Button></div>}
-    {error && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-border bg-destructive/5 px-4 py-2 text-xs leading-5 text-destructive"><span>{error}</span><button type="button" aria-label="Retry loading chats" onClick={() => void refresh()}><RefreshCw className="h-3.5 w-3.5" /></button></div>}
-    {loading ? <div role="status" className="flex flex-1 items-center justify-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Loading your chats…</div> : selected ? <PlanningChatSession key={planningChatKey(workspaceId, planId, selected.id)} workspaceId={workspaceId} planId={planId} conversation={selected} conversations={open} onDocumentChange={onDocumentChange} onPatch={values => patch(selected, values)} onIndependent={create} onState={onState} /> : <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6"><div className="mb-6"><h3 className="text-base font-semibold tracking-tight">Start with your preferred CLI.</h3><p className="mt-2 text-xs leading-6 text-muted-foreground">Each chat keeps its own conversation and model. Your plan and research stay alongside it.</p></div><PlanningCliSetup onCreate={create} /></div>}
+    {(open.length > 0 || closed.length > 0) && (
+      <div className="flex shrink-0 items-end gap-1 border-b border-border bg-muted/35 px-2 pt-2">
+        <div role="tablist" aria-label="Planning chats" className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto">
+          {open.map((conversation, index) => (
+            <div
+              key={conversation.id}
+              className={`group relative flex min-w-24 max-w-44 shrink-0 items-center rounded-t-xl border border-b-0 ${
+                selected?.id === conversation.id
+                  ? 'border-border bg-background text-foreground'
+                  : 'border-transparent text-muted-foreground hover:bg-muted/70'
+              }`}
+            >
+              <button
+                type="button"
+                role="tab"
+                id={`planning-tab-${conversation.id}`}
+                aria-selected={selected?.id === conversation.id}
+                aria-controls={`planning-chat-${conversation.id}`}
+                tabIndex={selected?.id === conversation.id ? 0 : -1}
+                title={`${conversation.title} · ${planningCliName(conversation.runtimeType)} · Double click to rename`}
+                className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-tl-xl pl-3 pr-1 text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                onClick={() => usePlanningChatStore.getState().select(planKey, conversation.id)}
+                onDoubleClick={() => {
+                  setRenaming(conversation);
+                  setTitle(conversation.title);
+                }}
+                onKeyDown={event => {
+                  if (event.key === 'ArrowRight' || event.key === 'ArrowLeft' || event.key === 'Home' || event.key === 'End') {
+                    event.preventDefault();
+                    const nextIndex =
+                      event.key === 'Home'
+                        ? 0
+                        : event.key === 'End'
+                        ? open.length - 1
+                        : (index + (event.key === 'ArrowRight' ? 1 : -1) + open.length) % open.length;
+                    usePlanningChatStore.getState().select(planKey, open[nextIndex].id);
+                    document.getElementById(`planning-tab-${open[nextIndex].id}`)?.focus();
+                  }
+                }}
+              >
+                <RuntimeBrandIcon runtimeId={conversation.runtimeType} className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{conversation.title}</span>
+                {statuses[conversation.id] === 'running' && <Loader2 className="h-3 w-3 shrink-0 animate-spin text-primary" />}
+              </button>
+              <button
+                type="button"
+                aria-label={`Close ${conversation.title}`}
+                disabled={pending}
+                title="Close tab · history is kept"
+                className="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md opacity-60 transition-opacity hover:bg-accent hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => void close(conversation)}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+          {!open.length && (
+            <span className="pb-2 text-xs text-muted-foreground">All chats closed. Reopen below or add a new chat.</span>
+          )}
+        </div>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="mb-0.5 h-8 w-8 shrink-0 rounded-lg"
+          aria-label="New planning chat"
+          title="New chat · choose a CLI"
+          onClick={() => setAdding(true)}
+        >
+          <Plus className="h-4 w-4" />
+        </Button>
+        {closed.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="mb-0.5 h-8 gap-1.5 px-2 text-xs text-muted-foreground hover:text-foreground"
+                aria-label="Reopen closed chat"
+                title="Reopen closed chat"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Closed ({closed.length})</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-60">
+              <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">Reopen closed chat</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {closed.map(item => (
+                <DropdownMenuItem
+                  key={item.id}
+                  className="flex items-center justify-between gap-2"
+                  onSelect={() => {
+                    void patch(item, { closed: false })
+                      .then(() => usePlanningChatStore.getState().select(planKey, item.id))
+                      .catch(cause => setError(errorText(cause)));
+                  }}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <RuntimeBrandIcon runtimeId={item.runtimeType} className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate">{item.title}</span>
+                  </div>
+                  <RotateCcw className="h-3 w-3 shrink-0 opacity-70" />
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
+    )}
+    {error && (
+      <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-border bg-destructive/5 px-4 py-2 text-xs leading-5 text-destructive">
+        <span>{error}</span>
+        <button type="button" aria-label="Retry loading chats" onClick={() => void refresh()}>
+          <RefreshCw className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    )}
+    {loading ? (
+      <div role="status" className="flex flex-1 items-center justify-center gap-2 text-xs text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />Loading your chats…
+      </div>
+    ) : selected ? (
+      <PlanningChatSession
+        key={planningChatKey(workspaceId, planId, selected.id)}
+        workspaceId={workspaceId}
+        planId={planId}
+        conversation={selected}
+        conversations={open}
+        onDocumentChange={onDocumentChange}
+        onPatch={values => patch(selected, values)}
+        onIndependent={create}
+        onState={onState}
+      />
+    ) : (
+      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6">
+        {closed.length > 0 && (
+          <div className="mb-6 rounded-xl border border-border bg-card p-4">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold">Closed chats</h3>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {closed.length} closed conversation{closed.length === 1 ? '' : 's'} preserved. Reopen anytime to continue.
+                </p>
+              </div>
+            </div>
+            <div className="mt-3 divide-y divide-border/60">
+              {closed.map(item => (
+                <div key={item.id} className="flex items-center justify-between py-2 text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <RuntimeBrandIcon runtimeId={item.runtimeType} className="h-4 w-4 shrink-0" />
+                    <span className="truncate font-medium">{item.title}</span>
+                    <span className="text-[10px] text-muted-foreground">({planningCliName(item.runtimeType)})</span>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 gap-1.5 px-2.5 text-xs"
+                    onClick={() => {
+                      void patch(item, { closed: false })
+                        .then(() => usePlanningChatStore.getState().select(planKey, item.id))
+                        .catch(cause => setError(errorText(cause)));
+                    }}
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    Reopen
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="mb-6">
+          <h3 className="text-base font-semibold tracking-tight">Start with your preferred CLI.</h3>
+          <p className="mt-2 text-xs leading-6 text-muted-foreground">Each chat keeps its own conversation and model. Your plan and research stay alongside it.</p>
+        </div>
+        <PlanningCliSetup onCreate={create} />
+      </div>
+    )}
     <Dialog open={adding} onOpenChange={setAdding}><DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-lg"><DialogHeader><DialogTitle>New planning chat</DialogTitle><DialogDescription>Choose a CLI and model, just like Manual. This chat starts with its own history.</DialogDescription></DialogHeader><div className="min-h-0 overflow-y-auto"><PlanningCliSetup onCreate={create} onCancel={() => setAdding(false)} initialRuntime={selected?.runtimeType} /></div></DialogContent></Dialog>
     <Dialog open={Boolean(closing)} onOpenChange={value => { if (!value && !pending) setClosing(undefined); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Stop and close this chat?</DialogTitle><DialogDescription>{closing?.title} is still working. Stopping keeps its conversation and any completed document updates.</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" disabled={pending} onClick={() => setClosing(undefined)}>Keep working</Button><Button disabled={pending} onClick={() => closing && void close(closing, true)}>{pending && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}Stop and close</Button></DialogFooter></DialogContent></Dialog>
     <Dialog open={Boolean(renaming)} onOpenChange={value => { if (!value && !pending) setRenaming(undefined); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Rename chat</DialogTitle><DialogDescription>Keep this conversation easy to find.</DialogDescription></DialogHeader><form onSubmit={event => { event.preventDefault(); if (!renaming || !title.trim() || busy.current) return; busy.current = true; setPending(true); void patch(renaming, { title: title.trim() }).then(() => setRenaming(undefined)).catch(cause => setError(errorText(cause))).finally(() => { busy.current = false; setPending(false); }); }}><Input aria-label="Chat name" value={title} onChange={event => setTitle(event.target.value)} maxLength={200} autoFocus /><DialogFooter className="mt-4"><Button type="submit" disabled={pending || !title.trim()}>Save name</Button></DialogFooter></form></DialogContent></Dialog>
@@ -334,7 +511,7 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     <div ref={timeline} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain" onScroll={event => {
       const element = event.currentTarget; setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 64);
     }}>
-      <div ref={content} className="space-y-6 px-4 py-5">
+      <div ref={content} className="mx-auto w-full max-w-4xl space-y-6 px-4 py-5">
         {!chat && !loadError && <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="size-3 animate-spin" />Loading conversation…</p>}
         {chat?.messages.length === 0 && <div className="py-5">
           <h3 className="text-sm font-medium">Think it through together</h3>
@@ -359,13 +536,15 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
       </div>
     </div>
     <div className="shrink-0 border-t border-border/70 px-4 pt-2">
-      {!following && <Button variant="ghost" size="sm" className="mb-2 w-full" onClick={() => setFollowing(true)}><ArrowDown />Latest messages</Button>}
-      <div role="status" className="mb-2 flex min-h-4 items-center gap-2 text-[11px] text-muted-foreground">{running ? <><Loader2 className="size-3 shrink-0 animate-spin" /><span className="min-w-0 break-words">{chat?.activity || 'Working on your plan'}</span></> : chat?.status === 'cancelled' ? 'Stopped · partial response kept' : chat?.status === 'complete' ? 'Ready for your next thought' : chat?.status === 'failed' || chat?.status === 'interrupted' ? 'Needs attention' : 'Plan and research in context'}</div>
-      {(loadError || actionError || chat?.error) && <div role="alert" className="mb-2 max-h-28 overflow-y-auto rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs leading-relaxed text-destructive [overflow-wrap:anywhere]">{[loadError, actionError, chat?.error].filter(Boolean).join('\n')}</div>}
-      {!model && <p className="mb-2 text-xs leading-5 text-muted-foreground">This model is unavailable. Choose another verified model using Model & CLI below.</p>}
-      {chat?.approvals?.map(approval => <div key={approval.id} className="mb-3 rounded-xl border border-primary/25 bg-primary/5 p-3"><p className="text-xs font-semibold">OpenCode needs your approval</p><p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{approval.description}</p>{approval.command && <pre className="mt-2 overflow-auto rounded-lg bg-background p-2 text-[11px]">{approval.command}</pre>}{approval.error && <p role="alert" className="mt-2 text-xs text-destructive">{approval.error}</p>}<div className="mt-3 flex gap-2"><Button size="sm" variant="outline" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'deny')}>Deny</Button><Button size="sm" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'allow')}>Allow once</Button></div></div>)}
+      <div className="mx-auto w-full max-w-4xl">
+        {!following && <Button variant="ghost" size="sm" className="mb-2 w-full" onClick={() => setFollowing(true)}><ArrowDown />Latest messages</Button>}
+        <div role="status" className="mb-2 flex min-h-4 items-center gap-2 text-[11px] text-muted-foreground">{running ? <><Loader2 className="size-3 shrink-0 animate-spin" /><span className="min-w-0 break-words">{chat?.activity || 'Working on your plan'}</span></> : chat?.status === 'cancelled' ? 'Stopped · partial response kept' : chat?.status === 'complete' ? 'Ready for your next thought' : chat?.status === 'failed' || chat?.status === 'interrupted' ? 'Needs attention' : 'Plan and research in context'}</div>
+        {(loadError || actionError || chat?.error) && <div role="alert" className="mb-2 max-h-28 overflow-y-auto rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs leading-relaxed text-destructive [overflow-wrap:anywhere]">{[loadError, actionError, chat?.error].filter(Boolean).join('\n')}</div>}
+        {!model && <p className="mb-2 text-xs leading-5 text-muted-foreground">This model is unavailable. Choose another verified model using Model & CLI below.</p>}
+        {chat?.approvals?.map(approval => <div key={approval.id} className="mb-3 rounded-xl border border-primary/25 bg-primary/5 p-3"><p className="text-xs font-semibold">OpenCode needs your approval</p><p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{approval.description}</p>{approval.command && <pre className="mt-2 overflow-auto rounded-lg bg-background p-2 text-[11px]">{approval.command}</pre>}{approval.error && <p role="alert" className="mt-2 text-xs text-destructive">{approval.error}</p>}<div className="mt-3 flex gap-2"><Button size="sm" variant="outline" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'deny')}>Deny</Button><Button size="sm" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'allow')}>Allow once</Button></div></div>)}
+        <ManualComposer key={conversation.id} surface="planning" agent={controlAgent} agents={conversations} native live={Boolean(chat) && !loadError} pending={busy} sendDisabled={running || !model} draft={preferences.draft} files={files} onDraft={value => update(key, { draft: value })} onAddFiles={incoming => { try { usePlanningChatStore.getState().updateFiles(key, current => addManualFiles(current, incoming)); setActionError(undefined); } catch (cause) { setActionError(errorText(cause)); } }} onRemoveFile={file => usePlanningChatStore.getState().updateFiles(key, current => current.filter(item => item !== file))} onSend={() => void send()} onApply={applyModel} autoApprove={conversation.runtimeType === 'opencode' ? { available: Boolean(chat), enabled: conversation.openCodeAutoApprove } : undefined} onAutoApprove={async enabled => { await onPatch({ openCodeAutoApprove: enabled }); }} permissionControl={conversation.runtimeType === 'codex' ? <CodexPermissions agent={controlAgent} live={false} disabled={busy} onApply={applyPermissions} /> : undefined} statusText={running ? 'Working · settings apply next reply' : busy ? 'Saving…' : 'Ready · @ for integrations'} />
+      </div>
     </div>
-    <ManualComposer key={conversation.id} surface="planning" agent={controlAgent} agents={conversations} native live={Boolean(chat) && !loadError} pending={busy} sendDisabled={running || !model} draft={preferences.draft} files={files} onDraft={value => update(key, { draft: value })} onAddFiles={incoming => { try { usePlanningChatStore.getState().updateFiles(key, current => addManualFiles(current, incoming)); setActionError(undefined); } catch (cause) { setActionError(errorText(cause)); } }} onRemoveFile={file => usePlanningChatStore.getState().updateFiles(key, current => current.filter(item => item !== file))} onSend={() => void send()} onApply={applyModel} autoApprove={conversation.runtimeType === 'opencode' ? { available: Boolean(chat), enabled: conversation.openCodeAutoApprove } : undefined} onAutoApprove={async enabled => { await onPatch({ openCodeAutoApprove: enabled }); }} permissionControl={conversation.runtimeType === 'codex' ? <CodexPermissions agent={controlAgent} live={false} disabled={busy} onApply={applyPermissions} /> : undefined} statusText={running ? 'Working · settings apply next reply' : busy ? 'Saving…' : 'Ready · @ for integrations'} />
     <Dialog open={!!review} onOpenChange={open => { if (!open && !busy) setReview(undefined); }}>
       <DialogContent className="min-w-0 sm:max-w-3xl">
         <DialogHeader><DialogTitle>Review document update</DialogTitle><DialogDescription className="break-all">{review?.proposal.path} · Compare the latest saved document with the proposed replacement. Unsaved editor drafts stay in the editor.</DialogDescription></DialogHeader>

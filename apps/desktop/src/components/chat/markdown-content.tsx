@@ -156,10 +156,10 @@ function inlineNodes(text: string, keyPrefix: string, onLocalImageLink?: (path: 
       return <code key={key} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.92em] text-foreground">{part.slice(1, -1)}</code>;
     }
     if ((part.startsWith('**') && part.endsWith('**')) || (part.startsWith('__') && part.endsWith('__'))) {
-      return <strong key={key} className="font-semibold text-foreground">{part.slice(2, -2)}</strong>;
+      return <strong key={key} className="font-semibold text-foreground">{inlineNodes(part.slice(2, -2), key, onLocalImageLink)}</strong>;
     }
     if ((part.startsWith('*') && part.endsWith('*')) || (part.startsWith('_') && part.endsWith('_'))) {
-      return <em key={key}>{part.slice(1, -1)}</em>;
+      return <em key={key}>{inlineNodes(part.slice(1, -1), key, onLocalImageLink)}</em>;
     }
     const link = part.match(/^!?\[([^\]]+)\]\(([^\s]+)\)$/);
     if (link && isSafeLink(link[2])) {
