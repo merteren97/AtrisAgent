@@ -596,17 +596,20 @@ for (const end of ['stop', 'complete', 'close'] as const) {
   store.create('w', { id: 'p', title: 'Dynamic workspace' });
   const f = fixture('antigravity');
   const controller = new PlanningChatController({ ...f.options, store });
-  const board = { schemaVersion: 1, planId: 'p', updatedAt: '', sections: [{ id: 'discovery', title: 'Discovery', kind: 'research', body: 'Project-specific context', items: [{ id: 'validate', title: 'Validate first-run flow', status: 'idea', body: 'Acceptance: one useful result.' }] }] };
+  const board = { schemaVersion: 1, planId: 'p', updatedAt: '', summary: 'A focused project page.', appearance: { font: 'editorial', accent: 'sage', density: 'comfortable' }, sections: [{ id: 'discovery', title: 'Discovery', kind: 'research', body: 'Project-specific context', items: [{ id: 'validate', title: 'Validate first-run flow', status: 'idea', body: 'Acceptance: one useful result.' }] }] };
   try {
     await controller.send('w', 'p', input()); await until(() => Boolean(f.adapters[0]?.options));
     const filename = JSON.parse(f.adapters[0].options!.prompt.split('\n')[0].split('JSON quoted): ')[1]);
     const task = fs.readFileSync(filename, 'utf8');
     assert.match(task, /create\/update its board automatically/); assert.match(task, /"path":"board.json"/);
+    assert.match(task, /appearance/); assert.match(task, /preserving unrelated content/);
     f.adapters[0].emit('task_completed', { result: update('plan.md', '# Dynamic plan\n\n## Discovery\nValidate first-run flow.') + update('board.json', JSON.stringify(board)) });
     let state = controller.get('w', 'p');
     assert.equal(state.status, 'complete'); assert(state.proposals.every(item => item.status === 'applied'));
     assert.equal(store.readBoard('w', 'p')!.board.sections[0].items![0].title, 'Validate first-run flow');
     const first = store.readBoard('w', 'p')!;
+    assert.deepEqual(first.board.appearance, board.appearance, 'AI appearance updates use the same persisted board protocol');
+    assert.equal(first.board.summary, board.summary);
     await controller.send('w', 'p', input('board-conflict')); await until(() => Boolean(f.adapters[1]?.options));
     store.writeBoard('w', 'p', { board: { ...first.board, sections: [...first.board.sections, { id: 'manual', title: 'My own note', kind: 'note', body: 'Keep this.' }] }, expectedRevision: first.revision });
     f.adapters[1].emit('task_completed', { result: update('board.json', JSON.stringify({ ...board, sections: [{ ...board.sections[0], title: 'Revised discovery' }] })) });

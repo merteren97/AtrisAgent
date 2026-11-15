@@ -42,9 +42,11 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
   const planId = store.activeByWorkspace[workspaceId] || null;
   const plan = plans.find(item => item.id === planId);
   const [query, setQuery] = useState(''); const [showArchive, setShowArchive] = useState(false); const [listView, setListView] = useState(false);
-  const [view, setView] = useState<'board' | 'document'>('board');
+  const locationKey = documentKey(workspaceId, planId || '', 'location');
+  const savedLocation = store.locations[locationKey];
+  const [view, setView] = useState<'board' | 'document'>(savedLocation?.view || 'board');
   const [filesOpen, setFilesOpen] = useState(false);
-  const [documentPath, setDocumentPath] = useState('plan.md'); const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
+  const [documentPath, setDocumentPath] = useState(savedLocation?.documentPath || 'plan.md'); const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [files, setFiles] = useState<PlanningFile[]>([]); const [refreshKey, setRefreshKey] = useState(0);
   const [saveStatus, setSaveStatus] = useState('Saved locally'); const [boardStatus, setBoardStatus] = useState('Loading board...'); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
   const [pending, setPending] = useState(false); const [title, setTitle] = useState(''); const [dialog, setDialog] = useState<'note' | 'rename' | null>(null);
@@ -59,12 +61,25 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
   const chosenModel = availableModels.find(item => item.catalogId === model) || availableModels[0];
   const browserOpen = useBrowserStore(state => Boolean(state.url));
   const width = store.widths[workspaceId] || 440;
-  const narrow = availableWidth < 846;
-  const showChat = !store.chatHidden[workspaceId] && !(browserOpen && narrow);
+  const narrow = availableWidth < 1120;
+  const showChat = store.chatHidden[workspaceId] === false && !(browserOpen && narrow);
   const overlayChat = narrow || chatExpanded;
   const maximumChatWidth = Math.max(320, Math.min(640, Math.floor(availableWidth - 466)));
   const effectiveChatWidth = Math.min(width, maximumChatWidth);
   const resizeChat = (value: number) => store.setWidth(workspaceId, Math.min(maximumChatWidth, Math.max(320, value)));
+  useEffect(() => {
+    if (!showChat || !overlayChat) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = requestAnimationFrame(() => host.current?.querySelector<HTMLElement>('[aria-label="Planning assistant panel"] button')?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || (event.target as HTMLElement)?.closest?.('[role="dialog"], [role="menu"]')) return;
+      event.preventDefault();
+      if (chatExpanded && !narrow) setChatExpanded(false);
+      else { store.setChatHidden(workspaceId, true); setChatExpanded(false); }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => { cancelAnimationFrame(frame); window.removeEventListener('keydown', onKeyDown); if (previous?.isConnected) previous.focus({ preventScroll: true }); };
+  }, [showChat, overlayChat, chatExpanded, narrow, workspaceId, store.setChatHidden]);
   useEffect(() => { void usePlanningStore.getState().refresh(workspaceId); }, [workspaceId]);
   useEffect(() => { if (store.creating) setTitle(''); }, [store.creating]);
   useEffect(() => {
@@ -72,7 +87,7 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
     const observer = new ResizeObserver(entries => setAvailableWidth(entries[0].contentRect.width)); observer.observe(host.current);
     return () => observer.disconnect();
   }, []);
-  useEffect(() => { setDocumentPath('plan.md'); setSelectedAsset(null); setView('board'); setFilesOpen(false); setError(''); setNotice(''); setChatExpanded(false); }, [planId]);
+  useEffect(() => { if (planId) store.setLocation(locationKey, { view, documentPath }); }, [planId, locationKey, view, documentPath, store.setLocation]);
   useEffect(() => { if (view === 'board') setSaveStatus(boardStatus); }, [boardStatus, view]);
   const refreshFiles = useCallback(async () => {
     if (!planId) return;
@@ -91,11 +106,12 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
     try { await work(); } catch (cause) { setError(message(cause)); } finally { actionBusy.current = false; setPending(false); }
   };
   const openDocument = useCallback((path: string) => { if (path === 'board.json') { setView('board'); setSelectedAsset(null); } else { setDocumentPath(path); setSelectedAsset(null); setView('document'); } setRefreshKey(value => value + 1); void refreshFiles(); }, [refreshFiles]);
-  const askBoardAssistant = () => {
+  const askBoardAssistant = (instruction = 'Help me shape this plan into a simple, readable project page.\n\n') => {
     if (!planId) return;
     const chatStore = usePlanningChatStore.getState();
     const key = planningChatKey(workspaceId, planId);
-    chatStore.update(planningChatKey(workspaceId, planId, chatStore.activeByPlan[key]), { draft: 'Create or update this plan’s board using plan.md, research and project context. Organize useful categories and actionable tasks automatically; preserve existing work and statuses.' });
+    const conversationKey = planningChatKey(workspaceId, planId, chatStore.activeByPlan[key]);
+    chatStore.setEditContext(conversationKey, instruction);
     store.setChatHidden(workspaceId, false);
     if (browserOpen && narrow) useBrowserStore.getState().close();
   };
@@ -203,13 +219,13 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
       <div className="mb-5 mt-8 flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4"><div className="relative w-full max-w-sm"><Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" /><Input value={query} onChange={event => setQuery(event.target.value)} placeholder="Find a plan…" aria-label="Find a plan" className="h-9 rounded-lg pl-9 text-xs" /></div><div className="flex items-center gap-2"><Button size="sm" variant={showArchive ? 'secondary' : 'ghost'} className="text-xs" aria-pressed={showArchive} onClick={() => setShowArchive(value => !value)}><Archive className="mr-1.5 h-3.5 w-3.5" />Archive</Button><Button size="icon" variant="ghost" className="h-8 w-8" aria-label={listView ? 'Use card view' : 'Use list view'} onClick={() => setListView(value => !value)}>{listView ? <LayoutGrid className="h-4 w-4" /> : <List className="h-4 w-4" />}</Button><span className="text-xs tabular-nums text-muted-foreground">{visiblePlans.length} plans</span></div></div>
       {store.loading[workspaceId] && !plans.length ? <p role="status" className="flex items-center gap-2 py-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Loading plans…</p> : visiblePlans.length ? <div className={listView ? 'space-y-2' : 'grid gap-4 @min-[600px]:grid-cols-2 @min-[1000px]:grid-cols-3'}>{visiblePlans.map(item => <button key={item.id} onClick={() => openPlan(item.id)} className={`group min-w-0 rounded-xl border border-border bg-card text-left transition-colors hover:border-primary/40 hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${listView ? 'flex items-center gap-4 p-4' : 'flex min-h-48 flex-col p-5'}`}><span className={`flex items-center ${listView ? 'gap-3' : 'mb-6 w-full justify-between'}`}><span className="flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-muted/40"><FileText className="h-4 w-4 text-primary" /></span>{item.pinned && <Pin className="h-3.5 w-3.5 text-muted-foreground" />}</span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold">{item.title}</span><span className="mt-2 block text-xs text-muted-foreground">{item.status === 'ready' ? 'Ready to put into action' : 'A work in progress'}</span></span><span className={`flex items-center justify-between gap-3 text-[11px] text-muted-foreground ${listView ? '' : 'mt-6 w-full border-t border-border/60 pt-3'}`}><span className={`rounded-md px-2 py-1 ${item.status === 'ready' ? 'bg-primary/10 text-primary' : 'bg-muted'}`}>{item.status === 'ready' ? 'Ready' : 'Draft'}</span><span>{dateLabel(item.updatedAt)}</span><ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" /></span></button>)}</div> : <div className="flex min-h-72 flex-col items-center justify-center rounded-xl border border-dashed border-border px-6 py-10 text-center"><span className="mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10 text-primary"><BookOpen className="h-6 w-6" /></span><h2 className="text-base font-semibold">{query ? 'No matching plans' : showArchive ? 'No archived plans' : 'Start with an idea, leave with a plan.'}</h2><p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">{query ? 'Try a different title or clear your search.' : showArchive ? 'Archived plans stay available here.' : 'A focused document, your own AI conversation, and all the context you need in one place.'}</p>{!query && !showArchive && <Button className="mt-5" size="sm" onClick={create}><Plus className="mr-2 h-4 w-4" />Create your first plan</Button>}</div>}
     </div></div> : <div className="planning-workspace-layout relative flex min-h-0 min-w-0 flex-1 gap-3">
-      <section aria-label="Plan document panel" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-background">
+      <section aria-label="Plan document panel" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-background [&>header>div:first-child]:min-w-[min(18rem,100%)]">
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3"><div className="flex min-w-0 flex-1 items-center gap-2"><Button size="icon" variant="ghost" className="h-8 w-8 shrink-0" aria-label="All plans" onClick={() => openPlan(null)}><ArrowLeft className="h-4 w-4" /></Button><div className="min-w-0"><button className="block max-w-full truncate text-left text-sm font-semibold hover:text-primary" title="Rename plan" onClick={() => { setTitle(plan.title); setDialog('rename'); }}>{plan.title}</button><span className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground"><span className={`h-1.5 w-1.5 rounded-full ${saveStatus === 'Saved locally' ? 'bg-emerald-500' : 'bg-amber-500'}`} />{saveStatus}</span></div></div><div className="flex shrink-0 items-center gap-2"><select aria-label="Plan status" value={plan.status} className="h-8 rounded-lg border border-border bg-background px-2 text-xs" onChange={event => void action(() => store.update(workspaceId, plan.id, { status: event.target.value as 'draft' | 'ready' }))}><option value="draft">Draft</option><option value="ready">Ready</option></select><Button size="icon" variant="ghost" aria-label={showChat ? 'Hide plan assistant' : 'Show plan assistant'} className="h-8 w-8" onClick={() => store.setChatHidden(workspaceId, showChat)}><PanelRightOpen className="h-4 w-4" /></Button><DropdownMenu><DropdownMenuTrigger asChild><Button size="icon" variant="ghost" aria-label="Plan actions" className="h-8 w-8"><MoreHorizontal className="h-4 w-4" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onSelect={() => { setTitle(plan.title); setDialog('rename'); }}>Rename plan</DropdownMenuItem><DropdownMenuItem onSelect={() => void action(() => store.update(workspaceId, plan.id, { pinned: !plan.pinned }))}><Pin className="h-4 w-4" />{plan.pinned ? 'Unpin' : 'Pin'} plan</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => void action(async () => { await store.update(workspaceId, plan.id, { archivedAt: plan.archivedAt ? null : new Date().toISOString() }); openPlan(null); })}><Archive className="h-4 w-4" />{plan.archivedAt ? 'Restore plan' : 'Archive plan'}</DropdownMenuItem></DropdownMenuContent></DropdownMenu><Button size="sm" className="h-8 rounded-lg text-xs" disabled={pending} onClick={beginExecution}><Workflow className="mr-1.5 h-3.5 w-3.5" />Put plan to work<ChevronDown className="ml-1.5 h-3 w-3" /></Button></div></header>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-        <div className="flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border px-4"><nav className="flex items-center gap-4" aria-label="Plan views">{([{ id: 'board', label: 'Board', icon: LayoutGrid }, { id: 'document', label: 'Document', icon: FileText }] as const).map(tab => <button key={tab.id} onClick={() => { setView(tab.id); setSelectedAsset(null); if (tab.id === 'document') setDocumentPath('plan.md'); }} aria-current={view === tab.id ? 'page' : undefined} className={`flex h-11 items-center gap-1.5 border-b-2 text-xs font-medium transition-colors ${view === tab.id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}><tab.icon className="h-3.5 w-3.5" />{tab.label}</button>)}</nav><div className="flex items-center gap-1"><Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={pending} onClick={() => uploadInput.current?.click()}><Upload className="mr-1 h-3.5 w-3.5" />Add files</Button><Button size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={pending} onClick={() => { setTitle(''); setDialog('note'); }}><FilePlus2 className="mr-1 h-3.5 w-3.5" />New note</Button></div></div>
+        {view === 'document' && <div className="flex min-w-0 shrink-0 items-center gap-3 border-b border-border px-4 py-2"><Button size="sm" variant="ghost" className="h-7 gap-1.5 text-xs" onClick={() => setView('board')}><ArrowLeft className="h-3.5 w-3.5" />Back to plan</Button><span className="truncate text-xs text-muted-foreground">{documentPath}</span></div>}
         {runs.length > 0 && <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border/60 bg-muted/20 px-5 py-2 text-[11px] text-muted-foreground"><Workflow className="h-3 w-3 shrink-0" /><span className="shrink-0">Linked work</span>{runs.map(([key]) => <button key={key} onClick={() => void openRun(key)} className="shrink-0 rounded-md border border-border bg-background px-2 py-1 hover:text-primary">{key.startsWith('manual:') ? 'Manual agent' : 'Orchestrator mission'} ↗</button>)}</div>}
 
-        <div className={view === 'board' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}><PlanningBoardView key={`${plan.id}:board`} workspaceId={workspaceId} planId={plan.id} files={files} refreshKey={refreshKey} onAskAI={askBoardAssistant} onOpenFiles={() => { setSelectedAsset(null); setFilesOpen(true); }} onStatus={setBoardStatus} /></div>
+        <div className={view === 'board' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}><PlanningBoardView key={`${plan.id}:board`} workspaceId={workspaceId} planId={plan.id} planTitle={plan.title} visible={view === 'board'} files={files} refreshKey={refreshKey} onAskAI={askBoardAssistant} onOpenDocument={() => { setDocumentPath('plan.md'); setView('document'); }} onOpenFiles={() => { setSelectedAsset(null); setFilesOpen(true); }} onStatus={setBoardStatus} /></div>
         {view === 'document' && <PlanningDocumentEditor key={`${plan.id}:${documentPath}`} workspaceId={workspaceId} planId={plan.id} path={documentPath} refreshKey={refreshKey} onStatus={setSaveStatus} onOpen={openDocument} />}
       </div>
       </section>

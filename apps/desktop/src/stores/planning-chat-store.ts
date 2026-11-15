@@ -26,6 +26,7 @@ export interface PlanningChatState {
 }
 interface PlanPreferences {
   draft: string; catalogId: string; reasoning: string;
+  editContext?: string;
   /** Unacknowledged requests survive timeouts, plan switches, and app restarts. */
   attempts: PlanningChatInput[];
 }
@@ -44,7 +45,8 @@ interface PlanningChatStore {
   updateFiles: (key: string, update: (files: File[]) => File[]) => void;
   stageFile: (key: string, file: File, path: string) => void;
   clearSentFiles: (key: string, files: File[]) => void;
-  update: (key: string, patch: Partial<Pick<PlanPreferences, 'draft' | 'catalogId' | 'reasoning'>>) => void;
+  update: (key: string, patch: Partial<Pick<PlanPreferences, 'draft' | 'catalogId' | 'reasoning' | 'editContext'>>) => void;
+  setEditContext: (key: string, context: string) => void;
   prepare: (key: string, text: string, catalogId: string, reasoning?: string, attachmentPaths?: string[]) => PlanningChatInput;
   acknowledge: (key: string, input: PlanningChatInput) => void;
 }
@@ -60,6 +62,11 @@ export const usePlanningChatStore = create<PlanningChatStore>()(persist((set, ge
   update: (key, patch) => set(state => ({ plans: {
     ...state.plans, [key]: { ...(state.plans[key] || EMPTY_PLANNING_CHAT), ...patch },
   } })),
+  setEditContext: (key, context) => set(state => {
+    const plan = state.plans[key] || EMPTY_PLANNING_CHAT;
+    const text = plan.editContext && plan.draft.startsWith(plan.editContext) ? plan.draft.slice(plan.editContext.length) : plan.draft;
+    return { plans: { ...state.plans, [key]: { ...plan, draft: `${context}${text}`, editContext: context } } };
+  }),
   prepare: (key, rawText, catalogId, reasoning, attachmentPaths = []) => {
     const text = rawText.trim();
     const plan = get().plans[key] || EMPTY_PLANNING_CHAT;

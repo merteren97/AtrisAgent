@@ -75,8 +75,8 @@ function PlanningChatTabs({ workspaceId, planId, onDocumentChange, onClose, onEx
     const id = usePlanningChatStore.getState().prepareCreation(fingerprint);
     const conversation = await apiRequest<PlanningConversation>(base, { method: 'POST', body: JSON.stringify({ id, catalogId: model.catalogId, ...(reasoning ? { reasoning } : {}), title: `${planningCliName(model.runtimeType)} chat` }) });
     if (!alive.current) return;
-    const draft = usePlanningChatStore.getState().plans[planKey]?.draft;
-    if (!selected && draft) usePlanningChatStore.getState().update(planningChatKey(workspaceId, planId, conversation.id), { draft });
+    const initial = usePlanningChatStore.getState().plans[planKey];
+    if (!selected && initial?.draft) usePlanningChatStore.getState().update(planningChatKey(workspaceId, planId, conversation.id), { draft: initial.draft, editContext: initial.editContext });
     merge(conversation); usePlanningChatStore.getState().select(planKey, conversation.id); usePlanningChatStore.getState().acknowledgeCreation(fingerprint, id); setAdding(false);
   };
   const patch = async (conversation: PlanningConversation, values: Record<string, unknown>) => {

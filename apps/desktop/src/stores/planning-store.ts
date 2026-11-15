@@ -24,8 +24,16 @@ export interface PlanningBoardSection {
   summary?: string; cover?: string; body?: string;
   children?: PlanningBoardSection[]; items?: PlanningBoardItem[];
 }
-export interface PlanningBoard { schemaVersion: 1; planId: string; updatedAt: string; sections: PlanningBoardSection[] }
+export interface PlanningAppearance { font: 'sans' | 'editorial' | 'mono'; accent: 'default' | 'blue' | 'sage' | 'amber' | 'rose'; density: 'comfortable' | 'compact' }
+export interface PlanningBoard { schemaVersion: 1; planId: string; updatedAt: string; sections: PlanningBoardSection[]; summary?: string; cover?: string; appearance?: PlanningAppearance }
 export interface PlanningBoardVersion { board: PlanningBoard; revision: string }
+export interface PlanningLocation {
+  path: string[]; itemId: string | null; query: string; status: PlanningBoardStatus | '';
+  view: 'board' | 'document'; documentPath: string; scroll: Record<string, number>;
+  appearance?: PlanningAppearance;
+  comparisonDrafts?: Record<string, { before: string; after: string }>;
+}
+export const emptyPlanningLocation = (): PlanningLocation => ({ path: [], itemId: null, query: '', status: '', view: 'board', documentPath: 'plan.md', scroll: {} });
 export const boardApi = (workspaceId: string, planId: string) => `${planApi(workspaceId, planId)}/board`;
 export const planApi = (workspaceId: string, planId?: string) => `/workspaces/${encodeURIComponent(workspaceId)}/plans${planId ? `/${encodeURIComponent(planId)}` : ''}`;
 export const documentKey = (workspaceId: string, planId: string, path: string) => JSON.stringify([workspaceId, planId, path]);
@@ -38,6 +46,7 @@ interface PlanningState {
   drafts: Record<string, PlanningDraft>;
   sources: Record<string, PlanningSource>;
   handoffIds: Record<string, string>;
+  locations: Record<string, PlanningLocation>;
   errors: Record<string, string>;
   loading: Record<string, boolean>;
   creating: boolean;
@@ -46,6 +55,7 @@ interface PlanningState {
   toggleGroup(workspaceId: string, group: string): void;
   setWidth(workspaceId: string, width: number): void;
   setChatHidden(workspaceId: string, hidden: boolean): void;
+  setLocation(key: string, patch: Partial<PlanningLocation>): void;
   setDraft(key: string, draft: PlanningDraft): void;
   clearDraft(key: string, expectedContent?: string): void;
   rememberSource(target: string, id: string, source: PlanningSource): void;
@@ -57,12 +67,13 @@ interface PlanningState {
 }
 const generations = new Map<string, number>();
 export const usePlanningStore = create<PlanningState>()(persist((set, get) => ({
-  plans: {}, activeByWorkspace: {}, groups: {}, widths: {}, chatHidden: {}, drafts: {}, sources: {}, handoffIds: {}, errors: {}, loading: {}, creating: false,
+  plans: {}, activeByWorkspace: {}, groups: {}, widths: {}, chatHidden: {}, drafts: {}, sources: {}, handoffIds: {}, locations: {}, errors: {}, loading: {}, creating: false,
   setCreating: creating => set({ creating }),
   select: (workspaceId, planId) => set(state => ({ activeByWorkspace: { ...state.activeByWorkspace, [workspaceId]: planId } })),
   toggleGroup: (workspaceId, group) => set(state => { const key = `${workspaceId}:${group}`; return { groups: { ...state.groups, [key]: !state.groups[key] } }; }),
   setWidth: (workspaceId, width) => set(state => ({ widths: { ...state.widths, [workspaceId]: Math.max(320, Math.min(640, width)) } })),
   setChatHidden: (workspaceId, hidden) => set(state => ({ chatHidden: { ...state.chatHidden, [workspaceId]: hidden } })),
+  setLocation: (key, patch) => set(state => ({ locations: { ...state.locations, [key]: { ...emptyPlanningLocation(), ...state.locations[key], ...patch } } })),
   setDraft: (key, draft) => set(state => ({ drafts: { ...state.drafts, [key]: draft } })),
   clearDraft: (key, expectedContent) => set(state => {
     if (expectedContent !== undefined && state.drafts[key]?.content !== expectedContent) return state;
@@ -98,5 +109,5 @@ export const usePlanningStore = create<PlanningState>()(persist((set, get) => ({
   },
 }), {
   name: 'atris-planning-workspace', version: 1,
-  partialize: ({ activeByWorkspace, groups, widths, chatHidden, drafts, sources, handoffIds }) => ({ activeByWorkspace, groups, widths, chatHidden, drafts, sources, handoffIds }),
+  partialize: ({ activeByWorkspace, groups, widths, chatHidden, drafts, sources, handoffIds, locations }) => ({ activeByWorkspace, groups, widths, chatHidden, drafts, sources, handoffIds, locations }),
 }));
