@@ -40,6 +40,7 @@ jobs:
       - run: npm ci --include=dev --include=optional --no-audit --no-fund
       - run: node --test .github/scripts/prepare-mobile-android-signing.test.mjs
       - run: npm run tauri -w @atris-agent-code/mobile -- android init --ci
+      - run: node .github/scripts/configure-mobile-orientation.mjs android
       - name: Test generated release signing without production secrets
         env:
           ANDROID_KEY_ALIAS: ci-test

@@ -287,6 +287,7 @@ function boardSource(value: unknown): string | undefined {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') fail('Board source must use http or https.');
   return value;
 }
+export function validatePlanningBoard(value: unknown, planId: string): void { normalizeBoard(value, planId); }
 function normalizeBoard(value: unknown, planId: string): { manifest: StoredBoard; bodies: Map<string, string> } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('Expected a board object.');
   const input = value as Record<string, unknown>;

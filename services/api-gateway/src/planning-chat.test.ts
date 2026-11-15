@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import express from 'express';
+import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 import type { AccountProfile, CapabilitySnapshot, ModelDescriptor, RuntimeType } from '@atris-agent-code/domain';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
@@ -15,6 +17,7 @@ import {
 import { PlanningStore } from './planning-store';
 import type { PlanningConversation } from './planning-conversations';
 import { isLocalDataRequest } from './local-data-access';
+import { installManualConversations } from './manual-conversations';
 
 class Storage implements PlanningChatStorage {
   conversations = new Map<string, PlanningConversation[]>();
@@ -121,6 +124,96 @@ async function until(predicate: () => boolean) {
   assert.fail('Timed out waiting for fixture lifecycle');
 }
 const update = (path: string, content: string) => `\n\`\`\`atris-plan-update\n${JSON.stringify({ path, content })}\n\`\`\``;
+
+// A provider can deliver thousands of events in one pipe read. Never perform a
+// full-history rewrite/fsync for every token on the shared HTTP event loop.
+{
+  const f = fixture();
+  try {
+    await f.controller.send('w', 'p', input());
+    await until(() => Boolean(f.adapters[0]?.options));
+    const before = f.store.readMessages('w', 'p').length;
+    for (let index = 0; index < 2_000; index += 1) {
+      f.adapters[0].emit('text_delta', { content: index % 2 ? 'y' : 'x' });
+      f.adapters[0].emit('tool_call_started', { toolName: `Read-${index}` });
+    }
+    assert(f.store.readMessages('w', 'p').length - before <= 2,
+      'Burst streaming must coalesce persistence instead of blocking unrelated API requests with per-event writes');
+    const state = f.controller.get('w', 'p');
+    assert.equal(state.messages.at(-1)?.content, 'xy'.repeat(1_000));
+    assert.equal(state.activity, 'Reading with Read-1999');
+    f.adapters[0].emit('task_completed', { result: 'Codex turn completed' });
+    assert.equal(f.controller.get('w', 'p').status, 'complete');
+    assert.equal(f.controller.get('w', 'p').messages.at(-1)?.content, 'xy'.repeat(1_000));
+  } finally { await f.controller.close(); }
+}
+
+// Real disk journal + real manual routes on the same HTTP server, under an
+// ongoing provider event flood. No external CLI, account or user data is used.
+{
+  const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'atris-planning-concurrency-')));
+  const store = new PlanningStore(id => id === 'w' ? { id, path: temporary } : undefined);
+  store.create('w', { id: 'p', title: 'Concurrency regression' });
+  let journalWrites = 0;
+  const append = store.appendMessage.bind(store);
+  store.appendMessage = (...args) => { journalWrites += 1; return append(...args); };
+  const sqlite = new Database(':memory:');
+  sqlite.exec('PRAGMA foreign_keys = ON; CREATE TABLE workspaces (id TEXT PRIMARY KEY, path TEXT); CREATE TABLE missions (id TEXT PRIMARY KEY, workspace_id TEXT);');
+  sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('w', temporary);
+  const f = fixture();
+  const app = express(); app.use(express.json());
+  const controller = installPlanningChatRoutes(app, { ...f.options, store });
+  const manual = installManualConversations(app, sqlite, f.options.runtimeHost as any, temporary);
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  let streaming: ReturnType<typeof setInterval> | undefined;
+  let emitted = 0;
+  const request = (route: string, method = 'GET', body?: unknown) => fetch(`${origin}/api${route}`, {
+    method, signal: AbortSignal.timeout(3_000), headers: { 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  try {
+    await controller.send('w', 'p', input());
+    await until(() => Boolean(f.adapters[0]?.options));
+    streaming = setInterval(() => {
+      if (emitted >= 10_000) return;
+      for (let index = 0; index < 100; index += 1) {
+        f.adapters[0].emit('text_delta', { content: emitted % 2 ? 'y' : 'x' });
+        f.adapters[0].emit('tool_call_completed', { toolName: 'Read' });
+        emitted += 1;
+      }
+    }, 5);
+    await until(() => emitted > 0);
+    for (let index = 0; index < 3; index += 1) {
+      const id = randomUUID(); const agentId = randomUUID();
+      assert.equal((await request('/manual/conversations', 'POST', { id, workspaceId: 'w' })).status, 200);
+      assert.equal((await request(`/manual/conversations/${id}/agents`, 'POST', { id: agentId, catalogId: 'catalog-route' })).status, 200);
+      const listed = await request('/manual/conversations?workspaceId=w');
+      assert.equal(listed.status, 200);
+      assert((await listed.json()).some((item: any) => item.id === id && item.agents.some((agent: any) => agent.id === agentId)));
+      assert.equal((await request(`/manual/agents/${agentId}/messages`)).status, 200);
+      assert.equal((await request(`/manual/agents/${agentId}`, 'DELETE')).status, 204);
+      assert.equal((await request(`/manual/conversations/${id}`, 'DELETE')).status, 204);
+    }
+    await delay(180); // Exercise scheduled persistence without a chat poll/finish.
+    assert(store.readMessages('w', 'p').some(record => record.planningChat?.kind === 'delta'));
+    clearInterval(streaming); streaming = undefined;
+    assert(emitted >= 100);
+    assert(journalWrites < emitted / 10, 'Disk writes must scale with flush windows, not provider event count');
+    f.adapters[0].emit('task_completed', { result: 'Codex turn completed' });
+    const final = controller.get('w', 'p');
+    assert.equal(final.status, 'complete');
+    assert.equal(final.messages.at(-1)?.content, 'xy'.repeat(emitted / 2));
+    assert.equal(new PlanningChatController({ ...f.options, store }).get('w', 'p').messages.at(-1)?.content, 'xy'.repeat(emitted / 2));
+    console.log(`Planning/manual concurrency: ${emitted} text + ${emitted} activity events, ${journalWrites} journal writes; manual create/list/read/delete passed.`);
+  } finally {
+    if (streaming) clearInterval(streaming);
+    await controller.close(); await manual.codexSessions.closeAll();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    sqlite.close(); fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
 
 // Real HTTP acceptance, private adapter hooks during spawn, polling and explicit JSON writes.
 {
@@ -312,6 +405,7 @@ for (const end of ['stop', 'complete', 'close'] as const) {
   const running = await f.controller.send('w', 'p', input());
   await until(() => Boolean(f.adapters[0]?.options));
   f.adapters[0].emit('text_delta', { content: 'Partial answer before restart' });
+  await until(() => f.store.readMessages('w', 'p').some(record => record.text === 'Partial answer before restart'));
   const diskCopy = new Storage().seed();
   diskCopy.journals = structuredClone(f.store.journals);
   const restartedFixture = fixture('codex', diskCopy);
@@ -325,6 +419,35 @@ for (const end of ['stop', 'complete', 'close'] as const) {
   await until(() => Boolean(restartedFixture.adapters[0]?.options));
   assert.match(restartedFixture.adapters[0].options!.prompt, /Partial answer before restart/);
   await f.controller.close(); await restartedFixture.controller.close();
+}
+
+// Scheduled flush failures fence the turn rather than escaping a timer callback
+// and terminating the shared gateway. Stop also drains the last buffered text.
+{
+  const f = fixture();
+  const append = f.store.appendMessage.bind(f.store);
+  let failed = false;
+  f.store.appendMessage = (w, p, record) => {
+    if (!failed && record.planningChat?.kind === 'delta') { failed = true; throw new Error('Disk write failed'); }
+    append(w, p, record);
+  };
+  try {
+    await f.controller.send('w', 'p', input());
+    await until(() => Boolean(f.adapters[0]?.options));
+    f.adapters[0].emit('text_delta', { content: 'Buffered answer' });
+    await until(() => failed);
+    const state = f.controller.get('w', 'p');
+    assert.equal(state.status, 'failed'); assert.match(state.error!, /Disk write failed/);
+    assert(f.adapters[0].cancelled.length);
+    await f.controller.send('w', 'p', input('after-disk-failure'));
+    await until(() => Boolean(f.adapters[1]?.options));
+    f.adapters[1].emit('text_delta', { content: 'Keep on stop' });
+    f.controller.stop('w', 'p');
+    const reopened = new PlanningChatController(f.options);
+    assert.equal(reopened.get('w', 'p').status, 'cancelled');
+    assert.equal(reopened.get('w', 'p').messages.at(-1)?.content, 'Keep on stop');
+    await reopened.close();
+  } finally { await f.controller.close(); }
 }
 
 // Concurrent plan/workspace turns have disjoint sessions, prompts, private event buses and document writes.
@@ -442,6 +565,66 @@ for (const end of ['stop', 'complete', 'close'] as const) {
   assert.equal(f.store.readMessages('w', 'p').length, 0);
   assert.equal(f.adapters.length, 0);
   await f.controller.close();
+}
+
+// Activity extends the inactivity deadline, but a separate ceiling still bounds a turn.
+{
+  const f = fixture('antigravity'); f.options.timeoutMs = 100; f.options.maxDurationMs = 2_000;
+  try {
+    await f.controller.send('w', 'p', input()); await until(() => Boolean(f.adapters[0]?.options));
+    for (let index = 0; index < 5; index++) {
+      await delay(35); f.adapters[0].emit('text_delta', { content: 'x' });
+      assert.equal(f.controller.get('w', 'p').status, 'running');
+    }
+    await delay(120);
+    const stopped = f.controller.get('w', 'p');
+    assert.equal(stopped.status, 'failed'); assert.match(stopped.error!, /Last activity: Writing response/);
+    assert.equal(stopped.messages.at(-1)?.content, 'xxxxx');
+  } finally { await f.controller.close(); }
+  const bounded = fixture(); bounded.options.timeoutMs = 1_000; bounded.options.maxDurationMs = 40;
+  try {
+    await bounded.controller.send('w', 'p', input());
+    await until(() => bounded.controller.get('w', 'p').status === 'failed');
+    assert.match(bounded.controller.get('w', 'p').error!, /maximum duration/);
+  } finally { await bounded.controller.close(); }
+}
+
+// AI board output uses the real store's validator, durable proposals and revision fence.
+{
+  const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'atris-ai-board-')));
+  const store = new PlanningStore(id => id === 'w' ? { id, path: temporary } : undefined);
+  store.create('w', { id: 'p', title: 'Dynamic workspace' });
+  const f = fixture('antigravity');
+  const controller = new PlanningChatController({ ...f.options, store });
+  const board = { schemaVersion: 1, planId: 'p', updatedAt: '', sections: [{ id: 'discovery', title: 'Discovery', kind: 'research', body: 'Project-specific context', items: [{ id: 'validate', title: 'Validate first-run flow', status: 'idea', body: 'Acceptance: one useful result.' }] }] };
+  try {
+    await controller.send('w', 'p', input()); await until(() => Boolean(f.adapters[0]?.options));
+    const filename = JSON.parse(f.adapters[0].options!.prompt.split('\n')[0].split('JSON quoted): ')[1]);
+    const task = fs.readFileSync(filename, 'utf8');
+    assert.match(task, /create\/update its board automatically/); assert.match(task, /"path":"board.json"/);
+    f.adapters[0].emit('task_completed', { result: update('plan.md', '# Dynamic plan\n\n## Discovery\nValidate first-run flow.') + update('board.json', JSON.stringify(board)) });
+    let state = controller.get('w', 'p');
+    assert.equal(state.status, 'complete'); assert(state.proposals.every(item => item.status === 'applied'));
+    assert.equal(store.readBoard('w', 'p')!.board.sections[0].items![0].title, 'Validate first-run flow');
+    const first = store.readBoard('w', 'p')!;
+    await controller.send('w', 'p', input('board-conflict')); await until(() => Boolean(f.adapters[1]?.options));
+    store.writeBoard('w', 'p', { board: { ...first.board, sections: [...first.board.sections, { id: 'manual', title: 'My own note', kind: 'note', body: 'Keep this.' }] }, expectedRevision: first.revision });
+    f.adapters[1].emit('task_completed', { result: update('board.json', JSON.stringify({ ...board, sections: [{ ...board.sections[0], title: 'Revised discovery' }] })) });
+    state = controller.get('w', 'p');
+    const proposal = state.proposals.find(item => item.turnId === state.turnId)!;
+    assert.equal(proposal.status, 'conflict'); assert.equal(store.readBoard('w', 'p')!.board.sections[1].title, 'My own note');
+    controller.apply('w', 'p', proposal.id, store.readBoard('w', 'p')!.revision);
+    assert.equal(store.readBoard('w', 'p')!.board.sections[0].title, 'Revised discovery');
+    const document = store.readDocument('w', 'p', 'plan.md');
+    const preserved = store.readBoard('w', 'p')!;
+    await controller.send('w', 'p', input('invalid-board')); await until(() => Boolean(f.adapters[2]?.options));
+    f.adapters[2].emit('task_completed', { result: update('plan.md', '# Must not be written') + update('board.json', JSON.stringify({ ...board, planId: 'another-plan' })) });
+    assert.equal(controller.get('w', 'p').status, 'failed');
+    assert.deepEqual(store.readDocument('w', 'p', 'plan.md'), document); assert.deepEqual(store.readBoard('w', 'p'), preserved);
+    const restarted = new PlanningChatController({ ...f.options, store: new PlanningStore(id => id === 'w' ? { id, path: temporary } : undefined) });
+    assert(restarted.get('w', 'p').proposals.some(item => item.id === proposal.id && item.status === 'applied'));
+    await restarted.close();
+  } finally { await controller.close(); fs.rmSync(temporary, { recursive: true, force: true }); }
 }
 
 // Native approvals/questions are visibly rejected by cancelling the turn; no hidden waiting or auto-approval.

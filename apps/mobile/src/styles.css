@@ -139,3 +139,13 @@ html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 .account-notice svg{flex-shrink:0;color:#adc7fa}
 .account-secondary{height:43px;width:100%;border:1px solid #455366;background:#252f3d;border-radius:10px;color:#dce5f2;font-size:13px;font-weight:700}
 @media(max-width:350px){.account-button span{display:none}.account-button{width:34px;justify-content:center;padding:0}.header-actions{gap:4px}}
+/* Flex children must be allowed to shrink for long project and agent names. */
+.page,.agent-list,.agent-card,.agent-card-top,.agent-title,.workspace-info,.workspace-hero>div,.header-title,.message-content{min-width:0;max-width:100%}
+.agent-card,.workspace-card{width:100%}
+.agent-title{flex:1;overflow:hidden}
+.agent-title strong,.agent-title span,.workspace-info strong,.workspace-hero h1,.header-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-card-top>svg,.agent-card-top>.avatar,.workspace-card>svg{flex-shrink:0}
+.agent-card p,.message-text{overflow-wrap:anywhere}
+.workspace-extra section{margin-top:24px}.workspace-items{display:grid;gap:8px}.workspace-item{min-width:0;display:flex;justify-content:space-between;gap:12px;padding:14px;border:1px solid #303b49;border-radius:10px;background:#1a2029;font-size:13px}.workspace-item strong{min-width:0;overflow-wrap:anywhere}.workspace-item span{color:#a2aebe;flex-shrink:0;text-transform:capitalize}.workspace-extra-note{color:#9facc0;font-size:11px}
+.scan-button{display:flex;align-items:center;justify-content:center;margin-top:20px;position:relative;overflow:hidden;cursor:pointer}.scan-button input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}.manual-summary{margin-top:20px;color:#bdcbe0;font-size:13px;cursor:pointer}
+.workspace-item{text-align:left;color:#e9edf4;cursor:pointer}.workspace-item svg{flex-shrink:0}.detail-status{text-transform:capitalize}.detail-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;font-size:13px;color:#d5dfec}.detail-task{padding:12px 0;border-bottom:1px solid #3b4859;font-size:13px}.detail-task strong{overflow-wrap:anywhere}.detail-task span{display:block;color:#aab8ca;font-size:12px;text-transform:capitalize;margin-top:4px}.detail-task p{white-space:pre-wrap;overflow-wrap:anywhere}

@@ -51,8 +51,25 @@ async function executeMobileRequest(method: string, params: Record<string, unkno
     const workspaces = await apiRequest<Array<{ id: string; name: string }>>('/workspaces');
     return Promise.all(workspaces.map(async workspace => {
       const conversations = await apiRequest<ManualConversation[]>(`/manual/conversations?workspaceId=${encodeURIComponent(workspace.id)}`);
-      return { id: workspace.id, name: workspace.name, agents: await Promise.all(conversations.flatMap(conversation => conversation.agents).map(agentView)) };
+      const [plans, missions] = await Promise.all([
+        apiRequest<Array<{ id: string; title: string; status: string; archivedAt: string | null }>>(`/workspaces/${encodeURIComponent(workspace.id)}/plans`).then(items => items.filter(item => !item.archivedAt).map(({ id, title, status }) => ({ id, title, status }))).catch(() => null),
+        apiRequest<Array<{ id: string; title: string; status: string }>>(`/missions?workspaceId=${encodeURIComponent(workspace.id)}`).then(items => items.map(({ id, title, status }) => ({ id, title, status }))).catch(() => null),
+      ]);
+      return { id: workspace.id, name: workspace.name, agents: await Promise.all(conversations.flatMap(conversation => conversation.agents).map(agentView)), plans, missions };
     }));
+  }
+  if (method === 'planDetail') {
+    const workspaceId = required(params.workspaceId); const planId = required(params.planId);
+    const plans = await apiRequest<Array<{ id: string; archivedAt: string | null }>>(`/workspaces/${encodeURIComponent(workspaceId)}/plans`);
+    if (!plans.some(plan => plan.id === planId && !plan.archivedAt)) throw new Error('Plan no longer exists.');
+    const document = await apiRequest<{ content: string }>(`/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/document?path=plan.md`);
+    return { content: document.content.slice(0, 100_000), truncated: document.content.length > 100_000 };
+  }
+  if (method === 'missionDetail') {
+    const workspaceId = required(params.workspaceId); const missionId = required(params.missionId);
+    const result = await apiRequest<{ mission?: { workspaceId: string; description?: string }; tasks?: Array<{ id: string; title: string; status: string; description?: string }> }>(`/missions/${encodeURIComponent(missionId)}`);
+    if (!result.mission || result.mission.workspaceId !== workspaceId) throw new Error('Mission no longer exists in this workspace.');
+    return { description: (result.mission.description || '').slice(0, 20_000), tasks: (result.tasks || []).slice(0, 100).map(task => ({ id: task.id, title: task.title, status: task.status, description: (task.description || '').slice(0, 2000) })) };
   }
   const { agent, workspaceId } = await findAgent(required(params.agentId));
   if (method === 'controls') {

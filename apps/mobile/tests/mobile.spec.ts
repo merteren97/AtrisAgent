@@ -1,4 +1,7 @@
 import { expect, test, type Page, type APIRequestContext } from '@playwright/test';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { QRCodeSVG } from 'qrcode.react';
 
 async function login(page: Page) {
   await page.route('https://atrishub.com/api/auth/login', async route => {
@@ -18,6 +21,7 @@ async function pair(page: Page, request: APIRequestContext) {
   await login(page);
   const config = await (await request.get('http://127.0.0.1:4191/fixture')).json();
   await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await page.getByText('Enter pairing code manually').click();
   await page.getByLabel('Pairing code').fill(config.code);
   await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
   await expect(page.getByText('Approve your phone on desktop', { exact: true })).toBeVisible();
@@ -60,6 +64,28 @@ test('real WebSocket relay: pair, approve, message, model change, revoke', async
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
 
+test('QR photo pairs and workspace details open', async ({ page, request }, testInfo) => {
+  await login(page);
+  const config = await (await request.get('http://127.0.0.1:4191/fixture')).json();
+  await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await page.screenshot({ path: testInfo.outputPath('connect-qr.png'), scale: 'css' });
+  const qrPage = await page.context().newPage();
+  await qrPage.setContent(renderToStaticMarkup(React.createElement(QRCodeSVG, { value: config.code, size: 240, marginSize: 4 })));
+  const qr = await qrPage.locator('svg').screenshot();
+  await qrPage.close();
+  await page.getByLabel('Scan QR code').setInputFiles({ name: 'qr.png', mimeType: 'image/png', buffer: qr });
+  await expect(page.getByText('Approve your phone on desktop', { exact: true })).toBeVisible();
+  await request.get(`http://127.0.0.1:4191/approve?id=${config.id}`);
+  await expect(page.getByText('Test Desktop')).toBeVisible({ timeout: 10000 });
+  await page.getByRole('button', { name: /AtrisAgent.*agents/ }).click();
+  await page.getByRole('button', { name: /Release plan/ }).click();
+  await expect(page.getByText('Ship the mobile update.', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Close panel' }).click();
+  await page.getByRole('button', { name: /Build project/ }).click();
+  await expect(page.getByText('Run tests', { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('mission-detail.png'), scale: 'css' });
+});
+
 test('uncertain delivery retains the draft', async ({ page, request }) => {
   await pair(page, request); await chat(page);
   await page.getByRole('textbox', { name: 'Message Builder' }).fill('uncertain');
@@ -77,6 +103,7 @@ test('short narrow screen keeps composer in view', async ({ page, request }) => 
 test('no pairing means no fake desktop connection; malformed code is rejected', async ({ page }) => {
   await login(page);
   await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await page.getByText('Enter pairing code manually').click();
   await page.getByLabel('Pairing code').fill('invalid');
   await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('pairing code');

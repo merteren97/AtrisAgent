@@ -16,7 +16,7 @@ import { PlanningMedia } from './planning-media';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import {
   EMPTY_PLANNING_CHAT, planningChatDisplayText, planningChatKey, usePlanningChatStore,
-   type PlanningChatProposal, type PlanningChatState, type PlanningConversation, type PlanningChatInput,
+   type PlanningChatProposal, type PlanningChatState, type PlanningConversation, type PlanningChatInput, type PlanningChatMessage,
 } from '@/stores/planning-chat-store';
 
 export interface PlanningChatProps {
@@ -24,7 +24,7 @@ export interface PlanningChatProps {
   onClose?: () => void; onExpand?: () => void; expanded?: boolean;
 }
 type Review = { proposal: PlanningChatProposal; document?: { content: string; revision: string | null }; error?: string };
-const suggestions = ['Help me shape this plan', 'Find risks and open questions', 'Research the project before we decide'];
+const suggestions = ['Create a plan and organize its board from the project context', 'Update the board from this plan and research', 'Find risks and open questions'];
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const EMPTY_FILES: File[] = [];
 const fileMime = (file: File) => ({ md: 'text/markdown', txt: 'text/plain', csv: 'text/csv', json: 'application/json', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', pdf: 'application/pdf' }[file.name.split('.').pop()?.toLowerCase() || ''] || file.type);
@@ -75,6 +75,8 @@ function PlanningChatTabs({ workspaceId, planId, onDocumentChange, onClose, onEx
     const id = usePlanningChatStore.getState().prepareCreation(fingerprint);
     const conversation = await apiRequest<PlanningConversation>(base, { method: 'POST', body: JSON.stringify({ id, catalogId: model.catalogId, ...(reasoning ? { reasoning } : {}), title: `${planningCliName(model.runtimeType)} chat` }) });
     if (!alive.current) return;
+    const draft = usePlanningChatStore.getState().plans[planKey]?.draft;
+    if (!selected && draft) usePlanningChatStore.getState().update(planningChatKey(workspaceId, planId, conversation.id), { draft });
     merge(conversation); usePlanningChatStore.getState().select(planKey, conversation.id); usePlanningChatStore.getState().acknowledgeCreation(fingerprint, id); setAdding(false);
   };
   const patch = async (conversation: PlanningConversation, values: Record<string, unknown>) => {
@@ -408,15 +410,15 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     observer.observe(content.current);
     return () => observer.disconnect();
   }, [following]);
-  const send = async () => {
-    if (!canSend || !model || actionBusy.current) return;
+   const send = async (retry?: PlanningChatMessage) => {
+    if ((!retry && !canSend) || !chat || running || !model || actionBusy.current) return;
     actionBusy.current = true; setBusy(true); setActionError(undefined);
-    const sentFiles = [...files];
-    const text = preferences.draft.trim() || 'Review the attached files in the context of this plan.';
+    const sentFiles = retry ? [] : [...files];
+    const text = retry?.content || preferences.draft.trim() || 'Review the attached files in the context of this plan.';
     try {
       const store = usePlanningChatStore.getState();
-      const recovered = !sentFiles.length ? store.plans[key]?.attempts.find(item => item.text === text && item.catalogId === model.catalogId && item.reasoning === reasoning) : undefined;
-      const paths: string[] = [];
+      const recovered = !sentFiles.length ? store.plans[key]?.attempts.find(item => item.text === text && item.catalogId === model.catalogId && item.reasoning === reasoning && (!retry || JSON.stringify(item.attachmentPaths || []) === JSON.stringify(retry.attachmentPaths || []))) : undefined;
+      const paths: string[] = retry?.attachmentPaths ? [...retry.attachmentPaths] : [];
       if (!recovered) for (const file of sentFiles) {
         let path = usePlanningChatStore.getState().staged[key]?.find(item => item.file === file)?.path;
         if (!path) {
@@ -474,7 +476,10 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     try {
       let document;
       try {
-        document = await request<{ content: string; revision: string }>(`/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/document?path=${encodeURIComponent(proposal.path)}`);
+        if (proposal.path === 'board.json') {
+          const version = await request<{ board: unknown; revision: string } | null>(`/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/board`);
+          document = { content: version ? JSON.stringify(version.board, null, 2) : '', revision: version?.revision ?? null };
+        } else document = await request<{ content: string; revision: string }>(`/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/document?path=${encodeURIComponent(proposal.path)}`);
       } catch (error) {
         if (!(error instanceof ApiError && error.status === 404)) throw error;
         document = { content: '', revision: null };
@@ -506,8 +511,10 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
   };
 
   const controlAgent = { ...conversation, name: planningCliName(conversation.runtimeType) };
+  const failed = chat?.status === 'failed' || chat?.status === 'interrupted';
+  const retryMessage = failed ? [...(chat?.messages || [])].reverse().find(message => message.role === 'user' && message.turnId === chat?.turnId) : undefined;
   return <section ref={root} role="tabpanel" id={`planning-chat-${conversation.id}`} aria-labelledby={`planning-tab-${conversation.id}`} className="flex min-h-0 w-full min-w-0 flex-1 flex-col bg-background text-foreground">
-    <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border/60 px-4 text-[11px]"><span className="flex min-w-0 items-center gap-2 text-muted-foreground"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${running ? 'animate-pulse bg-primary' : chat ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} /><span className="truncate">{planningCliName(conversation.runtimeType)} · Independent context</span></span>{running ? <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[10px]" disabled={busy} aria-label="Stop response" onClick={() => void stop()}><Square className="mr-1 h-2.5 w-2.5" />Interrupt</Button> : <span className="shrink-0 text-[10px] text-muted-foreground">Plan + research</span>}</div>
+    <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border/60 px-4 text-[11px]"><span className="flex min-w-0 items-center gap-2 text-muted-foreground"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${running ? 'animate-pulse bg-primary' : failed ? 'bg-amber-500' : chat ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} /><span className="truncate">{planningCliName(conversation.runtimeType)} · Independent context</span></span>{running ? <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[10px]" disabled={busy} aria-label="Stop response" onClick={() => void stop()}><Square className="mr-1 h-2.5 w-2.5" />Interrupt</Button> : <span className="shrink-0 text-[10px] text-muted-foreground">Plan + board</span>}</div>
     <div ref={timeline} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain" onScroll={event => {
       const element = event.currentTarget; setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 64);
     }}>
@@ -528,8 +535,8 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
             {message.role === 'assistant' && !text && message.partial && running && <p className="text-xs text-muted-foreground">Preparing document update…</p>}
             {message.role === 'assistant' && proposals.map(proposal => <div key={proposal.id} className="min-w-0 rounded-lg border border-border bg-card p-3">
               <div className="flex items-center gap-2"><FileText className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1 break-all text-xs font-medium">{proposal.path}</span>{proposal.status === 'applied' && <Check className="size-3.5 shrink-0 text-primary" />}</div>
-              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{proposal.status === 'applied' ? 'Document updated' : proposal.status === 'conflict' ? 'The document changed. Compare before applying.' : 'Document update pending'}</p>
-              <div className="mt-2 flex flex-wrap gap-2"><Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => onDocumentChange(proposal.path)}>Show in document</Button>{proposal.status !== 'applied' && <Button variant="outline" size="sm" className="h-7 px-2" disabled={running || busy} onClick={() => void loadReview(proposal)}>Review update</Button>}</div>
+              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{proposal.status === 'applied' ? proposal.path === 'board.json' ? 'Board updated' : 'Document updated' : proposal.status === 'conflict' ? 'Changed while the assistant was working. Compare before applying.' : 'Update pending'}</p>
+              <div className="mt-2 flex flex-wrap gap-2"><Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => onDocumentChange(proposal.path)}>{proposal.path === 'board.json' ? 'Show board' : 'Show in document'}</Button>{proposal.status !== 'applied' && <Button variant="outline" size="sm" className="h-7 px-2" disabled={running || busy} onClick={() => void loadReview(proposal)}>Review update</Button>}</div>
             </div>)}
           </article>;
         })}
@@ -538,7 +545,8 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     <div className="shrink-0 border-t border-border/70 px-4 pt-2">
       <div className="mx-auto w-full max-w-4xl">
         {!following && <Button variant="ghost" size="sm" className="mb-2 w-full" onClick={() => setFollowing(true)}><ArrowDown />Latest messages</Button>}
-        <div role="status" className="mb-2 flex min-h-4 items-center gap-2 text-[11px] text-muted-foreground">{running ? <><Loader2 className="size-3 shrink-0 animate-spin" /><span className="min-w-0 break-words">{chat?.activity || 'Working on your plan'}</span></> : chat?.status === 'cancelled' ? 'Stopped · partial response kept' : chat?.status === 'complete' ? 'Ready for your next thought' : chat?.status === 'failed' || chat?.status === 'interrupted' ? 'Needs attention' : 'Plan and research in context'}</div>
+        <div role="status" className="mb-2 flex min-h-4 items-center gap-2 text-[11px] text-muted-foreground">{running ? <><Loader2 className="size-3 shrink-0 animate-spin" /><span className="min-w-0 break-words">{chat?.activity || 'Working on your plan'}</span></> : chat?.status === 'cancelled' ? 'Stopped · partial response kept' : chat?.status === 'complete' ? 'Ready for your next thought' : failed ? 'Response stopped · partial reply kept' : 'Plan, board and research in context'}</div>
+        {retryMessage && <div className="mb-2 flex flex-wrap items-center gap-2"><Button size="sm" variant="outline" className="h-7 text-xs" disabled={busy || !model || Boolean(loadError)} onClick={() => void send(retryMessage)}><RotateCcw className="mr-1.5 size-3" />Retry last message</Button><span className="text-[11px] text-muted-foreground">Uses the current model and saved context.</span></div>}
         {(loadError || actionError || chat?.error) && <div role="alert" className="mb-2 max-h-28 overflow-y-auto rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs leading-relaxed text-destructive [overflow-wrap:anywhere]">{[loadError, actionError, chat?.error].filter(Boolean).join('\n')}</div>}
         {!model && <p className="mb-2 text-xs leading-5 text-muted-foreground">This model is unavailable. Choose another verified model using Model & CLI below.</p>}
         {chat?.approvals?.map(approval => <div key={approval.id} className="mb-3 rounded-xl border border-primary/25 bg-primary/5 p-3"><p className="text-xs font-semibold">OpenCode needs your approval</p><p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{approval.description}</p>{approval.command && <pre className="mt-2 overflow-auto rounded-lg bg-background p-2 text-[11px]">{approval.command}</pre>}{approval.error && <p role="alert" className="mt-2 text-xs text-destructive">{approval.error}</p>}<div className="mt-3 flex gap-2"><Button size="sm" variant="outline" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'deny')}>Deny</Button><Button size="sm" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'allow')}>Allow once</Button></div></div>)}

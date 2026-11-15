@@ -12,8 +12,10 @@ deployed relay, without exposing the desktop loopback gateway.
    enough. The production endpoint is `wss://agent.atrishub.com/remote/v1/ws`.
 2. Install the desktop build containing **Settings → Mobile access**.
 3. Install the new mobile build. Sign in to AtrisHub.
-4. Enable mobile access on desktop. Copy the private pairing code into the
-   phone's **Connect** panel, then approve the phone on desktop.
+4. Enable mobile access on desktop. In the phone's **Connect** panel, choose
+   **Scan QR code** and photograph the code shown on desktop. Alternatively,
+   expand **Enter pairing code manually** and paste the private code. Approve
+   the phone on desktop.
 
 Codes expire after 10 minutes. Desktop approval is required before reading or
 controlling agents. Approved connections last while both apps remain connected;
@@ -32,16 +34,22 @@ its tray option) and prevent the computer from sleeping during remote work.
   other CLIs restart only when not working/waiting, using desktop launch paths.
 - Runtime-supported questions, OpenCode auto-approve, live Codex permissions,
   and reading conversation-scoped memory.
+- Read-only plan documents and orchestrator mission descriptions and tasks.
 - Hub token storage through native iOS Keychain/Android Keystore. Browser previews
   stay memory-only. If native storage is unavailable (including some sideloading
   setups), sign-in still works in memory and account settings report it.
 
-Cross-runtime/account agent creation, mobile attachments, Mission/Orchestrator
+Cross-runtime/account agent creation, mobile attachments, plan editing and Mission/Orchestrator
 controls, durable device registration and background push notifications are not
 implemented in this first remote-control increment. Native iOS/Android behavior
 and LiveContainer compatibility must still be checked on actual devices.
 
 ## Development and verification
+
+For local Android builds, after `tauri android init` run
+`node .github/scripts/configure-mobile-orientation.mjs android` from the repository
+root. CI and release workflows apply this automatically. iOS portrait and camera
+settings are also provided through `src-tauri/Info.ios.plist`.
 
 ```sh
 npm install

@@ -20,6 +20,10 @@ async function main() {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/workspaces') { res.end(JSON.stringify([{ id: 'workspace', name: 'Project' }])); return; }
     if (req.url === '/api/manual/conversations?workspaceId=workspace') { res.end(JSON.stringify([conversation])); return; }
+    if (req.url === '/api/workspaces/workspace/plans') { res.end(JSON.stringify([{ id: 'plan', title: 'Plan', status: 'draft', archivedAt: null }, { id: 'old', title: 'Archived', status: 'ready', archivedAt: '2026-01-01' }])); return; }
+    if (req.url === '/api/missions?workspaceId=workspace') { res.end(JSON.stringify([{ id: 'mission', title: 'Orchestration', status: 'running', description: 'private details' }])); return; }
+    if (req.url === '/api/workspaces/workspace/plans/plan/document?path=plan.md') { res.end(JSON.stringify({ content: '# Plan', revision: '1' })); return; }
+    if (req.url === '/api/missions/mission') { res.end(JSON.stringify({ mission: { workspaceId: 'workspace', description: 'Mission description' }, tasks: [{ id: 'task', title: 'Test', status: 'running', description: 'Run tests' }] })); return; }
     if (req.url === '/api/manual/agents/agent/activity') { res.end(JSON.stringify({ state: activity })); return; }
     if (req.url === '/api/manual/agents/agent/messages') { res.end(JSON.stringify({ messages: [{ id: 'message', role: 'assistant', text: 'Persisted provider history' }] })); return; }
     res.statusCode = 404; res.end('{"error":"Unexpected test route"}');
@@ -35,6 +39,12 @@ async function main() {
     const projects = await handleMobileRequest('workspaces', {}) as any[];
     assert.equal(projects[0].agents[0].id, 'agent');
     assert.equal(projects[0].agents[0].status, 'idle');
+    assert.deepEqual(projects[0].plans, [{ id: 'plan', title: 'Plan', status: 'draft' }]);
+    assert.deepEqual(projects[0].missions, [{ id: 'mission', title: 'Orchestration', status: 'running' }]);
+    assert.deepEqual(await handleMobileRequest('planDetail', { workspaceId: 'workspace', planId: 'plan' }), { content: '# Plan', truncated: false });
+    await assert.rejects(handleMobileRequest('planDetail', { workspaceId: 'workspace', planId: 'old' }), /no longer exists/);
+    assert.deepEqual(await handleMobileRequest('missionDetail', { workspaceId: 'workspace', missionId: 'mission' }), { description: 'Mission description', tasks: [{ id: 'task', title: 'Test', status: 'running', description: 'Run tests' }] });
+    await assert.rejects(handleMobileRequest('missionDetail', { workspaceId: 'wrong', missionId: 'mission' }), /no longer exists/);
     assert.deepEqual(await handleMobileRequest('messages', { agentId: 'agent' }), [{ id: 'message', role: 'assistant', text: 'Persisted provider history' }]);
     const command = { agentId: 'agent', workspaceId: 'workspace', conversationId: 'conversation', id: 'request-1', text: 'Continue' };
     await assert.rejects(handleMobileRequest('send', { ...command, workspaceId: 'wrong' }), /context changed/);
