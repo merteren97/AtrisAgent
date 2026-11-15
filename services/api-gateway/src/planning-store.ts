@@ -213,6 +213,13 @@ const MIME: Record<string, string> = {
   '.pdf': 'application/pdf', '.md': 'text/markdown', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json',
 };
 export function planningMime(filename: string): string { return MIME[path.extname(filename).toLowerCase()] || 'application/octet-stream'; }
+export function sniffImageMime(sample: Buffer): string | null {
+  if (sample.length >= 8 && sample.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
+  if (sample.length >= 3 && sample[0] === 255 && sample[1] === 216 && sample[2] === 255) return 'image/jpeg';
+  if (sample.length >= 6 && /^GIF8[79]a$/.test(sample.subarray(0, 6).toString('ascii'))) return 'image/gif';
+  if (sample.length >= 12 && sample.subarray(0, 4).toString('ascii') === 'RIFF' && sample.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return null;
+}
 function validateMime(sample: Buffer, mime: string): void {
   const ascii = (start: number, end: number) => sample.subarray(start, end).toString('ascii');
   const checks: Record<string, boolean> = {
@@ -499,7 +506,7 @@ export class PlanningStore {
   }
   private plan(workspaceId: string, planId: string): { root: string; metadata: PlanningDocument } {
     identifier(planId);
-    const result = this.records(workspaceId).find((record) => record.metadata.id === planId);
+    const result = this.records(workspaceId).find((record) => record.metadata.id === planId || path.basename(record.root) === planId || (planId.includes('--') && record.metadata.id === planId.split('--').pop()));
     if (!result) fail('Plan not found in this workspace.', 404, 'PLANNING_NOT_FOUND');
     return result;
   }
@@ -661,7 +668,7 @@ export class PlanningStore {
   }
   async importAsset(workspaceId: string, planId: string, input: { filename: string; mimeType: string; stream: Readable }): Promise<PlanningFile> {
     safeName(input.filename);
-    const mime = planningMime(input.filename);
+    let mime = planningMime(input.filename);
     if (mime === 'application/octet-stream' || mime !== input.mimeType) fail('Unsupported MIME type or filename extension.');
     const { root } = this.plan(workspaceId, planId);
     const assets = directory(root, 'assets');
@@ -690,7 +697,7 @@ export class PlanningStore {
         input.stream.removeListener('error', onError).removeListener('close', onClose);
         if (!input.stream.readableEnded) input.stream.resume();
       }
-      validateMime(sample, mime);
+      const sniffed = sniffImageMime(sample); if (sniffed && (mime.startsWith('image/') || mime === 'application/octet-stream')) mime = sniffed; validateMime(sample, mime);
       if (mime.startsWith('text/') || mime === 'application/json') {
         const content = text(readBytes(assets, temporaryName, MAX_PLANNING_DOCUMENT_BYTES));
         if (mime === 'application/json') { try { JSON.parse(content); } catch { fail('Invalid JSON asset.'); } }
@@ -720,9 +727,15 @@ export class PlanningStore {
     let stat: fs.Stats;
     try { stat = fs.lstatSync(absolutePath); } catch (error) { if (missing(error)) fail('Planning file not found.', 404); throw error; }
     if (!stat.isFile()) fail('Expected a planning file.', 404);
-    const mimeType = planningMime(relative);
+    let mimeType = planningMime(relative);
     const fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    try { const sample = Buffer.alloc(64); const size = fs.readSync(fd, sample, 0, 64, 0); validateMime(sample.subarray(0, size), mimeType); }
+    try {
+      const sample = Buffer.alloc(64);
+      const size = fs.readSync(fd, sample, 0, 64, 0);
+      const sniffed = sniffImageMime(sample.subarray(0, size));
+      if (sniffed && (mimeType.startsWith('image/') || mimeType === 'application/octet-stream')) mimeType = sniffed;
+      validateMime(sample.subarray(0, size), mimeType);
+    }
     finally { fs.closeSync(fd); }
     return { path: relative, byteSize: stat.size, mimeType, absolutePath };
   }

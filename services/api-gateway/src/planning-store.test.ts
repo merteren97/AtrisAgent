@@ -160,8 +160,13 @@ test('streamed imports validate bytes and size, avoid overwrite, and clean rejec
   await assert.rejects(upload('page.html', Buffer.from('<html>'), 'text/html'), /Unsupported/);
   await assert.rejects(upload('big.png', Buffer.alloc(101)), status(413));
   await assert.rejects(upload('../escape.png'), /safe filename/);
-  await assert.rejects(upload('invalid.txt', Buffer.from([255]), 'text/plain'), /UTF-8/);
-  assert.equal(fs.readdirSync(path.join(planRoot, 'assets')).length, 2);
+    await assert.rejects(upload('invalid.txt', Buffer.from([255]), 'text/plain'), /UTF-8/);
+  const jpegBytes = Buffer.from([255, 216, 255, 224, 0, 16, 74, 70, 0, 1, 1, 1]);
+  const mislabeled = await upload('hero.png', jpegBytes, 'image/png');
+  assert.equal(mislabeled.mimeType, 'image/jpeg');
+  const resolved = store.resolveFile('one', 'plan-one', mislabeled.path);
+  assert.equal(resolved.mimeType, 'image/jpeg');
+  assert.equal(fs.readdirSync(path.join(planRoot, 'assets')).length, 3);
 });
 
 test('portable chat append is idempotent, conflicts are explicit, and state is per-plan', (t) => {
