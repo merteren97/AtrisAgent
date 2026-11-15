@@ -488,14 +488,11 @@ fn read_project_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(&candidate).map_err(|_| "Image is unavailable")?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 8 * 1024 * 1024 { return Err("Image is unavailable or exceeds 8 MB".into()); }
     let bytes = std::fs::read(&candidate).map_err(|_| "Image is unavailable")?;
-    let valid = match extension.as_str() {
-        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "jpg" | "jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
-        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        "webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()),
-        _ => false,
-    };
-    if !valid { return Err("Image format does not match its filename".into()); }
+    let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    let is_jpeg = bytes.starts_with(b"\xff\xd8\xff");
+    let is_gif = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+    let is_webp = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice());
+    if !(is_png || is_jpeg || is_gif || is_webp) { return Err("Image format is not a supported image".into()); }
     Ok(bytes)
 }
 fn read_staged_image(root: &Path, id: &str, path: &str) -> Result<Vec<u8>, String> {
@@ -781,11 +778,14 @@ mod tests {
         let project = root.join("workspace");
         std::fs::create_dir_all(project.join("AtrisAgent")).unwrap();
         let image = b"\x89PNG\r\n\x1a\npreview";
+        let jpeg_named_png = b"\xff\xd8\xff\xe0jpeg";
         std::fs::write(project.join("AtrisAgent/screen.png"), image).unwrap();
+        std::fs::write(project.join("AtrisAgent/photo.png"), jpeg_named_png).unwrap();
         std::fs::write(root.join("private.png"), image).unwrap();
         std::fs::write(project.join("not-image.png"), b"private data").unwrap();
         assert_eq!(read_project_image(&project, "AtrisAgent/screen.png").unwrap(), image.to_vec());
         assert_eq!(read_project_image(&project, project.join("AtrisAgent/screen.png").to_str().unwrap()).unwrap(), image.to_vec());
+        assert_eq!(read_project_image(&project, "AtrisAgent/photo.png").unwrap(), jpeg_named_png.to_vec());
         assert!(read_project_image(&project, "../private.png").is_err());
         assert!(read_project_image(&project, "not-image.png").is_err());
         std::fs::remove_dir_all(root).unwrap();

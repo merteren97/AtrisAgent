@@ -44,7 +44,7 @@ export function extractChatImages(text: string): ChatImageItem[] {
   }
 
   // 2. Raw file:/// or Windows/Unix paths ending in image extensions
-  const pathMatches = text.matchAll(/(?:file:\/\/\/[^\s<>"`']+\.(?:png|jpe?g|webp|gif)|\b[a-zA-Z]:[\\/][^\s<>"`']+\.(?:png|jpe?g|webp|gif)|assets\/[^\s<>"`']+\.(?:png|jpe?g|webp|gif))/gi);
+  const pathMatches = text.matchAll(/(?:file:\/\/\/[^\s<>"`']+\.(?:png|jpe?g|webp|gif)|\b[a-zA-Z]:[\\/][^\s<>"`']+\.(?:png|jpe?g|webp|gif)|assets[/\\][^\s<>"`']+\.(?:png|jpe?g|webp|gif))/gi);
   for (const match of pathMatches) {
     const path = normalizeImagePath(match[0]);
     if (seen.has(path.toLowerCase()) || !/\.(?:png|jpe?g|webp|gif)$/i.test(path)) continue;
@@ -83,10 +83,15 @@ export function ChatImageThumbnail({
     const mime = extension === 'jpg' ? 'jpeg' : extension;
 
     // If it's a planning asset and planning credentials are provided, use planning media-grant API
-    if (workspaceId && planId && image.path.startsWith('assets/')) {
+    const planningAssetMatch = /(?:^|[/\\])\.atris-plans[/\\][^/\\]+[/\\](assets[/\\][^\s?#]+)$/.exec(image.path);
+    const planningPath = planningAssetMatch
+      ? planningAssetMatch[1].replace(/\\/g, '/')
+      : (/^assets[/\\]/i.test(image.path) ? image.path.replace(/\\/g, '/') : undefined);
+
+    if (workspaceId && planId && planningPath) {
       void apiRequest<{ url: string }>(`${planApi(workspaceId, planId)}/media-grant`, {
         method: 'POST',
-        body: JSON.stringify({ path: image.path }),
+        body: JSON.stringify({ path: planningPath }),
       })
         .then((grant) => {
           if (!active) return;
@@ -108,7 +113,17 @@ export function ChatImageThumbnail({
     })
       .then((bytes) => {
         if (!active) return;
-        objectUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: `image/${mime}` }));
+        const b = new Uint8Array(bytes);
+        const isPng = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+        const isJpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+        const isGif = b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46;
+        const isWebp = b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46;
+        const detectedMime = isPng ? 'image/png'
+          : isJpeg ? 'image/jpeg'
+          : isGif ? 'image/gif'
+          : isWebp ? 'image/webp'
+          : `image/${mime}`;
+        objectUrl = URL.createObjectURL(new Blob([b], { type: detectedMime }));
         setUrl(objectUrl);
         setError(false);
       })
