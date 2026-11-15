@@ -478,8 +478,11 @@ fn read_project_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> {
     let candidate = std::fs::canonicalize(if supplied.is_absolute() { supplied.to_path_buf() } else { root.join(supplied) })
         .map_err(|_| "Image is unavailable")?;
     let in_project = candidate.starts_with(&root);
-    let in_temp = std::fs::canonicalize(std::env::temp_dir()).map(|t| candidate.starts_with(t)).unwrap_or(false);
-    if !in_project && !in_temp { return Err("Image is outside this project".into()); }
+    let in_attachments = supplied.is_absolute() && {
+        let attachments = std::env::temp_dir().join("atris-agent-attachments");
+        std::fs::canonicalize(&attachments).map(|t| candidate.starts_with(t)).unwrap_or(false)
+    };
+    if !in_project && !in_attachments { return Err("Image is outside this project".into()); }
     let extension = candidate.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     if !["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.as_str()) { return Err("Not a supported image".into()); }
     let metadata = std::fs::metadata(&candidate).map_err(|_| "Image is unavailable")?;
