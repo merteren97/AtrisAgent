@@ -86,6 +86,56 @@ test('QR photo pairs and workspace details open', async ({ page, request }, test
   await page.screenshot({ path: testInfo.outputPath('mission-detail.png'), scale: 'css' });
 });
 
+test('live camera QR stream pairs desktop automatically', async ({ page, request }) => {
+  await login(page);
+  const config = await (await request.get('http://127.0.0.1:4191/fixture')).json();
+  const qrPage = await page.context().newPage();
+  await qrPage.setContent(renderToStaticMarkup(React.createElement(QRCodeSVG, { value: config.code, size: 280, marginSize: 4 })));
+  const qr = await qrPage.locator('svg').screenshot();
+  await qrPage.close();
+  const qrDataUrl = `data:image/png;base64,${qr.toString('base64')}`;
+  await page.evaluate(async (dataUrl: string) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 320;
+    canvas.height = 320;
+    const ctx = canvas.getContext('2d')!;
+    const img = new Image();
+    img.src = dataUrl;
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('Failed to load QR image'));
+    });
+    const draw = () => {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 20, 20, 280, 280);
+    };
+    draw();
+    const timer = window.setInterval(draw, 100);
+    const stream = canvas.captureStream(15);
+    for (const track of stream.getTracks()) {
+      const origStop = track.stop.bind(track);
+      track.stop = () => {
+        (window as any).__qrTrackStopped = true;
+        window.clearInterval(timer);
+        origStop();
+      };
+    }
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => stream,
+      },
+    });
+  }, qrDataUrl);
+  await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
+  await expect(page.getByTestId('qr-scanner-video')).toBeVisible();
+  await expect(page.getByText('Approve your phone on desktop', { exact: true })).toBeVisible({ timeout: 10000 });
+  expect(await page.evaluate(() => (window as any).__qrTrackStopped)).toBe(true);
+  await request.get(`http://127.0.0.1:4191/approve?id=${config.id}`);
+  await expect(page.getByText('Test Desktop')).toBeVisible({ timeout: 10000 });
+});
+
 test('uncertain delivery retains the draft', async ({ page, request }) => {
   await pair(page, request); await chat(page);
   await page.getByRole('textbox', { name: 'Message Builder' }).fill('uncertain');

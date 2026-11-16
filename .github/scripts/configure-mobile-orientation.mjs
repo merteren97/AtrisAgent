@@ -7,6 +7,22 @@ export function androidPortrait(xml) {
   return xml.replace(activity, tag => tag.includes('android:screenOrientation=') ? tag.replace(/android:screenOrientation="[^"]*"/, 'android:screenOrientation="portrait"') : tag.replace('<activity', '<activity android:screenOrientation="portrait"'));
 }
 
+export function androidCamera(xml) {
+  if (!xml.includes('</manifest>')) throw new Error('Invalid Android manifest');
+  const tags = [
+    '<uses-permission android:name="android.permission.CAMERA" />',
+    '<uses-feature android:name="android.hardware.camera" android:required="false" />',
+    '<uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />',
+  ];
+  const missing = tags.filter(tag => {
+    const match = tag.match(/android:name="([^"]+)"/);
+    return match ? !xml.includes(match[1]) : !xml.includes(tag);
+  });
+  if (!missing.length) return xml;
+  const anchor = xml.includes('<application') ? '<application' : '</manifest>';
+  return xml.replace(anchor, `${missing.map(t => `    ${t}`).join('\n')}\n\n    ${anchor}`);
+}
+
 export function iosPortrait(xml) {
   if (!xml.includes('</dict>')) throw new Error('Invalid iOS plist');
   let result = xml;
@@ -23,7 +39,7 @@ async function main() {
   const platform = process.argv[2];
   if (platform === 'android') {
     const file = 'apps/mobile/src-tauri/gen/android/app/src/main/AndroidManifest.xml';
-    await writeFile(file, androidPortrait(await readFile(file, 'utf8')));
+    await writeFile(file, androidCamera(androidPortrait(await readFile(file, 'utf8'))));
   } else if (platform === 'ios') {
     const root = 'apps/mobile/src-tauri/gen/apple';
     const dirs = (await readdir(root, { withFileTypes: true })).filter(entry => entry.isDirectory() && entry.name.endsWith('_iOS'));
