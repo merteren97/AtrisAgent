@@ -4,7 +4,7 @@ import { api, connectDesktop, disconnectDesktop, type Agent, type Message, type 
 import { clearHubSession, loginHub, restoreHubSession, type HubAccount } from './hub-auth';
 import logo from '../../desktop/public/logo.svg';
 import { AgentControls } from './agent-controls';
-import jsQR from 'jsqr';
+import { decodeQrFromImageFile, LiveQrScanner } from './qr-scanner';
 
 const statusLabel: Record<Agent['status'], string> = { working: 'Working', waiting: 'Needs input', idle: 'Ready', offline: 'Offline', error: 'Needs attention', unknown: 'Open · status unavailable' };
 function Brand() { return <div className="brand"><span className="brand-mark"><img src={logo} alt="AtrisAgent logo" /></span><span>Atris<span>Agent</span></span></div>; }
@@ -116,19 +116,8 @@ export function App() {
     if (!file || connectBusy) return;
     setConnectError('');
     try {
-      const url = URL.createObjectURL(file);
-      try {
-        const image = new Image(); image.src = url;
-        await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error('Could not open this image.')); });
-        const scale = Math.min(1, 2000 / Math.max(image.naturalWidth, image.naturalHeight));
-        const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(image.naturalWidth * scale)); canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-        const context = canvas.getContext('2d', { willReadFrequently: true }); if (!context) throw new Error('Could not read the image.');
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
-        const result = jsQR(pixels.data, pixels.width, pixels.height);
-        if (!result) throw new Error('No QR code found. Try again with the whole code in view.');
-        await pair(result.data);
-      } finally { URL.revokeObjectURL(url); }
+      const data = await decodeQrFromImageFile(file);
+      await pair(data);
     } catch (cause) { setConnectError(cause instanceof Error ? cause.message : 'Could not scan the QR code.'); }
   };
   const signIn = async () => {
@@ -206,7 +195,7 @@ export function App() {
         <p className="account-note">Credentials are sent only to AtrisHub over HTTPS.</p>
       </>}
     </Sheet>}
-    {panel === 'connect' && <Sheet title="Connect your desktop" close={closePanel}><p>On your computer, open Settings → Mobile access and enable access. Photograph the QR code shown there.</p><label className="primary-button scan-button">{connectBusy ? 'Connecting…' : 'Scan QR code'}<input aria-label="Scan QR code" type="file" accept="image/*" capture="environment" disabled={connectBusy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; void scanImage(file); }} /></label>{connectError && <p role="alert" className="sheet-error">{connectError}</p>}<details><summary className="manual-summary">Enter pairing code manually</summary><form className="account-form" onSubmit={event => { event.preventDefault(); void pair(); }}><label>Pairing code<textarea required value={code} spellCheck={false} onChange={event => setCode(event.target.value)} /></label><button className="primary-button" disabled={connectBusy || !code.trim()}>{connectBusy ? 'Connecting…' : 'Connect desktop'}</button></form></details><p className="account-note">Approve your phone on desktop after connecting. Your computer must remain open and online.</p><button className="account-secondary" onClick={unpair}>Disconnect desktop</button></Sheet>}
+    {panel === 'connect' && <Sheet title="Connect your desktop" close={closePanel}><p>On your computer, open Settings → Mobile access and enable access. Point your camera at the QR code shown there.</p><LiveQrScanner active={panel === 'connect'} onDetected={detected => void pair(detected)} /><label className="primary-button scan-button">{connectBusy ? 'Connecting…' : 'Upload or take QR photo'}<input aria-label="Scan QR code" type="file" accept="image/*" capture="environment" disabled={connectBusy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; void scanImage(file); }} /></label>{connectError && <p role="alert" className="sheet-error">{connectError}</p>}<details><summary className="manual-summary">Enter pairing code manually</summary><form className="account-form" onSubmit={event => { event.preventDefault(); void pair(); }}><label>Pairing code<textarea required value={code} spellCheck={false} onChange={event => setCode(event.target.value)} /></label><button className="primary-button" disabled={connectBusy || !code.trim()}>{connectBusy ? 'Connecting…' : 'Connect desktop'}</button></form></details><p className="account-note">Approve your phone on desktop after connecting. Your computer must remain open and online.</p><button className="account-secondary" onClick={unpair}>Disconnect desktop</button></Sheet>}
     {panel === 'controls' && agent && <Sheet title="Agent controls" close={closePanel}><AgentControls agentId={agent.id} /></Sheet>}
     {panel === 'detail' && detail && <Sheet title={detail.item.title} close={closePanel}><p className="detail-status">{detail.kind === 'plan' ? 'Planning' : 'Orchestrator'} · {detail.item.status.replaceAll('_', ' ')}</p>{detail.error ? <p role="alert" className="sheet-error">{detail.error}</p> : !detail.data ? <p>Loading details…</p> : detail.kind === 'plan' ? <><div className="detail-text">{(detail.data as PlanDetail).content || 'This plan is empty.'}</div>{(detail.data as PlanDetail).truncated && <p>Earlier content is shown; open the desktop to see the full document.</p>}</> : <><div className="detail-text">{(detail.data as MissionDetail).description || 'No description.'}</div><h3>Tasks</h3>{(detail.data as MissionDetail).tasks.length ? (detail.data as MissionDetail).tasks.map(task => <div className="detail-task" key={task.id}><strong>{task.title}</strong><span>{task.status.replaceAll('_', ' ')}</span>{task.description && <p>{task.description}</p>}</div>) : <p>No tasks yet.</p>}</>}<p className="account-note">Changes and controls are available on desktop.</p></Sheet>}
     {panel === 'models' && agent && <Sheet title="Model & reasoning" close={closePanel}><p>Available models on this agent's desktop account. Non-OpenCode sessions restart when idle; an active turn cannot be interrupted here.</p>{modelError && <p role="alert" className="sheet-error">{modelError}</p>}<div className="model-list">{models.map(model => <div className="model-item" key={model.id}><button disabled={!model.available || modelBusy} onClick={() => void selectModel(model, model.reasoning[0])}><span className="model-icon"><Sparkles size={16} /></span><span><strong>{model.name}</strong><small>{model.runtime}</small></span>{model.selected && <Check size={17} />}</button>{model.selected && <div className="reasoning"><span>REASONING</span><div>{model.reasoning.map(level => <button disabled={modelBusy} key={level} className={agent.reasoning === level ? 'selected' : ''} onClick={() => void selectModel(model, level)}>{level}</button>)}</div></div>}</div>)}{!models.length && !modelError && <p className="empty-state">Loading models…</p>}</div></Sheet>}
