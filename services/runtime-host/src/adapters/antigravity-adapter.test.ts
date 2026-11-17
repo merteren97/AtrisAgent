@@ -2,6 +2,8 @@ import nodeAssert from 'node:assert/strict';
 import type { ChildProcess } from 'child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { LocalEventBus } from '@atris-agent-code/event-bus';
+import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AntigravityAdapter, findAntigravityExecutable, resolveAntigravityExecutionMode } from './antigravity-adapter';
 
 async function runTests() {
@@ -212,6 +214,31 @@ claude-opus-4-6-thinking   Claude Opus 4.6 (Thinking)
   assert(await noisyProbe.verifyAuthentication() === 'error', 'bounded authentication diagnostics classify a failed provider probe');
   const noisyMessage = String((noisyProbe as any).lastVerification?.message || '');
   assert(noisyMessage.length <= 1_500 && !noisyMessage.includes('secret-token'), 'authentication diagnostics are bounded and redact bearer credentials');
+
+  const streamBus = new LocalEventBus();
+  const streamEvents: AgentEvent[] = [];
+  streamBus.on('*', (event) => { streamEvents.push(event); });
+  const streamAdapter = new AntigravityAdapter(streamBus);
+  (streamAdapter as any).sessionContext.set('stream-1', { missionId: 'm-stream', taskId: 't-stream' });
+  (streamAdapter as any).handleStreamLine('stream-1', JSON.stringify({
+    event: 'step_update',
+    step_update: {
+      step_index: 1,
+      step_type: 'planner_response',
+      thinking_delta: 'Let me inspect the options',
+      text_delta: 'I have a quick question.',
+      tool_info: {
+        name: 'ask_question',
+        args: { questions: JSON.stringify([{ question: 'Proceed?', options: ['Yes', 'No'] }]) },
+      },
+    },
+  }));
+  const thoughtEv = streamEvents.find((e) => e.type === 'agent_thought') as any;
+  const toolEv = streamEvents.find((e) => e.type === 'agent_tool_call') as any;
+  const textEv = streamEvents.find((e) => e.type === 'text_delta') as any;
+  assert(thoughtEv?.thought === 'Let me inspect the options', 'handleStreamLine emits agent_thought for thinking_delta');
+  assert(toolEv?.toolName === 'ask_question' && Array.isArray(toolEv?.args?.questions), 'handleStreamLine emits agent_tool_call with unwrapped args');
+  assert(textEv?.content === 'I have a quick question.', 'planner_response text_delta is emitted as text_delta rather than swallowed as a thought');
 
   console.log(`\nAntigravity adapter tests: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);

@@ -11,6 +11,12 @@ import {
   AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, OpenCodeAdapter,
   type BaseRuntimeAdapter, type RuntimeHost, type SpawnAgentOptions,
 } from '@atris-agent-code/runtime-host';
+import {
+  buildAntigravityToolItem, parseAntigravityQuestions,
+  type ManualToolArtifact, type ManualToolItem, type ManualToolSubagent,
+} from './manual-antigravity-bridge';
+import type { ManualQuestion } from './manual-conversations';
+export type { ManualToolArtifact, ManualToolItem, ManualToolSubagent };
 
 /** Synchronous, workspace-scoped storage. null is a create-only document revision. */
 export interface PlanningChatStorage {
@@ -40,6 +46,7 @@ export type PlanningChatStatus = 'idle' | 'running' | 'complete' | 'failed' | 'c
 export interface PlanningChatMessage {
   id: string; role: 'user' | 'assistant' | 'system'; content: string; turnId: string; createdAt: string;
   clientMessageId?: string; partial?: boolean; attachmentPaths?: string[];
+  thinking?: string; thinkingTokens?: number; tools?: ManualToolItem[];
 }
 export interface PlanningChatProposal {
   id: string; turnId: string; path: string; content: string; baseRevision: string | null;
@@ -51,6 +58,7 @@ export interface PlanningChatState {
   catalogId?: string; reasoning?: string; sessionId?: string; updatedAt?: string;
   conversation?: PlanningConversation;
   approvals?: PlanningChatApproval[];
+  questions?: ManualQuestion[];
 }
 export interface PlanningChatApproval { id: string; turnId: string; toolName?: string; description: string; path?: string; command?: string; status?: 'pending' | 'replying' | 'failed'; error?: string }
 export interface PlanningChatInput { id: string; text: string; catalogId: string; reasoning?: string; attachmentPaths?: string[] }
@@ -73,7 +81,7 @@ const MAX_HISTORY = 24_000;
 const MAX_ARGV_PROMPT = 2_000;
 const STREAM_FLUSH_MS = 150;
 const ROOT = '/api/planning/:workspaceId/plans/:planId/chat';
-type Journal = { kind: 'start' | 'delta' | 'answer' | 'state' | 'notice' | 'proposal'; turnId: string; [key: string]: unknown };
+type Journal = { kind: 'start' | 'delta' | 'thought' | 'tools' | 'answer' | 'state' | 'notice' | 'proposal'; turnId: string; [key: string]: unknown };
 interface ActiveTurn {
   turnId: string; sessionId: string; adapter?: PlanningChatAdapter; closed: boolean;
   unsubscribe?: () => void; timer?: ReturnType<typeof setTimeout>; launchTimer?: ReturnType<typeof setTimeout>;
@@ -82,9 +90,44 @@ interface ActiveTurn {
   approvals?: Map<string, { approval: PlanningChatApproval; decision?: 'allow' | 'deny'; reply?: Promise<void>; delivered?: boolean }>;
   streamTimer?: ReturnType<typeof setTimeout>;
   pendingText?: string;
+  pendingThinking?: string;
+  pendingTools?: Map<string, ManualToolItem>;
   pendingActivity?: string;
+  tools?: Map<string, ManualToolItem>;
+  questions?: ManualQuestion[];
   deadlineTimer?: ReturnType<typeof setTimeout>;
   lastActivity?: string;
+}
+
+function mergeTools(existing: ManualToolItem[] | undefined, updates: ManualToolItem[]): ManualToolItem[] {
+  const byId = new Map<string, ManualToolItem>();
+  for (const item of existing || []) byId.set(item.id, item);
+  for (const item of updates) byId.set(item.id, item);
+  return [...byId.values()];
+}
+
+function formatQuestionsMarkdown(questions: ManualQuestion[]): string {
+  const lines: string[] = [];
+  for (const group of questions) {
+    for (const item of group.questions) {
+      if (item.header) lines.push(`**${item.header}**`);
+      lines.push(item.question);
+      for (const option of item.options) {
+        lines.push(`- ${option.label}${option.description ? ` — ${option.description}` : ''}`);
+      }
+      lines.push('');
+    }
+  }
+  return lines.join('\n').trim();
+}
+
+function describePlanningToolActivity(eventType: string, toolName: string, item: ManualToolItem): string {
+  if (eventType === 'tool_call_completed') return `Finished ${toolName}`;
+  if (['read_file', 'edit_file', 'write_file', 'run_command', 'search_web'].includes(toolName)) {
+    return item.summary;
+  }
+  if (toolName === 'invoke_subagent') return `Running ${item.summary}`;
+  return `Reading with ${toolName}`;
 }
 
 function fail(message: string, status = 400): never { throw Object.assign(new Error(message), { status }); }
@@ -307,8 +350,21 @@ export class PlanningChatController {
     }
   }
 
-  private queueStream(w: string, p: string, active: ActiveTurn, delta?: string, activity?: string): void {
+  private queueStream(
+    w: string,
+    p: string,
+    active: ActiveTurn,
+    delta?: string,
+    activity?: string,
+    thinkingDelta?: string,
+    toolItem?: ManualToolItem,
+  ): void {
     if (delta) active.pendingText = (active.pendingText || '') + delta;
+    if (thinkingDelta) active.pendingThinking = (active.pendingThinking || '') + thinkingDelta;
+    if (toolItem) {
+      if (!active.pendingTools) active.pendingTools = new Map();
+      active.pendingTools.set(toolItem.id, toolItem);
+    }
     if (activity !== undefined) active.pendingActivity = activity;
     // A fixed window (not debounce) bounds recovery loss even during continuous
     // output. Only text and transient activity are coalesced; lifecycle, approvals
@@ -327,10 +383,16 @@ export class PlanningChatController {
     if (active.streamTimer) clearTimeout(active.streamTimer);
     active.streamTimer = undefined;
     const text = active.pendingText;
+    const thinking = active.pendingThinking;
+    const tools = active.pendingTools?.size ? [...active.pendingTools.values()] : undefined;
     const activity = active.pendingActivity;
     active.pendingText = undefined;
+    active.pendingThinking = undefined;
+    active.pendingTools = undefined;
     active.pendingActivity = undefined;
     if (text) this.writeRecord(w, p, { kind: 'delta', turnId: active.turnId }, text, 'assistant');
+    if (thinking) this.writeRecord(w, p, { kind: 'thought', turnId: active.turnId, thinking }, '', 'assistant');
+    if (tools) this.writeRecord(w, p, { kind: 'tools', turnId: active.turnId, tools }, '', 'assistant');
     if (activity !== undefined) this.writeRecord(w, p, { kind: 'state', turnId: active.turnId, activity });
   }
 
@@ -357,13 +419,56 @@ export class PlanningChatController {
         state.activity = 'Preparing planner'; state.catalogId = String(meta.catalogId);
         state.reasoning = typeof meta.reasoning === 'string' ? meta.reasoning : undefined;
         state.sessionId = String(meta.sessionId);
+        state.questions = undefined;
         messages.set(String(record.id), { id: String(record.id), role: 'user', content, turnId,
           clientMessageId: String(meta.clientMessageId), createdAt: String(record.createdAt), attachmentPaths: meta.attachmentPaths as string[] | undefined });
       } else if (meta.kind === 'delta' || meta.kind === 'answer') {
         const id = `assistant:${turnId}`;
         const previous = messages.get(id);
-        messages.set(id, { id, role: 'assistant', turnId, content: meta.kind === 'answer' ? content : (previous?.content || '') + content,
-          createdAt: previous?.createdAt || String(record.createdAt), partial: meta.kind === 'delta' });
+        messages.set(id, {
+          id,
+          role: 'assistant',
+          turnId,
+          content: meta.kind === 'answer' ? content : (previous?.content || '') + content,
+          createdAt: previous?.createdAt || String(record.createdAt),
+          partial: meta.kind === 'delta',
+          ...(previous?.thinking ? { thinking: previous.thinking } : {}),
+          ...(previous?.thinkingTokens !== undefined ? { thinkingTokens: previous.thinkingTokens } : {}),
+          ...(previous?.tools ? { tools: previous.tools } : {}),
+        });
+      } else if (meta.kind === 'thought') {
+        const id = `assistant:${turnId}`;
+        const previous = messages.get(id);
+        const thoughtText = typeof meta.thinking === 'string' ? meta.thinking : content;
+        const thinking = (previous?.thinking || '') + thoughtText;
+        const thinkingTokens = typeof meta.thinkingTokens === 'number' ? meta.thinkingTokens : previous?.thinkingTokens;
+        messages.set(id, {
+          id,
+          role: 'assistant',
+          turnId,
+          content: previous?.content || '',
+          createdAt: previous?.createdAt || String(record.createdAt),
+          partial: previous?.partial ?? true,
+          ...(thinking ? { thinking } : {}),
+          ...(thinkingTokens !== undefined ? { thinkingTokens } : {}),
+          ...(previous?.tools ? { tools: previous.tools } : {}),
+        });
+      } else if (meta.kind === 'tools') {
+        const id = `assistant:${turnId}`;
+        const previous = messages.get(id);
+        const incoming = Array.isArray(meta.tools) ? meta.tools as ManualToolItem[] : [];
+        const tools = mergeTools(previous?.tools, incoming);
+        messages.set(id, {
+          id,
+          role: 'assistant',
+          turnId,
+          content: previous?.content || '',
+          createdAt: previous?.createdAt || String(record.createdAt),
+          partial: previous?.partial ?? true,
+          ...(previous?.thinking ? { thinking: previous.thinking } : {}),
+          ...(previous?.thinkingTokens !== undefined ? { thinkingTokens: previous.thinkingTokens } : {}),
+          ...(tools.length ? { tools } : {}),
+        });
       } else if (meta.kind === 'notice') {
         messages.set(String(record.id), { id: String(record.id), role: 'system', content, turnId, createdAt: String(record.createdAt) });
       } else if (meta.kind === 'proposal') {
@@ -373,6 +478,7 @@ export class PlanningChatController {
         if (typeof meta.status === 'string') state.status = meta.status as PlanningChatStatus;
         if ('error' in meta) state.error = meta.error as string | undefined;
         if ('activity' in meta) state.activity = meta.activity as string | undefined;
+        if ('questions' in meta) state.questions = Array.isArray(meta.questions) ? meta.questions as ManualQuestion[] : undefined;
       }
     }
     state.messages = [...messages.values()];
@@ -556,6 +662,16 @@ export class PlanningChatController {
     if (active.launchTimer) clearTimeout(active.launchTimer);
     this.active.delete(this.key(w, p));
     try {
+      if (status === 'complete' && active.tools) {
+        for (const item of active.tools.values()) {
+          if (item.status === 'running') {
+            const completedItem: ManualToolItem = { ...item, status: 'completed' };
+            active.tools.set(item.id, completedItem);
+            if (!active.pendingTools) active.pendingTools = new Map();
+            active.pendingTools.set(item.id, completedItem);
+          }
+        }
+      }
       this.flushStream(w, p, active);
       this.append(w, p, { kind: 'state', turnId: active.turnId, status, error, activity: status === 'complete' ? 'Complete' : status });
     } finally {
@@ -629,6 +745,10 @@ export class PlanningChatController {
     reasoning: string | undefined, cwd: string, prompt: string, revisions: Map<string, string | null>): Promise<void> {
     let output = '';
     let previousProviderText = '';
+    let thinkingOutput = '';
+    let previousThinking = '';
+    let toolSeq = 0;
+    active.tools = new Map();
     const current = () => !active.closed && this.active.get(this.key(w, p)) === active;
     try {
       const bus = new LocalEventBus();
@@ -660,19 +780,36 @@ export class PlanningChatController {
         try {
           if (event.type === 'text_delta') {
             if (event.content) touch('Writing response');
-            // Codex item.updated and OpenCode part.updated can contain growing
+            // Codex item.updated, OpenCode part.updated, and Antigravity step_update can contain growing
             // snapshots, not just deltas. Strip the repeated prefix on those adapters.
-            const snapshot = ['opencode', 'codex'].includes(profile.runtimeType) && previousProviderText && event.content.startsWith(previousProviderText);
+            const snapshot = ['opencode', 'codex', 'antigravity'].includes(profile.runtimeType) && previousProviderText && event.content.startsWith(previousProviderText);
             const delta = snapshot ? event.content.slice(previousProviderText.length) : event.content;
             previousProviderText = event.content;
             if (output.length + delta.length > MAX_OUTPUT) return this.finish(w, p, active, 'failed', 'The planner response exceeded the supported size. Request a smaller update.');
             if (delta) { output += delta; this.queueStream(w, p, active, delta); }
+          } else if (event.type === 'agent_thought') {
+            const rawThought = typeof event.thought === 'string' ? event.thought : '';
+            if (rawThought) {
+              touch('Thinking');
+              const snapshot = ['opencode', 'codex', 'antigravity'].includes(profile.runtimeType) && previousThinking && rawThought.startsWith(previousThinking);
+              const delta = snapshot ? rawThought.slice(previousThinking.length) : rawThought;
+              previousThinking = rawThought;
+              if (delta && thinkingOutput.length + delta.length <= MAX_OUTPUT) {
+                thinkingOutput += delta;
+                this.queueStream(w, p, active, undefined, 'Thinking', delta);
+              } else {
+                this.queueStream(w, p, active, undefined, 'Thinking');
+              }
+            }
           } else if (event.type === 'task_completed') {
             // OpenCode's task_completed result is a lifecycle marker, not the
             // assistant answer. Other adapters also supply fallback marker strings.
             const result = String(event.result || '');
             const marker = /^(?:OpenCode session|Codex turn|Claude task|Antigravity task) completed$/.test(result);
-            const answer = (marker ? output : result || output).trim();
+            let answer = (marker ? output : result || output).trim();
+            if (!answer && active.questions?.length) {
+              answer = formatQuestionsMarkdown(active.questions);
+            }
             if (!answer || answer.length > MAX_OUTPUT) return fail('The provider returned an empty or oversized planning response.');
             this.append(w, p, { kind: 'answer', turnId: active.turnId }, answer, 'assistant');
             const updates = extractPlanningUpdates(answer);
@@ -714,10 +851,40 @@ export class PlanningChatController {
               : [event.toolName, event.description, event.path, event.command].filter(Boolean).join(': ');
             this.append(w, p, { kind: 'notice', turnId: active.turnId }, `${description}\n${diagnostic(details)}`);
             this.finish(w, p, active, 'failed', description);
-          } else if (event.type === 'tool_call_started' || event.type === 'tool_call_completed' || event.type === 'agent_started' || event.type === 'agent_tool_call') {
-            const activity = event.type === 'agent_started' ? 'Thinking' : `${event.type === 'tool_call_completed' ? 'Finished' : 'Reading with'} ${event.toolName}`;
+          } else if (event.type === 'tool_call_started' || event.type === 'tool_call_completed' || event.type === 'agent_tool_call') {
+            const toolName = String(event.toolName || 'Tool');
+            const args = 'args' in event && event.args && typeof event.args === 'object' ? event.args as Record<string, unknown> : {};
+            if (event.type !== 'tool_call_completed' && toolName === 'ask_question') {
+              const parsed = parseAntigravityQuestions(args.questions, `planning-question:${active.turnId}`);
+              if (parsed) {
+                active.questions = [parsed];
+                touch('Waiting for your answer');
+                this.append(w, p, { kind: 'state', turnId: active.turnId, questions: active.questions, activity: 'Waiting for your answer' });
+                return;
+              }
+            }
+            const callId = 'toolCallId' in event && typeof event.toolCallId === 'string' && event.toolCallId ? event.toolCallId : undefined;
+            let existing = callId ? active.tools?.get(callId) : undefined;
+            if (!existing && event.type === 'tool_call_completed' && active.tools) {
+              existing = [...active.tools.values()].reverse().find(item => item.name === toolName && item.status === 'running');
+            }
+            const id = existing?.id || callId || `${active.turnId}:tool:${++toolSeq}`;
+            const status: ManualToolItem['status'] = event.type === 'tool_call_completed'
+              ? (event.success ? 'completed' : 'failed')
+              : 'running';
+            const outputText = event.type === 'tool_call_completed' && typeof event.result === 'string' && event.result.trim()
+              ? event.result.trim().slice(0, 4000)
+              : existing?.output;
+            const built = event.type === 'tool_call_completed' && existing
+              ? { ...existing, status, ...(outputText ? { output: outputText } : {}) }
+              : buildAntigravityToolItem(toolName, args, { id, status, output: outputText });
+            active.tools?.set(id, built);
+            const activity = describePlanningToolActivity(event.type, toolName, built);
             touch(activity);
-            this.queueStream(w, p, active, undefined, activity.slice(0, 240));
+            this.queueStream(w, p, active, undefined, activity.slice(0, 240), undefined, built);
+          } else if (event.type === 'agent_started') {
+            touch('Thinking');
+            this.queueStream(w, p, active, undefined, 'Thinking');
           }
         } catch (error) {
           this.finish(w, p, active, 'failed', diagnostic(error));

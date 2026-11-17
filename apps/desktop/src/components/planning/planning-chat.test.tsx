@@ -104,4 +104,150 @@ assert.doesNotMatch(openCodeComposer, /Codex permissions/);
 const manual = renderToStaticMarkup(<ManualComposer {...props} onMemory={() => {}} />);
 assert.match(manual, /Manual message composer/);
 assert.match(manual, /Open memory and references/, 'Manual retains its existing memory action');
+
+const { AssistantTurnProcess } = await import('@/components/manual/manual-chat-content');
+const processHtml = renderToStaticMarkup(
+  <AssistantTurnProcess
+    thinking={'\n  Inspecting architecture first.\nSecond line of reasoning.'}
+    thinkingTokens={1500}
+    tools={[
+      {
+        id: 'sub-1',
+        name: 'invoke_subagent',
+        summary: 'Research subagent',
+        status: 'running',
+        subagent: { role: 'Codebase Researcher', typeName: 'research', model: 'gemini-2.5-pro' },
+      },
+      {
+        id: 'tool-1',
+        name: 'read_file',
+        summary: 'Read planning-chat.tsx',
+        status: 'completed',
+      },
+      {
+        id: 'tool-2',
+        name: 'run_command',
+        summary: 'Run command npm test',
+        status: 'failed',
+      },
+      {
+        id: 'art-1',
+        name: 'write_file',
+        summary: 'Created plan',
+        status: 'completed',
+        artifact: {
+          path: 'plan.md',
+          title: 'Implementation Plan',
+          summary: 'Step-by-step rollout plan',
+          content: '# Plan\n\nDetails here.',
+        },
+      },
+    ]}
+  />
+);
+assert.match(processHtml, /Thought · 1\.5k tokens/);
+assert.match(processHtml, /Inspecting architecture first\./);
+assert.match(processHtml, /Second line of reasoning\./);
+assert.match(processHtml, /Codebase Researcher/);
+assert.match(processHtml, /research · gemini-2\.5-pro/);
+assert.match(processHtml, /aria-label="Running"/);
+assert.match(processHtml, /Read planning-chat\.tsx/);
+assert.match(processHtml, /Run command npm test/);
+assert.match(processHtml, /Implementation Plan/);
+assert.match(processHtml, /Step-by-step rollout plan/);
+assert.match(processHtml, /View document/);
+
+const manyToolsHtml = renderToStaticMarkup(
+  <AssistantTurnProcess
+    tools={[
+      { id: 't1', name: 'read_file', summary: 'Read a.ts', status: 'completed' },
+      { id: 't2', name: 'read_file', summary: 'Read b.ts', status: 'completed' },
+      { id: 't3', name: 'edit_file', summary: 'Edit c.ts', status: 'completed' },
+    ]}
+  />
+);
+assert.match(manyToolsHtml, /3 tool calls/);
+assert.match(manyToolsHtml, /Read a\.ts/);
+assert.match(manyToolsHtml, /Edit c\.ts/);
+
+const { ManualQuestionCard, buildAntigravityQuestionKeystrokes } = await import('@/components/manual/manual-question');
+const questionRequest = {
+  id: 'q-req-1',
+  questions: [
+    {
+      header: '',
+      question: 'Which framework should we use?',
+      options: [
+        { label: 'React', description: 'Component UI' },
+        { label: 'Vue' },
+      ],
+      multiple: false,
+      custom: true,
+    },
+    {
+      header: 'Targets',
+      question: 'Select target platforms',
+      options: [
+        { label: 'Windows' },
+        { label: 'macOS' },
+        { label: 'Linux' },
+      ],
+      multiple: true,
+      custom: true,
+    },
+  ],
+};
+const questionNoCodeHtml = renderToStaticMarkup(<ManualQuestionCard request={questionRequest} onReply={async () => {}} />);
+assert.match(questionNoCodeHtml, /Question 1\/2/);
+assert.match(questionNoCodeHtml, /Which framework should we use\?/);
+assert.match(questionNoCodeHtml, /Targets/);
+assert.match(questionNoCodeHtml, /Multiple choice · Select all that apply/);
+assert.match(questionNoCodeHtml, /placeholder="Write-in… \(or type your own answer\)"/);
+assert.match(questionNoCodeHtml, /aria-label="Custom answer for Which framework should we use\?"/);
+assert.match(questionNoCodeHtml, /Submit answers/);
+assert.doesNotMatch(questionNoCodeHtml, /Answer in Code/);
+
+const questionWithCodeHtml = renderToStaticMarkup(<ManualQuestionCard request={questionRequest} onReply={async () => {}} onOpenCode={() => {}} />);
+assert.match(questionWithCodeHtml, /Answer in Code/);
+
+assert.deepEqual(
+  buildAntigravityQuestionKeystrokes(
+    {
+      id: 'q-single-opt',
+      questions: [{ header: '', question: 'Pick one', options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }] }],
+    },
+    [['C']]
+  ),
+  ['\u001b[B\u001b[B\r']
+);
+
+assert.deepEqual(
+  buildAntigravityQuestionKeystrokes(
+    {
+      id: 'q-single-custom',
+      questions: [{ header: '', question: 'Pick one', options: [{ label: 'A' }, { label: 'B' }] }],
+    },
+    [['Custom\nline two']]
+  ),
+  ['\u001b[B\u001b[B\r', 'Custom line two\r']
+);
+
+assert.deepEqual(
+  buildAntigravityQuestionKeystrokes(
+    {
+      id: 'q-multi',
+      questions: [
+        {
+          header: '',
+          question: 'Pick many',
+          options: [{ label: 'First' }, { label: 'Second' }, { label: 'Third' }],
+          multiple: true,
+        },
+      ],
+    },
+    [['Third', 'First', 'Extra\nnote']]
+  ),
+  [' ', '\u001b[B\u001b[B ', '\u001b[B\r', 'Extra note\r', '\r']
+);
+
 console.log('Planning chat assertions passed: per-tab state/attachments, durable request identity, shared Manual composer/mentions/CLI controls and provider parity.');

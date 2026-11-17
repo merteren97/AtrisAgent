@@ -9,10 +9,55 @@ export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string; runtimeType: RuntimeType;
   reasoning?: string; model: string; accountProfileId: string; providerSessionId: string; cwd: string; createdAt: string;
   codexPermissionMode?: CodexPermissionMode;
+  autoName?: boolean;
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
-export interface ManualQuestion { id: string; questions: Array<{ header: string; question: string; options: Array<{ label: string; description?: string }>; multiple?: boolean; custom?: boolean }>; deliveryError?: string }
-export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean; question?: ManualQuestion }
+export interface ManualToolSubagent {
+  conversationId?: string;
+  role?: string;
+  typeName?: string;
+  model?: string;
+}
+export interface ManualToolArtifact {
+  path: string;
+  title: string;
+  summary?: string;
+  content?: string;
+  requestFeedback?: boolean;
+}
+export interface ManualToolItem {
+  id: string;
+  name: string;
+  summary: string;
+  detail?: string;
+  output?: string;
+  status: 'running' | 'completed' | 'failed';
+  subagent?: ManualToolSubagent;
+  artifact?: ManualToolArtifact;
+}
+export interface ManualQuestion {
+  id: string;
+  questions: Array<{
+    header: string;
+    question: string;
+    options: Array<{ label: string; description?: string }>;
+    multiple?: boolean;
+    custom?: boolean;
+  }>;
+  deliveryError?: string;
+}
+export interface ManualMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'tool';
+  text: string;
+  toolName?: string;
+  failed?: boolean;
+  question?: ManualQuestion;
+  thinking?: string;
+  thinkingTokens?: number;
+  tools?: ManualToolItem[];
+  model?: string;
+}
 export interface ManualNamingUpdate { conversationId: string; agentId: string; agentName?: string; conversationTitle?: string }
 export type ManualMode = 'choose' | 'manual' | 'orchestrator' | 'planning';
 interface ManualState {

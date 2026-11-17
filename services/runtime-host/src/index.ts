@@ -7,6 +7,13 @@ export type { SpawnAgentOptions } from './adapters/base-adapter';
 export { CodexAdapter } from './adapters/codex-adapter';
 export { ClaudeCodeAdapter } from './adapters/claude-code-adapter';
 export { AntigravityAdapter } from './adapters/antigravity-adapter';
+export {
+  parseAntigravityStreamLine,
+  unwrapAntigravityArg,
+  unwrapAntigravityArgsRecord,
+  type AntigravityParsedEvent,
+  type AntigravitySubagentInfo,
+} from './adapters/antigravity-stream';
 export { OpenCodeAdapter } from './adapters/opencode-adapter';
 export { AccountProfileManager } from './account-profile-manager';
 export { ModelCatalogService } from './model-catalog-service';
