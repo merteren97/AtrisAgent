@@ -136,6 +136,34 @@ test('live camera QR stream pairs desktop automatically', async ({ page, request
   await expect(page.getByText('Test Desktop')).toBeVisible({ timeout: 10000 });
 });
 
+test('closing and reopening mobile app preserves desktop pairing without re-scanning', async ({ context, page, request }) => {
+  await context.addInitScript(() => {
+    (window as any).__TAURI_INTERNALS__ = {
+      invoke: async (command: string, args?: { token?: string }) => {
+        if (command === 'load_mobile_token') return localStorage.getItem('__test_native_hub_token');
+        if (command === 'save_mobile_token') { localStorage.setItem('__test_native_hub_token', args?.token || ''); return; }
+        if (command === 'delete_mobile_token') { localStorage.removeItem('__test_native_hub_token'); return; }
+        throw new Error('Unexpected native call');
+      },
+    };
+  });
+  await context.route('https://atrishub.com/api/auth/me', route => {
+    const headers = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, OPTIONS', 'access-control-allow-headers': 'authorization' };
+    if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+    return route.fulfill({ json: { user: { username: 'tester', name: 'Test User' } }, headers });
+  });
+  const config = await pair(page, request);
+  await page.close();
+  await expect.poll(async () => {
+    const stats = await (await request.get(`http://127.0.0.1:4191/stats?id=${config.id}`)).json();
+    return stats.devices;
+  }).toEqual(expect.arrayContaining([expect.objectContaining({ approved: true })]));
+  const reopened = await context.newPage();
+  await reopened.goto('/');
+  await expect(reopened.getByText('Test Desktop')).toBeVisible({ timeout: 10000 });
+  await reopened.close();
+});
+
 test('uncertain delivery retains the draft', async ({ page, request }) => {
   await pair(page, request); await chat(page);
   await page.getByRole('textbox', { name: 'Message Builder' }).fill('uncertain');

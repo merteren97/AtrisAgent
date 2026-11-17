@@ -12,22 +12,62 @@ export interface Session { connected: boolean; pendingApproval?: boolean; deskto
 export interface Question { id: string; questions: Array<{ header: string; question: string; options: Array<{ label: string; description?: string }>; multiple?: boolean; custom?: boolean }> }
 export interface AgentControls { questions: Question[]; autoApprove?: { available: boolean; enabled: boolean }; permissions?: { available: boolean; mode?: string; runtimeId?: string; threadId?: string; revision?: number; applying?: boolean; reason?: string }; preferredMode: string | null; memory: { nodes: Array<{ id: string; title: string; summary: string }>; unavailable?: boolean } }
 export const relay = import.meta.env.VITE_ATRIS_RELAY_URL || 'wss://agent.atrishub.com/remote/v1/ws';
+const DEVICE_ID_KEY = 'atris.mobile.device-id.v1';
+const PAIRING_STORAGE_KEY = 'atris.mobile.desktop-pairing.v1';
 let paired = false;
+let reconnecting: Promise<Session> | null = null;
 const client = new RemoteClient(undefined, () => { paired = false; window.dispatchEvent(new Event('desktop-disconnected')); });
-export async function connectDesktop(code: string): Promise<void> {
-  if (!hubToken()) throw new Error('Sign in to AtrisHub first.');
-  const pairing = decodePairing(code.trim(), relay);
+function getDeviceId(): string {
+  try {
+    const existing = localStorage.getItem(DEVICE_ID_KEY);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    localStorage.setItem(DEVICE_ID_KEY, created);
+    return created;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+function readSavedPairing(): string | null {
+  try { return localStorage.getItem(PAIRING_STORAGE_KEY); } catch { return null; }
+}
+function writeSavedPairing(code: string): void {
+  try { localStorage.setItem(PAIRING_STORAGE_KEY, code); } catch { /* ignore */ }
+}
+function clearSavedPairing(): void {
+  try { localStorage.removeItem(PAIRING_STORAGE_KEY); } catch { /* ignore */ }
+}
+export function hasSavedPairing(): boolean { return Boolean(readSavedPairing()); }
+async function establishConnection(code: string, allowExpired: boolean): Promise<Session> {
+  const token = hubToken();
+  if (!token) throw new Error('Sign in to AtrisHub first.');
+  const trimmed = code.trim();
+  const pairing = decodePairing(trimmed, relay, allowExpired ? { allowExpired: true } : undefined);
   paired = false;
   try {
-    await client.connect(pairing, hubToken()!);
+    await client.connect(pairing, token, getDeviceId());
     const status = await client.request<Session>('session');
     if (!status.connected && !status.pendingApproval) throw new Error('Desktop could not verify this pairing.');
     paired = true;
+    writeSavedPairing(trimmed);
+    return status;
   } catch (cause) { client.close(); throw cause; }
 }
-export function disconnectDesktop(): void { paired = false; client.close(); }
+export async function connectDesktop(code: string): Promise<void> {
+  await establishConnection(code, false);
+}
+export function disconnectDesktop(): void { paired = false; clearSavedPairing(); client.close(); }
+async function ensureSession(): Promise<Session> {
+  if (paired) return client.request<Session>('session');
+  const saved = readSavedPairing();
+  if (!saved || !hubToken()) return { connected: false };
+  if (!reconnecting) {
+    reconnecting = establishConnection(saved, true).finally(() => { reconnecting = null; });
+  }
+  return reconnecting;
+}
 export const api = {
-  session: () => paired ? client.request<Session>('session') : Promise.resolve<Session>({ connected: false }),
+  session: () => ensureSession(),
   workspaces: () => client.request<Workspace[]>('workspaces'),
   planDetail: (workspaceId: string, planId: string) => client.request<PlanDetail>('planDetail', { workspaceId, planId }),
   missionDetail: (workspaceId: string, missionId: string) => client.request<MissionDetail>('missionDetail', { workspaceId, missionId }),

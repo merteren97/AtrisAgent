@@ -31,11 +31,13 @@ export function createPairing(relay: string): Pairing {
   return { version: 1, relay: relayUrl(relay), hostId: crypto.randomUUID(), secret: toBase64(crypto.getRandomValues(new Uint8Array(32))), expiresAt: Date.now() + 10 * 60_000 };
 }
 export function encodePairing(pairing: Pairing): string { return `atrisagent:${toBase64(encoder.encode(JSON.stringify(pairing)))}`; }
-export function decodePairing(code: string, trustedRelay: string): Pairing {
+export function decodePairing(code: string, trustedRelay?: string, options?: { allowExpired?: boolean }): Pairing {
   if (code.length > 4096 || !code.startsWith('atrisagent:')) throw new Error('Paste an AtrisAgent pairing code from desktop settings.');
   const value = JSON.parse(decoder.decode(fromBase64(code.slice(11)))) as Pairing;
-  if (value.version !== 1 || typeof value.secret !== 'string' || fromBase64(value.secret).length !== 32 || !/^[0-9a-f-]{36}$/i.test(value.hostId) || !Number.isFinite(value.expiresAt) || value.expiresAt <= Date.now() || value.expiresAt > Date.now() + 11 * 60_000) throw new Error('Pairing code is invalid or expired. Create a new code on desktop.');
-  if (relayUrl(value.relay) !== relayUrl(trustedRelay)) throw new Error('Pairing code uses a different relay.');
+  const expired = !options?.allowExpired && (value.expiresAt <= Date.now() || value.expiresAt > Date.now() + 11 * 60_000);
+  if (value.version !== 1 || typeof value.secret !== 'string' || fromBase64(value.secret).length !== 32 || !/^[0-9a-f-]{36}$/i.test(value.hostId) || !Number.isFinite(value.expiresAt) || value.expiresAt <= 0 || expired) throw new Error('Pairing code is invalid or expired. Create a new code on desktop.');
+  const normalizedRelay = relayUrl(value.relay);
+  if (trustedRelay && normalizedRelay !== relayUrl(trustedRelay)) throw new Error('Pairing code uses a different relay.');
   return value;
 }
 
@@ -80,7 +82,7 @@ export class RemoteClient {
   private receive = Promise.resolve();
   private transmit = Promise.resolve();
   constructor(private readonly factory: SocketFactory = url => new WebSocket(url), private readonly onClose: () => void = () => {}) {}
-  async connect(pairing: Pairing, token: string): Promise<void> {
+  async connect(pairing: Pairing, token: string, deviceId?: string): Promise<void> {
     this.close();
     return new Promise((resolve, reject) => {
       const socket = this.factory(pairing.relay);
@@ -89,14 +91,14 @@ export class RemoteClient {
       let sessionId = '';
       const deviceNonce = toBase64(crypto.getRandomValues(new Uint8Array(32)));
       const timer = setTimeout(() => { reject(new Error('Connection timed out. Check the relay and desktop.')); if (this.socket === socket) this.close(); }, 15_000);
-      socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'auth', role: 'device', hostId: pairing.hostId, token })));
+      socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'auth', role: 'device', hostId: pairing.hostId, token, ...(deviceId ? { deviceId } : {}) })));
       socket.addEventListener('message', event => {
         this.receive = this.receive.then(async () => {
           if (this.socket !== socket) return;
           const message = JSON.parse(String(event.data));
           if (message.type === 'ready' && typeof message.sessionId === 'string' && !sessionId) {
             sessionId = message.sessionId;
-            socket.send(JSON.stringify({ type: 'hello', sessionId, deviceNonce }));
+            socket.send(JSON.stringify({ type: 'hello', sessionId, deviceNonce, ...(deviceId ? { deviceId } : {}) }));
           } else if (message.type === 'hello' && message.sessionId === sessionId && message.deviceNonce === deviceNonce && isNonce(message.hostNonce) && !ready) {
             this.channel = new EncryptedChannel(pairing.secret, sessionId, 'device', `${deviceNonce}:${message.hostNonce}`);
             ready = true; clearTimeout(timer); resolve();
@@ -131,12 +133,28 @@ export class RemoteClient {
   close(): void { const socket = this.socket; this.socket = undefined; this.channel = undefined; this.rejectPending(); socket?.close(); }
 }
 
-export interface DeviceConnection { id: string; username: string; approved: boolean }
+export interface DeviceConnection { id: string; username: string; approved: boolean; online?: boolean; deviceId?: string }
 export class RemoteHost {
   private socket?: SocketLike;
   private devices = new Map<string, { channel?: EncryptedChannel; info: DeviceConnection; verified: boolean; queue: Promise<void> }>();
   private transmit = Promise.resolve();
-  constructor(private readonly pairing: Pairing, private readonly handle: (method: string, params: Record<string, unknown>) => Promise<unknown>, private readonly changed: (devices: DeviceConnection[]) => void, private readonly factory: SocketFactory = url => new WebSocket(url), private readonly disconnected: () => void = () => {}) {}
+  constructor(private readonly pairing: Pairing, private readonly handle: (method: string, params: Record<string, unknown>) => Promise<unknown>, private readonly changed: (devices: DeviceConnection[]) => void, private readonly factory: SocketFactory = url => new WebSocket(url), private readonly disconnected: () => void = () => {}, initialApprovedDevices: DeviceConnection[] = []) {
+    for (const item of initialApprovedDevices) {
+      if (!item?.id || !item.approved) continue;
+      this.devices.set(item.id, { info: { id: item.id, username: String(item.username || '').slice(0, 80), approved: true, online: false, ...(item.deviceId ? { deviceId: item.deviceId } : {}) }, verified: true, queue: Promise.resolve() });
+    }
+  }
+  private findApprovedMatch(username: string, deviceId?: string): [string, { channel?: EncryptedChannel; info: DeviceConnection; verified: boolean; queue: Promise<void> }] | undefined {
+    if (deviceId) {
+      for (const entry of this.devices.entries()) {
+        if (entry[1].info.approved && entry[1].info.deviceId === deviceId) return entry;
+      }
+    }
+    for (const entry of this.devices.entries()) {
+      if (entry[1].info.approved && entry[1].info.online === false && entry[1].info.username === username) return entry;
+    }
+    return undefined;
+  }
   connect(token: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const socket = this.factory(this.pairing.relay); this.socket = socket;
@@ -148,15 +166,44 @@ export class RemoteHost {
           const message = JSON.parse(String(event.data));
           if (message.type === 'registered') { clearTimeout(timer); resolve(); }
           else if (message.type === 'device') {
-            if (Date.now() > this.pairing.expiresAt || this.devices.size >= 8) { this.disconnectDevice(message.sessionId); return; }
-            this.devices.set(message.sessionId, { info: { id: message.sessionId, username: String(message.username).slice(0, 80), approved: false }, verified: false, queue: Promise.resolve() });
+            const username = String(message.username).slice(0, 80);
+            const incomingDeviceId = typeof message.deviceId === 'string' && message.deviceId.length > 0 && message.deviceId.length <= 128 ? message.deviceId : undefined;
+            const matched = this.findApprovedMatch(username, incomingDeviceId);
+            if (!matched && (Date.now() > this.pairing.expiresAt || this.devices.size >= 8)) { this.disconnectDevice(message.sessionId); return; }
+            if (matched) {
+              const [oldKey, existing] = matched;
+              if (oldKey !== message.sessionId) this.devices.delete(oldKey);
+              const resolvedDeviceId = incomingDeviceId || existing.info.deviceId;
+              this.devices.set(message.sessionId, { info: { id: message.sessionId, username, approved: true, online: true, ...(resolvedDeviceId ? { deviceId: resolvedDeviceId } : {}) }, verified: false, queue: Promise.resolve() });
+            } else {
+              this.devices.set(message.sessionId, { info: { id: message.sessionId, username, approved: false, online: true, ...(incomingDeviceId ? { deviceId: incomingDeviceId } : {}) }, verified: false, queue: Promise.resolve() });
+            }
           } else if (message.type === 'hello') {
             const device = this.devices.get(message.sessionId);
             if (!device || device.channel || !isNonce(message.deviceNonce)) { this.disconnectDevice(message.sessionId); return; }
+            if (!device.info.approved && typeof message.deviceId === 'string' && message.deviceId.length > 0 && message.deviceId.length <= 128) {
+              const matched = this.findApprovedMatch(device.info.username, message.deviceId);
+              if (matched) {
+                const [oldKey, existing] = matched;
+                if (oldKey !== message.sessionId) this.devices.delete(oldKey);
+                device.info.approved = true;
+                device.info.deviceId = message.deviceId || existing.info.deviceId;
+              }
+            }
             const hostNonce = toBase64(crypto.getRandomValues(new Uint8Array(32)));
             device.channel = new EncryptedChannel(this.pairing.secret, message.sessionId, 'host', `${message.deviceNonce}:${hostNonce}`);
             socket.send(JSON.stringify({ type: 'hello', sessionId: message.sessionId, deviceNonce: message.deviceNonce, hostNonce }));
-          } else if (message.type === 'left') { this.devices.delete(message.sessionId); this.notify(); }
+          } else if (message.type === 'left') {
+            const device = this.devices.get(message.sessionId);
+            if (device?.info.approved) {
+              device.channel = undefined;
+              device.verified = true;
+              device.info = { ...device.info, online: false };
+            } else {
+              this.devices.delete(message.sessionId);
+            }
+            this.notify();
+          }
           else if (message.type === 'packet') {
             const device = this.devices.get(message.sessionId);
             if (!device?.channel) return;

@@ -10,10 +10,49 @@ import { useAccountStore } from '@/stores/account-store';
 import { isTauriRuntime } from './secure-storage';
 
 const defaultRelay = import.meta.env?.VITE_ATRIS_RELAY_URL || 'wss://agent.atrishub.com/remote/v1/ws';
+const STORAGE_KEY = 'atris.desktop.mobile-host.v1';
+interface PersistedMobileHost { hostId: string; secret: string; relay: string; approvedDevices: DeviceConnection[] }
 interface MobileHostState { status: 'disabled' | 'connecting' | 'online' | 'error'; code: string; error: string; devices: DeviceConnection[]; expiresAt: number }
 export const useMobileHost = create<MobileHostState>(() => ({ status: 'disabled', code: '', error: '', devices: [], expiresAt: 0 }));
 let host: RemoteHost | undefined;
 let generation = 0;
+
+function readPersistedHost(): PersistedMobileHost | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedMobileHost>;
+    if (!parsed || typeof parsed.hostId !== 'string' || !/^[0-9a-f-]{36}$/i.test(parsed.hostId) || typeof parsed.secret !== 'string' || !parsed.secret || typeof parsed.relay !== 'string' || !parsed.relay) return null;
+    const approvedDevices = Array.isArray(parsed.approvedDevices)
+      ? parsed.approvedDevices
+          .filter((d): d is DeviceConnection => Boolean(d && typeof d.id === 'string' && typeof d.username === 'string' && d.approved === true))
+          .map(d => ({ id: d.id, username: d.username, approved: true, online: false, ...(typeof d.deviceId === 'string' && d.deviceId ? { deviceId: d.deviceId } : {}) }))
+      : [];
+    return { hostId: parsed.hostId, secret: parsed.secret, relay: parsed.relay, approvedDevices };
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedHost(data: PersistedMobileHost): void {
+  if (typeof localStorage === 'undefined') return;
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch { /* ignore storage quota/privacy errors */ }
+}
+
+function syncApprovedDevices(devices: DeviceConnection[]): void {
+  const current = readPersistedHost();
+  if (!current) return;
+  const approvedDevices = devices
+    .filter(device => device.approved)
+    .map(device => ({ id: device.id, username: device.username, approved: true, online: false, ...(device.deviceId ? { deviceId: device.deviceId } : {}) }));
+  writePersistedHost({ ...current, approvedDevices });
+}
+
+function clearPersistedHost(): void {
+  if (typeof localStorage === 'undefined') return;
+  try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+}
 
 const commands = new RemoteAgentCommands(createRemoteAgentHost({
   conversations: workspaceId => apiRequest<ManualConversation[]>(`/manual/conversations?workspaceId=${encodeURIComponent(workspaceId)}`),
@@ -131,18 +170,36 @@ async function executeMobileRequest(method: string, params: Record<string, unkno
   throw new Error('Unsupported remote operation.');
 }
 
-export async function startMobileHost(token: string, relay = defaultRelay): Promise<void> {
+export async function startMobileHost(token: string, relay = defaultRelay, options?: { resetPairing?: boolean }): Promise<void> {
   if (!isTauriRuntime()) { useMobileHost.setState({ status: 'error', error: 'Mobile access requires the installed desktop app.' }); return; }
-  stopMobileHost(); const current = generation;
-  const pairing = createPairing(relay);
-  useMobileHost.setState({ status: 'connecting', error: '', expiresAt: pairing.expiresAt });
-  const next = new RemoteHost(pairing, handleMobileRequest, devices => { if (current === generation) useMobileHost.setState({ devices }); }, undefined, () => {
-    if (current === generation) useMobileHost.setState({ status: 'error', error: 'Relay disconnected. Enable mobile access again to reconnect.', code: '' });
-  });
+  disconnectMobileHost(); const current = generation;
+  const existing = options?.resetPairing ? null : readPersistedHost();
+  const base = existing && existing.relay === relay
+    ? { version: 1 as const, relay: existing.relay, hostId: existing.hostId, secret: existing.secret, expiresAt: Date.now() + 10 * 60_000 }
+    : createPairing(relay);
+  const initialApproved = existing && existing.relay === relay ? existing.approvedDevices : [];
+  writePersistedHost({ hostId: base.hostId, secret: base.secret, relay: base.relay, approvedDevices: initialApproved });
+  useMobileHost.setState({ status: 'connecting', error: '', devices: initialApproved, expiresAt: base.expiresAt });
+  const next = new RemoteHost(base, handleMobileRequest, devices => {
+    if (current !== generation || host !== next) return;
+    useMobileHost.setState({ devices });
+    if (useMobileHost.getState().status === 'online') syncApprovedDevices(devices);
+  }, undefined, () => {
+    if (current === generation && host === next) useMobileHost.setState({ status: 'error', error: 'Relay disconnected. Enable mobile access again to reconnect.', code: '' });
+  }, initialApproved);
   host = next;
-  try { await next.connect(token); if (current === generation) useMobileHost.setState({ status: 'online', code: encodePairing(pairing) }); }
-  catch (cause) { if (current === generation) { next.close(); useMobileHost.setState({ status: 'error', error: cause instanceof Error ? cause.message : 'Could not connect to relay.', code: '' }); } }
+  try { await next.connect(token); if (current === generation && host === next) useMobileHost.setState({ status: 'online', code: encodePairing(base) }); }
+  catch (cause) { if (current === generation && host === next) { host = undefined; next.close(); useMobileHost.setState({ status: 'error', error: cause instanceof Error ? cause.message : 'Could not connect to relay.', code: '', devices: initialApproved }); } }
+}
+export async function restoreMobileHost(token: string, relay = defaultRelay): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const existing = readPersistedHost();
+  if (!existing) return;
+  const status = useMobileHost.getState().status;
+  if (host && (status === 'online' || status === 'connecting')) return;
+  await startMobileHost(token, existing.relay || relay);
 }
 export function approveMobile(id: string): void { host?.approve(id); }
 export function revokeMobile(id: string): void { host?.disconnectDevice(id); }
-export function stopMobileHost(): void { generation++; host?.close(); host = undefined; useMobileHost.setState({ status: 'disabled', code: '', error: '', devices: [], expiresAt: 0 }); }
+export function disconnectMobileHost(): void { generation++; host?.close(); host = undefined; useMobileHost.setState({ status: 'disabled', code: '', error: '', devices: [], expiresAt: 0 }); }
+export function stopMobileHost(): void { clearPersistedHost(); disconnectMobileHost(); }

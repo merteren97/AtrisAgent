@@ -61,6 +61,24 @@ async function main() {
     assert.equal(closed, 0, 'Rejected model changes must not close a native session');
     await assert.rejects(handleMobileRequest('send', { ...command, agentId: 'missing' }), /no longer exists/);
     await assert.rejects(handleMobileRequest('arbitrary-command', { agentId: 'agent' }), /Unsupported/);
+
+    // Persisted desktop mobile host state survives disconnectMobileHost and is cleared by stopMobileHost.
+    const { disconnectMobileHost, restoreMobileHost, stopMobileHost, useMobileHost } = await import('./mobile-host');
+    const persisted = {
+      hostId: '11111111-1111-4111-8111-111111111111',
+      secret: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      relay: 'ws://127.0.0.1:4190/remote/v1/ws',
+      approvedDevices: [{ id: 'sess-1', username: 'owner', approved: true, online: false, deviceId: 'phone-1' }],
+    };
+    storage.setItem('atris.desktop.mobile-host.v1', JSON.stringify(persisted));
+    disconnectMobileHost();
+    assert.ok(storage.getItem('atris.desktop.mobile-host.v1'), 'disconnectMobileHost must preserve persisted pairing');
+    // restoreMobileHost attempts to connect to the relay; even if relay is offline, it restores initialApprovedDevices first.
+    await restoreMobileHost('owner-token');
+    assert.equal(useMobileHost.getState().devices.length, 1);
+    assert.equal(useMobileHost.getState().devices[0].deviceId, 'phone-1');
+    stopMobileHost();
+    assert.equal(storage.getItem('atris.desktop.mobile-host.v1'), null, 'stopMobileHost must clear persisted pairing');
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 }
 void main();
