@@ -91,8 +91,12 @@ export function App() {
     window.addEventListener('desktop-disconnected', offline);
     const resume = () => { if (!document.hidden) void refresh(); };
     document.addEventListener('visibilitychange', resume);
-    return () => { window.clearInterval(timer); window.removeEventListener('desktop-disconnected', offline); document.removeEventListener('visibilitychange', resume); };
+    window.addEventListener('online', resume);
+    return () => { window.clearInterval(timer); window.removeEventListener('desktop-disconnected', offline); document.removeEventListener('visibilitychange', resume); window.removeEventListener('online', resume); };
   }, [refresh]);
+  useEffect(() => {
+    if (account) void refresh();
+  }, [account, refresh]);
   useEffect(() => {
     if (!session.connected || screen !== 'chat' || !agentId) return;
     let active = true; let busy = false;

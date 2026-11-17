@@ -7,6 +7,10 @@ test('pairing rejects expired codes and unexpected relay addresses', () => {
   assert.deepEqual(decodePairing(encodePairing(pairing), pairing.relay), pairing);
   assert.throws(() => decodePairing(encodePairing(pairing), 'wss://other.example/remote/v1/ws'));
   assert.throws(() => decodePairing(encodePairing({ ...pairing, expiresAt: Date.now() - 1 }), pairing.relay));
+  const expired = { ...pairing, expiresAt: Date.now() - 60_000 };
+  assert.deepEqual(decodePairing(encodePairing(expired), pairing.relay, { allowExpired: true }), expired);
+  assert.deepEqual(decodePairing(encodePairing(expired), undefined, { allowExpired: true }), expired);
+  assert.throws(() => decodePairing(encodePairing(expired), 'wss://other.example/remote/v1/ws', { allowExpired: true }));
   assert.throws(() => createPairing('ws://public.example/remote/v1/ws'));
   assert.throws(() => createPairing('wss://user:password@public.example'));
 });

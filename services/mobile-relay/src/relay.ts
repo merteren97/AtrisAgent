@@ -59,8 +59,9 @@ export function createMobileRelay(options: { authorize?: (token: string) => Prom
           } else {
             const host = hosts.get(next.hostId);
             if (!host || host.identity.id !== identity.id) throw new Error('Desktop unavailable');
+            const deviceId = typeof message.deviceId === 'string' && message.deviceId.length > 0 && message.deviceId.length <= 128 ? message.deviceId : undefined;
             next.sessionId = randomUUID(); peers.set(socket, next); sessions.set(next.sessionId, next);
-            send(host.socket, { type: 'device', sessionId: next.sessionId, username: identity.username });
+            send(host.socket, { type: 'device', sessionId: next.sessionId, username: identity.username, ...(deviceId ? { deviceId } : {}) });
             send(socket, { type: 'ready', sessionId: next.sessionId });
           }
           clearTimeout(deadline);
@@ -77,7 +78,8 @@ export function createMobileRelay(options: { authorize?: (token: string) => Prom
             if (peer.sessionId !== message.sessionId) throw new Error('Session mismatch');
             const host = hosts.get(peer.hostId);
             if (!host) throw new Error('Desktop disconnected');
-            send(host.socket, { type: 'hello', sessionId: peer.sessionId, deviceNonce: message.deviceNonce });
+            const deviceId = typeof message.deviceId === 'string' && message.deviceId.length > 0 && message.deviceId.length <= 128 ? message.deviceId : undefined;
+            send(host.socket, { type: 'hello', sessionId: peer.sessionId, deviceNonce: message.deviceNonce, ...(deviceId ? { deviceId } : {}) });
           } else {
             const device = sessions.get(message.sessionId);
             if (!device || device.hostId !== peer.hostId) throw new Error('Session mismatch');

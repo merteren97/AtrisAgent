@@ -14,6 +14,12 @@ const server = http.createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1:4191');
     if (url.pathname === '/health') { res.end('{}'); return; }
     if (url.pathname === '/fixture') {
+      while (hosts.size >= 4) {
+        const oldest = hosts.entries().next().value;
+        if (!oldest) break;
+        oldest[1].host.close();
+        hosts.delete(oldest[0]);
+      }
       const pairing = createPairing('ws://127.0.0.1:4190/remote/v1/ws');
       const agent = { id: 'a1', conversationId: 'c1', name: 'Builder', runtime: 'opencode', model: 'GPT Terra', modelId: 'model-1', reasoning: 'high', status: 'idle' };
       const messages = [{ id: 'm1', role: 'assistant', text: 'Ready to continue the implementation.' }];
