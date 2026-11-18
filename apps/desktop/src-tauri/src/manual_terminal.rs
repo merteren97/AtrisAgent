@@ -462,27 +462,90 @@ fn prepare_tui_config(managed: &str, inherited: Option<&str>) -> Result<String, 
 pub async fn manual_project_image_preview(cwd: String, path: String) -> Result<Vec<u8>, String> {
     tauri::async_runtime::spawn_blocking(move || read_project_image(Path::new(&cwd), &path)).await.map_err(|e| e.to_string())?
 }
+fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    }
+}
+fn percent_decode_path(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16)) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).map_err(|_| "Invalid image path".into())
+}
 fn read_project_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> {
+    read_project_image_with_home(root, reference, user_home_dir().as_deref())
+}
+fn read_project_image_with_home(root: &Path, reference: &str, home_dir: Option<&Path>) -> Result<Vec<u8>, String> {
     if reference.is_empty() || reference.len() > 2048 || reference.chars().any(char::is_control) { return Err("Invalid image path".into()); }
-    let root = std::fs::canonicalize(root).map_err(|_| "Project is unavailable")?;
-    if !root.is_dir() { return Err("Project is unavailable".into()); }
     let clean = reference.trim();
-    let stripped = if clean.to_ascii_lowercase().starts_with("file:///") {
-        &clean[8..]
-    } else if clean.to_ascii_lowercase().starts_with("file://") {
-        &clean[7..]
+    let stripped = if clean.to_ascii_lowercase().starts_with("file://") {
+        let after_scheme = &clean[7..];
+        #[cfg(windows)]
+        let normalized = {
+            let bytes = after_scheme.as_bytes();
+            if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+                &after_scheme[1..]
+            } else {
+                after_scheme
+            }
+        };
+        #[cfg(not(windows))]
+        let normalized = after_scheme;
+        percent_decode_path(normalized)?
     } else {
-        clean
+        clean.to_string()
     };
-    let supplied = Path::new(stripped);
-    let candidate = std::fs::canonicalize(if supplied.is_absolute() { supplied.to_path_buf() } else { root.join(supplied) })
-        .map_err(|_| "Image is unavailable")?;
-    let in_project = candidate.starts_with(&root);
+    if stripped.is_empty() || stripped.chars().any(char::is_control) { return Err("Invalid image path".into()); }
+    let supplied = Path::new(&stripped);
+    let canonical_root = if !root.as_os_str().is_empty() {
+        std::fs::canonicalize(root).ok().filter(|p| p.is_dir())
+    } else {
+        None
+    };
+    let candidate_input = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        let base = canonical_root.as_ref().ok_or("Project is unavailable")?;
+        base.join(supplied)
+    };
+    let candidate = std::fs::canonicalize(candidate_input).map_err(|_| "Image is unavailable")?;
+    let in_project = canonical_root.as_ref().map(|r| candidate.starts_with(r)).unwrap_or(false);
     let in_attachments = supplied.is_absolute() && {
         let attachments = std::env::temp_dir().join("atris-agent-attachments");
         std::fs::canonicalize(&attachments).map(|t| candidate.starts_with(t)).unwrap_or(false)
     };
-    if !in_project && !in_attachments { return Err("Image is outside this project".into()); }
+    let in_antigravity_brain = supplied.is_absolute() && home_dir.map(|h| {
+        [
+            h.join(".gemini").join("antigravity-cli").join("brain"),
+            h.join(".gemini").join("antigravity").join("brain"),
+        ]
+        .into_iter()
+        .filter_map(|d| std::fs::canonicalize(d).ok())
+        .any(|brain_root| candidate.starts_with(&brain_root))
+    }).unwrap_or(false);
+    if !in_project && !in_attachments && !in_antigravity_brain { return Err("Image is outside this project".into()); }
     let extension = candidate.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     if !["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.as_str()) { return Err("Not a supported image".into()); }
     let metadata = std::fs::metadata(&candidate).map_err(|_| "Image is unavailable")?;
@@ -788,6 +851,21 @@ mod tests {
         assert_eq!(read_project_image(&project, "AtrisAgent/photo.png").unwrap(), jpeg_named_png.to_vec());
         assert!(read_project_image(&project, "../private.png").is_err());
         assert!(read_project_image(&project, "not-image.png").is_err());
+        let fake_home = root.join("home");
+        let brain_session = fake_home.join(".gemini").join("antigravity-cli").join("brain").join("7fd73736-96f6-452d-b233-a1edbdd186fd");
+        std::fs::create_dir_all(&brain_session).unwrap();
+        let brain_img = brain_session.join("walkthrough-slide.png");
+        std::fs::write(&brain_img, image).unwrap();
+        assert_eq!(read_project_image_with_home(&project, brain_img.to_str().unwrap(), Some(&fake_home)).unwrap(), image.to_vec());
+        assert_eq!(read_project_image_with_home(Path::new(""), brain_img.to_str().unwrap(), Some(&fake_home)).unwrap(), image.to_vec());
+        assert!(read_project_image_with_home(&project, brain_session.join("../../../../private.png").to_str().unwrap(), Some(&fake_home)).is_err());
+        let agy_brain_session = fake_home.join(".gemini").join("antigravity").join("brain").join("8bd84847-1111-452d-b233-a1edbdd186fd");
+        std::fs::create_dir_all(&agy_brain_session).unwrap();
+        let agy_brain_img = agy_brain_session.join("diagram.png");
+        std::fs::write(&agy_brain_img, image).unwrap();
+        assert_eq!(read_project_image_with_home(&project, agy_brain_img.to_str().unwrap(), Some(&fake_home)).unwrap(), image.to_vec());
+        assert_eq!(read_project_image_with_home(Path::new(""), agy_brain_img.to_str().unwrap(), Some(&fake_home)).unwrap(), image.to_vec());
+        assert!(read_project_image_with_home(&project, agy_brain_session.join("../../../../private.png").to_str().unwrap(), Some(&fake_home)).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

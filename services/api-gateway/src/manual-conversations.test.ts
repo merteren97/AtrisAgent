@@ -9,6 +9,7 @@ import express from 'express';
 import type { AddressInfo } from 'node:net';
 import type { RuntimeHost, runCommand } from '@atris-agent-code/runtime-host';
 import { ManualConversationStore, installManualConversations, parseManualTranscript } from './manual-conversations';
+import { isLocalDataRequest } from './local-data-access';
 import { manualContentTitle } from './manual-titles';
 import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
 import { manualCoordination } from './manual-coordination';
@@ -388,5 +389,102 @@ try {
   assert.throws(() => store.agent(batchAgents[0].id));
   assert.equal(store.agent(agent.id).id,agent.id,'Deleting one conversation preserves other sessions');
   assert.equal((await fetch(`${base}/conversations/${group.id}`,{method:'DELETE'})).status,204,'Delete retry is idempotent');
+
+  // Local image preview allowlist + POST /api/manual/image-preview endpoint tests
+  assert.equal(isLocalDataRequest({ method: 'POST', originalUrl: '/api/manual/image-preview', headers: { 'x-atris-runtime-token': 'rt-test' } } as any, 'rt-test'), true);
+  assert.equal(isLocalDataRequest({ method: 'POST', originalUrl: '/api/manual/image-preview', headers: {} } as any, 'rt-test'), false);
+
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03]);
+  const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  const gifBytes = Buffer.from('GIF89a\x01\x00\x01\x00', 'binary');
+  const webpBytes = Buffer.from('RIFF\x10\x00\x00\x00WEBPVP8 ', 'binary');
+
+  const previewRoot = path.join(temporary, 'image-preview-suite');
+  const wsDir = path.join(previewRoot, 'standalone-ws');
+  const outsideDir = path.join(previewRoot, 'outside');
+  const monorepoDir = path.join(previewRoot, 'monorepo');
+  const subprojectDir = path.join(monorepoDir, 'subproject');
+  fs.mkdirSync(path.join(wsDir, 'assets'), { recursive: true });
+  fs.mkdirSync(outsideDir, { recursive: true });
+  fs.mkdirSync(path.join(monorepoDir, '.git'), { recursive: true });
+  fs.mkdirSync(subprojectDir, { recursive: true });
+  fs.writeFileSync(path.join(wsDir, 'assets', 'screen.png'), pngBytes);
+  fs.writeFileSync(path.join(wsDir, 'My Screen.jpg'), jpegBytes);
+  fs.writeFileSync(path.join(wsDir, 'not-image.png'), 'plain text');
+  fs.writeFileSync(path.join(wsDir, 'notes.txt'), 'secret');
+  fs.writeFileSync(path.join(outsideDir, 'secret.png'), pngBytes);
+  fs.writeFileSync(path.join(previewRoot, 'parent-secret.png'), pngBytes);
+  fs.writeFileSync(path.join(monorepoDir, 'architecture.webp'), webpBytes);
+  sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('ws-image-standalone', wsDir);
+  sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('ws-image-subproject', subprojectDir);
+
+  const relPreview = await post('/image-preview', { cwd: wsDir, path: 'assets/screen.png' });
+  assert.equal(relPreview.status, 200);
+  const relPayload = await relPreview.json();
+  assert.equal(relPayload.mimeType, 'image/png');
+  assert.deepEqual(Buffer.from(relPayload.dataBase64, 'base64'), pngBytes);
+
+  const fileUri = `file:///${path.join(wsDir, 'My%20Screen.jpg').replace(/\\/g, '/')}?v=1#frag`;
+  const uriPreview = await post('/image-preview', { cwd: '', path: fileUri });
+  assert.equal(uriPreview.status, 200);
+  assert.equal((await uriPreview.json()).mimeType, 'image/jpeg');
+
+  const parentRepoPreview = await post('/image-preview', { cwd: '', path: path.join(monorepoDir, 'architecture.webp') });
+  assert.equal(parentRepoPreview.status, 200);
+  assert.equal((await parentRepoPreview.json()).mimeType, 'image/webp');
+
+  const outsideRes = await post('/image-preview', { cwd: wsDir, path: path.join(outsideDir, 'secret.png') });
+  assert.equal(outsideRes.status, 403);
+  const traversalRes = await post('/image-preview', { cwd: wsDir, path: '../outside/secret.png' });
+  assert.equal(traversalRes.status, 403);
+  const badMagicRes = await post('/image-preview', { cwd: wsDir, path: 'not-image.png' });
+  assert.equal(badMagicRes.status, 400);
+  const badExtRes = await post('/image-preview', { cwd: wsDir, path: 'notes.txt' });
+  assert.equal(badExtRes.status, 400);
+  const missingRes = await post('/image-preview', { cwd: wsDir, path: 'missing.png' });
+  assert.equal(missingRes.status, 404);
+  const ctrlRes = await post('/image-preview', { cwd: wsDir, path: 'bad\u0000.png' });
+  assert.equal(ctrlRes.status, 400);
+
+  const attachmentSubdir = path.join(os.tmpdir(), 'atris-agent-attachments', `test-${randomUUID()}`);
+  fs.mkdirSync(attachmentSubdir, { recursive: true });
+  const fakeHome = path.join(previewRoot, 'fake-home');
+  const cliBrainDir = path.join(fakeHome, '.gemini', 'antigravity-cli', 'brain', 'sess-1');
+  const agyBrainDir = path.join(fakeHome, '.gemini', 'antigravity', 'brain', 'sess-2');
+  fs.mkdirSync(cliBrainDir, { recursive: true });
+  fs.mkdirSync(agyBrainDir, { recursive: true });
+  fs.writeFileSync(path.join(fakeHome, 'outside-brain.png'), pngBytes);
+  const cliBrainImg = path.join(cliBrainDir, 'walkthrough.png');
+  const agyBrainImg = path.join(agyBrainDir, 'diagram.gif');
+  const attachmentImg = path.join(attachmentSubdir, 'staged.png');
+  fs.writeFileSync(cliBrainImg, pngBytes);
+  fs.writeFileSync(agyBrainImg, gifBytes);
+  fs.writeFileSync(attachmentImg, pngBytes);
+
+  const prevHome = process.env.HOME;
+  const prevUserProfile = process.env.USERPROFILE;
+  process.env.HOME = fakeHome;
+  process.env.USERPROFILE = fakeHome;
+  try {
+    const cliBrainRes = await post('/image-preview', { cwd: '', path: cliBrainImg });
+    assert.equal(cliBrainRes.status, 200);
+    assert.equal((await cliBrainRes.json()).mimeType, 'image/png');
+
+    const agyBrainRes = await post('/image-preview', { cwd: '', path: agyBrainImg });
+    assert.equal(agyBrainRes.status, 200);
+    assert.equal((await agyBrainRes.json()).mimeType, 'image/gif');
+
+    const brainTraversalRes = await post('/image-preview', { cwd: '', path: path.join(agyBrainDir, '..', '..', '..', '..', 'outside-brain.png') });
+    assert.equal(brainTraversalRes.status, 403);
+
+    const attachmentRes = await post('/image-preview', { cwd: '', path: attachmentImg });
+    assert.equal(attachmentRes.status, 200);
+    assert.equal((await attachmentRes.json()).mimeType, 'image/png');
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;
+    fs.rmSync(attachmentSubdir, { recursive: true, force: true });
+  }
+
   console.log('Manual conversation persistence, isolation, idempotency, transcript and route tests passed.');
 } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }

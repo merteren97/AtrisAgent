@@ -40,6 +40,7 @@ export function isLocalDataRequest(req: Request, runtimeToken?: string): boolean
     ['GET', /^\/api\/missions\/[^/]+\/deletion$/],
     ['GET', /^\/api\/manual\/conversations$/],
     ['GET|PATCH|DELETE', /^\/api\/manual\/conversations\/[^/]+$/],
+    ['POST', /^\/api\/manual\/image-preview$/],
     ['DELETE', /^\/api\/manual\/agents\/[^/]+$/],
     ['GET', /^\/api\/activity\/summary$/],
     ['PUT', /^\/api\/activity\/meta$/],

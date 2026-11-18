@@ -278,6 +278,7 @@ async function runTests(): Promise<void> {
   assert.equal(planSummaries[0].conversationId, planConvId);
   assert.equal(planSummaries[0].status, 'complete');
   assert.equal(planSummaries[0].startedAt, isoAgo(180_000));
+  assert.equal(planSummaries[0].closedAt, null);
   assert.deepEqual(planningStore.listFiles('ws-1', plan.id), planFilesBefore);
 
   // Spin up Express app
@@ -447,6 +448,294 @@ async function runTests(): Promise<void> {
     assert.equal(isLocalDataRequest({ method: 'PATCH', originalUrl: '/api/missions/m-1', headers: tokenHeaders } as any, 'rt-test'), true);
     assert.equal(isLocalDataRequest({ method: 'PATCH', originalUrl: '/api/workspaces/ws-1', headers: tokenHeaders } as any, 'rt-test'), true);
     assert.equal(isLocalDataRequest({ method: 'PATCH', originalUrl: '/api/manual/conversations/c-1', headers: tokenHeaders } as any, 'rt-test'), true);
+
+    // 8. Closed planning conversations, stale failures, cleared meta, stale manual durations, and historical unreadCompletion
+    const HOUR_MS = 60 * 60 * 1000;
+    const DAY_MS = 24 * HOUR_MS;
+
+    // 8a. Closed planning chat: skipped unless pinned; pinned closed never shows attention/running
+    const closedUnpinnedId = '55555555-5555-4555-8555-555555555555';
+    const closedPinnedFailedId = '66666666-6666-4666-8666-666666666666';
+    await planningChat.createConversation('ws-1', plan.id, {
+      id: closedUnpinnedId,
+      title: 'Closed Unpinned Tab',
+      catalogId: 'codex-gpt5',
+    });
+    await planningChat.updateConversation('ws-1', plan.id, closedUnpinnedId, { closed: true });
+
+    await planningChat.createConversation('ws-1', plan.id, {
+      id: closedPinnedFailedId,
+      title: 'Closed Pinned Tab',
+      catalogId: 'codex-gpt5',
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'cp-start-1',
+      role: 'user',
+      text: 'Fail then close',
+      createdAt: isoAgo(10 * 60_000),
+      planningChat: { version: 1, kind: 'start', turnId: 'cpt-1', sessionId: 'cps-1', clientMessageId: 'cpm-1', catalogId: 'codex-gpt5', runtimeType: 'codex', model: 'gpt-5.4', conversationId: closedPinnedFailedId },
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'cp-fail-1',
+      role: 'system',
+      text: '',
+      createdAt: isoAgo(5 * 60_000),
+      planningChat: { version: 1, kind: 'state', turnId: 'cpt-1', status: 'failed', error: 'Timed out', conversationId: closedPinnedFailedId },
+    });
+    await planningChat.updateConversation('ws-1', plan.id, closedPinnedFailedId, { closed: true });
+
+    const closedSummaryList = planningChat.summarizePlanConversations('ws-1', plan.id);
+    assert.ok(closedSummaryList.find((c) => c.conversationId === closedUnpinnedId)?.closedAt);
+
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+    assert.equal(summary.items.find((i) => i.itemKey === `planning:ws-1:${plan.id}:${closedUnpinnedId}`), undefined);
+    assert.equal(summary.items.find((i) => i.itemKey === `planning:ws-1:${plan.id}:${closedPinnedFailedId}`), undefined);
+
+    const closedPinnedKey = `planning:ws-1:${plan.id}:${closedPinnedFailedId}`;
+    await fetch(`${baseUrl}/api/activity/meta`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemKey: closedPinnedKey, pinned: true }),
+    });
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+    const closedPinnedItem = summary.items.find((i) => i.itemKey === closedPinnedKey)!;
+    assert.ok(closedPinnedItem, 'pinned closed planning conversation appears in activity');
+    assert.equal(closedPinnedItem.state, 'failed');
+    assert.equal(closedPinnedItem.attention, null);
+    assert.equal(closedPinnedItem.activeCount, 0);
+
+    // 8b. Stale vs recent/seen failed items (Planning + Orchestrator) and PUT /api/activity/meta { cleared }
+    const recentFailPlanConvId = '77777777-7777-4777-8777-777777777777';
+    const staleFailPlanConvId = '88888888-8888-4888-8888-888888888888';
+    await planningChat.createConversation('ws-1', plan.id, {
+      id: recentFailPlanConvId,
+      title: 'Recent Failed Plan',
+      catalogId: 'codex-gpt5',
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'rf-start',
+      role: 'user',
+      text: 'Run turn',
+      createdAt: isoAgo(12 * 60_000),
+      planningChat: { version: 1, kind: 'start', turnId: 'rft-1', sessionId: 'rfs-1', clientMessageId: 'rfm-1', catalogId: 'codex-gpt5', runtimeType: 'codex', model: 'gpt-5.4', conversationId: recentFailPlanConvId },
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'rf-fail',
+      role: 'system',
+      text: '',
+      createdAt: isoAgo(10 * 60_000),
+      planningChat: { version: 1, kind: 'state', turnId: 'rft-1', status: 'failed', error: 'Rate limit exceeded', conversationId: recentFailPlanConvId },
+    });
+
+    await planningChat.createConversation('ws-1', plan.id, {
+      id: staleFailPlanConvId,
+      title: 'Stale Failed Plan',
+      catalogId: 'codex-gpt5',
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'sf-start',
+      role: 'user',
+      text: 'Old run',
+      createdAt: isoAgo(44 * HOUR_MS + 60_000),
+      planningChat: { version: 1, kind: 'start', turnId: 'sft-1', sessionId: 'sfs-1', clientMessageId: 'sfm-1', catalogId: 'codex-gpt5', runtimeType: 'codex', model: 'gpt-5.4', conversationId: staleFailPlanConvId },
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'sf-fail',
+      role: 'system',
+      text: '',
+      createdAt: isoAgo(44 * HOUR_MS),
+      planningChat: { version: 1, kind: 'state', turnId: 'sft-1', status: 'failed', error: 'Timed out 44h ago', conversationId: staleFailPlanConvId },
+    });
+
+    // Stale and recent failed orchestrator missions
+    sqlite.prepare('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'm-fail-recent', 'ws-1', 'Recent failed mission', '', 'failed', '', null, 'balanced', null, isoAgo(30 * 60_000), isoAgo(10 * 60_000), isoAgo(10 * 60_000),
+    );
+    sqlite.prepare('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'm-fail-stale', 'ws-1', 'Stale failed mission', '', 'failed', '', null, 'balanced', null, isoAgo(45 * HOUR_MS), isoAgo(44 * HOUR_MS), isoAgo(44 * HOUR_MS),
+    );
+
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+
+    const recentPlanKey = `planning:ws-1:${plan.id}:${recentFailPlanConvId}`;
+    const stalePlanKey = `planning:ws-1:${plan.id}:${staleFailPlanConvId}`;
+    const recentFailPlanItem = summary.items.find((i) => i.itemKey === recentPlanKey)!;
+    const staleFailPlanItem = summary.items.find((i) => i.itemKey === stalePlanKey)!;
+    const recentFailMissionItem = summary.items.find((i) => i.itemKey === 'orchestrator:m-fail-recent')!;
+    const staleFailMissionItem = summary.items.find((i) => i.itemKey === 'orchestrator:m-fail-stale')!;
+
+    assert.equal(recentFailPlanItem.state, 'attention', 'recent unseen failed plan shows in attention');
+    assert.equal(recentFailPlanItem.attention?.kind, 'error');
+    assert.equal(staleFailPlanItem.state, 'failed', '44h-old failed plan stays in history, not attention');
+    assert.equal(staleFailPlanItem.statusLabel, 'Failed');
+    assert.equal(staleFailPlanItem.attention, null);
+
+    assert.equal(recentFailMissionItem.state, 'attention', 'recent unseen failed mission shows in attention');
+    assert.equal(recentFailMissionItem.attention?.kind, 'error');
+    assert.equal(staleFailMissionItem.state, 'failed', '44h-old failed mission stays in history, not attention');
+    assert.equal(staleFailMissionItem.statusLabel, 'Failed');
+    assert.equal(staleFailMissionItem.attention, null);
+
+    // Marking recent failures as seen moves them from attention -> failed
+    await fetch(`${baseUrl}/api/activity/meta`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemKey: recentPlanKey, markSeen: true }),
+    });
+    await fetch(`${baseUrl}/api/activity/meta`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemKey: 'orchestrator:m-fail-recent', markSeen: true }),
+    });
+
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+    assert.equal(summary.items.find((i) => i.itemKey === recentPlanKey)?.state, 'failed');
+    assert.equal(summary.items.find((i) => i.itemKey === recentPlanKey)?.attention, null);
+    assert.equal(summary.items.find((i) => i.itemKey === 'orchestrator:m-fail-recent')?.state, 'failed');
+    assert.equal(summary.items.find((i) => i.itemKey === 'orchestrator:m-fail-recent')?.attention, null);
+
+    // Dismissing a single planning item via PUT /api/activity/meta { cleared: true } does NOT archive the plan
+    res = await fetch(`${baseUrl}/api/activity/meta`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemKey: stalePlanKey, cleared: 'bad' }),
+    });
+    assert.equal(res.status, 400);
+
+    res = await fetch(`${baseUrl}/api/activity/meta`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemKey: stalePlanKey, cleared: true }),
+    });
+    assert.equal(res.status, 200);
+    const metaClearBody = (await res.json()) as { clearedAt: string | null };
+    assert.ok(metaClearBody.clearedAt);
+
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+    assert.equal(summary.items.find((i) => i.itemKey === stalePlanKey), undefined);
+    assert.equal(planningStore.get('ws-1', plan.id).archivedAt, null);
+
+    // Un-clearing restores the item
+    res = await fetch(`${baseUrl}/api/activity/meta`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemKey: stalePlanKey, cleared: false }),
+    });
+    assert.equal(res.status, 200);
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+    assert.ok(summary.items.find((i) => i.itemKey === stalePlanKey));
+
+    // 8c. Bogus 239h manual duration & false unreadCompletion on 19-day-old historical sessions
+    const oldWorkingConvId = '99999999-9999-4999-8999-999999999999';
+    const oldWorkingAgentId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const oldProvSess1 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1';
+    const oldTranscript1 = path.join(claudeProjectDir, `${oldProvSess1}.jsonl`);
+    fs.writeFileSync(oldTranscript1, JSON.stringify({ sessionId: oldProvSess1, type: 'assistant', message: { content: [] } }) + '\n');
+    const oldSessDir = path.join(dataDir, 'manual-sessions', oldWorkingAgentId);
+    fs.mkdirSync(oldSessDir, { recursive: true });
+    fs.appendFileSync(
+      path.join(oldSessDir, 'bindings.jsonl'),
+      JSON.stringify({ sessionId: oldProvSess1, transcriptPath: oldTranscript1, event: 'UserPromptSubmit', at: isoAgo(10 * DAY_MS) }) + '\n',
+    );
+    manualStore.create('ws-1', '10d Old Dead Terminal', oldWorkingConvId);
+    manualStore.save({
+      id: oldWorkingAgentId,
+      conversationId: oldWorkingConvId,
+      name: 'Claude Old',
+      catalogId: 'claude-sonnet',
+      runtimeType: 'claude_code',
+      model: 'claude-sonnet-4-5',
+      accountProfileId: 'acc-claude',
+      providerSessionId: oldProvSess1,
+      cwd: wsOneDir,
+      configDir: claudeConfigDir,
+      sharedProfile: false,
+      createdAt: isoAgo(10 * DAY_MS),
+    });
+
+    // Historical 19d-old completed manual, orchestrator, and planning sessions without activity_item_meta
+    const oldDoneConvId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const oldDoneAgentId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const oldProvSess2 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2';
+    const oldTranscript2 = path.join(claudeProjectDir, `${oldProvSess2}.jsonl`);
+    fs.writeFileSync(oldTranscript2, JSON.stringify({ sessionId: oldProvSess2, type: 'assistant', message: { content: [] } }) + '\n');
+    const oldDoneSessDir = path.join(dataDir, 'manual-sessions', oldDoneAgentId);
+    fs.mkdirSync(oldDoneSessDir, { recursive: true });
+    fs.appendFileSync(
+      path.join(oldDoneSessDir, 'bindings.jsonl'),
+      JSON.stringify({ sessionId: oldProvSess2, transcriptPath: oldTranscript2, event: 'Stop', at: isoAgo(19 * DAY_MS) }) + '\n',
+    );
+    manualStore.create('ws-1', '19d Old Manual Done', oldDoneConvId);
+    manualStore.save({
+      id: oldDoneAgentId,
+      conversationId: oldDoneConvId,
+      name: 'Claude Old Done',
+      catalogId: 'claude-sonnet',
+      runtimeType: 'claude_code',
+      model: 'claude-sonnet-4-5',
+      accountProfileId: 'acc-claude',
+      providerSessionId: oldProvSess2,
+      cwd: wsOneDir,
+      configDir: claudeConfigDir,
+      sharedProfile: false,
+      createdAt: isoAgo(19 * DAY_MS),
+    });
+
+    sqlite.prepare('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'm-old-done', 'ws-1', '19d Old Mission Done', '', 'completed', '', null, 'balanced', null, isoAgo(19 * DAY_MS), isoAgo(19 * DAY_MS), isoAgo(19 * DAY_MS),
+    );
+
+    const oldPlanConvId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    await planningChat.createConversation('ws-1', plan.id, {
+      id: oldPlanConvId,
+      title: '19d Old Plan Done',
+      catalogId: 'codex-gpt5',
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'op-start',
+      role: 'user',
+      text: 'Old plan turn',
+      createdAt: isoAgo(19 * DAY_MS + 60_000),
+      planningChat: { version: 1, kind: 'start', turnId: 'opt-1', sessionId: 'ops-1', clientMessageId: 'opm-1', catalogId: 'codex-gpt5', runtimeType: 'codex', model: 'gpt-5.4', conversationId: oldPlanConvId },
+    });
+    planningStore.appendMessage('ws-1', plan.id, {
+      id: 'op-done',
+      role: 'system',
+      text: '',
+      createdAt: isoAgo(19 * DAY_MS),
+      planningChat: { version: 1, kind: 'state', turnId: 'opt-1', status: 'complete', activity: 'Complete', conversationId: oldPlanConvId },
+    });
+
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+
+    const oldWorkingItem = summary.items.find((i) => i.itemKey === `manual:${oldWorkingConvId}`)!;
+    assert.equal(oldWorkingItem.state, 'running');
+    assert.equal(oldWorkingItem.durationMs, null, '10d-old stale working manual session must not compute 239h durationMs');
+
+    // Transitioning a >12h active_started_at manual item to completed sets durationMs = null
+    fs.appendFileSync(
+      path.join(oldSessDir, 'bindings.jsonl'),
+      JSON.stringify({ sessionId: oldProvSess1, transcriptPath: oldTranscript1, event: 'Stop', at: isoAgo(1_000) }) + '\n',
+    );
+    res = await fetch(`${baseUrl}/api/activity/summary`);
+    summary = (await res.json()) as ActivitySummaryResponse;
+    const transitionedOldItem = summary.items.find((i) => i.itemKey === `manual:${oldWorkingConvId}`)!;
+    assert.equal(transitionedOldItem.state, 'completed');
+    assert.equal(transitionedOldItem.durationMs, null, '>12h wall-clock gap does not persist bogus durationMs');
+
+    // Historical 19d-old completed items must NOT have unreadCompletion = true
+    const oldDoneManualItem = summary.items.find((i) => i.itemKey === `manual:${oldDoneConvId}`)!;
+    assert.equal(oldDoneManualItem.state, 'completed');
+    assert.equal(oldDoneManualItem.unreadCompletion, false);
+    assert.equal(summary.items.find((i) => i.itemKey === 'orchestrator:m-old-done')?.unreadCompletion, false);
+    assert.equal(summary.items.find((i) => i.itemKey === `planning:ws-1:${plan.id}:${oldPlanConvId}`)?.unreadCompletion, false);
 
     console.log('Activity routes tests passed.');
   } finally {

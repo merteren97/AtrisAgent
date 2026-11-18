@@ -128,6 +128,8 @@ export function reconcileActivitySummary(
         activeCount: 0,
         attention: null,
         startedAt: null,
+        durationMs: item.completedAt ? item.durationMs : null,
+        unreadCompletion: false,
         statusLabel: nextState === 'completed' ? 'Completed' : anyOpen ? 'Ready' : 'Session closed',
       };
     }

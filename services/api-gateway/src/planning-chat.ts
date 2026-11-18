@@ -90,6 +90,7 @@ export interface PlanningConversationSummary {
   startedAt: string | null;
   updatedAt: string;
   createdAt: string;
+  closedAt: string | null;
   approvals: PlanningChatApproval[];
   questions: ManualQuestion[];
   pendingProposalsCount: number;
@@ -589,6 +590,7 @@ export class PlanningChatController {
         startedAt,
         updatedAt,
         createdAt,
+        closedAt: target.config?.closedAt ?? null,
         approvals: state.approvals || [],
         questions: activeTurn?.questions ?? state.questions ?? [],
         pendingProposalsCount: state.proposals.filter(item => item.status === 'pending').length,

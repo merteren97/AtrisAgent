@@ -19,12 +19,15 @@ import type { ActivitySummaryItem, ActivitySummaryResponse } from '@/lib/activit
 useRightDockStore.setState({ open: false, activeTab: 'activity', width: RIGHT_DOCK_DEFAULT_WIDTH, expanded: false });
 useBrowserStore.setState({ url: null, requestId: 0, expanded: false, width: RIGHT_DOCK_DEFAULT_WIDTH });
 
+assert.equal(RIGHT_DOCK_MIN_WIDTH, 260);
+assert.equal(RIGHT_DOCK_DEFAULT_WIDTH, 360);
 assert.equal(useRightDockStore.getState().open, false);
 assert.equal(useRightDockStore.getState().activeTab, 'activity');
-assert.equal(useRightDockStore.getState().width, 400);
+assert.equal(useRightDockStore.getState().width, 360);
 
 // Width clamping
 assert.equal(clampRightDockWidth(100), RIGHT_DOCK_MIN_WIDTH);
+assert.equal(clampRightDockWidth(260), 260);
 assert.equal(clampRightDockWidth(1400), RIGHT_DOCK_MAX_WIDTH);
 assert.equal(clampRightDockWidth(Number.NaN), RIGHT_DOCK_DEFAULT_WIDTH);
 useRightDockStore.getState().setWidth(520.6);
@@ -147,9 +150,46 @@ const reconciled = reconcileActivitySummary(
 assert.equal(reconciled.items[0]?.state, 'completed', 'closed terminal with durationMs downgrades working to completed');
 assert.equal(reconciled.items[0]?.manualAgents?.[0]?.rawState, 'completed');
 assert.equal(reconciled.items[0]?.activeCount, 0);
+assert.equal(reconciled.items[0]?.durationMs, null, 'downgraded running item without completedAt clears bogus durationMs');
+assert.equal(reconciled.items[0]?.unreadCompletion, false, 'downgraded dead session clears unreadCompletion');
 assert.equal(reconciled.items[1]?.state, 'idle', 'exited terminal without durationMs downgrades attention to idle');
 assert.equal(reconciled.items[1]?.attention, null);
+assert.equal(reconciled.items[1]?.durationMs, null);
+assert.equal(reconciled.items[1]?.unreadCompletion, false);
 assert.deepEqual(reconciled.counts, { attention: 0, running: 0, unreadCompleted: 0, total: 2 });
+
+const staleBogusRunning: ActivitySummaryItem = {
+  ...baseManualItem,
+  itemKey: 'manual:bogus-239h',
+  durationMs: 239 * 3_600_000,
+  completedAt: null,
+  unreadCompletion: true,
+  manualAgents: [{ ...baseManualItem.manualAgents![0], id: 'agent-bogus' }],
+};
+const completedWithTimestamp: ActivitySummaryItem = {
+  ...baseManualItem,
+  itemKey: 'manual:completed-at',
+  durationMs: 45_000,
+  completedAt: '2026-11-18T10:02:00.000Z',
+  unreadCompletion: true,
+  manualAgents: [{ ...baseManualItem.manualAgents![0], id: 'agent-done-ts' }],
+};
+const reconciledBogus = reconcileActivitySummary(
+  {
+    items: [staleBogusRunning, completedWithTimestamp],
+    counts: { attention: 0, running: 2, unreadCompleted: 0, total: 2 },
+    generatedAt: '2026-11-18T10:05:00.000Z',
+  },
+  {
+    'agent-bogus': { lifecycle: 'closed', state: 'unknown' },
+    'agent-done-ts': { lifecycle: 'closed', state: 'unknown' },
+  },
+  true,
+);
+assert.equal(reconciledBogus.items[0]?.durationMs, null);
+assert.equal(reconciledBogus.items[0]?.unreadCompletion, false);
+assert.equal(reconciledBogus.items[1]?.durationMs, 45_000, 'preserves durationMs when completedAt is already set');
+assert.equal(reconciledBogus.items[1]?.unreadCompletion, false);
 
 const keepLive = reconcileActivitySummary(
   summary,
