@@ -1,5 +1,7 @@
+import { useState } from 'react';
 import { ArrowRight, BookOpen, Bot, FileText, FolderGit2, MessageSquare, Plus, TerminalSquare, Workflow } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { CreateWorkspaceDialog } from '@/components/workspace/create-workspace-dialog';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useManualStore } from '@/stores/manual-store';
 import { useMissionStore } from '@/stores/mission-store';
@@ -8,6 +10,7 @@ import { useAccountStore } from '@/stores/account-store';
 import { usePlanningStore } from '@/stores/planning-store';
 
 export function ConversationChoice() {
+  const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
   const workspace = useWorkspaceStore(s => s.workspaces.find(w => w.id === s.activeWorkspaceId));
   const manualConversations = useManualStore(s => s.conversations);
@@ -31,7 +34,7 @@ export function ConversationChoice() {
           <h2 className="truncate text-2xl font-semibold tracking-tight">{workspace?.name || 'A place for your next idea'}</h2>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">Start a conversation. Keep your agents and their work in one place.</p>
         </div>
-        <Button variant="outline" size="sm" className="hidden shrink-0 sm:inline-flex" onClick={() => useSettingsStore.getState().setActiveView('projects')}><FolderGit2 className="mr-2 h-4 w-4" />Projects</Button>
+        <Button variant="outline" size="sm" className="hidden shrink-0 sm:inline-flex" onClick={() => useSettingsStore.setState({ sidebarCollapsed: false })}><FolderGit2 className="mr-2 h-4 w-4" />Workspaces</Button>
       </div>
 
        <div className="mb-4 flex items-center gap-2"><h3 className="text-sm font-semibold">Choose a workflow</h3><span className="text-xs text-muted-foreground">Same project, different levels of control</span></div>
@@ -58,7 +61,7 @@ export function ConversationChoice() {
          </button>
        </div>
 
-      {!workspace ? <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-4"><p className="text-sm text-muted-foreground">Open a project before starting your first conversation.</p><Button onClick={() => useSettingsStore.getState().setActiveView('projects')}><Plus className="mr-2 h-4 w-4" />Open a project</Button></div>
+      {!workspace ? <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-4"><p className="text-sm text-muted-foreground">Open a project before starting your first conversation.</p><Button onClick={() => setIsWorkspaceDialogOpen(true)}><Plus className="mr-2 h-4 w-4" />Open a project</Button></div>
         : availableModels === 0 && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border px-4 py-3"><p className="text-xs leading-5 text-muted-foreground">No available model in the current catalog. Connect a CLI account to get started.</p><Button size="sm" variant="outline" onClick={() => useSettingsStore.getState().setActiveView('accounts')}>Connect an account</Button></div>}
 
       <div className="mb-3 mt-8 flex items-center justify-between"><h3 className="text-sm font-semibold">Recent work</h3><span className="text-xs text-muted-foreground">{workspace ? 'In this project' : 'Your work stays organized here'}</span></div>
@@ -69,5 +72,6 @@ export function ConversationChoice() {
         </button>) : <div className="flex items-center gap-3 px-4 py-5"><MessageSquare className="h-5 w-5 shrink-0 text-muted-foreground" /><div><p className="text-sm font-medium">Ready when you are</p><p className="mt-1 text-xs text-muted-foreground">Your conversations will appear here once you start.</p></div></div>}
       </div>
     </div>
+    <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
   </section>;
 }

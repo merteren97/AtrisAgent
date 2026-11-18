@@ -4,7 +4,7 @@ import { AGENT_ROLES, type AgentRole } from '@atris-agent-code/domain';
 import { DEFAULT_TEAM_TEMPLATE_ID, normalizeStoredTeamTemplateId } from '@/lib/team-template-utils';
 import { normalizeColorPalette, type ColorPalette } from '@/lib/theme-palettes';
 
-export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'projects' | 'accounts' | 'integrations';
+export type AppView = 'chat' | 'dashboard' | 'settings' | 'agents' | 'accounts' | 'integrations';
 export type TrustMode = 'Review Driven' | 'Balanced' | 'Autonomous' | 'Candidate';
 export type InspectorTab = 'plan' | 'board' | 'agents' | 'context' | 'changes' | 'checks' | 'memory' | 'artifacts' | 'activity';
 export type CloseBehavior = 'quit' | 'tray';
@@ -149,11 +149,22 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: 'atris-settings-storage',
       version: 14,
+      merge: (persistedState, currentState) => {
+        const merged = { ...currentState, ...(persistedState as Partial<SettingsState>) };
+        const validViews: AppView[] = ['chat', 'dashboard', 'settings', 'agents', 'accounts', 'integrations'];
+        if (!validViews.includes(merged.activeView)) merged.activeView = 'chat';
+        return merged;
+      },
       migrate: (persistedState) => {
-        const state = (persistedState || {}) as Partial<SettingsState>;
+        const state = (persistedState || {}) as Partial<SettingsState> & { activeView?: string };
+        const validViews: AppView[] = ['chat', 'dashboard', 'settings', 'agents', 'accounts', 'integrations'];
+        const activeView: AppView = validViews.includes(state.activeView as AppView)
+          ? (state.activeView as AppView)
+          : 'chat';
         const validInspectorTabs: InspectorTab[] = ['plan', 'board', 'agents', 'context', 'changes', 'checks', 'memory', 'artifacts', 'activity'];
         return {
           ...state,
+          activeView,
           selectedModel: state.selectedModel?.includes(':') ? state.selectedModel : '',
           reasoningLevel: (state.reasoningLevel || 'medium').toLowerCase(),
           teamTemplate: normalizeStoredTeamTemplateId(state.teamTemplate),

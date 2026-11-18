@@ -229,8 +229,6 @@ interface MissionState {
   pauseMission: (id: string) => Promise<void>;
   stopMission: (id: string) => Promise<Mission>;
   retryMission: (id: string) => Promise<void>;
-  missionFilter: 'all' | 'active' | 'review' | 'blocked';
-  setMissionFilter: (filter: 'all' | 'active' | 'review' | 'blocked') => void;
   composerInput?: string;
   setComposerInput: (input: string) => void;
 }
@@ -933,12 +931,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   transportStatus: 'idle',
   transportError: null,
   pendingMissionStart: null,
-  missionFilter: 'all',
   composerInput: '',
 
   setComposerInput: (input) => set({ composerInput: input }),
   setTransportStatus: (transportStatus, transportError = null) => set({ transportStatus, transportError }),
-  setMissionFilter: (filter) => set({ missionFilter: filter }),
 
   fetchMissions: async (workspaceId) => {
     const requestId = ++missionListRequestId;

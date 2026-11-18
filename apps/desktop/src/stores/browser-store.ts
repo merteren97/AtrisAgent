@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { useRightDockStore } from '@/stores/right-dock-store';
 
 export function browserUrl(value: string): string | null {
   try {
@@ -13,16 +14,31 @@ interface BrowserState {
   requestId: number;
   expanded: boolean;
   width: number;
-  open: (url:string) => void;
+  open: (url: string) => void;
   close: () => void;
-  setExpanded: (expanded:boolean) => void;
-  setWidth: (width:number) => void;
+  setExpanded: (expanded: boolean) => void;
+  setWidth: (width: number) => void;
 }
 
 export const useBrowserStore = create<BrowserState>((set) => ({
-  url: null, requestId: 0, expanded: false, width: 480,
-  open: value => { const url = browserUrl(value); if (url) set(state => ({url,requestId:state.requestId+1})); },
-  close: () => set({url:null,expanded:false}),
-  setExpanded: expanded => set({expanded}),
-  setWidth: width => set({width:Math.max(320,Math.min(900,width))}),
+  url: null,
+  requestId: 0,
+  expanded: false,
+  width: useRightDockStore.getState().width,
+  open: (value) => {
+    const url = browserUrl(value);
+    if (!url) return;
+    set((state) => ({ url, requestId: state.requestId + 1 }));
+    useRightDockStore.getState().openBrowser();
+  },
+  close: () => set({ url: null, expanded: false }),
+  setExpanded: (expanded) => {
+    set({ expanded });
+    useRightDockStore.getState().setExpanded(expanded);
+  },
+  setWidth: (width) => {
+    const clamped = Math.max(340, Math.min(900, Math.round(width)));
+    set({ width: clamped });
+    useRightDockStore.getState().setWidth(clamped);
+  },
 }));

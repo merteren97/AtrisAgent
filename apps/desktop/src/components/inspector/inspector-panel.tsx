@@ -5,6 +5,7 @@ import { ClipboardList, Layers3, PanelRightOpen, Users, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { useSettingsStore, type InspectorTab } from '@/stores/settings-store';
+import { useRightDockStore } from '@/stores/right-dock-store';
 import { PlanTab } from './plan-tab';
 import { BoardTab } from './board-tab';
 import { AgentsTab } from './agents-tab';
@@ -23,13 +24,23 @@ const sections = [
 
 export function InspectorPanel() {
   const { inspectorCollapsed, inspectorTab, setInspectorTab } = useSettingsStore();
+  const dockOpen = useRightDockStore((state) => state.open);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const section = sections.find(item => item.views.some(view => view.id === inspectorTab)) || sections[0];
   const setOpen = (open: boolean) => useSettingsStore.setState({ inspectorCollapsed: !open, inspectorExpanded: open });
 
   return <DialogPrimitive.Root open={!inspectorCollapsed} onOpenChange={setOpen}>
     <DialogPrimitive.Trigger asChild>
-      <Button ref={triggerRef} variant="outline" size="icon" className="absolute right-0 top-1/2 z-10 h-12 w-8 -translate-y-1/2 rounded-l-lg rounded-r-none border-r-0 bg-card shadow-sm" aria-label="Open Mission Workbench">
+      <Button
+        ref={triggerRef}
+        variant="outline"
+        size="icon"
+        className={cn(
+          'absolute right-0 top-1/2 z-10 h-12 w-8 -translate-y-1/2 rounded-l-lg rounded-r-none border-r-0 bg-card shadow-sm',
+          dockOpen && 'hidden',
+        )}
+        aria-label="Open Mission Workbench"
+      >
         <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
       </Button>
     </DialogPrimitive.Trigger>

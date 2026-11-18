@@ -36,11 +36,16 @@ export function isLocalDataRequest(req: Request, runtimeToken?: string): boolean
     ['GET', /^\/api\/planning\/[^/]+\/plans\/[^/]+\/chat\/conversations(?:\/[^/]+)?$/],
     ['GET', /^\/api\/planning-source\/(manual|orchestrator)\/[^/]+$/],
     ['GET', /^\/api\/workspaces\/[^/]+\/plans\/[^/]+\/executions\/[^/]+$/],
-    ['GET|DELETE', /^\/api\/(workspaces|missions)\/[^/]+$/],
+    ['GET|PATCH|DELETE', /^\/api\/(workspaces|missions)\/[^/]+$/],
     ['GET', /^\/api\/missions\/[^/]+\/deletion$/],
     ['GET', /^\/api\/manual\/conversations$/],
-    ['GET|DELETE', /^\/api\/manual\/conversations\/[^/]+$/],
+    ['GET|PATCH|DELETE', /^\/api\/manual\/conversations\/[^/]+$/],
     ['DELETE', /^\/api\/manual\/agents\/[^/]+$/],
+    ['GET', /^\/api\/activity\/summary$/],
+    ['PUT', /^\/api\/activity\/meta$/],
+    ['PATCH', /^\/api\/activity\/rename$/],
+    ['POST', /^\/api\/activity\/clear-completed$/],
+    ['GET', /^\/api\/insights\/usage$/],
   ];
   return routes.some(([methods, pattern]) => methods.split('|').includes(method) && pattern.test(pathname));
 }

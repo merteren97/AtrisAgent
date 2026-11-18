@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
+import { redactSensitiveValue } from '@atris-agent-code/event-bus';
 import type { ManualAgent, ManualMessage, ManualQuestion } from './manual-conversations';
 import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 import { MANUAL_OPENCODE_TUI } from './manual-opencode-tui';
@@ -210,8 +211,91 @@ function codexIdentity(filename: string, id: string): boolean {
   } catch { return false; } finally { fs.closeSync(file); }
 }
 
+export interface ManualAgentActivitySummary {
+  state: 'ready' | 'working' | 'attention' | 'completed' | 'unknown';
+  at?: string;
+  attentionKind?: 'question' | 'approval' | 'error';
+  attentionPreview?: string;
+}
+
+export interface ManualAgentUsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  totalCostUsd: number | null;
+  turnCount: number;
+  durationMs: number;
+  usageAvailable: boolean;
+  lastRecordedAt: string | null;
+}
+
+const MAX_USAGE_CACHE_ENTRIES = 512;
+const usageSummaryCache = new Map<string, { signature: string; summary: ManualAgentUsageSummary }>();
+
+function setUsageCache(key: string, signature: string, summary: ManualAgentUsageSummary): void {
+  if (usageSummaryCache.has(key)) usageSummaryCache.delete(key);
+  usageSummaryCache.set(key, { signature, summary });
+  while (usageSummaryCache.size > MAX_USAGE_CACHE_ENTRIES) {
+    const oldest = usageSummaryCache.keys().next().value;
+    if (oldest === undefined) break;
+    usageSummaryCache.delete(oldest);
+  }
+}
+
+function nonNegInt(value: unknown): number {
+  const num = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN;
+  return Number.isFinite(num) && num > 0 ? Math.round(num) : 0;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 1e12 ? value : value > 1e9 ? value * 1000 : null;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function formatAttentionPreview(raw: unknown, fallback: string): string {
+  const text = typeof raw === 'string' && raw.trim() ? raw : fallback;
+  const cleaned = String(redactSensitiveValue(text)).replace(/\s+/g, ' ').trim();
+  const resolved = cleaned || fallback;
+  return resolved.length > 140 ? `${resolved.slice(0, 137)}...` : resolved;
+}
+
+function normalizeManualActivityState(value: unknown): ManualAgentActivitySummary['state'] {
+  return value === 'ready' || value === 'working' || value === 'attention' || value === 'completed'
+    ? value
+    : 'unknown';
+}
+
+function findClaudeTranscriptFile(agent: ManualAgent): string | null {
+  if (agent.runtimeType !== 'claude_code') return null;
+  const root = agent.sharedProfile ? process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude') : agent.configDir;
+  const projects = path.join(root, 'projects');
+  try {
+    for (const entry of fs.readdirSync(projects, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const candidate = path.join(projects, entry.name, `${agent.providerSessionId}.jsonl`);
+      if (fs.existsSync(candidate) && !fs.lstatSync(candidate).isSymbolicLink()) return candidate;
+    }
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  return null;
+}
+
+function readJsonlBounded(filename: string, maxFullBytes = 16 * 1024 * 1024): string {
+  const stat = fs.statSync(filename);
+  if (stat.size <= maxFullBytes) return fs.readFileSync(filename, 'utf8');
+  return readTail(filename, maxFullBytes).source;
+}
+
 export class ManualProviderBridge {
-  constructor(private dataDir: string) {}
+  constructor(private dataDir: string, private antigravityTranscriptRoot?: string) {}
   activity(agent: ManualAgent): { state: string; at?: string } {
     if (agent.runtimeType === 'opencode') {
       try {
@@ -427,5 +511,527 @@ export class ManualProviderBridge {
       return history.messages;
     });
     return {messages, truncated, bound:bindings.length > 0, loading};
+  }
+
+  agentActivitySummary(
+    agent: ManualAgent,
+    overrideActivity?: { state: string; at?: string },
+  ): ManualAgentActivitySummary {
+    const raw = overrideActivity ?? this.activity(agent);
+    const state = normalizeManualActivityState(raw?.state);
+    const at = typeof raw?.at === 'string' ? raw.at : undefined;
+    if (state !== 'attention') {
+      return { state, ...(at ? { at } : {}) };
+    }
+
+    if (agent.runtimeType === 'antigravity') {
+      let questionText: string | undefined;
+      try {
+        const readResult = new ManualAntigravityBridge(this.dataDir).read(agent);
+        questionText = readResult.questions[0]?.questions?.[0]?.question;
+      } catch {
+        // Best effort preview extraction.
+      }
+      return {
+        state,
+        ...(at ? { at } : {}),
+        attentionKind: 'question',
+        attentionPreview: formatAttentionPreview(questionText, 'Waiting for your response'),
+      };
+    }
+
+    if (agent.runtimeType === 'opencode') {
+      const questions = this.pendingQuestions(agent);
+      const questionText = questions[0]?.questions?.[0]?.question;
+      if (questionText) {
+        return {
+          state,
+          ...(at ? { at } : {}),
+          attentionKind: 'question',
+          attentionPreview: formatAttentionPreview(questionText, 'Waiting for your answer'),
+        };
+      }
+      let toolName: string | undefined;
+      try {
+        const history = this.openCodeHistory(agent);
+        const lastTool = [...history.messages].reverse().find((msg) => msg.role === 'tool' && msg.toolName);
+        if (lastTool?.toolName) toolName = `Permission requested: ${lastTool.toolName}`;
+      } catch {
+        // Ignore history parse errors for preview.
+      }
+      return {
+        state,
+        ...(at ? { at } : {}),
+        attentionKind: 'approval',
+        attentionPreview: formatAttentionPreview(toolName, 'Permission requested in OpenCode'),
+      };
+    }
+
+    if (agent.runtimeType === 'codex') {
+      let preview: string | undefined;
+      let attentionKind: 'question' | 'approval' = 'approval';
+      try {
+        const { messages } = this.read(agent);
+        const recent = [...messages].reverse();
+        const qMsg = recent.find((msg) => msg.question?.questions?.[0]?.question);
+        if (qMsg?.question?.questions?.[0]?.question) {
+          preview = qMsg.question.questions[0].question;
+          attentionKind = 'question';
+        } else {
+          const toolMsg = recent.find((msg) => msg.role === 'tool' && msg.toolName);
+          if (toolMsg?.toolName) {
+            preview = `Approval requested: ${toolMsg.toolName}`;
+          }
+        }
+      } catch {
+        // Best effort preview extraction.
+      }
+      return {
+        state,
+        ...(at ? { at } : {}),
+        attentionKind,
+        attentionPreview: formatAttentionPreview(preview, 'Approval required in Codex'),
+      };
+    }
+
+    if (agent.runtimeType === 'claude_code') {
+      let preview: string | undefined;
+      let attentionKind: 'question' | 'approval' = 'approval';
+      try {
+        const bindings = this.claudeBindings(agent);
+        const target = bindings.at(-1) || (() => {
+          const file = findClaudeTranscriptFile(agent);
+          return file ? { sessionId: agent.providerSessionId, transcriptPath: file } : undefined;
+        })();
+        if (target && fs.existsSync(target.transcriptPath)) {
+          const tail = readTail(target.transcriptPath, 128 * 1024).source;
+          const lines = tail.split('\n').reverse();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let item: any;
+            try { item = JSON.parse(line); } catch { continue; }
+            if (item.sessionId !== target.sessionId || item.isSidechain) continue;
+            const content = item.message?.content;
+            if (!Array.isArray(content)) continue;
+            for (const block of [...content].reverse()) {
+              if (block?.type === 'tool_use') {
+                if (block.name === 'AskUserQuestion' && Array.isArray(block.input?.questions) && typeof block.input.questions[0]?.question === 'string') {
+                  preview = block.input.questions[0].question;
+                  attentionKind = 'question';
+                } else if (typeof block.name === 'string' && block.name.trim()) {
+                  preview = `Permission requested: ${block.name}`;
+                  attentionKind = 'approval';
+                }
+                break;
+              }
+            }
+            if (preview) break;
+          }
+        }
+      } catch {
+        // Best effort preview extraction.
+      }
+      return {
+        state,
+        ...(at ? { at } : {}),
+        attentionKind,
+        attentionPreview: formatAttentionPreview(preview, 'Permission requested in Claude Code'),
+      };
+    }
+
+    return {
+      state,
+      ...(at ? { at } : {}),
+      attentionKind: 'approval',
+      attentionPreview: 'Needs attention',
+    };
+  }
+
+  agentUsageSummary(agent: ManualAgent): ManualAgentUsageSummary {
+    const empty: ManualAgentUsageSummary = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+      totalCostUsd: null,
+      turnCount: 0,
+      durationMs: 0,
+      usageAvailable: false,
+      lastRecordedAt: null,
+    };
+
+    try {
+      if (agent.runtimeType === 'claude_code') {
+        const bindings = this.claudeBindings(agent);
+        const targets = bindings.length
+          ? bindings
+          : (() => {
+              const file = findClaudeTranscriptFile(agent);
+              return file ? [{ sessionId: agent.providerSessionId, transcriptPath: file }] : [];
+            })();
+        if (!targets.length) return empty;
+
+        const fileSignatures: string[] = [];
+        const filesToRead = new Map<string, { sessionIds: Set<string>; mtimeMs: number }>();
+        for (const target of targets) {
+          try {
+            const stat = fs.statSync(target.transcriptPath);
+            if (!stat.isFile()) continue;
+            fileSignatures.push(`${target.transcriptPath}:${stat.mtimeMs}:${stat.size}:${target.sessionId}`);
+            let entry = filesToRead.get(target.transcriptPath);
+            if (!entry) {
+              entry = { sessionIds: new Set(), mtimeMs: stat.mtimeMs };
+              filesToRead.set(target.transcriptPath, entry);
+            }
+            entry.sessionIds.add(target.sessionId);
+          } catch {
+            // Skip missing transcript.
+          }
+        }
+        if (!filesToRead.size) return empty;
+
+        const cacheKey = `claude:${agent.id}`;
+        const signature = fileSignatures.sort().join('|');
+        const cached = usageSummaryCache.get(cacheKey);
+        if (cached && cached.signature === signature) return cached.summary;
+
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let cachedTokens = 0;
+        let costSum = 0;
+        let hasCost = false;
+        let hasUsage = false;
+        let turnCount = 0;
+        let minTs: number | null = null;
+        let maxTs: number | null = null;
+        let latestFileMtime = 0;
+
+        for (const [transcriptPath, info] of filesToRead.entries()) {
+          latestFileMtime = Math.max(latestFileMtime, info.mtimeMs);
+          const source = readJsonlBounded(transcriptPath);
+          const deduped = new Map<string, any>();
+          let anonSeq = 0;
+          for (const line of source.split('\n')) {
+            if (!line.trim()) continue;
+            let item: any;
+            try { item = JSON.parse(line); } catch { continue; }
+            if (!info.sessionIds.has(item.sessionId) || item.isSidechain) continue;
+            const ts = parseTimestampMs(item.timestamp);
+            if (ts !== null) {
+              minTs = minTs === null ? ts : Math.min(minTs, ts);
+              maxTs = maxTs === null ? ts : Math.max(maxTs, ts);
+            }
+            if (item.type !== 'assistant' && !item.message?.usage) continue;
+            const dedupeId = String(item.message?.id || item.uuid || `anon:${++anonSeq}`);
+            deduped.set(dedupeId, item);
+          }
+          for (const item of deduped.values()) {
+            turnCount += 1;
+            const usage = item.message?.usage || item.usage;
+            if (usage && typeof usage === 'object') {
+              inputTokens += nonNegInt(usage.input_tokens);
+              cachedTokens += nonNegInt(usage.cache_read_input_tokens) + nonNegInt(usage.cache_creation_input_tokens);
+              outputTokens += nonNegInt(usage.output_tokens);
+              hasUsage = true;
+            }
+            if (typeof item.costUSD === 'number' && Number.isFinite(item.costUSD) && item.costUSD >= 0) {
+              costSum += item.costUSD;
+              hasCost = true;
+            }
+          }
+        }
+
+        const summary: ManualAgentUsageSummary = {
+          inputTokens,
+          outputTokens,
+          cachedTokens,
+          reasoningTokens: 0,
+          totalCostUsd: hasCost ? costSum : null,
+          turnCount,
+          durationMs: minTs !== null && maxTs !== null ? Math.max(0, maxTs - minTs) : 0,
+          usageAvailable: hasUsage && (inputTokens > 0 || outputTokens > 0 || cachedTokens > 0),
+          lastRecordedAt: maxTs !== null
+            ? new Date(maxTs).toISOString()
+            : latestFileMtime > 0
+              ? new Date(latestFileMtime).toISOString()
+              : null,
+        };
+        setUsageCache(cacheKey, signature, summary);
+        return summary;
+      }
+
+      if (agent.runtimeType === 'codex') {
+        const bindings = this.codexBindings(agent);
+        if (!bindings.length) return empty;
+        const uniqueFiles = new Map<string, fs.Stats>();
+        const signatures: string[] = [];
+        for (const binding of bindings) {
+          if (uniqueFiles.has(binding.transcriptPath)) continue;
+          try {
+            const stat = fs.statSync(binding.transcriptPath);
+            if (!stat.isFile()) continue;
+            uniqueFiles.set(binding.transcriptPath, stat);
+            signatures.push(`${binding.transcriptPath}:${stat.mtimeMs}:${stat.size}`);
+          } catch {
+            // Skip missing rollout.
+          }
+        }
+        if (!uniqueFiles.size) return empty;
+
+        const cacheKey = `codex:${agent.id}`;
+        const signature = signatures.sort().join('|');
+        const cached = usageSummaryCache.get(cacheKey);
+        if (cached && cached.signature === signature) return cached.summary;
+
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let cachedTokens = 0;
+        let reasoningTokens = 0;
+        let turnCount = 0;
+        let hasTokenUsage = false;
+        let minTs: number | null = null;
+        let maxTs: number | null = null;
+        let latestFileMtime = 0;
+
+        for (const [rolloutPath, stat] of uniqueFiles.entries()) {
+          latestFileMtime = Math.max(latestFileMtime, stat.mtimeMs);
+          const source = readJsonlBounded(rolloutPath);
+          let latestUsage: Record<string, unknown> | null = null;
+          let taskCompletes = 0;
+          let assistantMsgs = 0;
+          for (const line of source.split('\n')) {
+            if (!line.trim()) continue;
+            let record: any;
+            try { record = JSON.parse(line); } catch { continue; }
+            const ts = parseTimestampMs(record.timestamp);
+            if (ts !== null) {
+              minTs = minTs === null ? ts : Math.min(minTs, ts);
+              maxTs = maxTs === null ? ts : Math.max(maxTs, ts);
+            }
+            if (record.type === 'event_msg' && record.payload && typeof record.payload === 'object') {
+              if (record.payload.type === 'token_count' && record.payload.info?.total_token_usage) {
+                latestUsage = record.payload.info.total_token_usage as Record<string, unknown>;
+              } else if (record.payload.type === 'task_complete') {
+                taskCompletes += 1;
+              } else if (
+                record.payload.type === 'agent_message'
+                || (record.payload.type === 'item_completed' && record.payload.item?.type === 'AgentMessage')
+              ) {
+                assistantMsgs += 1;
+              }
+            } else if (
+              record.type === 'response_item'
+              && record.payload?.type === 'message'
+              && record.payload?.role === 'assistant'
+            ) {
+              assistantMsgs += 1;
+            }
+          }
+          if (latestUsage) {
+            hasTokenUsage = true;
+            inputTokens += nonNegInt(latestUsage.input_tokens);
+            cachedTokens += nonNegInt(latestUsage.cached_input_tokens);
+            outputTokens += nonNegInt(latestUsage.output_tokens);
+            reasoningTokens += nonNegInt(latestUsage.reasoning_output_tokens);
+          }
+          turnCount += taskCompletes > 0 ? taskCompletes : assistantMsgs > 0 ? assistantMsgs : latestUsage ? 1 : 0;
+        }
+
+        const summary: ManualAgentUsageSummary = {
+          inputTokens,
+          outputTokens,
+          cachedTokens,
+          reasoningTokens,
+          totalCostUsd: null,
+          turnCount,
+          durationMs: minTs !== null && maxTs !== null ? Math.max(0, maxTs - minTs) : 0,
+          usageAvailable: hasTokenUsage && (inputTokens > 0 || outputTokens > 0 || cachedTokens > 0 || reasoningTokens > 0),
+          lastRecordedAt: maxTs !== null
+            ? new Date(maxTs).toISOString()
+            : latestFileMtime > 0
+              ? new Date(latestFileMtime).toISOString()
+              : null,
+        };
+        setUsageCache(cacheKey, signature, summary);
+        return summary;
+      }
+
+      if (agent.runtimeType === 'opencode') {
+        const history = this.openCodeHistory(agent);
+        const sessionId = history.sessionId;
+        if (!sessionId) return empty;
+
+        const candidates = [
+          ...(!agent.sharedProfile && agent.configDir
+            ? [
+                path.join(agent.configDir, 'data', 'opencode', 'storage', 'message', sessionId),
+                path.join(agent.configDir, 'opencode', 'storage', 'message', sessionId),
+              ]
+            : []),
+          path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'opencode', 'storage', 'message', sessionId),
+        ];
+        const msgDir = candidates.find((candidate) => {
+          try {
+            const stat = fs.lstatSync(candidate);
+            return stat.isDirectory() && !stat.isSymbolicLink();
+          } catch {
+            return false;
+          }
+        });
+
+        if (msgDir) {
+          const entries = fs.readdirSync(msgDir, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith('.json'))
+            .slice(0, 2000);
+          const fileStats: Array<{ file: string; mtimeMs: number; size: number }> = [];
+          for (const entry of entries) {
+            const file = path.join(msgDir, entry.name);
+            try {
+              const stat = fs.statSync(file);
+              fileStats.push({ file, mtimeMs: stat.mtimeMs, size: stat.size });
+            } catch {
+              // Ignore disappearing temp files.
+            }
+          }
+          if (fileStats.length) {
+            const cacheKey = `opencode:${agent.id}:${sessionId}`;
+            const signature = fileStats.map((f) => `${f.file}:${f.mtimeMs}:${f.size}`).sort().join('|');
+            const cached = usageSummaryCache.get(cacheKey);
+            if (cached && cached.signature === signature) return cached.summary;
+
+            let inputTokens = 0;
+            let outputTokens = 0;
+            let cachedTokens = 0;
+            let reasoningTokens = 0;
+            let costSum = 0;
+            let hasCost = false;
+            let hasTokens = false;
+            let turnCount = 0;
+            let minTs: number | null = null;
+            let maxTs: number | null = null;
+            let latestMtime = 0;
+
+            for (const { file, mtimeMs } of fileStats) {
+              latestMtime = Math.max(latestMtime, mtimeMs);
+              let msg: any;
+              try { msg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+              const created = parseTimestampMs(msg.time?.created ?? msg.createdAt);
+              const completed = parseTimestampMs(msg.time?.completed ?? msg.completedAt);
+              for (const ts of [created, completed]) {
+                if (ts !== null) {
+                  minTs = minTs === null ? ts : Math.min(minTs, ts);
+                  maxTs = maxTs === null ? ts : Math.max(maxTs, ts);
+                }
+              }
+              if (msg.role === 'assistant' || (msg.tokens && typeof msg.tokens === 'object')) {
+                turnCount += 1;
+                if (msg.tokens && typeof msg.tokens === 'object') {
+                  inputTokens += nonNegInt(msg.tokens.input);
+                  outputTokens += nonNegInt(msg.tokens.output);
+                  reasoningTokens += nonNegInt(msg.tokens.reasoning);
+                  cachedTokens += nonNegInt(msg.tokens.cache?.read) + nonNegInt(msg.tokens.cache?.write);
+                  hasTokens = true;
+                }
+                if (typeof msg.cost === 'number' && Number.isFinite(msg.cost) && msg.cost >= 0) {
+                  costSum += msg.cost;
+                  hasCost = true;
+                }
+              }
+            }
+
+            const summary: ManualAgentUsageSummary = {
+              inputTokens,
+              outputTokens,
+              cachedTokens,
+              reasoningTokens,
+              totalCostUsd: hasCost ? costSum : null,
+              turnCount,
+              durationMs: minTs !== null && maxTs !== null ? Math.max(0, maxTs - minTs) : 0,
+              usageAvailable: hasTokens && (inputTokens > 0 || outputTokens > 0 || cachedTokens > 0 || reasoningTokens > 0),
+              lastRecordedAt: maxTs !== null
+                ? new Date(maxTs).toISOString()
+                : latestMtime > 0
+                  ? new Date(latestMtime).toISOString()
+                  : null,
+            };
+            setUsageCache(cacheKey, signature, summary);
+            return summary;
+          }
+        }
+
+        const assistantTurns = history.messages.filter((msg) => msg.role === 'assistant').length;
+        const act = this.activity(agent);
+        let fallbackAt = act.at || null;
+        if (!fallbackAt) {
+          try {
+            const histPath = path.join(this.directory(agent), 'opencode-history.json');
+            fallbackAt = fs.statSync(histPath).mtime.toISOString();
+          } catch {
+            // No history file.
+          }
+        }
+        return {
+          ...empty,
+          turnCount: assistantTurns,
+          lastRecordedAt: fallbackAt,
+        };
+      }
+
+      if (agent.runtimeType === 'antigravity') {
+        const agBridge = new ManualAntigravityBridge(this.dataDir, this.antigravityTranscriptRoot);
+        const bindingFile = path.join(this.directory(agent), 'antigravity-binding.json');
+        let signaturePrefix = '';
+        try {
+          const bStat = fs.statSync(bindingFile);
+          const binding = JSON.parse(fs.readFileSync(bindingFile, 'utf8')) as { launchId?: string; sessionId?: string };
+          signaturePrefix = `${bStat.mtimeMs}:${bStat.size}`;
+          if (binding.sessionId) {
+            const agBase = this.antigravityTranscriptRoot || path.join(os.homedir(), '.gemini', 'antigravity-cli');
+            const agRoot = path.join(agBase, 'brain', binding.sessionId, '.system_generated', 'logs');
+            for (const name of ['transcript_full.jsonl', 'transcript.jsonl']) {
+              const candidate = path.join(agRoot, name);
+              try {
+                const tStat = fs.statSync(candidate);
+                signaturePrefix += `:${candidate}:${tStat.mtimeMs}:${tStat.size}`;
+                break;
+              } catch {
+                // Try next.
+              }
+            }
+          }
+        } catch {
+          // No binding file yet.
+        }
+        const cacheKey = `antigravity:${agent.id}`;
+        const cached = signaturePrefix ? usageSummaryCache.get(cacheKey) : undefined;
+        if (cached && cached.signature === signaturePrefix) return cached.summary;
+
+        const readResult = agBridge.read(agent);
+        if (!readResult.bound && readResult.messages.length === 0) return empty;
+        const assistantMessages = readResult.messages.filter((msg) => msg.role === 'assistant');
+        const reasoningTokens = assistantMessages.reduce(
+          (sum, msg) => sum + (typeof msg.thinkingTokens === 'number' && Number.isFinite(msg.thinkingTokens) ? Math.max(0, Math.round(msg.thinkingTokens)) : 0),
+          0,
+        );
+        const act = agBridge.activity(agent);
+        const summary: ManualAgentUsageSummary = {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedTokens: 0,
+          reasoningTokens,
+          totalCostUsd: null,
+          turnCount: assistantMessages.length,
+          durationMs: 0,
+          usageAvailable: reasoningTokens > 0,
+          lastRecordedAt: act.at || null,
+        };
+        if (signaturePrefix) setUsageCache(cacheKey, signaturePrefix, summary);
+        return summary;
+      }
+
+      return empty;
+    } catch {
+      return empty;
+    }
   }
 }

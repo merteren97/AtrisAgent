@@ -75,9 +75,9 @@ export function PlanTab() {
             <ListTodo className="h-6 w-6 text-muted-foreground" />
           </div>
           <div className="space-y-1">
-            <h3 className="text-sm font-medium">Plan bekleniyor</h3>
+            <h3 className="text-sm font-medium">Waiting for plan</h3>
             <p className="max-w-[220px] text-xs text-muted-foreground">
-              Görev incelenip plan hazırlandığında adımlar burada görünecektir.
+              Steps will appear here once the task is analyzed and the plan is ready.
             </p>
           </div>
         </div>

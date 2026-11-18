@@ -574,6 +574,8 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     missionTurns.add(activeTurn);
     this.activeSupervisorTurns.set(request.missionId, missionTurns);
 
+    const turnStartedAt = Date.now();
+    let outcome: 'completed' | 'failed' = 'failed';
     try {
       try {
         emitObservation({ type: 'process_started', model: route.model?.displayName || route.model?.runtimeModelId, phase: 'turn', agentProfileId: agentProfile.profile.id, agentProfileName: agentProfile.profile.name });
@@ -645,10 +647,49 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
         emitObservation({ type: 'process_failed', error: error instanceof Error ? error.message : String(error) });
         throw error;
       }
-      return await resultPromise;
+      const result = await resultPromise;
+      outcome = 'completed';
+      return result;
     } finally {
       unregisterQuestions();
       cleanup();
+      if (this.observationBus) {
+        const now = Date.now();
+        let usage: Awaited<ReturnType<BaseRuntimeAdapter['getUsage']>> = null;
+        try {
+          usage = await adapter.getUsage(sessionId);
+        } catch {
+          // Usage discovery is best effort; lifecycle telemetry remains durable.
+        }
+        const maxSessions = Math.max(1, this.config.maxConcurrentSessions || 1);
+        const attemptId = request.turnId || sessionId;
+        this.observationBus.emit({
+          id: `runtime-telemetry:${attemptId}`,
+          type: 'runtime_telemetry',
+          missionId: request.missionId,
+          taskId: 'supervisor',
+          agentInstanceId: 'supervisor',
+          adapterId: route.adapterId,
+          accountProfileId: route.profile?.id,
+          agentProfileId: agentProfile.profile.id,
+          profileId: agentProfile.profile.id,
+          profileName: agentProfile.profile.name,
+          profileSource: agentProfile.source,
+          attemptId,
+          outcome,
+          usageAvailable: usage !== null,
+          usageSource: usage ? 'provider_reported' : 'unavailable',
+          inputTokens: Math.max(0, Math.round(usage?.inputTokens || 0)),
+          outputTokens: Math.max(0, Math.round(usage?.outputTokens || 0)),
+          cost: usage?.totalCost == null ? null : Math.max(0, Number(usage.totalCost) || 0),
+          currency: usage?.currency || null,
+          queueWaitMs: 0,
+          durationMs: Math.max(0, now - turnStartedAt),
+          retryCount: 0,
+          workerUtilization: Math.min(1, 1 / maxSessions),
+          timestamp: new Date(now).toISOString(),
+        });
+      }
       const active = this.activeSupervisorTurns.get(request.missionId);
       active?.delete(activeTurn);
       if (active?.size === 0) this.activeSupervisorTurns.delete(request.missionId);

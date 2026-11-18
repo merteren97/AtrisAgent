@@ -1,5 +1,5 @@
 import { ReactNode } from 'react';
-import { LinkBrowser } from '@/components/browser/link-browser';
+import { RightDock } from '@/components/dock/RightDock';
 
 interface AppShellProps {
   titlebar: ReactNode;
@@ -16,7 +16,7 @@ export function AppShell({ titlebar, sidebar, main, inspector }: AppShellProps) 
         {sidebar}
         {main}
         {inspector}
-        <LinkBrowser />
+        <RightDock />
       </div>
     </div>
   );

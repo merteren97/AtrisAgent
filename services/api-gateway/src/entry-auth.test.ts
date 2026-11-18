@@ -134,6 +134,18 @@ async function runTests(): Promise<void> {
     response = await jsonRequest(issued.token, '/api/internal/control-plane/call');
     assert.equal(response.status, 401, 'revoked control-plane grants cannot be replayed');
     assert.equal(hubCalls.length, 1, 'revoked grants never call AtrisHub');
+
+    response = await fetch(`${baseUrl}/api/activity/summary`, {
+      headers: { 'X-Atris-Runtime-Token': 'entry-runtime-secret' },
+    });
+    assert.equal(response.status, 200, 'local-data activity summary route allows runtime-token access without Hub');
+    assert.equal(hubCalls.length, 1, 'activity summary never calls AtrisHub');
+
+    response = await fetch(`${baseUrl}/api/insights/usage?range=7d`, {
+      headers: { 'X-Atris-Runtime-Token': 'entry-runtime-secret' },
+    });
+    assert.equal(response.status, 200, 'local-data insights usage route allows runtime-token access without Hub');
+    assert.equal(hubCalls.length, 1, 'insights usage never calls AtrisHub');
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error: Error | undefined) => error ? reject(error) : resolve()));
     await new Promise<void>((resolve, reject) => hubServer.close((error: Error | undefined) => error ? reject(error) : resolve()));

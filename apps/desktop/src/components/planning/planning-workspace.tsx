@@ -13,7 +13,7 @@ import { useManualStore, type ManualAgent, type ManualConversation } from '@/sto
 import { useMissionStore } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useAccountStore } from '@/stores/account-store';
-import { useBrowserStore } from '@/stores/browser-store';
+import { useRightDockStore } from '@/stores/right-dock-store';
 import { useOrchestratorPreferencesStore } from '@/stores/orchestrator-preferences-store';
 import { planningChatKey, usePlanningChatStore } from '@/stores/planning-chat-store';
 import { documentKey, planApi, usePlanningStore, type DocumentVersion, type PlanningFile, type PlanningSource } from '@/stores/planning-store';
@@ -59,10 +59,10 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
   const models = useAccountStore(state => state.discoveredModels);
   const availableModels = models.filter(item => item.available && ['claude_code', 'codex', 'opencode', 'antigravity'].includes(item.runtimeType));
   const chosenModel = availableModels.find(item => item.catalogId === model) || availableModels[0];
-  const browserOpen = useBrowserStore(state => Boolean(state.url));
+  const dockOpen = useRightDockStore(state => state.open);
   const width = store.widths[workspaceId] || 440;
-  const narrow = availableWidth < 1120;
-  const showChat = store.chatHidden[workspaceId] === false && !(browserOpen && narrow);
+  const narrow = availableWidth < (dockOpen ? 1240 : 1120);
+  const showChat = store.chatHidden[workspaceId] === false && !(dockOpen && narrow);
   const overlayChat = narrow || chatExpanded;
   const maximumChatWidth = Math.max(320, Math.min(640, Math.floor(availableWidth - 466)));
   const effectiveChatWidth = Math.min(width, maximumChatWidth);
@@ -113,7 +113,7 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
     const conversationKey = planningChatKey(workspaceId, planId, chatStore.activeByPlan[key]);
     chatStore.setEditContext(conversationKey, instruction);
     store.setChatHidden(workspaceId, false);
-    if (browserOpen && narrow) useBrowserStore.getState().close();
+    if (dockOpen && narrow) useRightDockStore.getState().closeDock();
   };
   const openPlan = (id: string | null) => store.select(workspaceId, id);
   const create = () => { setTitle(''); store.setCreating(true); };
@@ -233,7 +233,7 @@ function PlanningWorkspaceContent({ workspaceId }: { workspaceId: string }) {
         {!overlayChat && <div role="separator" aria-label="Resize planning assistant" aria-orientation="vertical" aria-valuemin={320} aria-valuemax={maximumChatWidth} aria-valuenow={effectiveChatWidth} tabIndex={0} className="absolute inset-y-0 -left-1 z-20 w-2 cursor-col-resize touch-none hover:bg-primary/20 focus-visible:bg-primary/25 focus-visible:outline-none" onPointerDown={event => { drag.current = { x: event.clientX, width: effectiveChatWidth }; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={event => { if (drag.current) resizeChat(drag.current.width + drag.current.x - event.clientX); }} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }} onKeyDown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); resizeChat(effectiveChatWidth + (event.key === 'ArrowLeft' ? 20 : -20)); } }} />}
         <PlanningChat key={`${workspaceId}:${plan.id}`} workspaceId={workspaceId} planId={plan.id} onDocumentChange={openDocument} onClose={() => { store.setChatHidden(workspaceId, true); setChatExpanded(false); }} onExpand={() => setChatExpanded(value => !value)} expanded={chatExpanded} />
       </aside></>}
-      {!showChat && <Button variant="secondary" size="sm" className="absolute bottom-4 right-4 z-20 rounded-full border border-border shadow-sm" onClick={() => { if (browserOpen && narrow) useBrowserStore.getState().close(); store.setChatHidden(workspaceId, false); }}><MessageSquare className="mr-2 h-4 w-4" />Plan assistant</Button>}
+      {!showChat && <Button variant="secondary" size="sm" className="absolute bottom-4 right-4 z-20 rounded-full border border-border shadow-sm" onClick={() => { if (dockOpen && narrow) useRightDockStore.getState().closeDock(); store.setChatHidden(workspaceId, false); }}><MessageSquare className="mr-2 h-4 w-4" />Plan assistant</Button>}
     </div>}
     <Dialog open={filesOpen} onOpenChange={open => { setFilesOpen(open); if (!open) setSelectedAsset(null); }}><DialogContent className="flex max-h-[85vh] w-[calc(100vw-3rem)] max-w-2xl flex-col sm:max-w-2xl"><DialogHeader><DialogTitle>Files & research</DialogTitle><DialogDescription>Upload references, write research notes and preview media. Everything stays in this plan's folder.</DialogDescription></DialogHeader><div className="flex flex-wrap items-center gap-2"><Button size="sm" variant="outline" onClick={() => uploadInput.current?.click()}><Upload className="mr-1.5 h-3.5 w-3.5" />Add files</Button><Button size="sm" variant="outline" onClick={() => { setFilesOpen(false); setTitle(''); setDialog('note'); }}><FilePlus2 className="mr-1.5 h-3.5 w-3.5" />New research note</Button><span className="ml-auto text-xs tabular-nums text-muted-foreground">{files.length} {files.length === 1 ? 'file' : 'files'} · {research.length} {research.length === 1 ? 'note' : 'notes'}</span></div><div className="min-h-0 flex-1 overflow-y-auto" onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDrop={event => { if (event.dataTransfer.files.length) { event.preventDefault(); importFiles(Array.from(event.dataTransfer.files)); } }}>{files.map(file => <div key={file.path} className="flex min-w-0 items-center gap-3 border-b border-border/60 py-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted">{file.mimeType.startsWith('image/') ? <FileImage className="h-4 w-4 text-muted-foreground" /> : file.mimeType.startsWith('video/') ? <Film className="h-4 w-4 text-muted-foreground" /> : <FileText className="h-4 w-4 text-muted-foreground" />}</span><button className="min-w-0 flex-1 truncate text-left text-xs font-medium hover:text-primary" onClick={() => { if (/\.md$/i.test(file.path) && !file.path.startsWith('assets/')) { setFilesOpen(false); openDocument(file.path); } else setSelectedAsset(file.path); }}>{file.path}</button><span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{fileSize(file.byteSize)}</span>{file.path.startsWith('assets/') && <Button size="sm" variant="ghost" className="h-7 shrink-0 px-2 text-[10px]" disabled={pending} onClick={() => void insertAsset(file)}>Insert in document</Button>}</div>)}{!assets.length && <button onClick={() => uploadInput.current?.click()} className="mt-6 flex w-full flex-col items-center gap-2 rounded-xl border border-dashed border-border px-4 py-8 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"><Upload className="h-6 w-6" /><span>Images, videos, documents and Markdown notes</span></button>}{selectedAsset && <PlanningMedia key={selectedAsset} workspaceId={workspaceId} planId={plan?.id || ''} path={selectedAsset} />}</div></DialogContent></Dialog>
     {(error || store.errors[workspaceId] || notice) && <div role={error || store.errors[workspaceId] ? 'alert' : 'status'} className={`flex shrink-0 items-start justify-between gap-3 border-t border-border px-5 py-3 text-xs ${error || store.errors[workspaceId] ? 'bg-destructive/5 text-destructive' : 'bg-muted/30 text-muted-foreground'}`}><span>{error || store.errors[workspaceId] || notice}</span><button aria-label="Dismiss message" onClick={() => { setError(''); setNotice(''); if (store.errors[workspaceId]) void store.refresh(workspaceId); }}><X className="h-3.5 w-3.5" /></button></div>}
