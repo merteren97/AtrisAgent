@@ -62,6 +62,38 @@ export interface PlanningChatState {
 }
 export interface PlanningChatApproval { id: string; turnId: string; toolName?: string; description: string; path?: string; command?: string; status?: 'pending' | 'replying' | 'failed'; error?: string }
 export interface PlanningChatInput { id: string; text: string; catalogId: string; reasoning?: string; attachmentPaths?: string[] }
+export interface PlanningTurnTelemetry {
+  workspaceId: string;
+  planId: string;
+  conversationId: string;
+  turnId: string;
+  runtimeType: string;
+  model: string;
+  outcome: 'completed' | 'failed' | 'cancelled' | 'interrupted';
+  durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  totalCost: number | null;
+  currency: string;
+  usageAvailable: boolean;
+  recordedAt: string;
+}
+export interface PlanningConversationSummary {
+  conversationId: string;
+  title: string;
+  runtimeType: string;
+  model: string;
+  status: PlanningChatStatus;
+  activity?: string;
+  error?: string;
+  startedAt: string | null;
+  updatedAt: string;
+  createdAt: string;
+  approvals: PlanningChatApproval[];
+  questions: ManualQuestion[];
+  pendingProposalsCount: number;
+}
 export interface PlanningChatAdapter extends Pick<BaseRuntimeAdapter,
   'configureProfile' | 'probeCapabilities' | 'spawnAgent' | 'cancel' | 'shutdown'>, Partial<Pick<BaseRuntimeAdapter, 'respondToApproval'>> {}
 export interface PlanningChatOptions {
@@ -73,6 +105,7 @@ export interface PlanningChatOptions {
   maxDurationMs?: number;
   /** Internal scope for an independent conversation engine. */
   conversationId?: string;
+  onTurnTelemetry?: (entry: PlanningTurnTelemetry) => void;
 }
 
 const MAX_OUTPUT = 128_000;
@@ -84,6 +117,7 @@ const ROOT = '/api/planning/:workspaceId/plans/:planId/chat';
 type Journal = { kind: 'start' | 'delta' | 'thought' | 'tools' | 'answer' | 'state' | 'notice' | 'proposal'; turnId: string; [key: string]: unknown };
 interface ActiveTurn {
   turnId: string; sessionId: string; adapter?: PlanningChatAdapter; closed: boolean;
+  startedAt: string; startedAtMs: number; runtimeType?: string; model?: string;
   unsubscribe?: () => void; timer?: ReturnType<typeof setTimeout>; launchTimer?: ReturnType<typeof setTimeout>;
   run?: Promise<void>; promptPrepared?: boolean;
   conversation?: PlanningConversation;
@@ -398,13 +432,24 @@ export class PlanningChatController {
 
   private read(w: string, p: string): PlanningChatState {
     this.options.store.get(w, p);
+    return this.foldState(
+      this.records(w, p),
+      this.config(w, p),
+      this.active.get(this.key(w, p)),
+    );
+  }
+
+  private foldState(
+    records: PlanningChatRecord[],
+    config?: PlanningConversation,
+    activeTurn?: ActiveTurn,
+  ): PlanningChatState {
     const state: PlanningChatState = { messages: [], status: 'idle', turnId: null, revision: 0, proposals: [] };
-    const config = this.config(w, p);
     state.conversation = config && publicConversation(config);
-    state.approvals = [...(this.active.get(this.key(w, p))?.approvals?.values() || [])].filter(item => !item.delivered).map(item => ({ ...item.approval }));
+    state.approvals = [...(activeTurn?.approvals?.values() || [])].filter(item => !item.delivered).map(item => ({ ...item.approval }));
     const messages = new Map<string, PlanningChatMessage>();
     const proposals = new Map<string, PlanningChatProposal>();
-    for (const record of this.records(w, p)) {
+    for (const record of records) {
       const meta = record.planningChat as Journal & { version?: number } | undefined;
       if (meta?.version !== 1 || typeof meta.turnId !== 'string') {
         if (!meta) messages.set(record.id, { id: record.id, role: record.role, content: record.text, turnId: '', createdAt: record.createdAt });
@@ -486,6 +531,72 @@ export class PlanningChatController {
     return state;
   }
 
+  /** Non-mutating summary of all conversations for one plan, including 'default' if messages or active turn exist. */
+  summarizePlanConversations(w: string, p: string): PlanningConversationSummary[] {
+    if (this.closed) return [];
+    const entries = this.registry(w, p);
+    const allRecords = this.options.store.readMessages(w, p);
+    const byConversation = new Map<string, PlanningChatRecord[]>();
+    for (const record of allRecords) {
+      const convId = String(record.planningChat?.conversationId || 'default');
+      let list = byConversation.get(convId);
+      if (!list) {
+        list = [];
+        byConversation.set(convId, list);
+      }
+      list.push(record);
+    }
+
+    const targets: Array<{ id: string; config?: PlanningConversation }> = entries.map(item => ({ id: item.id, config: item }));
+    const defaultActive = this.active.get(this.key(w, p));
+    if (!entries.some(item => item.id === 'default') && (byConversation.has('default') || defaultActive)) {
+      targets.unshift({ id: 'default', config: undefined });
+    }
+
+    const summaries: PlanningConversationSummary[] = [];
+    for (const target of targets) {
+      const convId = target.id;
+      const records = byConversation.get(convId) || [];
+      const engine = convId === 'default' ? this : this.conversations.get(JSON.stringify([w, p, convId]));
+      const activeTurn = engine?.active.get(engine.key(w, p));
+      const state = this.foldState(records, target.config, activeTurn);
+      const starts = records.filter(record => record.planningChat?.kind === 'start');
+      const lastStart = starts.at(-1);
+      const status: PlanningChatStatus = !activeTurn && state.status === 'running' ? 'interrupted' : state.status;
+      const error = !activeTurn && state.status === 'running'
+        ? 'The gateway restarted before this turn finished.'
+        : state.error;
+      const activity = activeTurn?.pendingActivity ?? activeTurn?.lastActivity ?? state.activity;
+      const startedAt = activeTurn?.startedAt ?? (lastStart ? String(lastStart.createdAt) : null);
+      const createdAt = target.config?.createdAt || records[0]?.createdAt || activeTurn?.startedAt || new Date().toISOString();
+      const updatedAt = state.updatedAt || target.config?.updatedAt || createdAt;
+      const runtimeType = target.config?.runtimeType
+        || activeTurn?.runtimeType
+        || String(lastStart?.planningChat?.runtimeType || 'codex');
+      const model = target.config?.model
+        || activeTurn?.model
+        || String(lastStart?.planningChat?.model || '');
+      const title = target.config?.title || (convId === 'default' ? 'Planning chat' : 'New chat');
+
+      summaries.push({
+        conversationId: convId,
+        title,
+        runtimeType,
+        model,
+        status,
+        ...(activity ? { activity } : {}),
+        ...(error ? { error } : {}),
+        startedAt,
+        updatedAt,
+        createdAt,
+        approvals: state.approvals || [],
+        questions: activeTurn?.questions ?? state.questions ?? [],
+        pendingProposalsCount: state.proposals.filter(item => item.status === 'pending').length,
+      });
+    }
+    return summaries;
+  }
+
   get(w: string, p: string): PlanningChatState {
     if (this.closed) return fail('Planning chat is shutting down.', 503);
     const active = this.active.get(this.key(w, p));
@@ -540,7 +651,17 @@ export class PlanningChatController {
       const context = this.context(w, p);
       const turnId = randomUUID();
       const sessionId = `planning-${turnId}`;
-      const active: ActiveTurn = { turnId, sessionId, closed: false, conversation, approvals: new Map() };
+      const active: ActiveTurn = {
+        turnId,
+        sessionId,
+        closed: false,
+        startedAt: new Date().toISOString(),
+        startedAtMs: Date.now(),
+        runtimeType: profile.runtimeType,
+        model: descriptor.runtimeModelId,
+        conversation,
+        approvals: new Map(),
+      };
       let total = 0;
       const attachments = attachmentPaths.map(relative => {
         if (typeof relative !== 'string' || !relative.startsWith('assets/') || relative.length > 512 || relative.split('/').some(part => !part || part.startsWith('.') || /[\\:\x00-\x1f]/.test(part))) return fail('Attachments must be validated assets/ paths.');
@@ -675,7 +796,68 @@ export class PlanningChatController {
       this.flushStream(w, p, active);
       this.append(w, p, { kind: 'state', turnId: active.turnId, status, error, activity: status === 'complete' ? 'Complete' : status });
     } finally {
-      const cleanup = active.adapter ? this.track(this.cleanups, this.cleanup(active.adapter, active.sessionId)) : undefined;
+      const runTelemetryAndCleanup = async () => {
+        try {
+          if (this.options.onTurnTelemetry) {
+            let usage: { inputTokens?: number; outputTokens?: number; totalCost?: number | null; currency?: string } | null = null;
+            try {
+              const adapterWithUsage = active.adapter as (PlanningChatAdapter & { getUsage?: (sessionId: string) => Promise<typeof usage> }) | undefined;
+              if (typeof adapterWithUsage?.getUsage === 'function') {
+                usage = await adapterWithUsage.getUsage(active.sessionId);
+              }
+            } catch {
+              // Usage discovery is best effort.
+            }
+            let thinkingTokens = 0;
+            try {
+              const state = this.read(w, p);
+              for (const message of state.messages) {
+                if (message.turnId === active.turnId && message.role === 'assistant' && typeof message.thinkingTokens === 'number') {
+                  thinkingTokens += Math.max(0, Math.round(message.thinkingTokens));
+                }
+              }
+            } catch {
+              // Ignore state read failures during shutdown.
+            }
+            const inputTokens = Math.max(0, Math.round(usage?.inputTokens || 0));
+            const outputTokens = Math.max(0, Math.round(usage?.outputTokens || 0));
+            const usageAvailable = usage !== null || thinkingTokens > 0;
+            const outcome: PlanningTurnTelemetry['outcome'] = status === 'complete'
+              ? 'completed'
+              : status === 'cancelled'
+                ? 'cancelled'
+                : status === 'interrupted'
+                  ? 'interrupted'
+                  : 'failed';
+            this.options.onTurnTelemetry({
+              workspaceId: w,
+              planId: p,
+              conversationId: this.options.conversationId || 'default',
+              turnId: active.turnId,
+              runtimeType: active.runtimeType || active.conversation?.runtimeType || 'codex',
+              model: active.model || active.conversation?.model || '',
+              outcome,
+              durationMs: Math.max(0, Date.now() - active.startedAtMs),
+              inputTokens,
+              outputTokens,
+              reasoningTokens: thinkingTokens,
+              totalCost: usage?.totalCost == null ? null : Math.max(0, Number(usage.totalCost) || 0),
+              currency: usage?.currency || 'USD',
+              usageAvailable,
+              recordedAt: new Date().toISOString(),
+            });
+          }
+        } catch {
+          // Telemetry callbacks must never prevent adapter cleanup.
+        } finally {
+          if (active.adapter) {
+            await this.cleanup(active.adapter, active.sessionId);
+          }
+        }
+      };
+      const cleanup = (this.options.onTurnTelemetry || active.adapter)
+        ? this.track(this.cleanups, runTelemetryAndCleanup())
+        : undefined;
       // run may still be awaiting spawn after removal from active. Keep the input
       // pinned until that late session and the original cleanup have both settled.
       if (active.promptPrepared) this.track(this.cleanups, Promise.resolve().then(async () => {

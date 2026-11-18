@@ -65,6 +65,9 @@ import { installGithubConnectionRoutes } from './github-connection';
 import { installEditorMcpRoutes } from './editor-mcp-connections';
 import { installUnityCliRoutes } from './unity-cli-connection';
 import { installAutoSetupRoutes } from './integration-auto-setup';
+import { manualCoordination } from './manual-coordination';
+import { installActivityRoutes } from './activity-routes';
+import { installInsightsRoutes, recordPlanningTurnTelemetry } from './insights-routes';
 
 import path from 'path';
 import fs from 'fs';
@@ -542,7 +545,44 @@ installGithubConnectionRoutes(app);
 installAutoSetupRoutes(app, sqlite, gatewayDataPath.dataDir);
 export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
 installPlanningRoutes(app, planningStore, { fenced: planningFence, mediaAccess: planningMedia });
-export const planningChat = installPlanningChatRoutes(app, { store: planningStore, runtimeHost });
+export const planningChat = installPlanningChatRoutes(app, {
+  store: planningStore,
+  runtimeHost,
+  onTurnTelemetry: (entry) => {
+    let title = entry.planId;
+    try {
+      const plan = planningStore.get(entry.workspaceId, entry.planId);
+      const conv = entry.conversationId === 'default'
+        ? undefined
+        : planningStore.readConversations?.(entry.workspaceId, entry.planId).find((item) => item.id === entry.conversationId);
+      title = conv?.title && conv.title !== 'New chat' && conv.title !== 'Planning chat' ? conv.title : plan.title;
+    } catch {
+      // Fallback to planId when plan metadata is unavailable.
+    }
+    recordPlanningTurnTelemetry(sqlite, entry, title);
+  },
+});
+installActivityRoutes(app, {
+  sqlite,
+  manualConversationStore,
+  planningStore,
+  planningChat,
+  isDeletionFenced,
+  onManualConversationRemoved: (conversationId) => {
+    try {
+      const conv = manualConversationStore.conversation(conversationId);
+      for (const agent of manualConversationStore.list(conv.workspaceId).find((item) => item.id === conversationId)?.agents || []) {
+        manualCoordination.revoke(agent.id);
+      }
+    } catch {
+      // Best effort revocation.
+    }
+  },
+});
+installInsightsRoutes(app, {
+  sqlite,
+  manualConversationStore,
+});
 installPlanningHandoffRoutes(app, {
   store: planningStore, manualStore: manualConversationStore, runtimeHost, sqlite, fenced: planningFence,
   startOrchestrator: async ({ workspaceId, request, options, idempotencyKey }) => {

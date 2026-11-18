@@ -1,16 +1,55 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Activity,
+  BookOpen,
+  Bot,
+  File,
+  Folder,
+  Globe,
+  Plug,
+  Search,
+  Settings,
+  TerminalSquare,
+  Workflow,
+  type LucideIcon,
+} from 'lucide-react';
 import { Dialog, DialogContent } from '@/components/ui/dialog';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { navigateToActivityTarget } from '@/lib/activity-navigation';
+import type { ActivityMode } from '@/lib/activity-types';
+import { useActivityStore } from '@/stores/activity-store';
+import { useManualStore } from '@/stores/manual-store';
+import { useMissionStore } from '@/stores/mission-store';
+import { useRightDockStore } from '@/stores/right-dock-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
-import { useMissionStore } from '@/stores/mission-store';
-import { useManualStore } from '@/stores/manual-store';
-import { Search, FolderGit2, Activity, Settings, Bot, Folder, File, Plug } from 'lucide-react';
-import { ScrollArea } from '@/components/ui/scroll-area';
+
+interface PaletteItem {
+  id: string;
+  title: string;
+  subtitle?: string;
+  icon: LucideIcon;
+  type: string;
+  onSelect: () => void;
+}
+
+function modeIcon(mode: ActivityMode): LucideIcon {
+  if (mode === 'manual') return TerminalSquare;
+  if (mode === 'planning') return BookOpen;
+  return Workflow;
+}
+
+function modeLabel(mode: ActivityMode): string {
+  if (mode === 'manual') return 'Manual';
+  if (mode === 'planning') return 'Plan';
+  return 'Orchestrator';
+}
 
 export function CommandPalette() {
   const { commandPaletteOpen, setCommandPaletteOpen, setActiveView } = useSettingsStore();
   const { workspaces, setActiveWorkspace } = useWorkspaceStore();
-  const { missions, setActiveMission, setMissionFilter } = useMissionStore();
+  const { missions, setActiveMission } = useMissionStore();
+  const activityItems = useActivityStore((state) => state.items);
 
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -36,34 +75,69 @@ export function CommandPalette() {
     }
   }, [commandPaletteOpen]);
 
-  const items = [
-    // Views
-    ...[
-      { id: 'view-chat', title: 'Go to Chat', icon: Activity, type: 'View', onSelect: () => { setActiveView('chat'); setMissionFilter('active'); } },
-      { id: 'view-dashboard', title: 'Go to Command Center', icon: Activity, type: 'View', onSelect: () => setActiveView('dashboard') },
-      { id: 'view-projects', title: 'Go to Projects', icon: FolderGit2, type: 'View', onSelect: () => setActiveView('projects') },
+  const items = useMemo<PaletteItem[]>(() => {
+    const activityMissionIds = new Set(
+      activityItems
+        .filter((item) => item.mode === 'orchestrator' && item.target.missionId)
+        .map((item) => item.target.missionId!),
+    );
+
+    const staticItems: PaletteItem[] = [
+      { id: 'view-chat', title: 'Go to Chat', icon: Activity, type: 'View', onSelect: () => setActiveView('chat') },
+      { id: 'view-dashboard', title: 'Go to Insights', icon: Activity, type: 'View', onSelect: () => setActiveView('dashboard') },
       { id: 'view-agents', title: 'Go to Agents', icon: Bot, type: 'View', onSelect: () => setActiveView('agents') },
       { id: 'view-accounts', title: 'Go to Accounts & Models', icon: Settings, type: 'View', onSelect: () => setActiveView('accounts') },
       { id: 'view-integrations', title: 'Go to Integrations', icon: Plug, type: 'View', onSelect: () => setActiveView('integrations') },
       { id: 'view-settings', title: 'Go to Settings', icon: Settings, type: 'View', onSelect: () => setActiveView('settings') },
-    ],
-    // Workspaces
-    ...workspaces.map(ws => ({
+      { id: 'dock-activity', title: 'Toggle Activity', icon: Activity, type: 'Panel', onSelect: () => useRightDockStore.getState().toggleActivity() },
+      { id: 'dock-browser', title: 'Toggle Browser', icon: Globe, type: 'Panel', onSelect: () => useRightDockStore.getState().toggleBrowser() },
+    ];
+
+    const workspaceItems: PaletteItem[] = workspaces.map((ws) => ({
       id: `ws-${ws.id}`,
       title: `Switch to ${ws.name}`,
       icon: Folder,
       type: 'Workspace',
-       onSelect: () => { setActiveWorkspace(ws.id); useManualStore.getState().setMode('choose'); setActiveView('chat'); }
-    })),
-    // Missions
-    ...missions.map(m => ({
-      id: `mission-${m.id}`,
-      title: `Mission: ${m.title}`,
-      icon: File,
-      type: 'Mission',
-       onSelect: () => { setActiveWorkspace(m.workspaceId); useManualStore.getState().setMode('orchestrator'); setActiveMission(m.id); setActiveView('chat'); }
-    }))
-  ].filter(item => item.title.toLowerCase().includes(query.toLowerCase()));
+      onSelect: () => {
+        setActiveWorkspace(ws.id);
+        useManualStore.getState().setMode('choose');
+        setActiveView('chat');
+      },
+    }));
+
+    const unifiedActivityItems: PaletteItem[] = activityItems.map((item) => ({
+      id: `activity-${item.itemKey}`,
+      title: item.title,
+      subtitle: item.workspaceName,
+      icon: modeIcon(item.mode),
+      type: modeLabel(item.mode),
+      onSelect: () => { void navigateToActivityTarget(item.target); },
+    }));
+
+    const fallbackMissionItems: PaletteItem[] = missions
+      .filter((m) => !activityMissionIds.has(m.id))
+      .map((m) => ({
+        id: `mission-${m.id}`,
+        title: m.title,
+        icon: File,
+        type: 'Orchestrator',
+        onSelect: () => {
+          setActiveWorkspace(m.workspaceId);
+          useManualStore.getState().setMode('orchestrator');
+          setActiveMission(m.id);
+          setActiveView('chat');
+        },
+      }));
+
+    const lowered = query.trim().toLowerCase();
+    const all = [...staticItems, ...workspaceItems, ...unifiedActivityItems, ...fallbackMissionItems];
+    if (!lowered) return all;
+    return all.filter((item) => (
+      item.title.toLowerCase().includes(lowered)
+      || item.type.toLowerCase().includes(lowered)
+      || (item.subtitle && item.subtitle.toLowerCase().includes(lowered))
+    ));
+  }, [activityItems, missions, query, setActiveMission, setActiveView, setActiveWorkspace, workspaces]);
 
   useEffect(() => {
     setSelectedIndex(0);
@@ -124,9 +198,12 @@ export function CommandPalette() {
                       isSelected ? 'bg-accent text-accent-foreground' : 'text-foreground hover:bg-muted'
                     }`}
                   >
-                    <Icon className={`w-4 h-4 mr-3 ${isSelected ? 'text-primary' : 'text-muted-foreground'}`} />
-                    <span className="flex-1 text-left truncate">{item.title}</span>
-                    <span className="text-[10px] text-muted-foreground px-2 py-0.5 rounded-full bg-muted/50 border border-border/50">
+                    <Icon className={`w-4 h-4 mr-3 shrink-0 ${isSelected ? 'text-primary' : 'text-muted-foreground'}`} />
+                    <span className="flex-1 min-w-0 text-left truncate">
+                      {item.title}
+                      {item.subtitle ? <span className="ml-2 text-xs text-muted-foreground">{item.subtitle}</span> : null}
+                    </span>
+                    <span className="ml-2 shrink-0 text-[10px] text-muted-foreground px-2 py-0.5 rounded-full bg-muted/50 border border-border/50">
                       {item.type}
                     </span>
                   </button>

@@ -38,7 +38,6 @@ const SettingsView = lazy(() => import('@/components/settings/SettingsView').the
 const AccountsView = lazy(() => import('@/components/accounts/AccountsView').then((module) => ({ default: module.AccountsView })));
 const IntegrationsView = lazy(() => import('@/components/integrations/IntegrationsView').then((module) => ({ default: module.IntegrationsView })));
 const AgentsView = lazy(() => import('@/components/agents/AgentsView').then((module) => ({ default: module.AgentsView })));
-const ProjectsView = lazy(() => import('@/components/projects/ProjectsView').then((module) => ({ default: module.ProjectsView })));
 const DeveloperConsole = lazy(() => import('@/components/developer/DeveloperConsole').then((module) => ({ default: module.DeveloperConsole })));
 const ManualWorkspace = lazy(() => import('@/components/manual/manual-workspace').then(module => ({ default: module.ManualWorkspace })));
 const ConversationChoice = lazy(() => import('@/components/layout/workspace-home').then(module => ({ default: module.ConversationChoice })));
@@ -196,8 +195,6 @@ function WorkspaceApp() {
                   <IntegrationsView />
                ) : activeView === 'agents' ? (
                  <AgentsView />
-               ) : activeView === 'projects' ? (
-                 <ProjectsView />
                 ) : conversationMode === 'planning' ? (
                   <PlanningWorkspace />
                 ) : conversationMode === 'manual' ? (

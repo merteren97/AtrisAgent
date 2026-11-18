@@ -5,7 +5,13 @@ import path from 'node:path';
 import type Database from 'better-sqlite3';
 import type { Application, Request, Response } from 'express';
 import type { AntigravityAdapter, RuntimeHost } from '@atris-agent-code/runtime-host';
-import { ManualProviderBridge, readTail } from './manual-provider-bridge';
+import {
+  ManualProviderBridge,
+  readTail,
+  type ManualAgentActivitySummary,
+  type ManualAgentUsageSummary,
+} from './manual-provider-bridge';
+export type { ManualAgentActivitySummary, ManualAgentUsageSummary };
 import { ManualAntigravityBridge, type ManualToolArtifact, type ManualToolItem, type ManualToolSubagent } from './manual-antigravity-bridge';
 export type { ManualToolArtifact, ManualToolItem, ManualToolSubagent };
 import { manualContentTitle, manualProviderName } from './manual-titles';
@@ -102,6 +108,40 @@ export class ManualConversationStore {
   list(workspaceId: string): ManualConversation[] {
     const rows = this.sqlite.prepare('SELECT id, workspace_id AS workspaceId, title, created_at AS createdAt FROM manual_conversations WHERE workspace_id = ? ORDER BY created_at DESC').all(workspaceId) as Omit<ManualConversation, 'agents'>[];
     return rows.map(row => ({ ...row, agents: (this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE conversation_id = ? ORDER BY rowid').all(row.id) as {record: string}[]).map(a => JSON.parse(a.record)) }));
+  }
+  listAllConversations(workspaceId?: string): Array<ManualConversation & { workspaceName: string }> {
+    const sql = workspaceId
+      ? `SELECT mc.id, mc.workspace_id AS workspaceId, w.name AS workspaceName, mc.title, mc.created_at AS createdAt
+         FROM manual_conversations mc
+         JOIN workspaces w ON w.id = mc.workspace_id
+         WHERE mc.workspace_id = ?
+         ORDER BY mc.created_at DESC`
+      : `SELECT mc.id, mc.workspace_id AS workspaceId, w.name AS workspaceName, mc.title, mc.created_at AS createdAt
+         FROM manual_conversations mc
+         JOIN workspaces w ON w.id = mc.workspace_id
+         ORDER BY mc.created_at DESC`;
+    const rows = (workspaceId
+      ? this.sqlite.prepare(sql).all(workspaceId)
+      : this.sqlite.prepare(sql).all()) as Array<Omit<ManualConversation, 'agents'> & { workspaceName: string }>;
+    if (!rows.length) return [];
+    const agentsByConversation = new Map<string, ManualAgent[]>();
+    const agentRows = this.sqlite.prepare('SELECT conversation_id AS conversationId, record FROM manual_agent_sessions ORDER BY rowid').all() as Array<{ conversationId: string; record: string }>;
+    for (const row of agentRows) {
+      let list = agentsByConversation.get(row.conversationId);
+      if (!list) {
+        list = [];
+        agentsByConversation.set(row.conversationId, list);
+      }
+      list.push(JSON.parse(row.record) as ManualAgent);
+    }
+    return rows.map((row) => ({ ...row, agents: agentsByConversation.get(row.id) || [] }));
+  }
+  agentActivitySummary(agent: ManualAgent): ManualAgentActivitySummary {
+    const live = this.codexSessions.get(agent.id)?.activity();
+    return new ManualProviderBridge(this.dataDir).agentActivitySummary(agent, live);
+  }
+  agentUsageSummary(agent: ManualAgent): ManualAgentUsageSummary {
+    return new ManualProviderBridge(this.dataDir).agentUsageSummary(agent);
   }
   workspace(id: string): { id: string; path: string } {
     return this.sqlite.prepare('SELECT id, path FROM workspaces WHERE id = ?').get(id) as {id: string; path: string} || fail('Project not found.', 404);

@@ -14,7 +14,7 @@ import {
   PanelLeftOpen,
   KeyRound,
   UsersRound,
-  History,
+  Activity,
   BarChart2,
   Brain,
   Hammer,
@@ -39,12 +39,13 @@ import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { NavigationRowActions } from './navigation-row-actions';
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
-import { MissionHistoryDialog } from '../history/MissionHistoryDialog';
 import { ConversationDeleteDialog } from '../history/ConversationDeleteDialog';
 import { useWorkspaceStore } from '../../stores/workspace-store';
 import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
+import { useRightDockStore } from '@/stores/right-dock-store';
+import { useActivityStore } from '@/stores/activity-store';
 import { useManualStore } from '@/stores/manual-store';
 import { NavigationDeleteDialog, type NavigationDeleteTarget } from './navigation-delete-dialog';
 import { ConversationRenameDialog, type ConversationRenameTarget } from './conversation-rename-dialog';
@@ -63,6 +64,7 @@ interface SidebarItemProps {
   icon: ReactNode;
   label: string;
   badge?: ReactNode;
+  railBadge?: ReactNode;
   isActive?: boolean;
   expanded?: boolean;
   controls?: string;
@@ -70,7 +72,7 @@ interface SidebarItemProps {
   collapsed: boolean;
 }
 
-function SidebarItem({ icon, label, badge, isActive, expanded, controls, onClick, collapsed }: SidebarItemProps) {
+function SidebarItem({ icon, label, badge, railBadge, isActive, expanded, controls, onClick, collapsed }: SidebarItemProps) {
   const content = (
     <button
       type="button"
@@ -79,11 +81,12 @@ function SidebarItem({ icon, label, badge, isActive, expanded, controls, onClick
       aria-current={isActive ? 'page' : undefined}
       aria-expanded={expanded}
       aria-controls={controls}
-      className={`group flex min-h-9 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${isActive ? 'text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
+      className={`group relative flex min-h-9 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors ${isActive ? 'text-sidebar-foreground' : 'text-sidebar-muted hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'} ${collapsed ? 'justify-center' : ''}`}
     >
       {icon}
       {!collapsed && <span>{label}</span>}
       {!collapsed && badge}
+      {collapsed && railBadge}
     </button>
   );
 
@@ -201,10 +204,12 @@ export function Sidebar() {
   const { theme, resolvedTheme, setTheme } = useTheme();
   useManualActivityMonitor();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
-  const [isHistoryDialogOpen, setIsHistoryDialogOpen] = useState(false);
   const [navigationDelete, setNavigationDelete] = useState<NavigationDeleteTarget | null>(null);
   const [conversationRename, setConversationRename] = useState<ConversationRenameTarget | null>(null);
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
+  const dockOpen = useRightDockStore((state) => state.open);
+  const dockTab = useRightDockStore((state) => state.activeTab);
+  const activityCounts = useActivityStore((state) => state.counts);
   const newChatWorkspaceIntent = useRef<string | null>(null);
   const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
   const { missions, activeMissionId, fetchMissions, setActiveMission, clearActiveMission, setComposerInput } = useMissionStore();
@@ -364,9 +369,23 @@ export function Sidebar() {
           <SidebarItem collapsed icon={<Search className="h-4 w-4" />} label="Search conversations" onClick={() => setCommandPaletteOpen(true)} />
           <div className="my-1 border-t border-sidebar-border/70" />
           <SidebarItem collapsed icon={<House className="h-4 w-4" />} label="Home" isActive={activeView === 'chat' && manual.mode === 'choose'} onClick={() => { manual.setMode('choose'); setActiveView('chat'); }} />
-          <SidebarItem collapsed icon={<FolderGit2 className="h-4 w-4" />} label="Projects" isActive={activeView === 'projects'} onClick={() => setActiveView('projects')} />
           <SidebarItem collapsed icon={<PanelLeftOpen className="h-4 w-4" />} label="Workspaces" expanded={!sidebarCollapsed} controls="workspace-list-pane" onClick={toggleSidebar} />
-          <SidebarItem collapsed icon={<History className="h-4 w-4" />} label="History" onClick={() => setIsHistoryDialogOpen(true)} />
+          <SidebarItem
+            collapsed
+            icon={<Activity className="h-4 w-4" />}
+            label="Activity"
+            isActive={dockOpen && dockTab === 'activity'}
+            railBadge={
+              activityCounts.attention > 0 ? (
+                <span className="absolute right-1.5 top-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[9px] font-bold leading-none tabular-nums text-amber-950">
+                  {activityCounts.attention > 9 ? '9+' : activityCounts.attention}
+                </span>
+              ) : activityCounts.running > 0 ? (
+                <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-emerald-500 ring-2 ring-sidebar" />
+              ) : null
+            }
+            onClick={() => useRightDockStore.getState().toggleActivity()}
+          />
           <SidebarItem collapsed icon={<BarChart2 className="h-4 w-4" />} label="Insights" isActive={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
           <SidebarItem collapsed icon={<UsersRound className="h-4 w-4" />} label="Teams & specialists" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />
           <SidebarItem collapsed icon={<Plug className="h-4 w-4" />} label="Integrations" isActive={activeView === 'integrations'} onClick={() => setActiveView('integrations')} />
@@ -599,7 +618,6 @@ export function Sidebar() {
       {navigationDelete && <NavigationDeleteDialog target={navigationDelete} onClose={() => setNavigationDelete(null)}/>}
       {conversationRename && <ConversationRenameDialog key={`${conversationRename.kind}-${conversationRename.kind === 'manual' ? conversationRename.conversation.id : conversationRename.mission.id}`} target={conversationRename} onClose={() => setConversationRename(null)} />}
       <CreateWorkspaceDialog open={isWorkspaceDialogOpen} onOpenChange={setIsWorkspaceDialogOpen} />
-      <MissionHistoryDialog open={isHistoryDialogOpen} onOpenChange={setIsHistoryDialogOpen} />
       <ConversationDeleteDialog mission={dialogMission} onOpenChange={(open) => !open && setPendingDeleteMission(null)} onDeleted={handleConversationDeleted} />
     </aside>
   );
