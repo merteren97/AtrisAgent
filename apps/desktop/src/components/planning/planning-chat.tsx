@@ -5,6 +5,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { MarkdownContent } from '@/components/chat/markdown-content';
 import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
 import { ManualComposer, addManualFiles } from '@/components/manual/manual-composer';
+import { AssistantTurnProcess } from '@/components/manual/manual-chat-content';
+import { ManualQuestionCard } from '@/components/manual/manual-question';
 import { CodexPermissions } from '@/components/manual/codex-permissions';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
@@ -411,11 +413,12 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     observer.observe(content.current);
     return () => observer.disconnect();
   }, [following]);
-   const send = async (retry?: PlanningChatMessage) => {
-    if ((!retry && !canSend) || !chat || running || !model || actionBusy.current) return;
+   const send = async (retry?: PlanningChatMessage, overrideText?: string) => {
+    const trimmedOverride = overrideText?.trim();
+    if ((!retry && !trimmedOverride && !canSend) || !chat || running || !model || actionBusy.current) return;
     actionBusy.current = true; setBusy(true); setActionError(undefined);
-    const sentFiles = retry ? [] : [...files];
-    const text = retry?.content || preferences.draft.trim() || 'Review the attached files in the context of this plan.';
+    const sentFiles = retry || trimmedOverride ? [] : [...files];
+    const text = trimmedOverride || retry?.content || preferences.draft.trim() || 'Review the attached files in the context of this plan.';
     try {
       const store = usePlanningChatStore.getState();
       const recovered = !sentFiles.length ? store.plans[key]?.attempts.find(item => item.text === text && item.catalogId === model.catalogId && item.reasoning === reasoning && (!retry || JSON.stringify(item.attachmentPaths || []) === JSON.stringify(retry.attachmentPaths || []))) : undefined;
@@ -529,14 +532,16 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
         {chat?.messages.map(message => {
           const text = message.role === 'assistant' ? planningChatDisplayText(message.content) : message.content;
           const proposals = chat.proposals.filter(proposal => proposal.turnId === message.turnId);
+          const hasProcess = message.role === 'assistant' && Boolean(message.thinking?.trim() || message.tools?.length);
           return <article key={message.id} className="min-w-0 space-y-2">
             <p className="text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Assistant' : 'Activity'}{message.partial && running && message.turnId === chat.turnId ? ' · Writing' : ''}</p>
+            {hasProcess && <AssistantTurnProcess thinking={message.thinking} thinkingTokens={message.thinkingTokens} tools={message.tools} />}
             {text && (message.role === 'assistant' ? <div className="min-w-0 text-sm leading-relaxed [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
               <MarkdownContent content={text} />
               {extractChatImages(text).length > 0 && <ChatImageGallery images={extractChatImages(text)} workspaceId={workspaceId} planId={planId} />}
             </div> : <p className={`whitespace-pre-wrap [overflow-wrap:anywhere] ${message.role === 'user' ? 'rounded-xl bg-muted/60 px-3 py-2 text-sm leading-relaxed' : 'text-xs leading-relaxed text-muted-foreground'}`}>{text}</p>)}
             {!!message.attachmentPaths?.length && <div aria-label="Sent attachments" className="flex flex-wrap gap-2">{message.attachmentPaths.map(path => <button type="button" key={path} onClick={() => setAttachmentPreview(path)} className="flex max-w-full items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"><FileText className="h-3 w-3 shrink-0" /><span className="truncate">{path.split('/').pop()}</span></button>)}</div>}
-            {message.role === 'assistant' && !text && message.partial && running && <p className="text-xs text-muted-foreground">Preparing document update…</p>}
+            {message.role === 'assistant' && !text && !hasProcess && message.partial && running && <p className="text-xs text-muted-foreground">Preparing document update…</p>}
             {message.role === 'assistant' && proposals.map(proposal => <div key={proposal.id} className="min-w-0 rounded-lg border border-border bg-card p-3">
               <div className="flex items-center gap-2"><FileText className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1 break-all text-xs font-medium">{proposal.path}</span>{proposal.status === 'applied' && <Check className="size-3.5 shrink-0 text-primary" />}</div>
               <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{proposal.status === 'applied' ? proposal.path === 'board.json' ? 'Board updated' : 'Document updated' : proposal.status === 'conflict' ? 'Changed while the assistant was working. Compare before applying.' : 'Update pending'}</p>
@@ -554,6 +559,17 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
         {(loadError || actionError || chat?.error) && <div role="alert" className="mb-2 max-h-28 overflow-y-auto rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs leading-relaxed text-destructive [overflow-wrap:anywhere]">{[loadError, actionError, chat?.error].filter(Boolean).join('\n')}</div>}
         {!model && <p className="mb-2 text-xs leading-5 text-muted-foreground">This model is unavailable. Choose another verified model using Model & CLI below.</p>}
         {chat?.approvals?.map(approval => <div key={approval.id} className="mb-3 rounded-xl border border-primary/25 bg-primary/5 p-3"><p className="text-xs font-semibold">OpenCode needs your approval</p><p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{approval.description}</p>{approval.command && <pre className="mt-2 overflow-auto rounded-lg bg-background p-2 text-[11px]">{approval.command}</pre>}{approval.error && <p role="alert" className="mt-2 text-xs text-destructive">{approval.error}</p>}<div className="mt-3 flex gap-2"><Button size="sm" variant="outline" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'deny')}>Deny</Button><Button size="sm" disabled={busy || approval.status === 'replying'} onClick={() => void replyApproval(approval.id, approval.turnId, 'allow')}>Allow once</Button></div></div>)}
+        {chat?.questions?.map(question => (
+          <div key={question.id} className="mb-3">
+            <ManualQuestionCard
+              request={question}
+              onReply={!running && !busy && Boolean(model) ? async answers => {
+                const formatted = question.questions.map((q, idx) => `${idx + 1}. ${q.question}\n${(answers[idx] || []).join(', ')}`).join('\n\n');
+                await send(undefined, formatted);
+              } : undefined}
+            />
+          </div>
+        ))}
         <ManualComposer key={conversation.id} surface="planning" agent={controlAgent} agents={conversations} native live={Boolean(chat) && !loadError} pending={busy} sendDisabled={running || !model} draft={preferences.draft} files={files} onDraft={value => update(key, { draft: value })} onAddFiles={incoming => { try { usePlanningChatStore.getState().updateFiles(key, current => addManualFiles(current, incoming)); setActionError(undefined); } catch (cause) { setActionError(errorText(cause)); } }} onRemoveFile={file => usePlanningChatStore.getState().updateFiles(key, current => current.filter(item => item !== file))} onSend={() => void send()} onApply={applyModel} autoApprove={conversation.runtimeType === 'opencode' ? { available: Boolean(chat), enabled: conversation.openCodeAutoApprove } : undefined} onAutoApprove={async enabled => { await onPatch({ openCodeAutoApprove: enabled }); }} permissionControl={conversation.runtimeType === 'codex' ? <CodexPermissions agent={controlAgent} live={false} disabled={busy} onApply={applyPermissions} /> : undefined} statusText={running ? 'Working · settings apply next reply' : busy ? 'Saving…' : 'Ready · @ for integrations'} />
       </div>
     </div>

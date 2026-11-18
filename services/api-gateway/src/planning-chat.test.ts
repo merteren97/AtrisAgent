@@ -573,7 +573,7 @@ for (const end of ['stop', 'complete', 'close'] as const) {
   try {
     await f.controller.send('w', 'p', input()); await until(() => Boolean(f.adapters[0]?.options));
     for (let index = 0; index < 5; index++) {
-      await delay(35); f.adapters[0].emit('text_delta', { content: 'x' });
+      await delay(35); f.adapters[0].emit('text_delta', { content: 'x'.repeat(index + 1) });
       assert.equal(f.controller.get('w', 'p').status, 'running');
     }
     await delay(120);
@@ -977,6 +977,52 @@ for (const autoApprove of [false, true]) {
     } finally { await reopened.close(); }
     assert.throws(() => store.writeConversations('w', 'p', [...store.readConversations('w', 'p'), { ...legacy, workspaceId: 'other-workspace' }]), /Invalid/);
   } finally { await controller.close(); fs.rmSync(temporary, { recursive: true, force: true }); }
+}
+
+// Antigravity agent_thought, tools, and ask_question support in Planning Chat.
+{
+  const f = fixture('antigravity');
+  try {
+    await f.controller.send('w', 'p', input());
+    await until(() => Boolean(f.adapters[0]?.options));
+    const adapter = f.adapters[0];
+    adapter.emit('agent_thought', { thought: 'Inspecting project layout' });
+    adapter.emit('agent_tool_call', {
+      toolCallId: 'tool-1',
+      toolName: 'read_file',
+      args: { Path: '/repo/plan.md' },
+    });
+    let state = f.controller.get('w', 'p');
+    assert.equal(state.activity, 'Read plan.md');
+    assert.equal(state.messages.at(-1)?.thinking, 'Inspecting project layout');
+    assert.equal(state.messages.at(-1)?.tools?.[0].summary, 'Read plan.md');
+    assert.equal(state.messages.at(-1)?.tools?.[0].status, 'running');
+
+    adapter.emit('agent_tool_call', {
+      toolName: 'ask_question',
+      args: {
+        questions: JSON.stringify([
+          { question: 'Which auth mode?', options: ['OAuth', 'API Key'] },
+        ]),
+      },
+    });
+    state = f.controller.get('w', 'p');
+    assert.equal(state.activity, 'Waiting for your answer');
+    assert.equal(state.questions?.length, 1);
+    assert.equal(state.questions?.[0].questions[0].question, 'Which auth mode?');
+
+    adapter.emit('task_completed', { result: 'Antigravity task completed' });
+    state = f.controller.get('w', 'p');
+    assert.equal(state.status, 'complete');
+    assert.equal(state.questions?.length, 1, 'Pending questions remain visible on complete turn');
+    assert.match(state.messages.at(-1)?.content || '', /Which auth mode\?/);
+    assert.equal(state.messages.at(-1)?.tools?.[0].status, 'completed');
+
+    // Sending a follow-up turn clears previous state.questions
+    await f.controller.send('w', 'p', { ...input('follow-up'), text: 'Use OAuth' });
+    state = f.controller.get('w', 'p');
+    assert.equal(state.questions, undefined, 'New turn start clears prior questions');
+  } finally { await f.controller.close(); }
 }
 
 console.log('Planning chat: HTTP lifecycle, restart, CAS proposals, cancellation, model validation, independent conversations, archive/reopen, controls, native approval replies and portable attachments passed. No provider processes launched.');

@@ -3,7 +3,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import type { ManualAgent, ManualMessage } from './manual-conversations';
+import type { ManualAgent, ManualMessage, ManualQuestion } from './manual-conversations';
+import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 import { MANUAL_OPENCODE_TUI } from './manual-opencode-tui';
 import { readCodexManualHistory } from './manual-codex-history';
 import { codexPermissionArgs } from './manual-codex-permissions';
@@ -221,6 +222,9 @@ export class ManualProviderBridge {
         return {state:record.state,at:record.at};
       } catch { return {state:'unknown'}; }
     }
+    if (agent.runtimeType === 'antigravity') {
+      return new ManualAntigravityBridge(this.dataDir).activity(agent);
+    }
     if (!['claude_code', 'codex'].includes(agent.runtimeType)) return { state: 'unknown' };
     const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent, 'activity');
     const current = bindings.at(-1);
@@ -378,7 +382,10 @@ export class ManualProviderBridge {
     if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
     return {sessionId: record.sessionId, messages: Array.isArray(record.messages) ? record.messages.filter((m: any) => typeof m.id === 'string' && typeof m.text === 'string' && ['user','assistant','tool'].includes(m.role)) : []};
   }
-  pendingQuestions(agent: ManualAgent): Array<{id: string; questions: Array<{header: string; question: string; options: Array<{label: string; description?: string}>; multiple?: boolean; custom?: boolean}>; deliveryError?: string}> {
+  pendingQuestions(agent: ManualAgent): ManualQuestion[] {
+    if (agent.runtimeType === 'antigravity') {
+      return new ManualAntigravityBridge(this.dataDir).pendingQuestions(agent);
+    }
     if (agent.runtimeType !== 'opencode') return [];
     const sessionId = this.openCodeHistory(agent).sessionId;
     if (!sessionId) return [];

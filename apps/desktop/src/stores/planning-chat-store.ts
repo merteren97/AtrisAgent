@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { CodexPermissionMode, RuntimeType } from '@atris-agent-code/domain';
+import type { ManualQuestion, ManualToolItem } from '@/stores/manual-store';
 
 export interface PlanningConversation {
   id: string; title: string; workspaceId: string; planId: string;
@@ -12,6 +13,7 @@ export interface PlanningChatInput { id: string; text: string; catalogId: string
 export interface PlanningChatMessage {
   id: string; role: 'user' | 'assistant' | 'system'; content: string; turnId: string;
   createdAt: string; clientMessageId?: string; partial?: boolean; attachmentPaths?: string[];
+  thinking?: string; thinkingTokens?: number; tools?: ManualToolItem[];
 }
 export interface PlanningChatProposal {
   id: string; turnId: string; path: string; content: string; baseRevision: string | null;
@@ -23,6 +25,7 @@ export interface PlanningChatState {
   turnId: string | null; revision: number; error?: string; activity?: string;
   conversation?: PlanningConversation;
   approvals?: Array<{ id: string; turnId: string; toolName?: string; description: string; path?: string; command?: string; status?: 'pending' | 'replying' | 'failed'; error?: string }>;
+  questions?: ManualQuestion[];
 }
 interface PlanPreferences {
   draft: string; catalogId: string; reasoning: string;

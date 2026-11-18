@@ -6,7 +6,8 @@ import type Database from 'better-sqlite3';
 import type { Application, Request, Response } from 'express';
 import type { AntigravityAdapter, RuntimeHost } from '@atris-agent-code/runtime-host';
 import { ManualProviderBridge, readTail } from './manual-provider-bridge';
-import { ManualAntigravityBridge } from './manual-antigravity-bridge';
+import { ManualAntigravityBridge, type ManualToolArtifact, type ManualToolItem, type ManualToolSubagent } from './manual-antigravity-bridge';
+export type { ManualToolArtifact, ManualToolItem, ManualToolSubagent };
 import { manualContentTitle, manualProviderName } from './manual-titles';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import { isCodexPermissionMode } from './manual-codex-permissions';
@@ -27,7 +28,18 @@ export interface ManualAgent {
 }
 export interface ManualConversation { id: string; workspaceId: string; title: string; createdAt: string; agents: ManualAgent[] }
 export interface ManualQuestion { id: string; questions: Array<{ header: string; question: string; options: Array<{ label: string; description?: string }>; multiple?: boolean; custom?: boolean }>; deliveryError?: string }
-export interface ManualMessage { id: string; role: 'user' | 'assistant' | 'tool'; text: string; toolName?: string; failed?: boolean; question?: ManualQuestion }
+export interface ManualMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'tool';
+  text: string;
+  toolName?: string;
+  failed?: boolean;
+  question?: ManualQuestion;
+  thinking?: string;
+  thinkingTokens?: number;
+  tools?: ManualToolItem[];
+  model?: string;
+}
 export interface ManualNamingUpdate { conversationId: string; agentId: string; agentName?: string; conversationTitle?: string }
 
 const fail = (message: string, status = 400): never => { throw Object.assign(new Error(message), { status }); };
@@ -145,11 +157,15 @@ export class ManualConversationStore {
   }
   readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; loading?: boolean; naming?: ManualNamingUpdate } {
     const agent = this.agent(id);
-    const result = agent.runtimeType === 'antigravity'
-      ? {supported:true,...new ManualAntigravityBridge(this.dataDir).read(agent)}
-      : readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
+    const antigravityResult = agent.runtimeType === 'antigravity'
+      ? { supported: true, ...new ManualAntigravityBridge(this.dataDir).read(agent) }
+      : undefined;
+    const result = antigravityResult ?? readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
     const bridge = new ManualProviderBridge(this.dataDir);
-    return { ...result, questions: bridge.pendingQuestions(agent), autoApprove: agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined, routeStatus:bridge.openCodeRouteStatus(agent), naming: this.syncTitles(id, result.bound ? result.messages : []) };
+    const questions = antigravityResult
+      ? (antigravityResult.questions?.length ? antigravityResult.questions : bridge.pendingQuestions(agent))
+      : bridge.pendingQuestions(agent);
+    return { ...result, questions, autoApprove: agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined, routeStatus:bridge.openCodeRouteStatus(agent), naming: this.syncTitles(id, result.bound ? result.messages : []) };
   }
   needsTitle(id: string): boolean {
     const agent = this.agent(id);
@@ -160,7 +176,7 @@ export class ManualConversationStore {
       const agent = this.agent(id);
       const automatic = this.sqlite.prepare('SELECT source_id FROM manual_automatic_titles WHERE conversation_id = ?').get(agent.conversationId) as {source_id: string | null} | undefined;
       const pending = (agent.autoName && !agent.nameSourceId) || (automatic && !automatic.source_id);
-      const candidate = pending ? messages.filter(message => message.role === 'user').map(message => ({ id: message.id, title: manualContentTitle(message.text) })).find(message => message.title) : undefined;
+      const candidate = pending ? messages.filter(message => message.role === 'user' && !message.id.endsWith(':answer')).map(message => ({ id: message.id, title: manualContentTitle(message.text) })).find(message => message.title) : undefined;
       if (candidate?.title) {
         if (agent.autoName && !agent.nameSourceId) {
           const names = new Set((this.sqlite.prepare('SELECT record FROM manual_agent_sessions WHERE conversation_id = ? AND id != ?').all(agent.conversationId, id) as {record: string}[]).map(row => (JSON.parse(row.record) as ManualAgent).name));

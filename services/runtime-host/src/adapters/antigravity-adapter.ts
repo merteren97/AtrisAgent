@@ -832,14 +832,30 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       const stepType = parsed.stepType.toLowerCase();
       const isFinalResponseCandidate = /(?:^|[_-])(?:agent|final)[_-]?response(?:$|[_-])/.test(stepType)
         && /^(?:done|completed|success|succeeded)$/i.test(parsed.state || '');
-      if (/thought|reason|plan/.test(stepType) && parsed.content) {
+      const isPureThoughtStep = /^(?:thought|reason|plan|thinking)$/i.test(stepType);
+      const isToolStep = Boolean(parsed.toolName) || /tool|command|shell|subagent|ask_question/i.test(stepType);
+      let emitted = false;
+
+      if (parsed.thinking) {
+        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: parsed.thinking, timestamp });
+        emitted = true;
+      } else if (isPureThoughtStep && parsed.content) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought: parsed.content, timestamp });
-      } else if (/tool|command|shell|subagent/.test(stepType)) {
+        emitted = true;
+      }
+
+      if (isToolStep) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_tool_call', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, toolName: parsed.toolName || parsed.stepType, args: parsed.args || {}, ...antigravityCorrelationFields(parsed.raw), timestamp });
-      } else if (parsed.content) {
+        emitted = true;
+      }
+
+      if (parsed.content && !isPureThoughtStep) {
         this.lastOutputBySession.set(sessionId, parsed.content);
         this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: parsed.content, timestamp });
-      } else if (parsed.state) {
+        emitted = true;
+      }
+
+      if (!emitted && parsed.state) {
         this.emitEvent({ id: crypto.randomUUID(), type: 'agent_progressed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, progress: `${parsed.stepType}: ${parsed.state}`, timestamp });
       }
 

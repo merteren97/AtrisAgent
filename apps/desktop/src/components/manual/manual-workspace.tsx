@@ -20,9 +20,11 @@ import { sendManualDraft } from './manual-attachment-send';
 import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
 import { ManualChatContent } from './manual-chat-content';
-import { ManualQuestionCard } from './manual-question';
+import { ManualQuestionCard, buildAntigravityQuestionKeystrokes } from './manual-question';
 import { CodexPermissions, type CodexLivePermissions } from './codex-permissions';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
+
+export { buildAntigravityQuestionKeystrokes };
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode', 'antigravity'].includes(kind || '');
@@ -306,7 +308,18 @@ export function ManualWorkspace() {
   const questionIndex = recentTools.map(message => Boolean(message.question)).lastIndexOf(true);
   const unresolvedQuestion = questionIndex >= 0 && !recentTools.slice(questionIndex + 1).some(message => !message.toolName) ? recentTools[questionIndex].question : undefined;
   const activity = recentTools[recentTools.length - 1];
-  const replyQuestion = async (question: ManualQuestion, answers: string[][]) => { await apiRequest(`/manual/agents/${agentId}/questions/${encodeURIComponent(question.id)}/reply`, { method: 'POST', body: JSON.stringify({ answers }) }); };
+  const replyQuestion = async (question: ManualQuestion, answers: string[][]) => {
+    if (agent?.runtimeType === 'antigravity') {
+      if (!live || !native) throw new Error('Open the agent first to submit answers, or answer in Code.');
+      const steps = buildAntigravityQuestionKeystrokes(question, answers);
+      for (const step of steps) {
+        await invoke('manual_terminal_write', { id: agent.id, data: step, paste: false });
+        await new Promise(r => setTimeout(r, 45));
+      }
+      return;
+    }
+    await apiRequest(`/manual/agents/${agentId}/questions/${encodeURIComponent(question.id)}/reply`, { method: 'POST', body: JSON.stringify({ answers }) });
+  };
   const addFiles = (incoming: File[]) => {
     if (!agent || !incoming.length) return;
     try {
@@ -387,8 +400,8 @@ export function ManualWorkspace() {
                   {truncated && <p className="text-xs text-muted-foreground">Showing recent messages from this long session.</p>}
                   {historyLoading && <p role="status" className="text-xs text-muted-foreground">Syncing Codex history… Displayed messages remain available while records arrive.</p>}
                   {!messages.length && <div className="py-8"><RuntimeBrandIcon runtimeId={agent.runtimeType} className="mb-4 h-9 w-9 text-foreground" /><h3 className="text-xl font-semibold tracking-tight">What would you like to work on?</h3><p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">Message {agent.name}, choose a model in the composer, or open Code for the live terminal. Each agent keeps its own conversation.</p><div className="mt-5 flex flex-wrap gap-2">{['Explore this project', 'Review recent changes', 'Help me plan a task'].map(prompt => <Button key={prompt} size="sm" variant="outline" className="rounded-full text-xs" onClick={() => setDraft(agent.id, prompt)}>{prompt}</Button>)}</div></div>}
-                    {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : agent.name}</p><ManualChatContent text={message.text} agentId={agent.id} cwd={agent.cwd} user={message.role === 'user'} /></article>)}
-                   {unresolvedQuestion && !questions.length && <ManualQuestionCard key={unresolvedQuestion.id} request={unresolvedQuestion} onOpenCode={() => setSurface(conversation.id, 'code')} />}
+                    {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : (agent.autoName !== false ? cliName(agent.runtimeType) : agent.name)}</p><ManualChatContent text={message.text} agentId={agent.id} cwd={agent.cwd} user={message.role === 'user'} thinking={message.thinking} thinkingTokens={message.thinkingTokens} tools={message.tools} /></article>)}
+                   {unresolvedQuestion && !questions.length && <ManualQuestionCard key={unresolvedQuestion.id} request={unresolvedQuestion} onReply={agent.runtimeType === 'antigravity' && live ? answers => replyQuestion(unresolvedQuestion, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />}
                    {questions.map(question => <ManualQuestionCard key={question.id} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
                    {live && observations[agent.id]?.state !== 'completed' && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
                 </>}

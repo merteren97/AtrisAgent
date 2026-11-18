@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { FileText, ImageIcon, Loader2 } from 'lucide-react';
+import { AlertCircle, Bot, Brain, Check, ChevronRight, FileText, ImageIcon, Loader2, Wrench } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import { MarkdownContent } from '@/components/chat/markdown-content';
-import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { extractChatImages, normalizeImagePath } from '@/components/chat/chat-image-preview';
+import type { ManualToolArtifact, ManualToolItem } from '@/stores/manual-store';
 
 interface Attachment { name: string; path: string }
 interface ProjectImage { name: string; path: string }
@@ -79,7 +81,190 @@ function SentAttachment({ attachment, agentId }: { attachment: Attachment; agent
     : <span title={attachment.name} className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-background/50 px-2 py-1 text-xs text-muted-foreground">{image ? <ImageIcon className="h-4 w-4 shrink-0" /> : <FileText className="h-4 w-4 shrink-0" />}<span className="truncate">{attachment.name}</span></span>;
 }
 
-export function ManualChatContent({ text, agentId, cwd, user }: { text: string; agentId: string; cwd: string; user: boolean }) {
+function ToolStatusIcon({ status }: { status: ManualToolItem['status'] }) {
+  if (status === 'running') return <Loader2 aria-label="Running" className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />;
+  if (status === 'failed') return <AlertCircle aria-label="Failed" className="h-3.5 w-3.5 shrink-0 text-destructive" />;
+  return <Check aria-label="Completed" className="h-3.5 w-3.5 shrink-0 text-emerald-500" />;
+}
+
+export function AssistantTurnProcess({
+  thinking,
+  thinkingTokens,
+  tools,
+}: {
+  thinking?: string;
+  thinkingTokens?: number;
+  tools?: ManualToolItem[];
+}) {
+  const [openArtifact, setOpenArtifact] = useState<ManualToolArtifact | null>(null);
+  const trimmedThinking = thinking?.trim() ? thinking : undefined;
+  const subagents = (tools || []).filter(t => t.name === 'invoke_subagent' || Boolean(t.subagent));
+  const artifacts = (tools || []).filter(t => Boolean(t.artifact));
+  const otherTools = (tools || []).filter(t => t.name !== 'invoke_subagent' && !t.subagent && !t.artifact);
+
+  if (!trimmedThinking && !subagents.length && !otherTools.length && !artifacts.length) {
+    return null;
+  }
+
+  const firstThinkingLine = trimmedThinking
+    ? trimmedThinking.split(/\r?\n/).map(line => line.trim()).find(Boolean) || ''
+    : '';
+  const tokenLabel = thinkingTokens
+    ? ` · ${thinkingTokens >= 1000 ? `${(thinkingTokens / 1000).toFixed(1)}k` : thinkingTokens} tokens`
+    : '';
+
+  return (
+    <div className="mb-3 space-y-2">
+      {trimmedThinking && (
+        <details className="group rounded-xl border border-border/60 bg-muted/25 px-3 py-2 text-xs">
+          <summary className="flex cursor-pointer list-none items-center gap-2 select-none text-muted-foreground hover:text-foreground">
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 transition-transform group-open:rotate-90" />
+            <Brain className="h-3.5 w-3.5 shrink-0 text-primary/80" />
+            <span className="shrink-0 font-medium text-foreground/90">
+              Thought{tokenLabel}
+            </span>
+            {firstThinkingLine && (
+              <span className="min-w-0 flex-1 truncate text-muted-foreground/80 group-open:hidden">
+                {firstThinkingLine}
+              </span>
+            )}
+          </summary>
+          <div className="mt-2 border-l-2 border-primary/30 pl-3 whitespace-pre-wrap leading-relaxed text-muted-foreground">
+            {trimmedThinking}
+          </div>
+        </details>
+      )}
+
+      {subagents.length > 0 && (
+        <div className="space-y-1.5" aria-label="Subagents">
+          {subagents.map(t => {
+            const badge = [t.subagent?.typeName, t.subagent?.model].filter(Boolean).join(' · ');
+            return (
+              <div
+                key={t.id}
+                className="flex items-center justify-between gap-2 rounded-xl border border-border/70 bg-card/70 px-3 py-2 text-xs"
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
+                  <span className="truncate font-medium text-foreground">
+                    {t.subagent?.role || t.summary}
+                  </span>
+                  {badge && (
+                    <span className="shrink-0 rounded-md border border-border/70 bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      {badge}
+                    </span>
+                  )}
+                </div>
+                <ToolStatusIcon status={t.status} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {otherTools.length > 0 && (
+        otherTools.length <= 2 ? (
+          <div className="space-y-1 rounded-xl border border-border/60 bg-muted/20 px-3 py-2 text-xs" aria-label="Tool calls">
+            {otherTools.map(t => (
+              <div key={t.id} className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2 text-muted-foreground">
+                  <Wrench className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{t.summary || t.name}</span>
+                </div>
+                <ToolStatusIcon status={t.status} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <details className="group rounded-xl border border-border/60 bg-muted/20 px-3 py-2 text-xs">
+            <summary className="flex cursor-pointer list-none items-center gap-2 select-none text-muted-foreground hover:text-foreground">
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 transition-transform group-open:rotate-90" />
+              <Wrench className="h-3.5 w-3.5 shrink-0" />
+              <span className="font-medium text-foreground/90">{otherTools.length} tool calls</span>
+              <span className="min-w-0 flex-1 truncate text-muted-foreground/80 group-open:hidden">
+                {otherTools.map(t => t.summary || t.name).join(' · ')}
+              </span>
+            </summary>
+            <div className="mt-2 space-y-1 border-l-2 border-border/60 pl-3">
+              {otherTools.map(t => (
+                <div key={t.id} className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate text-muted-foreground">{t.summary || t.name}</span>
+                  <ToolStatusIcon status={t.status} />
+                </div>
+              ))}
+            </div>
+          </details>
+        )
+      )}
+
+      {artifacts.length > 0 && (
+        <div className="space-y-2" aria-label="Artifacts">
+          {artifacts.map(t => {
+            const artifact = t.artifact!;
+            return (
+              <div key={t.id} className="rounded-xl border border-primary/30 bg-primary/5 p-3 text-xs">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-start gap-2.5">
+                    <FileText className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                    <div className="min-w-0">
+                      <p className="font-medium text-foreground">{artifact.title}</p>
+                      {artifact.summary && (
+                        <p className="mt-1 leading-relaxed text-muted-foreground">{artifact.summary}</p>
+                      )}
+                    </div>
+                  </div>
+                  {artifact.content && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0 px-2.5 text-xs"
+                      onClick={() => setOpenArtifact(artifact)}
+                    >
+                      View document
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <Dialog open={Boolean(openArtifact)} onOpenChange={open => { if (!open) setOpenArtifact(null); }}>
+        <DialogContent className="flex max-h-[85vh] w-[min(900px,calc(100vw-2rem))] max-w-none flex-col overflow-hidden sm:max-w-none">
+          <DialogHeader>
+            <DialogTitle className="pr-8 text-base">{openArtifact?.title}</DialogTitle>
+            {openArtifact?.path && (
+              <DialogDescription className="truncate text-xs">{openArtifact.path}</DialogDescription>
+            )}
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto pr-1 text-sm leading-relaxed">
+            {openArtifact?.content && <MarkdownContent content={openArtifact.content} />}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+export function ManualChatContent({
+  text,
+  agentId,
+  cwd,
+  user,
+  thinking,
+  thinkingTokens,
+  tools,
+}: {
+  text: string;
+  agentId: string;
+  cwd: string;
+  user: boolean;
+  thinking?: string;
+  thinkingTokens?: number;
+  tools?: ManualToolItem[];
+}) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const content = user ? displayManualPrompt(text) : { text, attachments: [] };
   const images = user ? [] : assistantProjectImages(text);
@@ -88,5 +273,12 @@ export function ManualChatContent({ text, agentId, cwd, user }: { text: string; 
     const target = images.find(image => image.path === path || image.path === clean || normalizeImagePath(image.path) === clean);
     if (target) setSelectedPath(target.path);
   };
-  return <>{content.text && <MarkdownContent content={content.text} onLocalImageLink={images.length ? openImage : undefined} />}{content.attachments.length > 0 && <div aria-label="Sent attachments" className="mt-2 flex flex-wrap gap-2">{content.attachments.map((attachment, index) => <SentAttachment key={`${attachment.path}:${index}`} attachment={attachment} agentId={agentId} />)}</div>}{images.length > 0 && <div aria-label="Generated image previews" className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{images.map(image => <ProjectImagePreview key={image.path} image={image} cwd={cwd} open={selectedPath === image.path} onOpenChange={open => setSelectedPath(open ? image.path : null)} />)}</div>}</>;
+  return (
+    <>
+      {!user && <AssistantTurnProcess thinking={thinking} thinkingTokens={thinkingTokens} tools={tools} />}
+      {content.text && <MarkdownContent content={content.text} onLocalImageLink={images.length ? openImage : undefined} />}
+      {content.attachments.length > 0 && <div aria-label="Sent attachments" className="mt-2 flex flex-wrap gap-2">{content.attachments.map((attachment, index) => <SentAttachment key={`${attachment.path}:${index}`} attachment={attachment} agentId={agentId} />)}</div>}
+      {images.length > 0 && <div aria-label="Generated image previews" className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{images.map(image => <ProjectImagePreview key={image.path} image={image} cwd={cwd} open={selectedPath === image.path} onOpenChange={open => setSelectedPath(open ? image.path : null)} />)}</div>}
+    </>
+  );
 }

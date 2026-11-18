@@ -134,6 +134,7 @@ try {
   fs.writeFileSync(fileFor(automaticAgents[0]), userRow(automaticAgents[0],'Merhaba','greeting'));
   const greeting = await (await fetch(`${base}/agents/${automaticAgents[0].id}/messages`)).json();
   assert.equal(greeting.naming.agentName, undefined, 'Greetings wait for a real task');
+  assert.equal(installedStore.syncTitles(automaticAgents[0].id, [{ id: 's:1:answer', role: 'user', text: 'Deploy to AWS' }]).agentName, undefined, 'Synthetic ask_question answers do not set initial titles');
   const topic = 'Ödeme ekranındaki hataları düzelt';
   fs.appendFileSync(fileFor(automaticAgents[0]), '\n'+userRow(automaticAgents[0],topic));
   const named = await (await fetch(`${base}/agents/${automaticAgents[0].id}/messages`)).json();
@@ -156,6 +157,7 @@ try {
   assert.equal(reloaded.list('project-a').find(c=>c.id===automaticId)!.title, 'My own title', 'User title persists on reload');
   assert.equal(sqlite.prepare('SELECT 1 FROM manual_automatic_titles WHERE conversation_id = ?').get(automaticId), undefined, 'User rename disables automatic title replacement');
   assert.equal(reloaded.syncTitles(automaticAgents[0].id,[{id:'future',role:'user',text:'A new task title'}]).conversationTitle, undefined);
+  assert.equal(reloaded.syncTitles(automaticAgents[0].id,[{id:`${randomUUID()}:3:answer`,role:'user',text:'Option A from ask_question'}]).agentName, topic);
   assert.equal(reloaded.list('project-a').find(c=>c.id===automaticId)!.title, 'My own title');
   const stable = reloaded.syncTitles(automaticAgents[0].id,[{id:'later',role:'user',text:'Completely different task'}]);
   assert.equal(stable.agentName,topic,'A later/truncated transcript does not make established titles jump');

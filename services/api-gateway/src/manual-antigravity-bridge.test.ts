@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { ManualAntigravityBridge, parseAntigravityTranscript } from './manual-antigravity-bridge';
+import {
+  ManualAntigravityBridge,
+  parseAntigravityQuestions,
+  parseAntigravityTranscript,
+} from './manual-antigravity-bridge';
 import type { ManualAgent } from './manual-conversations';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(),'atris-manual-agy-'));
@@ -56,5 +60,124 @@ try {
   fs.writeFileSync(second[1],`Created conversation ${session}\nCreated conversation ${secondSession}\n`);
   assert.equal(bridge.read(other).bound,false,'Ambiguous root/subagent logs fail closed');
   assert.throws(()=>bridge.prepare({...first,id:'../../outside'}),'Agent identity cannot escape app data');
+
+  // parseAntigravityQuestions coverage
+  const singleQ = parseAntigravityQuestions(
+    JSON.stringify([{ question: 'Which runtime?', options: ['(Recommended) Node', 'Deno'] }]),
+    'q-single',
+  );
+  assert.deepEqual(singleQ, {
+    id: 'q-single',
+    questions: [{
+      header: '',
+      question: 'Which runtime?',
+      options: [{ label: '(Recommended) Node' }, { label: 'Deno' }],
+      multiple: false,
+      custom: true,
+    }],
+  });
+
+  const multiQ = parseAntigravityQuestions([
+    { question: 'Pick frameworks', options: [{ label: 'React', description: 'UI' }, { text: 'Solid' }], is_multi_select: true, custom: false },
+    { header: 'Target', question: 'Deploy?', options: ['Fly', 'AWS'] },
+  ], 'q-multi');
+  assert.equal(multiQ?.questions[0].header, 'Question 1/2');
+  assert.equal(multiQ?.questions[0].multiple, true);
+  assert.equal(multiQ?.questions[0].custom, false);
+  assert.equal(multiQ?.questions[1].header, 'Target');
+
+  // Backward compatibility: plain PLANNER_RESPONSE emits no extra keys
+  const plainMsg = parseAntigravityTranscript(
+    JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'Plain' }),
+    session,
+  )[0];
+  assert.deepEqual(plainMsg, { id: `${session}:0`, role: 'assistant', text: 'Plain' });
+
+  // Rich transcript: thinking, stringified args, tools, subagents, artifacts, ask_question + answer
+  const subagentId = randomUUID();
+  const richRows = [
+    { step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Audit the repo' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      source: 'MODEL',
+      status: 'DONE',
+      thinking: 'Need to read config and spawn researcher.',
+      output_tokens: 42,
+      content: 'Inspecting files now.',
+      tool_calls: [
+        { id: 'c1', name: 'read_file', args: { Path: JSON.stringify('D:\\repo\\package.json') } },
+        { id: 'c2', name: 'run_command', args: { CommandLine: JSON.stringify('npm test'), toolSummary: JSON.stringify('Run unit tests') } },
+        { id: 'c3', name: 'write_file', args: { Path: JSON.stringify(path.join(provider, 'brain', session, 'plan.md')), Content: JSON.stringify('# Plan'), ArtifactMetadata: JSON.stringify({ Summary: 'Implementation plan', RequestFeedback: true }) } },
+        { id: 'c4', name: 'invoke_subagent', args: { Role: JSON.stringify('Codebase Researcher'), TypeName: JSON.stringify('research'), Model: JSON.stringify('flash') } },
+      ],
+    },
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: '{"name":"app"}' },
+    { step_index: 3, type: 'GENERIC', status: 'ERROR', content: 'Test failed' },
+    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'Wrote plan.md' },
+    { step_index: 5, type: 'GENERIC', status: 'DONE', content: `Launched subagent ${subagentId}` },
+    { step_index: 6, type: 'SYSTEM_MESSAGE', source: 'SYSTEM', status: 'DONE', content: `[Message] sender=${subagentId} content=Done` },
+    {
+      step_index: 7,
+      type: 'PLANNER_RESPONSE',
+      source: 'MODEL',
+      status: 'DONE',
+      content: '',
+      tool_calls: [
+        { id: 'c5', name: 'ask_question', args: { questions: JSON.stringify([{ question: 'Proceed?', options: ['Yes', 'No'] }]) } },
+      ],
+    },
+    { step_index: 8, type: 'GENERIC', status: 'RUNNING', content: '' },
+  ].map(row => JSON.stringify(row)).join('\n');
+
+  const richMessages = parseAntigravityTranscript(richRows, session);
+  const planner1 = richMessages.find(m => m.id === `${session}:1`)!;
+  assert.equal(planner1.thinking, 'Need to read config and spawn researcher.');
+  assert.equal(planner1.thinkingTokens, 42);
+  assert.equal(planner1.tools?.length, 4);
+  assert.equal(planner1.tools?.[0].summary, 'Read package.json');
+  assert.equal(planner1.tools?.[0].status, 'completed');
+  assert.equal(planner1.tools?.[1].summary, 'Run unit tests');
+  assert.equal(planner1.tools?.[1].status, 'failed');
+  assert.equal(planner1.tools?.[2].artifact?.requestFeedback, true);
+  assert.equal(planner1.tools?.[2].artifact?.summary, 'Implementation plan');
+  assert.equal(planner1.tools?.[3].summary, 'Codebase Researcher (flash)');
+  assert.equal(planner1.tools?.[3].subagent?.conversationId, subagentId);
+  assert.equal(planner1.tools?.[3].status, 'completed');
+
+  // Answered ask_question emits :answer user message and resolves question
+  const answeredRows = richRows.replace(
+    JSON.stringify({ step_index: 8, type: 'GENERIC', status: 'RUNNING', content: '' }),
+    JSON.stringify({ step_index: 8, type: 'GENERIC', status: 'DONE', content: 'Q1: Proceed?\nA1: Yes' }),
+  );
+  const answeredMessages = parseAntigravityTranscript(answeredRows, session);
+  assert.equal(answeredMessages.find(m => m.id === `${session}:8:answer`)?.text, 'Yes');
+
+  // transcript_full.jsonl preference + pendingQuestions + activity states
+  const third = { ...first, id: randomUUID() };
+  const thirdLaunch = bridge.prepare(third);
+  const thirdSession = randomUUID();
+  assert.equal(bridge.activity(third).state, 'unknown');
+  fs.appendFileSync(thirdLaunch[1], `2026-11-18T00:00:00Z INFO Created conversation ${thirdSession}\n2026-11-18T00:00:01Z INFO CLI ready for user input\n`);
+  assert.equal(bridge.activity(third).state, 'ready');
+  fs.appendFileSync(thirdLaunch[1], `2026-11-18T00:00:02Z INFO Surfacing ask_question at step 7\n`);
+  assert.equal(bridge.activity(third).state, 'attention');
+
+  const fullTranscript = path.join(provider, 'brain', thirdSession, '.system_generated', 'logs', 'transcript_full.jsonl');
+  const compactTranscript = path.join(provider, 'brain', thirdSession, '.system_generated', 'logs', 'transcript.jsonl');
+  fs.mkdirSync(path.dirname(fullTranscript), { recursive: true });
+  fs.writeFileSync(compactTranscript, JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Compact' }));
+  fs.writeFileSync(fullTranscript, richRows);
+  const readThird = bridge.read(third);
+  assert.equal(readThird.messages[0].text, 'Audit the repo', 'prefers transcript_full.jsonl over transcript.jsonl');
+  assert.equal(readThird.questions.length, 1);
+  assert.equal(bridge.pendingQuestions(third).length, 1);
+  assert.equal(bridge.activity(third).state, 'attention');
+
+  fs.writeFileSync(fullTranscript, answeredRows + '\n' + JSON.stringify({ step_index: 9, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'All done!' }));
+  fs.appendFileSync(thirdLaunch[1], `2026-11-18T00:00:03Z INFO AskQuestion response for step 7\n`);
+  assert.equal(bridge.pendingQuestions(third).length, 0);
+  assert.equal(bridge.activity(third).state, 'completed');
+
   console.log('Antigravity transcript parsing, isolated log binding, resume and ambiguity tests passed.');
 } finally { fs.rmSync(root,{recursive:true,force:true}); }
