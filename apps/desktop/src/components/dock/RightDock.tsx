@@ -44,8 +44,10 @@ export function RightDock() {
   const narrowOverlay = windowWidth < 1120;
   const isOverlay = expanded || narrowOverlay;
   const sidebarActualWidth = sidebarCollapsed ? 70 : (62 + sidebarWidth + 16);
-  const maxSplitWidth = Math.max(320, windowWidth - sidebarActualWidth - 420);
+  const maxSplitWidth = Math.max(260, windowWidth - sidebarActualWidth - 420);
   const splitWidth = Math.min(width, maxSplitWidth);
+  const effectiveWidth = isOverlay ? 440 : splitWidth;
+  const isCompact = effectiveWidth < 340;
 
   const keepBrowserMounted = Boolean(browserUrl) || (open && activeTab === 'browser');
 
@@ -63,7 +65,7 @@ export function RightDock() {
         else closeDock();
       }}
       className={cn(
-        'relative flex min-h-0 min-w-0 shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm',
+        '@container/dock relative flex min-h-0 min-w-0 shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm',
         !open
           ? 'hidden'
           : expanded
@@ -104,7 +106,7 @@ export function RightDock() {
         />
       )}
 
-      <header className="flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-3 py-2 pl-3.5">
+      <header className="flex min-w-0 shrink-0 items-center justify-between gap-1.5 border-b border-border bg-card px-2.5 py-1.5">
         <div
           role="tablist"
           aria-label="Right dock sections"
@@ -116,20 +118,20 @@ export function RightDock() {
             aria-selected={activeTab === 'activity'}
             onClick={() => setTab('activity')}
             className={cn(
-              'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              'inline-flex min-w-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
               activeTab === 'activity'
                 ? 'bg-background text-foreground shadow-xs'
                 : 'text-muted-foreground hover:text-foreground',
             )}
           >
             <Activity className="h-3.5 w-3.5 shrink-0" />
-            <span>Activity</span>
+            <span className="truncate">Activity</span>
             {counts.attention > 0 ? (
-              <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500/20 px-1 text-[10px] font-semibold tabular-nums text-amber-600 dark:text-amber-400">
+              <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-amber-500/20 px-1 text-[10px] font-semibold tabular-nums text-amber-600 dark:text-amber-400">
                 {counts.attention}
               </span>
             ) : counts.running > 0 ? (
-              <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-500/15 px-1 text-[10px] font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+              <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 px-1 text-[10px] font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
                 {counts.running}
               </span>
             ) : null}
@@ -141,16 +143,16 @@ export function RightDock() {
             aria-selected={activeTab === 'browser'}
             onClick={() => setTab('browser')}
             className={cn(
-              'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              'inline-flex min-w-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
               activeTab === 'browser'
                 ? 'bg-background text-foreground shadow-xs'
                 : 'text-muted-foreground hover:text-foreground',
             )}
           >
             <Globe className="h-3.5 w-3.5 shrink-0" />
-            <span>Browser</span>
+            <span className="truncate">Browser</span>
             {browserUrl && (
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-label="Page active" />
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" aria-label="Page active" />
             )}
           </button>
         </div>
@@ -160,7 +162,7 @@ export function RightDock() {
             type="button"
             variant="ghost"
             size="icon"
-            className="h-7 w-7 text-muted-foreground hover:text-foreground"
+            className="h-6 w-6 text-muted-foreground hover:text-foreground"
             aria-label={expanded ? 'Restore side panel size' : 'Expand side panel'}
             title={expanded ? 'Restore size' : 'Expand'}
             onClick={() => setExpanded(!expanded)}
@@ -171,7 +173,7 @@ export function RightDock() {
             type="button"
             variant="ghost"
             size="icon"
-            className="h-7 w-7 text-muted-foreground hover:text-foreground"
+            className="h-6 w-6 text-muted-foreground hover:text-foreground"
             aria-label="Close side panel"
             title="Close"
             onClick={closeDock}
@@ -182,7 +184,7 @@ export function RightDock() {
       </header>
 
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-        {open && activeTab === 'activity' && <ActivityPanel />}
+        {open && activeTab === 'activity' && <ActivityPanel compact={isCompact} />}
         {keepBrowserMounted && (
           <div
             className={cn(

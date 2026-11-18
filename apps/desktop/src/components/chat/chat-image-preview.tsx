@@ -4,6 +4,7 @@ import { ImageIcon, Loader2, Maximize2 } from 'lucide-react';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { apiRequest, getApiOrigin } from '@/lib/api-client';
+import { isTauriRuntime } from '@/lib/secure-storage';
 import { planApi } from '@/stores/planning-store';
 
 export interface ChatImageItem {
@@ -12,17 +13,84 @@ export interface ChatImageItem {
 }
 
 export function normalizeImagePath(raw: string): string {
-  let cleaned = raw.trim();
-  if (/^file:\/\/\/?/i.test(cleaned)) {
-    cleaned = decodeURIComponent(cleaned.replace(/^file:\/\/\/?/i, ''));
+  let cleaned = raw.trim().replace(/^[`'"]+|[`'"]+$/g, '');
+  if (/^file:\/\//i.test(cleaned)) {
+    let afterScheme = cleaned.slice(7);
+    if (/^localhost\//i.test(afterScheme)) {
+      afterScheme = afterScheme.slice(9);
+    }
+    const withoutLeadingSlashOnDrive = /^\/[a-zA-Z]:/.test(afterScheme) ? afterScheme.slice(1) : afterScheme;
+    try {
+      cleaned = decodeURIComponent(withoutLeadingSlashOnDrive);
+    } catch {
+      cleaned = withoutLeadingSlashOnDrive;
+    }
   }
   // Remove wrapping quotes or backticks if any
   cleaned = cleaned.replace(/^[`'"]+|[`'"]+$/g, '');
+  // Strip URL query/hash suffix on local image paths
+  if (!/^https?:\/\//i.test(cleaned)) {
+    cleaned = cleaned.replace(/(\.(?:png|jpe?g|webp|gif))[?#].*$/i, '$1');
+  }
   // Unescape double backslashes in Windows paths (from JSON / logs)
   if (/^[a-zA-Z]:\\\\/.test(cleaned) || cleaned.includes('\\\\')) {
     cleaned = cleaned.replace(/\\\\/g, '\\');
   }
   return cleaned;
+}
+
+export function detectImageMime(bytes: Uint8Array, extension?: string): string {
+  const isPng = bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  const isGif = bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46;
+  const isWebp =
+    bytes.length >= 12
+    && bytes[0] === 0x52
+    && bytes[1] === 0x49
+    && bytes[2] === 0x46
+    && bytes[3] === 0x46
+    && bytes[8] === 0x57
+    && bytes[9] === 0x45
+    && bytes[10] === 0x42
+    && bytes[11] === 0x50;
+  if (isPng) return 'image/png';
+  if (isJpeg) return 'image/jpeg';
+  if (isGif) return 'image/gif';
+  if (isWebp) return 'image/webp';
+  const normalizedExt = extension?.replace(/^\./, '').toLowerCase();
+  if (normalizedExt === 'jpg' || normalizedExt === 'jpeg') return 'image/jpeg';
+  if (normalizedExt === 'png' || normalizedExt === 'gif' || normalizedExt === 'webp') return `image/${normalizedExt}`;
+  return 'image/png';
+}
+
+export async function loadLocalImagePreviewBlob(options: { cwd?: string; path: string }): Promise<Blob> {
+  const normalizedPath = normalizeImagePath(options.path);
+  const cwd = options.cwd || '';
+  const extension = normalizedPath.split('.').pop()?.toLowerCase();
+
+  if (isTauriRuntime()) {
+    try {
+      const bytes = await invoke<number[]>('manual_project_image_preview', {
+        cwd,
+        path: normalizedPath,
+      });
+      const data = new Uint8Array(bytes);
+      return new Blob([data], { type: detectImageMime(data, extension) });
+    } catch {
+      // Fall back to the API gateway endpoint when native preview rejects or predates newer allowed roots.
+    }
+  }
+
+  const res = await apiRequest<{ mimeType: string; dataBase64: string }>('/manual/image-preview', {
+    method: 'POST',
+    body: JSON.stringify({ cwd, path: normalizedPath }),
+  });
+  const binary = atob(res.dataBase64);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    data[i] = binary.charCodeAt(i);
+  }
+  return new Blob([data], { type: res.mimeType || detectImageMime(data, extension) });
 }
 
 export function extractChatImages(text: string): ChatImageItem[] {
@@ -79,8 +147,8 @@ export function ChatImageThumbnail({
   useEffect(() => {
     let active = true;
     let objectUrl: string | undefined;
-    const extension = image.path.split('.').pop()?.toLowerCase();
-    const mime = extension === 'jpg' ? 'jpeg' : extension;
+    setUrl(undefined);
+    setError(false);
 
     // If it's a planning asset and planning credentials are provided, use planning media-grant API
     const planningAssetMatch = /(?:^|[/\\])\.atris-plans[/\\][^/\\]+[/\\](assets[/\\][^\s?#]+)$/.exec(image.path);
@@ -106,24 +174,14 @@ export function ChatImageThumbnail({
       };
     }
 
-    // Otherwise use native Tauri preview
-    void invoke<number[]>('manual_project_image_preview', {
+    // Otherwise try native Tauri preview with automatic API gateway fallback
+    void loadLocalImagePreviewBlob({
       cwd: effectiveCwd,
       path: image.path,
     })
-      .then((bytes) => {
+      .then((blob) => {
         if (!active) return;
-        const b = new Uint8Array(bytes);
-        const isPng = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
-        const isJpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
-        const isGif = b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46;
-        const isWebp = b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46;
-        const detectedMime = isPng ? 'image/png'
-          : isJpeg ? 'image/jpeg'
-          : isGif ? 'image/gif'
-          : isWebp ? 'image/webp'
-          : `image/${mime}`;
-        objectUrl = URL.createObjectURL(new Blob([b], { type: detectedMime }));
+        objectUrl = URL.createObjectURL(blob);
         setUrl(objectUrl);
         setError(false);
       })

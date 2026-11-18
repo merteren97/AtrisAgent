@@ -3,9 +3,9 @@ import { persist } from 'zustand/middleware';
 
 export type RightDockTab = 'activity' | 'browser';
 
-export const RIGHT_DOCK_MIN_WIDTH = 340;
+export const RIGHT_DOCK_MIN_WIDTH = 260;
 export const RIGHT_DOCK_MAX_WIDTH = 900;
-export const RIGHT_DOCK_DEFAULT_WIDTH = 400;
+export const RIGHT_DOCK_DEFAULT_WIDTH = 360;
 
 export function clampRightDockWidth(width: number): number {
   if (!Number.isFinite(width)) return RIGHT_DOCK_DEFAULT_WIDTH;

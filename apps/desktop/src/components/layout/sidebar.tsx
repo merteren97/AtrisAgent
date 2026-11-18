@@ -32,6 +32,7 @@ import {
   Plug,
   BookOpen,
   FileText,
+  Globe,
 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Button } from '@/components/ui/button';
@@ -45,6 +46,7 @@ import { useMissionStore, type Mission } from '../../stores/mission-store';
 import { useAgentStore, type AgentInstance } from '../../stores/agent-store';
 import { useSettingsStore } from '../../stores/settings-store';
 import { useRightDockStore } from '@/stores/right-dock-store';
+import { useBrowserStore } from '@/stores/browser-store';
 import { useActivityStore } from '@/stores/activity-store';
 import { useManualStore } from '@/stores/manual-store';
 import { NavigationDeleteDialog, type NavigationDeleteTarget } from './navigation-delete-dialog';
@@ -209,6 +211,7 @@ export function Sidebar() {
   const [pendingDeleteMission, setPendingDeleteMission] = useState<Mission | null>(null);
   const dockOpen = useRightDockStore((state) => state.open);
   const dockTab = useRightDockStore((state) => state.activeTab);
+  const browserActive = useBrowserStore((state) => Boolean(state.url));
   const activityCounts = useActivityStore((state) => state.counts);
   const newChatWorkspaceIntent = useRef<string | null>(null);
   const { workspaces, activeWorkspaceId, setActiveWorkspace, rememberMission, loading: workspacesLoading, error: workspaceError, fetchWorkspaces } = useWorkspaceStore();
@@ -385,6 +388,23 @@ export function Sidebar() {
               ) : null
             }
             onClick={() => useRightDockStore.getState().toggleActivity()}
+          />
+          <SidebarItem
+            collapsed
+            icon={
+              <span className="relative inline-flex items-center justify-center">
+                <Globe className="h-4 w-4" />
+                {browserActive && (
+                  <span
+                    className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-emerald-500 ring-2 ring-sidebar"
+                    aria-label="Page active"
+                  />
+                )}
+              </span>
+            }
+            label="Browser"
+            isActive={dockOpen && dockTab === 'browser'}
+            onClick={() => useRightDockStore.getState().toggleBrowser()}
           />
           <SidebarItem collapsed icon={<BarChart2 className="h-4 w-4" />} label="Insights" isActive={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
           <SidebarItem collapsed icon={<UsersRound className="h-4 w-4" />} label="Teams & specialists" isActive={activeView === 'agents'} onClick={() => setActiveView('agents')} />

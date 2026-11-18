@@ -108,7 +108,9 @@ test('live camera QR stream pairs desktop automatically', async ({ page, request
     const draw = () => {
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 20, 20, 280, 280);
+      if ((window as any).__qrReady === true) {
+        ctx.drawImage(img, 20, 20, 280, 280);
+      }
     };
     draw();
     const timer = window.setInterval(draw, 100);
@@ -130,6 +132,9 @@ test('live camera QR stream pairs desktop automatically', async ({ page, request
   }, qrDataUrl);
   await page.getByRole('dialog').getByRole('button', { name: 'Connect desktop', exact: true }).click();
   await expect(page.getByTestId('qr-scanner-video')).toBeVisible();
+  await page.evaluate(() => {
+    (window as any).__qrReady = true;
+  });
   await expect(page.getByText('Approve your phone on desktop', { exact: true })).toBeVisible({ timeout: 10000 });
   expect(await page.evaluate(() => (window as any).__qrTrackStopped)).toBe(true);
   await request.get(`http://127.0.0.1:4191/approve?id=${config.id}`);

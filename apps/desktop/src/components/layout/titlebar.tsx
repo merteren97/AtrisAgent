@@ -1,17 +1,14 @@
 import { useEffect, useState, type MouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, Layers3, Square, RotateCcw, Minus, X, Maximize } from 'lucide-react';
+import { Layers3, Square, RotateCcw, Minus, X, Maximize } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useMissionStore } from '@/stores/mission-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useSettingsStore } from '@/stores/settings-store';
-import { useRightDockStore } from '@/stores/right-dock-store';
-import { useBrowserStore } from '@/stores/browser-store';
 import { useManualStore } from '@/stores/manual-store';
 import { useLanguageStore, t } from '@/stores/language-store';
 import { canRetryMission, isMissionCancellable, missionStatusLabel } from '@/lib/mission-display';
-import { cn } from '@/lib/utils';
 
 type WindowAction = 'move' | 'minimize' | 'maximize' | 'close';
 
@@ -34,9 +31,6 @@ function getErrorMessage(error: unknown): string {
 
 export function Titlebar() {
   const { setActiveView, activeView, openInspector } = useSettingsStore();
-  const dockOpen = useRightDockStore((state) => state.open);
-  const dockTab = useRightDockStore((state) => state.activeTab);
-  const browserActive = useBrowserStore((state) => Boolean(state.url));
   const [feedback, setFeedback] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<'stop' | 'retry' | null>(null);
   useLanguageStore();
@@ -182,25 +176,6 @@ export function Titlebar() {
           </Button>
         )}
         {showMissionControls && <div className="mx-1 h-5 w-px bg-border" />}
-        <Button
-          data-no-drag
-          variant="ghost"
-          size="icon"
-          className={cn(
-            'relative h-7 w-7 shrink-0 rounded-md',
-            dockOpen && dockTab === 'browser' && 'bg-accent text-foreground',
-          )}
-          onClick={() => useRightDockStore.getState().toggleBrowser()}
-          aria-label="Toggle browser"
-          aria-pressed={dockOpen && dockTab === 'browser'}
-          title="Browser"
-        >
-          <Globe className="h-3.5 w-3.5" />
-          {browserActive && (
-            <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-emerald-500" />
-          )}
-        </Button>
-        <div className="mx-1 h-5 w-px bg-border" />
         <Button
           data-no-drag
           variant="ghost"

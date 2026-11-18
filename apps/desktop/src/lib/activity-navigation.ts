@@ -1,4 +1,5 @@
 import type { ActivityTarget } from '@/lib/activity-types';
+import { apiRequest } from '@/lib/api-client';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useManualStore } from '@/stores/manual-store';
 import { useMissionStore } from '@/stores/mission-store';
@@ -70,6 +71,12 @@ export async function navigateToActivityTarget(target: ActivityTarget): Promise<
     usePlanningStore.getState().select(target.workspaceId, target.planId);
     usePlanningStore.getState().setChatHidden(target.workspaceId, false);
     if (target.conversationId) {
+      if (target.conversationId !== 'default') {
+        void apiRequest(
+          `/planning/${encodeURIComponent(target.workspaceId)}/plans/${encodeURIComponent(target.planId)}/chat/conversations/${encodeURIComponent(target.conversationId)}`,
+          { method: 'PATCH', body: JSON.stringify({ closed: false }) },
+        ).catch(() => {});
+      }
       usePlanningChatStore.getState().select(
         planningChatKey(target.workspaceId, target.planId),
         target.conversationId,

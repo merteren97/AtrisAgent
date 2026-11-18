@@ -330,6 +330,7 @@ export function LiveQrScanner({
       if (sessionRef.current !== sessionId) return;
       setStatus('streaming');
       setMessage('Point camera at the QR code on desktop.');
+      lastScanAtRef.current = performance.now();
       scanLoop(sessionId);
     },
     [scanLoop, stopTracks],

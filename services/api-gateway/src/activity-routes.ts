@@ -49,6 +49,35 @@ const ACTIVE_MISSION_STATUSES = new Set([
 ]);
 
 const TERMINAL_CLEARABLE_MISSION_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const FAILURE_ATTENTION_WINDOW_MS = 2 * 60 * 60 * 1000;
+const STALE_MANUAL_START_WINDOW_MS = 6 * 60 * 60 * 1000;
+const RECENT_MANUAL_AGENT_UPDATE_MS = 15 * 60 * 1000;
+const MAX_MANUAL_SESSION_DURATION_MS = 12 * 60 * 60 * 1000;
+const UNREAD_COMPLETION_WINDOW_MS = 30 * 60 * 1000;
+
+function isRecentUnseenFailure(
+  updatedAt: string,
+  meta: ActivityItemMetaRow | undefined,
+  nowMs: number,
+): boolean {
+  const unseen = !meta?.last_seen_at || updatedAt > meta.last_seen_at;
+  if (!unseen) return false;
+  const updMs = safeParseMs(updatedAt);
+  return updMs !== null && nowMs - updMs <= FAILURE_ATTENTION_WINDOW_MS;
+}
+
+function isUnreadCompletion(
+  state: ActivityState,
+  updatedAt: string,
+  meta: ActivityItemMetaRow | undefined,
+  nowMs: number,
+): boolean {
+  if (state !== 'completed') return false;
+  if (meta?.last_seen_at && updatedAt <= meta.last_seen_at) return false;
+  if (meta?.last_completed_at) return true;
+  const updMs = safeParseMs(updatedAt);
+  return updMs !== null && nowMs - updMs <= UNREAD_COMPLETION_WINDOW_MS;
+}
 
 function hasTable(sqlite: Database.Database, name: string): boolean {
   const row = sqlite
@@ -356,6 +385,8 @@ export async function buildActivitySummary(
       const pendingApprovals = approvalsByMission.get(m.id) || [];
       const pendingQuestions = questionsByMission.get(m.id) || [];
 
+      const updatedAt = m.updated_at || m.created_at;
+
       let state: ActivityState;
       let statusLabel: string;
       let attention: ActivityAttentionInfo | null = null;
@@ -396,14 +427,19 @@ export async function buildActivitySummary(
           sinceAt: m.updated_at,
         };
       } else if (m.status === 'failed') {
-        const failedRun = runs.find((run) => run.status === 'failed' && run.error);
-        state = 'attention';
-        statusLabel = 'Failed';
-        attention = {
-          kind: 'error',
-          preview: redactPreview(failedRun?.error, 'Mission failed'),
-          sinceAt: m.completed_at || m.updated_at,
-        };
+        if (isRecentUnseenFailure(updatedAt, meta, nowMs)) {
+          const failedRun = runs.find((run) => run.status === 'failed' && run.error);
+          state = 'attention';
+          statusLabel = 'Failed';
+          attention = {
+            kind: 'error',
+            preview: redactPreview(failedRun?.error, 'Mission failed'),
+            sinceAt: m.completed_at || m.updated_at,
+          };
+        } else {
+          state = 'failed';
+          statusLabel = 'Failed';
+        }
       } else if (ACTIVE_MISSION_STATUSES.has(m.status)) {
         state = 'running';
         statusLabel = capitalizeStatus(m.status);
@@ -418,7 +454,6 @@ export async function buildActivitySummary(
         statusLabel = capitalizeStatus(m.status);
       }
 
-      const updatedAt = m.updated_at || m.created_at;
       if (
         meta?.cleared_at &&
         !meta.pinned_at &&
@@ -478,8 +513,7 @@ export async function buildActivitySummary(
       const activeAgentId = attention?.agentId || activeAgents[0]?.id || agents[0]?.id;
 
       const pinnedAt = meta?.pinned_at ?? null;
-      const unreadCompletion =
-        state === 'completed' && (!meta?.last_seen_at || updatedAt > meta.last_seen_at);
+      const unreadCompletion = isUnreadCompletion(state, updatedAt, meta, nowMs);
 
       items.push({
         itemKey,
@@ -569,6 +603,9 @@ export async function buildActivitySummary(
       .filter((at): at is string => Boolean(at && safeParseMs(at) !== null))
       .sort()
       .at(-1);
+    const latestAgentMs = safeParseMs(latestAgentAt);
+    const hasRecentAgentUpdate =
+      latestAgentMs !== null && nowMs - latestAgentMs <= RECENT_MANUAL_AGENT_UPDATE_MS;
 
     let startedAt: string | null = null;
     let completedAt: string | null = null;
@@ -588,17 +625,31 @@ export async function buildActivitySummary(
       }
       startedAt = meta.active_started_at;
       const startMs = safeParseMs(startedAt);
-      durationMs = startMs !== null ? Math.max(0, nowMs - startMs) : null;
+      const isStaleStart =
+        startMs !== null &&
+        nowMs - startMs > STALE_MANUAL_START_WINDOW_MS &&
+        !hasRecentAgentUpdate;
+      durationMs = startMs !== null && !isStaleStart ? Math.max(0, nowMs - startMs) : null;
     } else if (state === 'attention') {
       startedAt = meta?.active_started_at ?? null;
       const startMs = safeParseMs(startedAt);
-      durationMs = startMs !== null ? Math.max(0, nowMs - startMs) : (meta?.duration_ms ?? null);
+      const isStaleStart =
+        startMs !== null &&
+        nowMs - startMs > STALE_MANUAL_START_WINDOW_MS &&
+        !hasRecentAgentUpdate;
+      durationMs = startMs !== null
+        ? (isStaleStart ? null : Math.max(0, nowMs - startMs))
+        : (meta?.duration_ms ?? null);
     } else {
       if (meta?.active_started_at) {
         const startMs = safeParseMs(meta.active_started_at);
         const endIso = latestAgentAt || nowIso;
         const endMs = safeParseMs(endIso) ?? nowMs;
-        const computedDuration = startMs !== null ? Math.max(0, endMs - startMs) : null;
+        let computedDuration: number | null =
+          startMs !== null && endMs >= startMs ? endMs - startMs : null;
+        if (computedDuration !== null && computedDuration > MAX_MANUAL_SESSION_DURATION_MS) {
+          computedDuration = null;
+        }
         startedAt = meta.active_started_at;
         completedAt = endIso;
         durationMs = computedDuration;
@@ -631,8 +682,7 @@ export async function buildActivitySummary(
     const activeCount = workingEntries.length + (attentionEntry ? 1 : 0);
     const targetAgentId = attention?.agentId || workingEntries[0]?.agent.id || conv.agents[0]?.id;
     const pinnedAt = meta?.pinned_at ?? null;
-    const unreadCompletion =
-      state === 'completed' && (!meta?.last_seen_at || updatedAt > meta.last_seen_at);
+    const unreadCompletion = isUnreadCompletion(state, updatedAt, meta, nowMs);
 
     items.push({
       itemKey,
@@ -683,11 +733,32 @@ export async function buildActivitySummary(
         const itemKey = `planning:${ws.id}:${plan.id}:${conv.conversationId}`;
         const meta = metaByKey.get(itemKey);
 
+        const isClosed = Boolean(conv.closedAt);
+        if (isClosed && !meta?.pinned_at) {
+          continue;
+        }
+
+        const updatedAt = conv.updatedAt || plan.updatedAt;
+
         let state: ActivityState;
         let statusLabel: string;
         let attention: ActivityAttentionInfo | null = null;
 
-        if (conv.approvals.length > 0) {
+        if (isClosed) {
+          if (conv.status === 'complete') {
+            state = 'completed';
+            statusLabel = 'Completed';
+          } else if (conv.status === 'failed') {
+            state = 'failed';
+            statusLabel = 'Failed';
+          } else if (conv.status === 'cancelled') {
+            state = 'cancelled';
+            statusLabel = 'Cancelled';
+          } else {
+            state = 'idle';
+            statusLabel = conv.status === 'interrupted' ? 'Interrupted' : 'Idle';
+          }
+        } else if (conv.approvals.length > 0) {
           const ap = conv.approvals[0];
           state = 'attention';
           statusLabel = 'Approval needed';
@@ -706,13 +777,18 @@ export async function buildActivitySummary(
             sinceAt: conv.updatedAt,
           };
         } else if (conv.status === 'failed') {
-          state = 'attention';
-          statusLabel = 'Failed';
-          attention = {
-            kind: 'error',
-            preview: redactPreview(conv.error, 'Planning turn failed'),
-            sinceAt: conv.updatedAt,
-          };
+          if (isRecentUnseenFailure(updatedAt, meta, nowMs)) {
+            state = 'attention';
+            statusLabel = 'Failed';
+            attention = {
+              kind: 'error',
+              preview: redactPreview(conv.error, 'Planning turn failed'),
+              sinceAt: conv.updatedAt,
+            };
+          } else {
+            state = 'failed';
+            statusLabel = 'Failed';
+          }
         } else if (conv.status === 'running') {
           state = 'running';
           statusLabel = conv.activity || 'Running';
@@ -727,7 +803,6 @@ export async function buildActivitySummary(
           statusLabel = conv.status === 'interrupted' ? 'Interrupted' : 'Idle';
         }
 
-        const updatedAt = conv.updatedAt || plan.updatedAt;
         if (
           meta?.cleared_at &&
           !meta.pinned_at &&
@@ -747,8 +822,7 @@ export async function buildActivitySummary(
         const title = isDefaultUntitled ? plan.title : conv.title;
         const subtitle = isDefaultUntitled ? 'Planning chat' : plan.title;
         const pinnedAt = meta?.pinned_at ?? null;
-        const unreadCompletion =
-          state === 'completed' && (!meta?.last_seen_at || updatedAt > meta.last_seen_at);
+        const unreadCompletion = !isClosed && isUnreadCompletion(state, updatedAt, meta, nowMs);
 
         items.push({
           itemKey,
@@ -834,11 +908,15 @@ export function installActivityRoutes(app: Application, deps: ActivityRoutesDepe
       }
       const pinned = req.body?.pinned;
       const markSeen = req.body?.markSeen;
+      const cleared = req.body?.cleared;
       if (pinned !== undefined && typeof pinned !== 'boolean') {
         return void res.status(400).json({ error: 'pinned must be a boolean.' });
       }
       if (markSeen !== undefined && typeof markSeen !== 'boolean') {
         return void res.status(400).json({ error: 'markSeen must be a boolean.' });
+      }
+      if (cleared !== undefined && typeof cleared !== 'boolean') {
+        return void res.status(400).json({ error: 'cleared must be a boolean.' });
       }
 
       const nowIso = new Date().toISOString();
@@ -847,6 +925,8 @@ export function installActivityRoutes(app: Application, deps: ActivityRoutesDepe
         pinned === true ? (existing?.pinned_at || nowIso) : pinned === false ? null : (existing?.pinned_at ?? null);
       const nextLastSeenAt =
         markSeen === true ? nowIso : (existing?.last_seen_at ?? null);
+      const nextClearedAt =
+        cleared === true ? nowIso : cleared === false ? null : (existing?.cleared_at ?? null);
 
       sqlite
         .prepare(
@@ -855,6 +935,7 @@ export function installActivityRoutes(app: Application, deps: ActivityRoutesDepe
            ON CONFLICT(item_key) DO UPDATE SET
              pinned_at = excluded.pinned_at,
              last_seen_at = excluded.last_seen_at,
+             cleared_at = excluded.cleared_at,
              updated_at = excluded.updated_at`,
         )
         .run(
@@ -864,7 +945,7 @@ export function installActivityRoutes(app: Application, deps: ActivityRoutesDepe
           existing?.active_started_at ?? null,
           existing?.last_completed_at ?? null,
           existing?.duration_ms ?? null,
-          existing?.cleared_at ?? null,
+          nextClearedAt,
           nowIso,
         );
 
@@ -873,6 +954,7 @@ export function installActivityRoutes(app: Application, deps: ActivityRoutesDepe
         itemKey,
         pinnedAt: nextPinnedAt,
         lastSeenAt: nextLastSeenAt,
+        clearedAt: nextClearedAt,
       });
     } catch (error: any) {
       res.status(500).json({ error: error?.message || 'Failed to update activity metadata' });

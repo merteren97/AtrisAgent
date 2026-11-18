@@ -109,38 +109,92 @@ assert.equal(useManualStore.getState().agentByConversation['conv-1'], 'manual-ag
 assert.equal(useManualStore.getState().hiddenAgents['manual-agent-1'], false);
 assert.equal(useSettingsStore.getState().activeView, 'chat');
 
-// Deep-linking: Planning
-usePlanningStore.setState({
-  plans: {
-    'ws-b': [
-      {
-        id: 'plan-9',
-        workspaceId: 'ws-b',
-        title: 'Dock architecture',
-        status: 'draft',
-        createdAt: '2026-11-18T00:00:00Z',
-        updatedAt: '2026-11-18T01:00:00Z',
-        pinned: false,
-        archivedAt: null,
-      },
-    ],
-  },
-  chatHidden: { 'ws-b': true },
-});
-useSettingsStore.setState({ activeView: 'agents' });
+// Deep-linking: Planning (including best-effort reopen for non-default closed tabs)
+const originalFetch = globalThis.fetch;
+const patchCalls: Array<{ url: string; method?: string; body?: string }> = [];
+let shouldRejectFetch = false;
 
-await navigateToActivityTarget({
-  mode: 'planning',
-  workspaceId: 'ws-b',
-  planId: 'plan-9',
-  conversationId: 'plan-chat-2',
-});
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+  patchCalls.push({
+    url,
+    method: init?.method,
+    body: typeof init?.body === 'string' ? init.body : undefined,
+  });
+  if (shouldRejectFetch) {
+    throw new Error('offline');
+  }
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}) as typeof fetch;
 
-assert.equal(useWorkspaceStore.getState().activeWorkspaceId, 'ws-b');
-assert.equal(useManualStore.getState().mode, 'planning');
-assert.equal(usePlanningStore.getState().activeByWorkspace['ws-b'], 'plan-9');
-assert.equal(usePlanningStore.getState().chatHidden['ws-b'], false);
-assert.equal(usePlanningChatStore.getState().activeByPlan[planningChatKey('ws-b', 'plan-9')], 'plan-chat-2');
-assert.equal(useSettingsStore.getState().activeView, 'chat');
+try {
+  usePlanningStore.setState({
+    plans: {
+      'ws-b': [
+        {
+          id: 'plan-9',
+          workspaceId: 'ws-b',
+          title: 'Dock architecture',
+          status: 'draft',
+          createdAt: '2026-11-18T00:00:00Z',
+          updatedAt: '2026-11-18T01:00:00Z',
+          pinned: false,
+          archivedAt: null,
+        },
+      ],
+    },
+    chatHidden: { 'ws-b': true },
+  });
+  useSettingsStore.setState({ activeView: 'agents' });
+
+  await navigateToActivityTarget({
+    mode: 'planning',
+    workspaceId: 'ws-b',
+    planId: 'plan-9',
+    conversationId: 'plan-chat-2',
+  });
+
+  assert.equal(useWorkspaceStore.getState().activeWorkspaceId, 'ws-b');
+  assert.equal(useManualStore.getState().mode, 'planning');
+  assert.equal(usePlanningStore.getState().activeByWorkspace['ws-b'], 'plan-9');
+  assert.equal(usePlanningStore.getState().chatHidden['ws-b'], false);
+  assert.equal(usePlanningChatStore.getState().activeByPlan[planningChatKey('ws-b', 'plan-9')], 'plan-chat-2');
+  assert.equal(useSettingsStore.getState().activeView, 'chat');
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(patchCalls.length, 1);
+  assert.ok(
+    patchCalls[0].url.endsWith('/api/planning/ws-b/plans/plan-9/chat/conversations/plan-chat-2'),
+    `unexpected reopen URL: ${patchCalls[0].url}`,
+  );
+  assert.equal(patchCalls[0].method, 'PATCH');
+  assert.equal(patchCalls[0].body, JSON.stringify({ closed: false }));
+
+  // Default conversationId must NOT send reopen PATCH
+  await navigateToActivityTarget({
+    mode: 'planning',
+    workspaceId: 'ws-b',
+    planId: 'plan-9',
+    conversationId: 'default',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(patchCalls.length, 1);
+
+  // Best-effort PATCH rejection must not break navigation
+  shouldRejectFetch = true;
+  await navigateToActivityTarget({
+    mode: 'planning',
+    workspaceId: 'ws-b',
+    planId: 'plan-9',
+    conversationId: 'plan-chat-3',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(usePlanningChatStore.getState().activeByPlan[planningChatKey('ws-b', 'plan-9')], 'plan-chat-3');
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 console.log('[PASS] activity-navigation formatting and deep-link tests');

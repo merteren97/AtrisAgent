@@ -281,6 +281,148 @@ export class ManualConversationStore {
       return result;
     })();
   }
+  readAllowedImagePreview(cwd: string | undefined, rawPath: string): { mimeType: string; dataBase64: string } {
+    const stripped = normalizeAllowedImageInput(rawPath);
+    const realCwd = resolveExistingDirectory(cwd);
+    let candidateInput: string;
+    if (path.isAbsolute(stripped)) {
+      candidateInput = path.resolve(stripped);
+    } else {
+      if (!realCwd) return fail('Project is unavailable.', 404);
+      candidateInput = path.resolve(realCwd, stripped);
+    }
+    let candidate: string;
+    try {
+      candidate = fs.realpathSync(candidateInput);
+    } catch {
+      return fail('Image is unavailable.', 404);
+    }
+
+    const allowedRoots = new Set<string>();
+    if (realCwd) allowedRoots.add(realCwd);
+
+    try {
+      const workspaceRows = this.sqlite.prepare('SELECT path FROM workspaces').all() as Array<{ path: string }>;
+      for (const row of workspaceRows) {
+        const wsReal = resolveExistingDirectory(row.path);
+        if (!wsReal) continue;
+        allowedRoots.add(wsReal);
+        const parent = path.dirname(wsReal);
+        if (parent !== wsReal && fs.existsSync(path.join(parent, '.git'))) {
+          const parentReal = resolveExistingDirectory(parent);
+          if (parentReal) allowedRoots.add(parentReal);
+        }
+      }
+    } catch {
+      // Ignore if workspaces table is unavailable in an isolated harness
+    }
+
+    const attachmentsRoot = resolveExistingDirectory(path.join(os.tmpdir(), 'atris-agent-attachments'));
+    if (attachmentsRoot) allowedRoots.add(attachmentsRoot);
+
+    for (const brainDir of [
+      path.join(os.homedir(), '.gemini', 'antigravity-cli', 'brain'),
+      path.join(os.homedir(), '.gemini', 'antigravity', 'brain'),
+    ]) {
+      const realBrainDir = resolveExistingDirectory(brainDir);
+      if (realBrainDir) allowedRoots.add(realBrainDir);
+    }
+
+    const allowed = Array.from(allowedRoots).some(root => isInsideAllowedRoot(root, candidate));
+    if (!allowed) return fail('Image is outside allowed project directories.', 403);
+
+    const extension = path.extname(candidate).toLowerCase();
+    if (!SUPPORTED_IMAGE_EXTENSIONS.has(extension)) {
+      return fail('Not a supported image.');
+    }
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(candidate);
+    } catch {
+      return fail('Image is unavailable.', 404);
+    }
+    if (!stat.isFile() || stat.size <= 0 || stat.size > IMAGE_PREVIEW_MAX_BYTES) {
+      return fail('Image is unavailable or exceeds 8 MB.');
+    }
+
+    let buffer: Buffer;
+    try {
+      buffer = fs.readFileSync(candidate);
+    } catch {
+      return fail('Image is unavailable.', 404);
+    }
+    const mimeType = detectImageMagicMime(buffer);
+    if (!mimeType) {
+      return fail('Image format is not a supported image.');
+    }
+    return { mimeType, dataBase64: buffer.toString('base64') };
+  }
+}
+
+const IMAGE_PREVIEW_MAX_BYTES = 8 * 1024 * 1024;
+const SUPPORTED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+
+function resolveExistingDirectory(dirPath?: string): string | undefined {
+  if (!dirPath || !dirPath.trim()) return undefined;
+  try {
+    const resolved = fs.realpathSync(dirPath.trim());
+    return fs.statSync(resolved).isDirectory() ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isInsideAllowedRoot(rootDir: string, candidate: string): boolean {
+  const rel = path.relative(rootDir, candidate);
+  return rel !== '' && !/^\.\.(?:[\\/]|$)/.test(rel) && !path.isAbsolute(rel);
+}
+
+function normalizeAllowedImageInput(rawPath: string): string {
+  if (!rawPath || rawPath.length > 2048 || /[\u0000-\u001f\u007f]/.test(rawPath)) {
+    return fail('Invalid image path.');
+  }
+  let stripped = rawPath.trim();
+  if (/^file:\/\//i.test(stripped)) {
+    let afterScheme = stripped.slice(7);
+    if (/^localhost\//i.test(afterScheme)) afterScheme = afterScheme.slice(9);
+    const withoutLeadingSlashOnDrive = /^\/[a-zA-Z]:/.test(afterScheme) ? afterScheme.slice(1) : afterScheme;
+    try {
+      stripped = decodeURIComponent(withoutLeadingSlashOnDrive);
+    } catch {
+      return fail('Invalid image path.');
+    }
+  }
+  stripped = stripped.replace(/(\.(?:png|jpe?g|webp|gif))[?#].*$/i, '$1').trim();
+  if (!stripped || /[\u0000-\u001f\u007f]/.test(stripped)) {
+    return fail('Invalid image path.');
+  }
+  return stripped;
+}
+
+function detectImageMagicMime(buffer: Buffer): string | undefined {
+  if (
+    buffer.length >= 8
+    && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47
+    && buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a
+  ) {
+    return 'image/png';
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (buffer.length >= 6) {
+    const header6 = buffer.subarray(0, 6).toString('ascii');
+    if (header6 === 'GIF87a' || header6 === 'GIF89a') return 'image/gif';
+  }
+  if (
+    buffer.length >= 12
+    && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  return undefined;
 }
 
 function transcriptPath(agent: ManualAgent): string | null {
@@ -321,6 +463,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   };
   const idParam = (req: Request, key: string) => required(req.params[key], key);
   app.get('/api/manual/conversations', route((req, res) => res.json(store.list(required(req.query.workspaceId, 'project')))));
+  app.post('/api/manual/image-preview', route((req, res) => res.json(store.readAllowedImagePreview(typeof req.body?.cwd === 'string' ? req.body.cwd : undefined, required(req.body?.path, 'image path', 2048)))));
   app.patch('/api/manual/conversations/:conversationId', route((req, res) => {
     res.json(store.rename(idParam(req, 'conversationId'), required(req.body?.title, 'title')));
   }));
