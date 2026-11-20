@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type RightDockTab = 'activity' | 'browser';
+export type RightDockTab = 'activity' | 'browser' | 'changes';
 
 export const RIGHT_DOCK_MIN_WIDTH = 260;
 export const RIGHT_DOCK_MAX_WIDTH = 900;

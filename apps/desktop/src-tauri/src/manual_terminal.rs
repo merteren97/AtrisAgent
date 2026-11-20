@@ -10,9 +10,9 @@ struct Geometry { columns: u16, rows: u16 }
 const INITIAL_GEOMETRY: Geometry = Geometry { columns: 120, rows: 30 };
 #[derive(Serialize, Debug, PartialEq)]
 struct ReplayResize { offset: usize, columns: u16, rows: u16 }
-struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, bytes: usize, ended: bool, geometry: Geometry, input_ready: Option<bool>, signal_tail: String }
+struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, last_output: Option<(u64, std::time::Instant)>, bytes: usize, ended: bool, geometry: Geometry, input_ready: Option<bool>, signal_tail: String }
 impl Replay {
-    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY, input_ready: None, signal_tail: String::new() } }
+    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, last_output: None, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY, input_ready: None, signal_tail: String::new() } }
     fn push(&mut self, text: String) {
         if self.input_ready == Some(false) {
             self.signal_tail.push_str(&text);
@@ -27,6 +27,7 @@ impl Replay {
             }
         }
         self.sequence += 1;
+        if !text.is_empty() { self.last_output = Some((self.sequence, std::time::Instant::now())); }
         self.bytes += text.len();
         self.chunks.push_back((self.sequence, text, self.geometry));
         while (self.bytes > REPLAY_LIMIT || self.chunks.len() > 4096) && self.chunks.len() > 1 {
@@ -54,6 +55,15 @@ impl Replay {
         }
         (output, resizes)
     }
+}
+
+fn paste_output_settled(replay: &Replay, after: u64, started: std::time::Instant, now: std::time::Instant) -> bool {
+    use std::time::Duration;
+    // Silence by itself is not a repaint. Resize-only replay entries are not
+    // output, either. Some TUIs insert pasted text asynchronously, after their
+    // stdin handler has already returned and can receive the next key.
+    now.duration_since(started) >= Duration::from_millis(250)
+        && replay.last_output.is_some_and(|(sequence, at)| sequence > after && now.duration_since(at) >= Duration::from_millis(200))
 }
 struct Terminal {
     master: Box<dyn MasterPty + Send>, writer: Arc<Mutex<Box<dyn Write + Send>>>, child: Box<dyn Child + Send + Sync>,
@@ -320,6 +330,16 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             std::thread::sleep(std::time::Duration::from_millis(25));
             if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
             let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
+            if state.ended { return Err("Agent disconnected before the message could be submitted.".into()); }
+            if !codex {
+                // This is a timing signal, not a CLI acknowledgement. Never
+                // blindly submit on timeout or retry Enter into a possible dialog.
+                if paste_output_settled(&state, after, started, std::time::Instant::now()) { break; }
+                if started.elapsed() >= std::time::Duration::from_secs(5) {
+                    return Err("The terminal did not settle after pasting. Open Code to inspect the prompt and press Enter once if it is still there; it was not submitted automatically.".into());
+                }
+                continue;
+            }
             let current = state.sequence;
             if let Some(labels) = &paste_labels {
                 if acknowledged_at.is_none() && current != sequence {
@@ -615,6 +635,22 @@ pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String
 mod tests {
     use super::*;
     #[test]
+    fn automatic_enter_waits_for_delayed_paste_output_not_silence_or_resize() {
+        use std::time::{Duration, Instant};
+        let mut replay = Replay::new();
+        replay.push("original prompt".into());
+        let after = replay.sequence;
+        let started = Instant::now();
+        replay.resized(Geometry { columns: 80, rows: 24 });
+        assert!(!paste_output_settled(&replay, after, started, started + Duration::from_millis(500)));
+
+        let echo_at = started + Duration::from_millis(700);
+        replay.push("pasted prompt".into());
+        replay.last_output = Some((replay.sequence, echo_at));
+        assert!(!paste_output_settled(&replay, after, started, echo_at + Duration::from_millis(199)));
+        assert!(paste_output_settled(&replay, after, started, echo_at + Duration::from_millis(200)));
+    }
+    #[test]
     fn codex_readiness_requires_a_complete_cli_signal() {
         let mut replay = Replay::new();
         replay.input_ready = Some(false);
@@ -809,6 +845,50 @@ mod tests {
         println!("Installed OpenCode TUI confirmed high → low reasoning and Auto → normal without submitting a provider prompt.");
         if let Ok(destination) = std::env::var("ATRIS_TEST_OPENCODE_CAPTURE") { std::fs::write(destination,serde_json::to_vec(&replay).unwrap()).unwrap(); }
         close_session(&manager,&id).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_opencode_bracketed_paste_submits_local_command() {
+        let Ok(executable) = std::env::var("ATRIS_TEST_OPENCODE_EXECUTABLE") else { return; };
+        let root = std::env::temp_dir().join(format!("atris-opencode-enter-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let manager = ManualTerminals::default();
+        struct Cleanup(ManualTerminals, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { self.0.shutdown(); let _ = std::fs::remove_dir_all(&self.1); }
+        }
+        let _cleanup = Cleanup(manager.clone(), root.clone());
+        let id = "00000000-0000-4000-8000-000000000040";
+        let env = [ ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state") ]
+            .into_iter().map(|(key, dir)| (key.into(), root.join(dir).to_string_lossy().into_owned())).collect();
+        start_with_cleanup(manager.clone(), Launch {
+            id: id.into(), executable, env, args: vec![], cwd: root.to_string_lossy().into_owned(),
+        }).unwrap();
+
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut cursor_replied = false;
+        loop {
+            let frame = snapshot(&manager, id.into(), 0, false).unwrap();
+            if !cursor_replied && frame.output.contains("\x1b[6n") {
+                write_input(&manager, id, "\x1b[1;1R", false).unwrap();
+                cursor_replied = true;
+            }
+            if frame.output.contains("Ask anything") { break; }
+            assert!(frame.status == "open" && Instant::now() < deadline, "OpenCode prompt did not become ready");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // :q runs locally; it exits only if OpenCode processes the submit key.
+        write_input(&manager, id, ":q", true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame = snapshot(&manager, id.into(), 0, true).unwrap();
+            if frame.status == "exited" { break; }
+            assert!(Instant::now() < deadline, "OpenCode did not submit the pasted local command");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

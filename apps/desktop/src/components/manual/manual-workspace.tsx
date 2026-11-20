@@ -96,6 +96,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
             <span className="block text-xl font-semibold">{amount}</span><span className="mt-1 block text-xs text-muted-foreground">{amount === 1 ? 'agent' : 'agents'}</span>
           </label>)}</div>
           <p className="mt-3 text-xs leading-5 text-muted-foreground">Opens {count} independent CLI {count === 1 ? 'session' : 'sessions'}. Terminals arrange automatically. Add more later, up to 30 per conversation.</p>
+          {!conversationId && <p className="mt-2 text-xs leading-5 text-muted-foreground">Tabs share a working copy. Review and apply its edits in Changes in the right panel.</p>}
         </fieldset>
         {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Use the desktop app to launch interactive terminals.</p>}
         {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
@@ -400,9 +401,34 @@ export function ManualWorkspace() {
                   {truncated && <p className="text-xs text-muted-foreground">Showing recent messages from this long session.</p>}
                   {historyLoading && <p role="status" className="text-xs text-muted-foreground">Syncing Codex history… Displayed messages remain available while records arrive.</p>}
                   {!messages.length && <div className="py-8"><RuntimeBrandIcon runtimeId={agent.runtimeType} className="mb-4 h-9 w-9 text-foreground" /><h3 className="text-xl font-semibold tracking-tight">What would you like to work on?</h3><p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">Message {agent.name}, choose a model in the composer, or open Code for the live terminal. Each agent keeps its own conversation.</p><div className="mt-5 flex flex-wrap gap-2">{['Explore this project', 'Review recent changes', 'Help me plan a task'].map(prompt => <Button key={prompt} size="sm" variant="outline" className="rounded-full text-xs" onClick={() => setDraft(agent.id, prompt)}>{prompt}</Button>)}</div></div>}
-                    {messages.filter(message => message.role !== 'tool').map(message => <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : 'min-w-0'}><p className="mb-2 text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : (agent.autoName !== false ? cliName(agent.runtimeType) : agent.name)}</p><ManualChatContent text={message.text} agentId={agent.id} cwd={agent.cwd} user={message.role === 'user'} thinking={message.thinking} thinkingTokens={message.thinkingTokens} tools={message.tools} /></article>)}
-                   {unresolvedQuestion && !questions.length && <ManualQuestionCard key={unresolvedQuestion.id} request={unresolvedQuestion} onReply={agent.runtimeType === 'antigravity' && live ? answers => replyQuestion(unresolvedQuestion, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />}
-                   {questions.map(question => <ManualQuestionCard key={question.id} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
+                    {(() => {
+                      const visibleMessages = messages.filter(message => message.role !== 'tool');
+                      const conversationTools = visibleMessages.flatMap(message => message.tools || []);
+                      return visibleMessages.map((message, index) => {
+                        const showAuthor = index === 0 || visibleMessages[index - 1].role !== message.role;
+                        return (
+                          <article key={message.id} className={message.role === 'user' ? 'ml-auto max-w-[90%] rounded-xl bg-secondary px-4 py-3' : `min-w-0${showAuthor ? '' : ' !mt-3'}`}>
+                            {showAuthor && (
+                              <p className="mb-2 text-[11px] font-medium text-muted-foreground">
+                                {message.role === 'user' ? 'You' : (agent.autoName !== false ? cliName(agent.runtimeType) : agent.name)}
+                              </p>
+                            )}
+                            <ManualChatContent
+                              text={message.text}
+                              agentId={agent.id}
+                              cwd={agent.cwd}
+                              user={message.role === 'user'}
+                              thinking={message.thinking}
+                              thinkingTokens={message.thinkingTokens}
+                              tools={message.tools}
+                              conversationTools={conversationTools}
+                            />
+                          </article>
+                        );
+                      });
+                    })()}
+                    {unresolvedQuestion && !questions.length && <ManualQuestionCard key={`${agent.id}:${unresolvedQuestion.id}`} draftScope={`manual:${agent.id}`} request={unresolvedQuestion} onReply={agent.runtimeType === 'antigravity' && live ? answers => replyQuestion(unresolvedQuestion, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />}
+                    {questions.map(question => <ManualQuestionCard key={`${agent.id}:${question.id}`} draftScope={`manual:${agent.id}`} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
                    {live && observations[agent.id]?.state !== 'completed' && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
                 </>}
                 <div ref={messageEnd} />

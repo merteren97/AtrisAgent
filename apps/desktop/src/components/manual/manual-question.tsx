@@ -3,6 +3,84 @@ import { HelpCircle, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { ManualQuestion } from '@/stores/manual-store';
 
+const QUESTION_DRAFTS_STORAGE_KEY = 'atris-manual-question-drafts-v2';
+const MAX_STORED_QUESTION_DRAFTS = 60;
+const memoryQuestionDrafts = new Map<string, string[][]>();
+
+function questionDraftKey(scope: string, request: ManualQuestion): string {
+  return JSON.stringify([scope, request.id, request.questions.map(q => [q.question, Boolean(q.multiple), Boolean(q.custom), q.options.map(o => o.label)])]);
+}
+
+function readPersistedDraftMap(): Record<string, string[][]> {
+  try {
+    if (typeof globalThis.localStorage === 'undefined') return {};
+    const raw = globalThis.localStorage.getItem(QUESTION_DRAFTS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, string[][]>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePersistedDraftMap(entries: Record<string, string[][]>): void {
+  try {
+    if (typeof globalThis.localStorage === 'undefined') return;
+    const keys = Object.keys(entries);
+    const trimmed = keys.length > MAX_STORED_QUESTION_DRAFTS
+      ? Object.fromEntries(keys.slice(keys.length - MAX_STORED_QUESTION_DRAFTS).map(k => [k, entries[k]]))
+      : entries;
+    globalThis.localStorage.setItem(QUESTION_DRAFTS_STORAGE_KEY, JSON.stringify(trimmed));
+  } catch {
+    // Ignore storage quota or private-mode errors; in-memory map still preserves drafts across tab switches.
+  }
+}
+
+function isValidDraftForRequest(candidate: unknown, questionCount: number): candidate is string[][] {
+  return (
+    Array.isArray(candidate)
+    && candidate.length === questionCount
+    && candidate.every(item => Array.isArray(item) && item.every(val => typeof val === 'string'))
+  );
+}
+
+export function getSavedQuestionDraft(request: ManualQuestion, scope: string): string[][] {
+  const count = request.questions.length;
+  const key = questionDraftKey(scope, request);
+  const fromMemory = memoryQuestionDrafts.get(key);
+  if (isValidDraftForRequest(fromMemory, count)) {
+    return fromMemory.map(items => [...items]);
+  }
+  const persisted = readPersistedDraftMap();
+  const fromStorage = persisted[key];
+  if (isValidDraftForRequest(fromStorage, count)) {
+    return fromStorage.map(items => [...items]);
+  }
+  return request.questions.map(() => []);
+}
+
+export function saveQuestionDraft(request: ManualQuestion, answers: string[][], scope: string): void {
+  const copy = answers.map(items => [...items]);
+  const key = questionDraftKey(scope, request);
+  memoryQuestionDrafts.delete(key);
+  memoryQuestionDrafts.set(key, copy);
+  if (memoryQuestionDrafts.size > MAX_STORED_QUESTION_DRAFTS) memoryQuestionDrafts.delete(memoryQuestionDrafts.keys().next().value!);
+  const persisted = readPersistedDraftMap();
+  delete persisted[key];
+  persisted[key] = copy;
+  writePersistedDraftMap(persisted);
+}
+
+export function clearSavedQuestionDraft(request: ManualQuestion, scope: string): void {
+  const key = questionDraftKey(scope, request);
+  memoryQuestionDrafts.delete(key);
+  const persisted = readPersistedDraftMap();
+  delete persisted[key];
+  writePersistedDraftMap(persisted);
+}
+
 export function buildAntigravityQuestionKeystrokes(question: ManualQuestion, answers: string[][]): string[] {
   const steps: string[] = [];
   for (let qIdx = 0; qIdx < question.questions.length; qIdx += 1) {
@@ -40,27 +118,36 @@ export function buildAntigravityQuestionKeystrokes(question: ManualQuestion, ans
 }
 
 export function ManualQuestionCard({
+  draftScope,
   request,
   onReply,
   onOpenCode,
 }: {
+  draftScope: string;
   request: ManualQuestion;
   onReply?: (answers: string[][]) => Promise<void>;
   onOpenCode?: () => void;
 }) {
-  const [answers, setAnswers] = useState<string[][]>(() => request.questions.map(() => []));
+  const draftKey = questionDraftKey(draftScope, request);
+  const [answers, setAnswers] = useState<string[][]>(() => getSavedQuestionDraft(request, draftScope));
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string>();
 
   useEffect(() => {
-    setAnswers(request.questions.map(() => []));
+    setAnswers(getSavedQuestionDraft(request, draftScope));
     setSubmitted(false);
     setError(undefined);
-  }, [request.id]);
+  }, [draftKey]);
+
+  const updateAnswers = (updater: (previous: string[][]) => string[][]) => {
+    const next = updater(answers);
+    setAnswers(next);
+    saveQuestionDraft(request, next, draftScope);
+  };
 
   const choose = (index: number, label: string, multiple?: boolean) =>
-    setAnswers(previous =>
+    updateAnswers(previous =>
       previous.map((selected, at) =>
         at !== index
           ? selected
@@ -131,7 +218,7 @@ export function ManualQuestionCard({
                 maxLength={2000}
                 value={customValue}
                 onChange={event =>
-                  setAnswers(previous =>
+                  updateAnswers(previous =>
                     previous.map((current, at) =>
                       at !== index
                         ? current

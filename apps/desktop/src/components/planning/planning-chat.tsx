@@ -5,7 +5,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { MarkdownContent } from '@/components/chat/markdown-content';
 import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
 import { ManualComposer, addManualFiles } from '@/components/manual/manual-composer';
-import { AssistantTurnProcess } from '@/components/manual/manual-chat-content';
+import { ArtifactPreviewDialog, AssistantTurnProcess, findMatchingArtifact } from '@/components/manual/manual-chat-content';
 import { ManualQuestionCard } from '@/components/manual/manual-question';
 import { CodexPermissions } from '@/components/manual/codex-permissions';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
@@ -13,6 +13,8 @@ import { Input } from '@/components/ui/input';
 import { ApiError, apiRequest, getApiBaseUrl, runtimeHeaders } from '@/lib/api-client';
 import { getAuthToken } from '@/lib/token-provider';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import type { ManualToolArtifact } from '@/stores/manual-store';
 import { PlanningCliSetup, planningCliName } from './planning-cli-setup';
 import { PlanningMedia } from './planning-media';
 import { extractChatImages, ChatImageGallery } from '@/components/chat/chat-image-preview';
@@ -312,6 +314,8 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
   const [busy, setBusy] = useState(false);
   const [review, setReview] = useState<Review>();
   const [attachmentPreview, setAttachmentPreview] = useState<string>();
+  const [openArtifact, setOpenArtifact] = useState<ManualToolArtifact | null>(null);
+  const workspacePath = useWorkspaceStore(state => state.workspaces.find(w => w.id === workspaceId)?.path || '');
   const [following, setFollowing] = useState(true);
   const root = useRef<HTMLElement>(null);
   const timeline = useRef<HTMLDivElement>(null);
@@ -533,11 +537,16 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
           const text = message.role === 'assistant' ? planningChatDisplayText(message.content) : message.content;
           const proposals = chat.proposals.filter(proposal => proposal.turnId === message.turnId);
           const hasProcess = message.role === 'assistant' && Boolean(message.thinking?.trim() || message.tools?.length);
+          const allTools = chat.messages.flatMap(item => item.tools || []);
+          const handleFileLink = (path: string) => {
+            const matched = findMatchingArtifact(message.tools, path) ?? findMatchingArtifact(allTools, path);
+            if (matched) setOpenArtifact(matched);
+          };
           return <article key={message.id} className="min-w-0 space-y-2">
             <p className="text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Assistant' : 'Activity'}{message.partial && running && message.turnId === chat.turnId ? ' · Writing' : ''}</p>
-            {hasProcess && <AssistantTurnProcess thinking={message.thinking} thinkingTokens={message.thinkingTokens} tools={message.tools} />}
+            {hasProcess && <AssistantTurnProcess thinking={message.thinking} thinkingTokens={message.thinkingTokens} tools={message.tools} cwd={workspacePath} openArtifact={openArtifact} onOpenArtifact={setOpenArtifact} />}
             {text && (message.role === 'assistant' ? <div className="min-w-0 text-sm leading-relaxed [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
-              <MarkdownContent content={text} />
+              <MarkdownContent content={text} cwd={workspacePath} workspaceId={workspaceId} planId={planId} onLocalFileLink={handleFileLink} />
               {extractChatImages(text).length > 0 && <ChatImageGallery images={extractChatImages(text)} workspaceId={workspaceId} planId={planId} />}
             </div> : <p className={`whitespace-pre-wrap [overflow-wrap:anywhere] ${message.role === 'user' ? 'rounded-xl bg-muted/60 px-3 py-2 text-sm leading-relaxed' : 'text-xs leading-relaxed text-muted-foreground'}`}>{text}</p>)}
             {!!message.attachmentPaths?.length && <div aria-label="Sent attachments" className="flex flex-wrap gap-2">{message.attachmentPaths.map(path => <button type="button" key={path} onClick={() => setAttachmentPreview(path)} className="flex max-w-full items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"><FileText className="h-3 w-3 shrink-0" /><span className="truncate">{path.split('/').pop()}</span></button>)}</div>}
@@ -562,6 +571,7 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
         {chat?.questions?.map(question => (
           <div key={question.id} className="mb-3">
             <ManualQuestionCard
+              draftScope={`planning:${key}`}
               request={question}
               onReply={!running && !busy && Boolean(model) ? async answers => {
                 const formatted = question.questions.map((q, idx) => `${idx + 1}. ${q.question}\n${(answers[idx] || []).join(', ')}`).join('\n\n');
@@ -582,5 +592,14 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
       </DialogContent>
     </Dialog>
     <Dialog open={Boolean(attachmentPreview)} onOpenChange={open => { if (!open) setAttachmentPreview(undefined); }}><DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-3xl"><DialogHeader><DialogTitle className="break-all text-sm">{attachmentPreview?.split('/').pop()}</DialogTitle><DialogDescription>Saved with this plan.</DialogDescription></DialogHeader>{attachmentPreview && <PlanningMedia workspaceId={workspaceId} planId={planId} path={attachmentPreview} />}</DialogContent></Dialog>
+    <ArtifactPreviewDialog
+      artifact={openArtifact}
+      cwd={workspacePath}
+      onClose={() => setOpenArtifact(null)}
+      onLocalFileLink={path => {
+        const matched = findMatchingArtifact(chat?.messages.flatMap(item => item.tools || []), path);
+        if (matched) setOpenArtifact(matched);
+      }}
+    />
   </section>;
 }

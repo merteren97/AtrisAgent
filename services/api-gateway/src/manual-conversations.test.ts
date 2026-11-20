@@ -379,6 +379,29 @@ try {
   assert.equal(store.list('project-b').find(c=>c.id===group.id)!.agents.length,29);
   assert.equal((await fetch(`${base}/agents/${batchAgents[0].id}`, {method:'DELETE'})).status,204,'Repeated agent deletion is idempotent');
   assert.equal(store.agent(batchAgents[1].id).id,batchAgents[1].id,'Other independent agents remain intact');
+  const reviewProject = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-manual-review-route-'));
+  try {
+    sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('review-project', reviewProject);
+    const reviewId = randomUUID();
+    assert.equal((await post('/conversations', { workspaceId: 'review-project', id: reviewId, isolated: true })).status, 200);
+    const reviewAgents = await post(`/conversations/${reviewId}/agents`, { agents: batch.slice(0, 2).map(item => ({ ...item, id: randomUUID() })) });
+    assert.equal(reviewAgents.status, 200);
+    const [one, two] = await reviewAgents.json();
+    assert.equal(one.cwd, two.cwd, 'Both tabs share the same isolated directory');
+    assert.notEqual(one.cwd, fs.realpathSync(reviewProject));
+    const launched = await post(`/agents/${one.id}/launch`, {});
+    assert.equal(launched.status, 200);
+    assert.equal((await launched.json()).cwd, one.cwd);
+    fs.writeFileSync(path.join(two.cwd, 'review.ts'), 'export {};\n');
+    const changesUrl = `${base}/conversations/${reviewId}/changes`;
+    const { files } = await (await fetch(changesUrl)).json();
+    assert.equal(files.length, 1);
+    assert.equal(fs.existsSync(path.join(reviewProject, 'review.ts')), false);
+    assert.equal((await fetch(`${base}/conversations/${reviewId}`, { method: 'DELETE' })).status, 409, 'Pending work blocks conversation removal');
+    assert.deepEqual(await (await post(`/conversations/${reviewId}/changes/resolve`, { action: 'apply', files })).json(), { completed: ['review.ts'] });
+    assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'export {};\n');
+    assert.deepEqual((await (await fetch(changesUrl)).json()).files, []);
+  } finally { fs.rmSync(reviewProject, { recursive: true, force: true }); }
   model.availability = 'unknown';
   assert.equal((await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).status, 400);
   profile.authStatus = 'reauth_required';
