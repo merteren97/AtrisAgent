@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ApiError, apiRequest } from '@/lib/api-client';
+import { ApiError, apiRequest, isAccountSessionRejection } from '@/lib/api-client';
 import {
   clearStoredSession,
   loginWithAtrisAccount,
@@ -76,7 +76,7 @@ export function AuthSessionProvider({ children }: { children: ReactNode }) {
         const refreshed = await refreshSession(stored.token, stored.remembered);
         setSession(refreshed);
       } catch (refreshError) {
-        if (refreshError instanceof ApiError && refreshError.status === 401) {
+        if (refreshError instanceof ApiError && isAccountSessionRejection(refreshError.status, refreshError.details)) {
           setSession(signedOutSession());
           setError('Your AtrisHub session expired. Sign in again to continue.');
         } else if (showOfflineState) {

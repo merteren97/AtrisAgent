@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { apiRequest, checkApiHealth, configureApiRuntime, getApiOrigin } from './api-client';
 import { apiBaseUrl, normalizeApiOrigin } from './api-base';
 import { hasPremiumAccess } from './auth-policy';
-import { clearAuthToken, getAuthToken, setAuthToken } from './token-provider';
+import { clearAuthToken, getAuthToken, registerUnauthorizedHandler, setAuthToken } from './token-provider';
 
 const cases = [
   ['http://127.0.0.1:3001', 'http://127.0.0.1:3001'],
@@ -56,6 +56,18 @@ try {
   const healthHeaders = new Headers(healthRequestInit?.headers);
   assert.equal(healthHeaders.get('Authorization'), null);
   assert.equal(healthHeaders.get('X-Atris-Runtime-Token'), 'runtime-secret');
+  let rejected = 0;
+  const unregister = registerUnauthorizedHandler(() => { rejected++; });
+  try {
+    globalThis.fetch = async () => Response.json({ code: 'RUNTIME_TOKEN_REQUIRED' }, { status: 401 });
+    await assert.rejects(apiRequest('/auth/me'));
+    assert.equal(rejected, 0);
+    globalThis.fetch = async () => Response.json({ code: 'AUTH_INVALID' }, { status: 401 });
+    await assert.rejects(apiRequest('/auth/me'));
+    assert.equal(rejected, 1);
+  } finally {
+    unregister();
+  }
 } finally {
   globalThis.fetch = originalFetch;
   clearAuthToken();
