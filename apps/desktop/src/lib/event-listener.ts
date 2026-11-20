@@ -1,7 +1,7 @@
 import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useAgentStore } from '@/stores/agent-store';
 import { useAccountStore } from '@/stores/account-store';
-import { getApiOrigin, runtimeHeaders } from '@/lib/api-client';
+import { getApiOrigin, isAccountSessionRejection, runtimeHeaders } from '@/lib/api-client';
 import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 import { consumeSseFrames } from '@/lib/sse-parser';
 import { boundStreamContent, compactTimelineMetadata } from '@/lib/timeline-metadata';
@@ -659,9 +659,13 @@ async function connectSse(): Promise<void> {
       signal: controller.signal,
     });
     if (response.status === 401) {
-      useMissionStore.getState().setTransportStatus('error', 'Live updates require authentication.');
-      notifyUnauthorized();
-      return;
+      const payload: unknown = await response.json().catch(() => null);
+      if (!controller.signal.aborted && getAuthToken() === token
+        && isAccountSessionRejection(response.status, payload)) {
+        useMissionStore.getState().setTransportStatus('error', 'Live updates require authentication.');
+        notifyUnauthorized();
+        return;
+      }
     }
     if (!response.ok || !response.body) throw new Error(`SSE connection failed with ${response.status}`);
     useAccountStore.getState().setServiceOnline(true);

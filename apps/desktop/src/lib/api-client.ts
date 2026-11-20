@@ -44,6 +44,11 @@ export class ApiError extends Error {
   }
 }
 
+export function isAccountSessionRejection(status: number, payload: unknown): boolean {
+  return status === 401 && typeof payload === 'object' && payload !== null
+    && 'code' in payload && payload.code === 'AUTH_INVALID';
+}
+
 export class ApiRequestTimeoutError extends Error {
   readonly timeoutMs: number;
 
@@ -114,7 +119,9 @@ export async function apiRequestWithHeaders<T>(pathname: string, init: ApiReques
     return { response, payload };
   });
   if (!response.ok) {
-    if (response.status === 401 && !suppressUnauthorized) notifyUnauthorized();
+    if (!suppressUnauthorized && token && getAuthToken() === token
+      && headers.get('Authorization') === `Bearer ${token}`
+      && isAccountSessionRejection(response.status, payload)) notifyUnauthorized();
     const message = payload && typeof payload === 'object' && 'error' in payload
       ? String((payload as { error: unknown }).error)
       : `Request failed with ${response.status}`;

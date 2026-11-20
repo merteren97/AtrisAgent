@@ -1,4 +1,4 @@
-import { apiRequest, ApiError } from '@/lib/api-client';
+import { apiRequest, ApiError, isAccountSessionRejection } from '@/lib/api-client';
 import { clearSecureToken, isTauriRuntime, readSecureToken, storeSecureToken } from '@/lib/secure-storage';
 import { clearAuthToken, getAuthToken, setAuthToken } from '@/lib/token-provider';
 
@@ -188,7 +188,8 @@ export async function refreshSession(token: string, remembered: boolean): Promis
     await persistSession(session, remembered);
     return session;
   } catch (error) {
-    if (error instanceof ApiError && error.status === 401) await clearStoredSession();
+    if (error instanceof ApiError && isAccountSessionRejection(error.status, error.details)
+      && getAuthToken() === token) await clearStoredSession();
     throw error;
   }
 }
