@@ -23,6 +23,7 @@ import { manualCoordination } from './manual-coordination';
 import { prepareManualCoordination } from './manual-coordination-config';
 import { configuredPlaywrightCommand } from './integration-connections';
 import { ManualChangeReview } from './manual-change-review';
+import { liveUndoSelection, type LiveProjectChanges } from './live-project-changes';
 
 export interface ManualAgent {
   id: string; conversationId: string; name: string; catalogId: string;
@@ -92,7 +93,7 @@ export function parseManualTranscript(source: string, sessionId: string): Manual
 export class ManualConversationStore {
   readonly codexSessions = new ManualCodexSessions();
   readonly changeReview: ManualChangeReview;
-  constructor(private sqlite: Database.Database, private dataDir = path.dirname(sqlite.name)) {
+  constructor(private sqlite: Database.Database, private dataDir = path.dirname(sqlite.name), private live?: LiveProjectChanges) {
     this.changeReview = new ManualChangeReview(dataDir);
     sqlite.exec(`CREATE TABLE IF NOT EXISTS manual_conversations (
       id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -157,7 +158,7 @@ export class ManualConversationStore {
   hasChangeReview(id: string): boolean {
     return Boolean(this.sqlite.prepare('SELECT 1 FROM manual_change_workspaces WHERE conversation_id = ?').get(id));
   }
-  create(workspaceId: string, title: string | undefined, id: string = randomUUID(), isolated = false): ManualConversation {
+  create(workspaceId: string, title: string | undefined, id: string = randomUUID(), isolated = false, live = false): ManualConversation {
     const workspace = this.workspace(workspaceId);
     const existing = this.sqlite.prepare('SELECT workspace_id FROM manual_conversations WHERE id = ?').get(id) as {workspace_id: string} | undefined;
     if (existing && existing.workspace_id !== workspaceId) return fail('Conversation identity conflict.', 409);
@@ -166,6 +167,10 @@ export class ManualConversationStore {
       this.sqlite.prepare('INSERT INTO manual_conversations VALUES (?, ?, ?, ?)').run(id, workspaceId, title ?? 'New conversation', new Date().toISOString());
       if (title === undefined) this.sqlite.prepare('INSERT INTO manual_automatic_titles (conversation_id) VALUES (?)').run(id);
       if (isolated) this.sqlite.prepare('INSERT INTO manual_change_workspaces VALUES (?)').run(id);
+      if (live && isolated && this.live) {
+        const scope = this.changeReview.scope(id, workspace.path);
+        this.live.start({ id: `manual:${id}`, kind: 'manual', owner: id, workspaceId, target: scope.project, source: scope.work, baseline: scope.baseline });
+      }
     })();
     return this.list(workspaceId).find(c => c.id === id)!;
   }
@@ -186,6 +191,7 @@ export class ManualConversationStore {
     this.saveBatch([agent]);
   }
   remove(id: string): void {
+    this.live?.stop(`manual:${id}`);
     this.sqlite.transaction(() => {
       this.sqlite.prepare('DELETE FROM manual_automatic_titles WHERE conversation_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id IN (SELECT id FROM manual_agent_sessions WHERE conversation_id = ?)').run(id);
@@ -465,8 +471,8 @@ function readAgentMessages(agent: ManualAgent, bridge: ManualProviderBridge) {
     return { supported: true, messages: parseManualTranscript(tail.source, agent.providerSessionId), truncated: tail.truncated, bound: true };
 }
 
-export function installManualConversations(app: Application, sqlite: Database.Database, runtime: RuntimeHost, dataDir = path.dirname(sqlite.name)): ManualConversationStore {
-  const store = new ManualConversationStore(sqlite, dataDir);
+export function installManualConversations(app: Application, sqlite: Database.Database, runtime: RuntimeHost, dataDir = path.dirname(sqlite.name), live?: LiveProjectChanges): ManualConversationStore {
+  const store = new ManualConversationStore(sqlite, dataDir, live);
   const bridge = new ManualProviderBridge(dataDir);
   const route = (handler: (req: Request, res: Response) => unknown) => (req: Request, res: Response) => {
     Promise.resolve().then(() => handler(req, res)).catch((error) => res.status(error.status || 500).json({ error: error.message || 'Manual session operation failed.' }));
@@ -477,17 +483,22 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     return { id, workspaceId, project: store.workspace(workspaceId).path };
   };
   app.get('/api/manual/conversations', route((req, res) => res.json(store.list(required(req.query.workspaceId, 'project')))));
-  app.get('/api/manual/conversations/:conversationId/changes', route((req, res) => {
+  app.get('/api/manual/conversations/:conversationId/changes', route(async (req, res) => {
     const { id, workspaceId, project } = reviewTarget(req);
-    res.json({ workspaceId, ...(store.hasChangeReview(id) ? store.changeReview.list(id, project) : { mode: 'direct', files: [] }) });
+    res.json({ workspaceId, ...(live?.list(`manual:${id}`) ?? (store.hasChangeReview(id) ? await store.changeReview.listAsync(id, project, req.query.summary === '1') : { mode: 'direct', files: [] })) });
   }));
   app.get('/api/manual/conversations/:conversationId/changes/file', route((req, res) => {
     const { id, project } = reviewTarget(req);
+    if (live?.get(`manual:${id}`)) return res.json(live.preview(`manual:${id}`, required(req.query.path, 'file path', 2048), required(req.query.revision, 'file revision', 64)));
     if (!store.hasChangeReview(id)) return fail('This conversation does not have an isolated copy.', 409);
     res.json(store.changeReview.preview(id, project, required(req.query.path, 'file path', 2048), required(req.query.revision, 'file revision', 64)));
   }));
   app.post('/api/manual/conversations/:conversationId/changes/resolve', route((req, res) => {
     const { id, project } = reviewTarget(req);
+    if (live?.get(`manual:${id}`)) {
+      if (req.body?.action !== 'undo') return fail('Choose Undo for live project changes.');
+      return res.json(live.undo(`manual:${id}`, liveUndoSelection(req.body.files)));
+    }
     if (!store.hasChangeReview(id)) return fail('This conversation does not have an isolated copy.', 409);
     const { action, files } = req.body || {};
     if (action !== 'apply' && action !== 'discard') return fail('Invalid review action.');
@@ -504,7 +515,10 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     const id = idParam(req, 'conversationId');
     try {
       const conversation = store.conversation(id);
-      if (store.hasChangeReview(id) && store.changeReview.list(id, store.workspace(conversation.workspaceId).path).files.length) {
+      if (live?.list(`manual:${id}`)?.files.some(file => file.state !== 'reverted')) {
+        return fail('Undo history is attached to this conversation. Close it without deleting it to keep the history.');
+      }
+      if (!live?.get(`manual:${id}`) && store.hasChangeReview(id) && store.changeReview.list(id, store.workspace(conversation.workspaceId).path).files.length) {
         return fail('Apply or discard pending files in Changes before deleting this conversation.', 409);
       }
       for (const agent of store.list(conversation.workspaceId).find(item => item.id === id)?.agents || []) manualCoordination.revoke(agent.id);
@@ -528,7 +542,8 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   app.post('/api/manual/conversations', route((req, res) => {
     const id = required(req.body.id, 'conversation ID');
     if (!/^[a-f0-9-]{36}$/i.test(id)) return fail('Invalid conversation identity.');
-    res.json(store.create(required(req.body.workspaceId, 'project'), req.body.title === undefined ? undefined : required(req.body.title, 'title'), id, req.body.isolated === true));
+    const liveMode = req.body.liveChanges === true;
+    res.json(store.create(required(req.body.workspaceId, 'project'), req.body.title === undefined ? undefined : required(req.body.title, 'title'), id, liveMode || req.body.isolated === true, liveMode));
   }));
   app.post('/api/manual/conversations/:conversationId/agents', route(async (req, res) => {
     const conversation = store.conversation(idParam(req, 'conversationId'));
