@@ -14,7 +14,7 @@ import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { hasExplicitImplementationIntent, Orchestrator } from '@atris-agent-code/orchestration-core';
 import { RuntimeHost } from '@atris-agent-code/runtime-host';
 import { MergeCoordinator } from '@atris-agent-code/merge-coordinator';
-import { ActionBroker } from '@atris-agent-code/policy-engine';
+import { ActionBroker, resolveAutomationAction } from '@atris-agent-code/policy-engine';
 import {
   AGENT_ROLES,
   isAgentRole,
@@ -54,6 +54,7 @@ import { ApplyVerificationOperationStore, executeApplyVerificationOperation } fr
 import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-sibling';
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 import { installManualConversations } from './manual-conversations';
+import { LiveProjectChanges, liveGitBase, liveUndoSelection } from './live-project-changes';
 import { PlanningStore } from './planning-store';
 import { createPlanningMediaAccess, installPlanningRoutes } from './planning-routes';
 import { installPlanningChatRoutes } from './planning-chat';
@@ -384,29 +385,90 @@ const workspaceManager = new WorkspaceManager(db, eventBus);
 const mergeCoordinator = new MergeCoordinator(workspaceManager);
 const applyVerificationStore = new ApplyVerificationOperationStore(sqlite);
 const actionBroker = new ActionBroker();
+const liveProjectChanges = new LiveProjectChanges(sqlite, scope => {
+  if (isDeletionFenced('workspace', scope.workspaceId)) return false;
+  const registered = sqlite.prepare('SELECT path FROM workspaces WHERE id = ?').get(scope.workspaceId) as { path: string } | undefined;
+  if (!registered) return false;
+  const workspace = fs.realpathSync(registered.path, { encoding: 'utf8' });
+  const relative = path.relative(workspace, scope.target);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || scope.kind === 'manual' && relative !== '') return false;
+  if (scope.kind === 'manual') return Boolean(sqlite.prepare('SELECT 1 FROM manual_conversations WHERE id = ? AND workspace_id = ?').get(scope.owner, scope.workspaceId));
+  return !isDeletionFenced('mission', scope.owner) && Boolean(sqlite.prepare(`SELECT 1 FROM tasks t JOIN missions m ON m.id = t.mission_id
+    WHERE t.id = ? AND m.id = ? AND m.workspace_id = ?`).get(scope.id.slice('builder:'.length), scope.owner, scope.workspaceId));
+}, scope => scope.kind === 'manual' || Boolean(sqlite.prepare(`SELECT 1 FROM tasks t JOIN missions m ON m.id = t.mission_id
+  WHERE t.id = ? AND m.id = ? AND t.status NOT IN ('cancelled','superseded','rejected')
+  AND m.status NOT IN ('cancelled','completed','failed')`).get(scope.id.slice('builder:'.length), scope.owner)));
+const publishOrApplyBuilder = async (taskId: string, operation?: { operationId?: string; idempotencyKey?: string }) => {
+  const id = `builder:${taskId}`;
+  if (liveProjectChanges.get(id)) {
+    await liveProjectChanges.finalize(id);
+    return { success: true, output: 'Live project changes are ready for verification.', checkpointId: undefined };
+  }
+  return mergeCoordinator.applyWorktree(taskId, undefined, operation);
+};
 const orchestrator = new Orchestrator(
   {
     workspacePath: process.cwd(),
     applyTaskChanges: async (taskId, operation) => {
-      const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
+      const result = await publishOrApplyBuilder(taskId, operation);
       return { success: result.success, output: result.output, checkpointId: result.checkpointId };
     },
     postApplyVerification: (context) => verifyAppliedMission(context, workspaceManager),
-    executeApplyVerificationOperation: (context) => executeApplyVerificationOperation(
+    executeApplyVerificationOperation: async (context) => {
+      const result = await executeApplyVerificationOperation(
       applyVerificationStore,
       context,
       async (taskId, operation) => {
-        const result = await mergeCoordinator.applyWorktree(taskId, undefined, operation);
+        const result = await publishOrApplyBuilder(taskId, operation);
         return { success: result.success, output: result.output };
       },
       (operation) => verifyAppliedMission(operation, workspaceManager),
-    ),
+      );
+      for (const id of context.builderTaskIds) liveProjectChanges.quality(`builder:${id}`, result.passed ? 'verified' : 'failed');
+      return result;
+    },
   },
   eventBus,
   db,
   workspaceManager,
 );
-const runtimeHost = new RuntimeHost(eventBus, { workspacePath: process.cwd(), workspaceManager });
+const runtimeHost = new RuntimeHost(eventBus, { workspacePath: process.cwd(), workspaceManager,
+  async onBuilderWorktreeReady(taskId, resumed) {
+    try {
+      const id = `builder:${taskId}`;
+      const existing = liveProjectChanges.get(id);
+      if (resumed && !existing) return; // Existing staged changes are never published as part of an upgrade.
+      const task = await workspaceManager.getTask(taskId);
+      const mission = task && await workspaceManager.getMission(task.missionId);
+      const policy = parseStoredAutomationPolicy(mission?.automationPolicy);
+      if (!mission || !policy || policy.strategy === 'candidate' || policy.overrides?.fileWrite === 'deny' || policy.overrides?.fileWrite === 'ask'
+        || resolveAutomationAction(policy.profile, 'workspaceApply', policy.overrides) !== 'auto') {
+        if (existing) liveProjectChanges.stop(id);
+        return;
+      }
+      if (existing) { liveProjectChanges.start(existing); liveProjectChanges.quality(id, 'pending'); return; }
+      const record = await workspaceManager.getWorktreeForTask(taskId);
+      if (!record || !record.isolationKind || record.isolationKind === 'new-sibling') return;
+      const targetPath = await workspaceManager.resolveAppliedTargetPath(taskId);
+      if (!targetPath) return;
+      const source = await fs.promises.realpath(record.path);
+      const target = await fs.promises.realpath(targetPath);
+      const gitBase = record.isolationKind === 'mirror' ? undefined : await liveGitBase(source);
+      liveProjectChanges.start({ id, kind: 'builder', owner: mission.id, workspaceId: mission.workspaceId, source, target,
+        baseline: gitBase ? source : path.join(source, '.atris-baseline'), gitBase });
+    } catch (error) {
+      // A tracking failure must not interrupt the Builder. Without a live scope its output remains staged.
+      console.warn(`[API Gateway] Could not start live project tracking for Builder ${taskId}:`, error instanceof Error ? error.message : error);
+    }
+  },
+});
+
+eventBus.on('mission_failed', event => {
+  void workspaceManager.listTasks(event.missionId).then(tasks => {
+    if (!sqlite.open) return;
+    for (const task of tasks) if (task.assignedRole === 'builder') liveProjectChanges.quality(`builder:${task.id}`, 'failed');
+  }).catch(() => {});
+});
 
 function redactEventValue(value: unknown): unknown {
   if (typeof value === 'string') {
@@ -512,7 +574,7 @@ const authService = new AtrisAuthService();
 const PORT = resolveGatewayPort();
 const server = http.createServer(app);
 const shutdownCoordinator = createRuntimeShutdownCoordinator({
-  stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); },
+  stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); await liveProjectChanges.close(); },
   closeServer: () => new Promise<void>((resolve) => {
     if (!server.listening) {
       resolve();
@@ -543,7 +605,7 @@ installEditorMcpRoutes(app, sqlite);
 installUnityCliRoutes(app, sqlite);
 installGithubConnectionRoutes(app);
 installAutoSetupRoutes(app, sqlite, gatewayDataPath.dataDir);
-export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir);
+export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir, liveProjectChanges);
 installPlanningRoutes(app, planningStore, { fenced: planningFence, mediaAccess: planningMedia });
 export const planningChat = installPlanningChatRoutes(app, {
   store: planningStore,
@@ -2205,6 +2267,80 @@ app.get('/api/tasks/:id/diff', async (req: Request, res: Response) => {
   } catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to generate diff' }); }
 });
 
+app.get('/api/tasks/:id/changes', async (req: Request, res: Response) => {
+  try {
+    const id = routeParam(req.params.id);
+    const task = await workspaceManager.getTask(id);
+    if (!task || task.assignedRole !== 'builder') return void res.status(404).json({ error: 'Builder task not found.' });
+    const live = liveProjectChanges.list(`builder:${id}`);
+    if (live) return void res.json(live);
+    const worktree = await workspaceManager.getWorktreeForTask(id);
+    return void res.json({ mode: 'staged', files: worktree ? await workspaceManager.getWorktreeManager().getReviewFileList(worktree.path) : [] });
+  } catch (error: any) { res.status(error.status || 500).json({ error: error.message || 'Could not list Builder changes.' }); }
+});
+
+const missionChangeFileCache = new Map<string, { at: number; files: Array<{ path: string; status: string }> }>();
+app.get('/api/missions/:id/changes', async (req: Request, res: Response) => {
+  try {
+    const id = routeParam(req.params.id);
+    const mission = await workspaceManager.getMission(id);
+    if (!mission) return void res.status(404).json({ error: 'Mission not found.' });
+    const builders = (await workspaceManager.listTasks(id)).filter(task => task.assignedRole === 'builder' && task.planId === mission.planId).slice(0, 12);
+    const summaries = await Promise.all(builders.map(async task => {
+      const live = liveProjectChanges.list(`builder:${task.id}`);
+      if (live) return { quality: live.quality, files: live.files.map(({ path, status, state }) => ({ path, status, state, taskId: task.id })) };
+      let cached = missionChangeFileCache.get(task.id);
+      if (!cached || Date.now() - cached.at > 10_000) {
+        const worktree = await workspaceManager.getWorktreeForTask(task.id);
+        if (!worktree) return { files: [] };
+        const files = await workspaceManager.getWorktreeManager().getReviewFileList(worktree.path).catch(() => cached?.files || []);
+        cached = { files, at: Date.now() };
+        missionChangeFileCache.delete(task.id);
+        missionChangeFileCache.set(task.id, cached);
+        if (missionChangeFileCache.size > 24) missionChangeFileCache.delete(missionChangeFileCache.keys().next().value!);
+      }
+      return { files: cached.files.map(({ path, status }) => ({ path, status, taskId: task.id })) };
+    }));
+    const files = summaries.flatMap(summary => summary.files as Array<{ path: string; status: string }>);
+    res.json({ files, quality: summaries.some(summary => summary.quality === 'failed') ? 'failed' : undefined });
+  } catch (error: any) { res.status(error.status || 500).json({ error: error.message || 'Could not list mission changes.' }); }
+});
+
+app.get('/api/tasks/:id/changes/file', async (req: Request, res: Response) => {
+  try {
+    const id = routeParam(req.params.id);
+    const task = await workspaceManager.getTask(id);
+    if (!task || task.assignedRole !== 'builder') return void res.status(404).json({ error: 'Builder task not found.' });
+    const relative = typeof req.query.path === 'string' ? req.query.path : '';
+    if (!relative || relative.length > 2048 || relative.split('/').some(part => !part || part === '.' || part === '..' || /[\\:\x00-\x1f]/.test(part))) {
+      return void res.status(400).json({ error: 'Invalid workspace file path.' });
+    }
+    if (liveProjectChanges.get(`builder:${id}`)) {
+      return void res.json(liveProjectChanges.preview(`builder:${id}`, relative, typeof req.query.revision === 'string' ? req.query.revision : ''));
+    }
+    const worktree = await workspaceManager.getWorktreeForTask(id);
+    if (!worktree) return void res.status(404).json({ error: 'Builder worktree is unavailable.' });
+    const manager = workspaceManager.getWorktreeManager();
+    const diff = await manager.getReviewFileDiff(worktree.path, relative);
+    if (diff.length > 320 * 1024) return void res.json({ unavailable: 'large' });
+    if (diff) return void res.json({ diff });
+    const entry = await manager.inspectEntry(worktree.path, relative);
+    if (entry.kind !== 'file' || entry.previewUnavailable) return void res.json({ unavailable: 'binary' });
+    if (entry.truncated) return void res.json({ unavailable: 'large' });
+    res.json({ before: null, after: entry.content || '' });
+  } catch (error: any) { res.status(error.status || 500).json({ error: error.message || 'Could not load this comparison.' }); }
+});
+
+app.post('/api/tasks/:id/changes/resolve', async (req: Request, res: Response) => {
+  try {
+    const id = routeParam(req.params.id);
+    const task = await workspaceManager.getTask(id);
+    if (!task || task.assignedRole !== 'builder') return void res.status(404).json({ error: 'Builder task not found.' });
+    if (req.body?.action !== 'undo') return void res.status(400).json({ error: 'Choose Undo for live project changes.' });
+    res.json(liveProjectChanges.undo(`builder:${id}`, liveUndoSelection(req.body.files)));
+  } catch (error: any) { res.status(error.status || 500).json({ error: error.message || 'Could not undo changes.' }); }
+});
+
 app.get('/api/tasks/:id/worktree', async (req: Request, res: Response) => {
   try {
     const task = await workspaceManager.getTask(routeParam(req.params.id));
@@ -2239,7 +2375,7 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
     if (!decision.allowed || decision.requiresApproval) {
       return void res.status(409).json({ code: 'APPROVAL_REQUIRED', error: 'Workspace apply must continue through the mission approval flow.' });
     }
-    const result = await mergeCoordinator.applyWorktree(taskId, undefined, {
+    const result = await publishOrApplyBuilder(taskId, {
       operationId: `direct-task-merge:${task.missionId}:${taskId}`,
       idempotencyKey: `direct-task-merge:${task.missionId}:${taskId}`,
     });
@@ -3614,6 +3750,7 @@ function isPostApplyVerificationPending(missionId: string): boolean {
 }
 
 export async function recoverGatewayStartup(): Promise<void> {
+  liveProjectChanges.resume();
   const recoveredAt = new Date().toISOString();
   deletionStore.recoverInterrupted();
   const pendingDeletions = deletionStore.listIncomplete();

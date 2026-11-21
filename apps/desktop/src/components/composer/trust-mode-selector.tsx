@@ -8,7 +8,7 @@ import { Label } from '@/components/ui/label';
 
 const MODES = [
   { id: 'Review Driven', label: 'Ask', desc: 'Ask before starting plans and making changes.' },
-  { id: 'Balanced', label: 'Review', desc: 'Work in isolation and review changes before applying.' },
+  { id: 'Balanced', label: 'Review', desc: 'See edits live in the project. Review and tests still run, and you decide what to undo.' },
   { id: 'Autonomous', label: 'Auto', desc: 'Run plans and allowed actions automatically. Git push still asks.' },
   { id: 'Candidate', label: 'Review + Candidate', desc: 'Compare parallel solutions, then choose one to review.' },
 ] as const;

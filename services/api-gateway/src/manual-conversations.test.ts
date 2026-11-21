@@ -9,6 +9,7 @@ import express from 'express';
 import type { AddressInfo } from 'node:net';
 import type { RuntimeHost, runCommand } from '@atris-agent-code/runtime-host';
 import { ManualConversationStore, installManualConversations, parseManualTranscript } from './manual-conversations';
+import { LiveProjectChanges } from './live-project-changes';
 import { isLocalDataRequest } from './local-data-access';
 import { manualContentTitle } from './manual-titles';
 import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
@@ -111,7 +112,8 @@ const runtime = {
 } as unknown as RuntimeHost;
 const app = express(); app.use(express.json());
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-manual-api-'));
-const installedStore = installManualConversations(app, sqlite, runtime, temporary);
+const liveChanges = new LiveProjectChanges(sqlite);
+const installedStore = installManualConversations(app, sqlite, runtime, temporary, liveChanges);
 const server = app.listen(0, '127.0.0.1');
 await new Promise<void>(resolve => server.once('listening', resolve));
 const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/manual`;
@@ -438,6 +440,23 @@ try {
     assert.deepEqual(await (await post(`/conversations/${reviewId}/changes/resolve`, { action: 'apply', files })).json(), { completed: ['review.ts'] });
     assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'export {};\n');
     assert.deepEqual((await (await fetch(changesUrl)).json()).files, []);
+
+    const liveId = randomUUID();
+    assert.equal((await post('/conversations', { workspaceId: 'review-project', id: liveId, liveChanges: true })).status, 200);
+    const liveAgent = await (await post(`/conversations/${liveId}/agents`, { ...input, id: randomUUID() })).json();
+    fs.writeFileSync(path.join(liveAgent.cwd, 'live.ts'), 'export const live = true;\n');
+    const liveFile = path.join(reviewProject, 'live.ts');
+    for (let tries = 0; tries < 60 && !fs.existsSync(liveFile); tries++) await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(fs.readFileSync(liveFile, 'utf8'), 'export const live = true;\n', 'A new Manual session publishes without a panel request');
+    const liveRoute = `/conversations/${liveId}/changes`;
+    const liveList = await (await fetch(`${base}${liveRoute}`)).json();
+    assert.equal(liveList.mode, 'live');
+    assert.equal(liveList.files[0].state, 'published');
+    const query = new URLSearchParams({ path: liveList.files[0].path, revision: liveList.files[0].revision });
+    assert.deepEqual(await (await fetch(`${base}${liveRoute}/file?${query}`)).json(), { before: null, after: 'export const live = true;\n' });
+    assert.deepEqual(await (await post(`${liveRoute}/resolve`, { action: 'undo', files: liveList.files })).json(), { completed: ['live.ts'], conflicts: [] });
+    assert.equal(fs.existsSync(liveFile), false);
+    assert.equal((await fetch(`${base}/conversations/${liveId}`, { method: 'DELETE' })).status, 204);
   } finally { fs.rmSync(reviewProject, { recursive: true, force: true }); }
   model.availability = 'unknown';
   assert.equal((await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).status, 400);
@@ -547,4 +566,4 @@ try {
   }
 
   console.log('Manual conversation persistence, isolation, idempotency, transcript and route tests passed.');
-} finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }
+} finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await liveChanges.close(); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }

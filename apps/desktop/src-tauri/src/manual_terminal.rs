@@ -65,9 +65,37 @@ fn paste_output_settled(replay: &Replay, after: u64, started: std::time::Instant
     now.duration_since(started) >= Duration::from_millis(250)
         && replay.last_output.is_some_and(|(sequence, at)| sequence > after && now.duration_since(at) >= Duration::from_millis(200))
 }
+
+// OpenCode collapses large multiline pastes in its composer. This is stronger
+// evidence than terminal quiet: a working session's spinner never stops painting.
+fn opencode_paste_summary(data: &str) -> Option<String> {
+    let text = data.trim();
+    let lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    (lines >= 3 || text.encode_utf16().count() > 150).then(|| format!("[Pasted ~{lines} lines]"))
+}
+
+fn output_contains_styled_text(output: &str, expected: &str) -> bool {
+    if output.contains(expected) { return true; }
+    // Drop style codes (not cursor movements) so fragments of separate screen
+    // locations cannot form a false acknowledgement.
+    let mut remaining = output;
+    let mut plain = String::with_capacity(output.len());
+    while let Some(index) = remaining.find("\x1b[") {
+        plain.push_str(&remaining[..index]);
+        let code = &remaining[index + 2..];
+        if let Some(end) = code.bytes().position(|byte| !(b'0'..=b'9').contains(&byte) && !matches!(byte, b';' | b':')) {
+            if code.as_bytes()[end] != b'm' { plain.push('\n'); }
+            if !code.is_char_boundary(end + 1) { return false; }
+            remaining = &code[end + 1..];
+        } else { return plain.contains(expected); }
+    }
+    plain.push_str(remaining);
+    plain.contains(expected)
+}
+
 struct Terminal {
     master: Box<dyn MasterPty + Send>, writer: Arc<Mutex<Box<dyn Write + Send>>>, child: Box<dyn Child + Send + Sync>,
-    replay: Arc<Mutex<Replay>>, closed: bool,
+    replay: Arc<Mutex<Replay>>, closed: bool, opencode: bool, paste_pending: Arc<AtomicBool>,
 }
 #[derive(Default)]
 struct TerminalSlot { terminal: Mutex<Option<Terminal>>, closing: AtomicBool }
@@ -185,6 +213,8 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
         if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "ATRIS_CODEX_REMOTE_TOKEN", "ATRIS_CONTROL_PLANE_URL", "ATRIS_CONTROL_PLANE_TOKEN", "ATRIS_MANUAL_COORDINATION"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
         command.env(key, value);
     }
+    let opencode = opencode_plugin.is_some() || opencode_mcp.is_some()
+        || Path::new(&request.executable).file_stem().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("opencode"));
     if opencode_plugin.is_some() || opencode_mcp.is_some() {
         let mut config: serde_json::Value = match std::env::var("OPENCODE_CONFIG_CONTENT") {
             Ok(value) => serde_json::from_str(&value).map_err(|_| "Inherited OpenCode configuration is not valid JSON")?,
@@ -235,7 +265,7 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
         }
         if let Ok(mut state) = output.lock() { state.ended = true; }
     });
-    let mut terminal = Terminal { master: pair.master, writer, child, replay, closed: false };
+    let mut terminal = Terminal { master: pair.master, writer, child, replay, closed: false, opencode, paste_pending: Arc::new(AtomicBool::new(false)) };
     if manager.stopping.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Application is shutting down".into()); }
     if session.closing.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Agent terminal is closing".into()); }
     *terminal_slot = Some(terminal);
@@ -301,12 +331,19 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     }
     let writer = terminal.writer.clone();
     let replay = terminal.replay.clone();
+    let opencode = terminal.opencode;
+    let paste_pending = terminal.paste_pending.clone();
     let codex = replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready.is_some();
     // A full PTY input buffer must not prevent Close from reaching the child.
     drop(terminal_slot);
     let mut writer = writer.lock().map_err(|_| "Terminal input is unavailable")?;
+    if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     if paste {
+        if paste_pending.load(Ordering::SeqCst) {
+            return Err("A previous message is still pending in Code. Inspect the terminal and finish that message before sending another; nothing was pasted again.".into());
+        }
         let after = replay.lock().map_err(|_| "Terminal output is unavailable")?.sequence;
+        paste_pending.store(true, Ordering::SeqCst);
         writer.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
         writer.flush().map_err(|e| e.to_string())?;
         // Codex's Win32 input path can classify ConPTY paste as key bursts.
@@ -326,16 +363,27 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             [format!("Pasted Content {count} chars"), format!("Pasted Content {} chars", count - 1)]
         });
         let mut acknowledged_at = None;
+        let open_summary = opencode.then(|| opencode_paste_summary(data)).flatten();
+        let open_echo = if opencode {
+            // The final line can be rendered after earlier wrapped lines.
+            data.trim().lines().last().filter(|line| (12..=96).contains(&line.chars().count()))
+        } else { None };
         loop {
             std::thread::sleep(std::time::Duration::from_millis(25));
             if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
             let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
             if state.ended { return Err("Agent disconnected before the message could be submitted.".into()); }
             if !codex {
-                // This is a timing signal, not a CLI acknowledgement. Never
-                // blindly submit on timeout or retry Enter into a possible dialog.
-                if paste_output_settled(&state, after, started, std::time::Instant::now()) { break; }
-                if started.elapsed() >= std::time::Duration::from_secs(5) {
+                if opencode && acknowledged_at.is_none() && state.sequence != sequence {
+                    sequence = state.sequence;
+                    let rendered = state.output_after(after, false).0;
+                    if open_summary.as_deref().into_iter().chain(open_echo).any(|expected| output_contains_styled_text(&rendered, expected)) {
+                        acknowledged_at = Some(std::time::Instant::now());
+                    }
+                }
+                if acknowledged_at.is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_millis(90)) { break; }
+                if acknowledged_at.is_none() && paste_output_settled(&state, after, started, std::time::Instant::now()) { break; }
+                if started.elapsed() >= std::time::Duration::from_secs(if opencode { 10 } else { 5 }) {
                     return Err("The terminal did not settle after pasting. Open Code to inspect the prompt and press Enter once if it is still there; it was not submitted automatically.".into());
                 }
                 continue;
@@ -363,7 +411,9 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         // Exactly one submit key; never retry Enter against an unknown dialog.
         writer.write_all(b"\r").map_err(|e| e.to_string())?;
     } else { writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?; }
-    writer.flush().map_err(|e| e.to_string())
+    writer.flush().map_err(|e| e.to_string())?;
+    if paste || matches!(data, "\r" | "\n" | "\r\n" | "\x15") { paste_pending.store(false, Ordering::SeqCst); }
+    Ok(())
 }
 /// Stage WebView file bytes in an app-owned temporary directory so the CLI can read
 /// the actual image/document. The original filename is never used as a path.
@@ -634,6 +684,23 @@ pub async fn manual_terminal_close(state: State<'_, ManualTerminals>, id: String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opencode_multiline_echo_can_be_confirmed_while_background_frames_continue() {
+        use std::time::{Duration, Instant};
+        let label = opencode_paste_summary("  Edit the file\n\nAttached files:\n- diagram.png \n").unwrap();
+        assert_eq!(label, "[Pasted ~4 lines]");
+        let mut replay = Replay::new();
+        let after = replay.sequence;
+        let started = Instant::now();
+        replay.push("\x1b[9;2H\x1b[38;5;214m[Pasted ~".into());
+        replay.push("4\x1b[1m lines]\x1b[0m".into());
+        replay.push("\x1b[14;2H⠋ working".into());
+        let now = started + Duration::from_secs(2);
+        replay.last_output = Some((replay.sequence, now - Duration::from_millis(20)));
+        assert!(!paste_output_settled(&replay, after, started, now));
+        assert!(output_contains_styled_text(&replay.output_after(after, false).0, &label));
+        assert!(!output_contains_styled_text("[Pasted ~4\x1b[12;2H lines]", &label));
+    }
     #[test]
     fn automatic_enter_waits_for_delayed_paste_output_not_silence_or_resize() {
         use std::time::{Duration, Instant};

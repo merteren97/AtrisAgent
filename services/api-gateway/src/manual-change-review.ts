@@ -9,13 +9,13 @@ const excluded = new Set(['.git', '.svn', '.hg', 'node_modules', 'dist', 'build'
 const conflict = (message: string, status = 409): never => { throw Object.assign(new Error(message), { status }); };
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 
-function excludedName(name: string): boolean {
+export function excludedName(name: string): boolean {
   const normalized = name.toLowerCase();
   return excluded.has(normalized) || normalized.startsWith('.atris-') || (normalized.startsWith('.env') && normalized !== '.env.example')
     || /\.(?:pem|key|pfx|p12|sqlite3?|db|credentials|secrets?)$/i.test(name);
 }
 
-function parts(relative: string): string[] {
+export function parts(relative: string): string[] {
   const items = relative.split('/');
   if (relative.length > 2048 || items.some(name => !name || name === '.' || name === '..' || /[\\:\x00-\x1f]/.test(name) || excludedName(name)
     || process.platform === 'win32' && (/[. ]$/.test(name) || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name)))) {
@@ -29,7 +29,7 @@ function stat(filename: string): fs.Stats | undefined {
 }
 
 /** Resolve every component without traversing links or special files. */
-function filePath(root: string, relative: string, createParents = false): string {
+export function filePath(root: string, relative: string, createParents = false): string {
   if (!stat(root)?.isDirectory() || fs.realpathSync(root) !== root) return conflict('The original review directory has moved or is unavailable.');
   const names = parts(relative);
   let current = root;
@@ -94,6 +94,52 @@ function scan(root: string, skip?: string): { files: Map<string, Version>; omitt
   return { files, omitted };
 }
 
+/** Legacy review lists still inspect both trees, but should not block chat and terminal traffic. */
+async function scanForList(root: string): Promise<{ files: Map<string, Version>; omitted: number }> {
+  if (await fs.promises.realpath(root) !== root) return conflict('The review directory is unavailable.');
+  const files = new Map<string, Version>();
+  const pending = [''];
+  let omitted = 0, bytes = 0, entries = 0;
+  while (pending.length) {
+    const prefix = pending.pop()!;
+    const folder = path.join(root, prefix);
+    if (await fs.promises.realpath(folder) !== folder) continue;
+    for (const entry of await fs.promises.readdir(folder, { withFileTypes: true })) {
+      if (++entries > maxFiles) return conflict('This project exceeds the entry review limit.', 413);
+      if (excludedName(entry.name) || (!entry.isFile() && !entry.isDirectory())) { omitted++; continue; }
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      parts(relative);
+      if (entry.isDirectory()) { pending.push(relative); continue; }
+      const filename = path.join(folder, entry.name);
+      const fd = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        const info = await fd.stat({ bigint: true });
+        const named = await fs.promises.lstat(filename, { bigint: true });
+        if (!info.isFile() || !named.isFile() || named.ino !== info.ino || named.dev !== info.dev) return conflict('A file changed during the scan. Refresh and try again.');
+        const size = Number(info.size);
+        bytes += size;
+        if (bytes > maxBytes) return conflict('The working files exceed the 256 MB review limit.', 413);
+        const permissions = Number(info.mode) & 0o777;
+        const mode = process.platform === 'win32' ? 0 : permissions & 0o111;
+        const hash = createHash('sha256').update(String(mode));
+        const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, size)));
+        let total = 0;
+        for (;;) {
+          const { bytesRead } = await fd.read(chunk, 0, chunk.length, null);
+          if (!bytesRead) break;
+          total += bytesRead;
+          if (total > size) return conflict('A file changed during the scan. Refresh and try again.');
+          hash.update(chunk.subarray(0, bytesRead));
+        }
+        const latest = await fd.stat({ bigint: true });
+        if (total !== size || latest.mtimeNs !== info.mtimeNs || latest.ctimeNs !== info.ctimeNs) return conflict('A file changed during the scan. Refresh and try again.');
+        files.set(relative, { hash: hash.digest('hex'), size, mode, permissions });
+      } finally { await fd.close(); }
+    }
+  }
+  return { files, omitted };
+}
+
 function replace(root: string, relative: string, from: string | undefined, expected: Version | undefined, source?: Version): void {
   const destination = filePath(root, relative, Boolean(from));
   const verifyDestination = () => {
@@ -118,6 +164,9 @@ function replace(root: string, relative: string, from: string | undefined, expec
 
 export class ManualChangeReview {
   constructor(private dataDir: string) {}
+
+  private pendingLists = new Map<string, Promise<ReturnType<ManualChangeReview['list']>>>();
+  private recentLists = new Map<string, { expires: number; data: ReturnType<ManualChangeReview['list']> }>();
 
   private directory(id: string): string {
     if (!/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id)) return conflict('Invalid conversation identity.', 400);
@@ -159,6 +208,10 @@ export class ManualChangeReview {
   private changes(scope: ReturnType<ManualChangeReview['scope']>) {
     const base = scan(scope.baseline).files;
     const current = scan(scope.work);
+    return this.compare(base, current);
+  }
+
+  private compare(base: Map<string, Version>, current: { files: Map<string, Version>; omitted: number }) {
     const files = [...new Set([...base.keys(), ...current.files.keys()])].sort().flatMap(relative => {
       const before = base.get(relative), after = current.files.get(relative);
       if (before?.hash === after?.hash) return [];
@@ -173,6 +226,25 @@ export class ManualChangeReview {
     const result = this.changes(scope);
     return { mode: 'isolated' as const, omitted: Math.max(scope.omitted, result.omitted),
       files: result.files.map(({ before: _before, after: _after, ...file }) => file) };
+  }
+
+  async listAsync(id: string, project: string, summary = false) {
+    const scope = this.scope(id, project);
+    const recent = this.recentLists.get(id);
+    if (summary && recent && recent.expires > Date.now()) return recent.data;
+    const existing = this.pendingLists.get(id);
+    if (existing) return existing;
+    const request = Promise.all([scanForList(scope.baseline), scanForList(scope.work)]).then(([baseline, current]) => {
+      const result = this.compare(baseline.files, current);
+      const data = { mode: 'isolated' as const, omitted: Math.max(scope.omitted, result.omitted),
+        files: result.files.map(({ before: _before, after: _after, ...file }) => file) };
+      this.recentLists.delete(id);
+      this.recentLists.set(id, { expires: Date.now() + 10_000, data });
+      if (this.recentLists.size > 16) this.recentLists.delete(this.recentLists.keys().next().value!);
+      return data;
+    }).finally(() => this.pendingLists.delete(id));
+    this.pendingLists.set(id, request);
+    return request;
   }
 
   preview(id: string, project: string, relative: string, revision: string) {
@@ -204,6 +276,7 @@ export class ManualChangeReview {
 
   resolve(id: string, project: string, action: 'apply' | 'discard', selection: Array<{ path: string; revision: string }>) {
     const scope = this.scope(id, project);
+    this.recentLists.delete(id);
     if (!selection.length || new Set(selection.map(item => item.path)).size !== selection.length) return conflict('Choose a valid, non-empty set of files.', 400);
     // Every selected revision must still match. Never silently include a newly changed file.
     const review = new Map(this.changes(scope).files.map(file => [file.path, file]));

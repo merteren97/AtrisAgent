@@ -614,6 +614,12 @@ export class WorktreeManager {
     if (!await this.isGitRepository(worktreePath)) {
       return { files: await this.getChangedFiles(worktreePath), diff: await this.getDiff(worktreePath) };
     }
+    const base = await this.reviewBase(worktreePath);
+    const [files, diff] = await Promise.all([this.reviewGitFiles(worktreePath, base), this.reviewGitDiff(worktreePath, base)]);
+    return { files, diff };
+  }
+
+  private async reviewBase(worktreePath: string): Promise<string> {
     const { stdout: gitDir } = await git(['rev-parse', '--absolute-git-dir'], worktreePath);
     const marker = path.join(gitDir.trim(), REVIEW_BASE_MARKER);
     let base = 'HEAD';
@@ -621,9 +627,29 @@ export class WorktreeManager {
       const recorded = fs.readFileSync(marker, 'utf8').trim();
       if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(recorded)) base = recorded;
     }
-    const [names, patch, untracked] = await Promise.all([
+    return base;
+  }
+
+  async getReviewFileList(worktreePath: string): Promise<ChangedFile[]> {
+    return await this.isGitRepository(worktreePath)
+      ? this.reviewGitFiles(worktreePath, await this.reviewBase(worktreePath))
+      : this.getChangedFiles(worktreePath);
+  }
+
+  async getReviewFileDiff(worktreePath: string, relative: string): Promise<string> {
+    return await this.isGitRepository(worktreePath)
+      ? this.reviewGitDiff(worktreePath, await this.reviewBase(worktreePath), relative)
+      : this.getDiff(worktreePath, undefined, relative);
+  }
+
+  private async reviewGitDiff(worktreePath: string, base: string, relative?: string): Promise<string> {
+    const result = await git(['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', base, '--', ...(relative ? [`:(literal)${relative}`] : [])], worktreePath);
+    return result.stdout;
+  }
+
+  private async reviewGitFiles(worktreePath: string, base: string): Promise<ChangedFile[]> {
+    const [names, untracked] = await Promise.all([
       git(['diff', '--name-status', '-z', '--no-renames', base, '--'], worktreePath),
-      git(['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', base, '--'], worktreePath),
       git(['ls-files', '--others', '--exclude-standard', '-z'], worktreePath),
     ]);
     const pairs = names.stdout.split('\0');
@@ -635,10 +661,10 @@ export class WorktreeManager {
     for (const filePath of untracked.stdout.split('\0')) {
       if (filePath && !files.has(filePath)) files.set(filePath, { path: filePath, status: 'added' });
     }
-    return { files: [...files.values()], diff: patch.stdout };
+    return [...files.values()];
   }
 
-  async getDiff(worktreePath: string, targetBranch?: string): Promise<string> {
+  async getDiff(worktreePath: string, targetBranch?: string, relative?: string): Promise<string> {
     if (!fs.existsSync(worktreePath)) return '';
     const isGit = await this.isGitRepository(worktreePath);
 
@@ -654,7 +680,7 @@ export class WorktreeManager {
       }
     }
 
-    const changedFiles = await this.getChangedFiles(worktreePath);
+    const changedFiles = (await this.getChangedFiles(worktreePath)).filter(file => !relative || file.path === relative);
     const baselineDir = path.join(worktreePath, '.atris-baseline');
     let diffText = '';
     for (const cf of changedFiles) {

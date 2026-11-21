@@ -105,6 +105,8 @@ export interface RuntimeHostConfig {
   workspaceAgentProfileOverrides?: Record<string, AgentProfile | AgentProfilePatch | Record<string, unknown>>;
   /** Optional integration hook for durable dispatch tracing. */
   onAgentDispatch?: (trace: AgentDispatchTrace) => void | Promise<void>;
+  /** Attach observers before a newly provisioned Builder can change its files. */
+  onBuilderWorktreeReady?: (taskId: string, resumed: boolean) => Promise<void>;
   /** Optional profile resolver supplied by a persistence layer. */
   resolveAgentProfile?: AgentProfileResolver;
 }
@@ -1208,6 +1210,7 @@ export class RuntimeHost {
         if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink()) {
           throw new Error(`Persisted Builder worktree is not a real directory for task ${event.taskId}.`);
         }
+        await this.config.onBuilderWorktreeReady?.(event.taskId, true);
         return {
           cwd: worktreePath,
           worktreePath,
@@ -1216,6 +1219,7 @@ export class RuntimeHost {
       }
       try {
         const worktreePath = await this.workspaceManager.createWorktreeForTask(event.taskId);
+        await this.config.onBuilderWorktreeReady?.(event.taskId, false);
         return { cwd: worktreePath, worktreePath };
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);

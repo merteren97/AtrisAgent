@@ -891,6 +891,7 @@ export function buildMissionRequestBody(request: string, workspaceId: string | u
   options = normalizeMissionOptions(options);
   request = missionRequestText(request, options);
   const agentProfileIds = normalizeAgentProfileIds(options?.agentProfileIds);
+  const executionMode = toExecutionMode(options);
   return {
     request,
     title: request,
@@ -901,7 +902,10 @@ export function buildMissionRequestBody(request: string, workspaceId: string | u
     reasoningLevel: options?.reasoningLevel || undefined,
     teamTemplate: options?.teamTemplate,
     trustMode: options?.trustMode,
-    executionMode: toExecutionMode(options),
+    executionMode,
+    // Balanced missions can publish draft files while tests run. Explicit review mode still stages them.
+    automationOverrides: executionMode === 'balanced' && options?.automationSettings?.fileWrite !== false
+      ? { workspaceApply: 'auto' } : undefined,
     targetRole: options?.targetRole,
     routeRole: options?.routeRole,
     routeScope: options?.routeScope,
@@ -1590,7 +1594,10 @@ export function buildMissionCommandOptions(options?: StartMissionOptions): Recor
   const { request: _request, title: _title, workspaceId: _workspace, clientMessageId: _client,
     ...serialized } = buildMissionRequestBody('', undefined, options);
   // Legacy follow-ups without a policy selection inherit the mission policy.
-  if (!options.executionMode && !options.trustMode) delete serialized.executionMode;
+  if (!options.executionMode && !options.trustMode) {
+    delete serialized.executionMode;
+    delete serialized.automationOverrides;
+  }
   return serialized;
 }
 

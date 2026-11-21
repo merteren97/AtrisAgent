@@ -21,6 +21,7 @@ import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
 import { findMatchingArtifact, ManualChatContent } from './manual-chat-content';
 import { LatestMessagesButton, LoadOlderMessages, useChatHistoryScroll } from '@/components/chat/chat-history';
+import { ChatChangeSummary } from '@/components/chat/chat-change-summary';
 import { useManualChatHistory } from './use-manual-chat-history';
 import { ManualQuestionCard, buildAntigravityQuestionKeystrokes } from './manual-question';
 import { CodexPermissions, type CodexLivePermissions } from './codex-permissions';
@@ -98,7 +99,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
             <span className="block text-xl font-semibold">{amount}</span><span className="mt-1 block text-xs text-muted-foreground">{amount === 1 ? 'agent' : 'agents'}</span>
           </label>)}</div>
           <p className="mt-3 text-xs leading-5 text-muted-foreground">Opens {count} independent CLI {count === 1 ? 'session' : 'sessions'}. Terminals arrange automatically. Add more later, up to 30 per conversation.</p>
-          {!conversationId && <p className="mt-2 text-xs leading-5 text-muted-foreground">Tabs share a working copy. Review and apply its edits in Changes in the right panel.</p>}
+          {!conversationId && <p className="mt-2 text-xs leading-5 text-muted-foreground">Edits from these tabs appear in your project as they are saved. Review or undo them in the Changes panel.</p>}
         </fieldset>
         {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Use the desktop app to launch interactive terminals.</p>}
         {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
@@ -407,6 +408,7 @@ export function ManualWorkspace() {
             </div>
             {scroll.detached && <div className="absolute bottom-3 right-4"><LatestMessagesButton onClick={scroll.jumpToLatest} /></div>}
             </div>
+            <ChatChangeSummary endpoint={`/manual/conversations/${encodeURIComponent(conversation.id)}/changes?summary=1`} />
             {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
           </div>
         </div>

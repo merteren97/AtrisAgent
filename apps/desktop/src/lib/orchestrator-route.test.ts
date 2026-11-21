@@ -76,10 +76,16 @@ test('an explicit worker-wide model directive keeps the coordinator and override
     assert.equal(result.error, undefined);
     assert.deepEqual(serialize(result.options), {
       request: 'Do the work', title: 'Do the work', workspaceId: 'project-a', executionMode: 'balanced',
+      automationOverrides: { workspaceApply: 'auto' },
       modelCatalogId: worker.catalogId, reasoningLevel: 'low', routeScope: 'subagents',
       orchestratorModelCatalogId: coordinator.catalogId, orchestratorReasoningLevel: 'high',
     });
   }
+});
+
+test('explicit review and disabled file changes do not opt into live workspace publication', () => {
+  assert.equal('automationOverrides' in serialize({ executionMode: 'review_driven' }), false);
+  assert.equal('automationOverrides' in serialize({ executionMode: 'balanced', automationSettings: { fileWrite: false, gitCommit: null, packageInstall: null } }), false);
 });
 
 test('same-selected-model worker directives stay child-only even with Everyone selected', () => {
