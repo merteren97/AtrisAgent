@@ -10,11 +10,14 @@ struct Geometry { columns: u16, rows: u16 }
 const INITIAL_GEOMETRY: Geometry = Geometry { columns: 120, rows: 30 };
 #[derive(Serialize, Debug, PartialEq)]
 struct ReplayResize { offset: usize, columns: u16, rows: u16 }
-struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, last_output: Option<(u64, std::time::Instant)>, bytes: usize, ended: bool, geometry: Geometry, input_ready: Option<bool>, signal_tail: String }
+struct Replay { chunks: VecDeque<(u64, String, Geometry)>, sequence: u64, last_output: Option<(u64, std::time::Instant)>, bytes: usize, ended: bool, geometry: Geometry, input_ready: Option<bool>, signal_tail: String, agy_input: Option<AntigravityInput> }
 impl Replay {
-    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, last_output: None, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY, input_ready: None, signal_tail: String::new() } }
+    fn new() -> Self { Self { chunks: VecDeque::new(), sequence: 0, last_output: None, bytes: 0, ended: false, geometry: INITIAL_GEOMETRY, input_ready: None, signal_tail: String::new(), agy_input: None } }
     fn push(&mut self, text: String) {
-        if self.input_ready == Some(false) {
+        if let Some(input) = &mut self.agy_input {
+            if !text.is_empty() { input.update(&text); }
+            self.input_ready = Some(input.bracketed && input.composer);
+        } else if self.input_ready == Some(false) {
             self.signal_tail.push_str(&text);
             // Codex emits this terminal state only after protected startup screens.
             if self.signal_tail.contains("\x1b]7501;state=idle:app=codex\x1b\\") || self.signal_tail.contains("\x1b]7501;state=idle:app=codex\x07") {
@@ -89,6 +92,10 @@ fn opencode_paste_summary(data: &str) -> Option<String> {
 
 fn output_contains_styled_text(output: &str, expected: &str) -> bool {
     if output.contains(expected) { return true; }
+    terminal_text(output).contains(expected)
+}
+
+fn terminal_text(output: &str) -> String {
     // Drop style codes (not cursor movements) so fragments of separate screen
     // locations cannot form a false acknowledgement.
     let mut remaining = output;
@@ -98,12 +105,31 @@ fn output_contains_styled_text(output: &str, expected: &str) -> bool {
         let code = &remaining[index + 2..];
         if let Some(end) = code.bytes().position(|byte| !(b'0'..=b'9').contains(&byte) && !matches!(byte, b';' | b':')) {
             if code.as_bytes()[end] != b'm' { plain.push('\n'); }
-            if !code.is_char_boundary(end + 1) { return false; }
+            if !code.is_char_boundary(end + 1) { return plain; }
             remaining = &code[end + 1..];
-        } else { return plain.contains(expected); }
+        } else { return plain; }
     }
     plain.push_str(remaining);
-    plain.contains(expected)
+    plain
+}
+
+#[derive(Default)]
+struct AntigravityInput { tail: String, bracketed: bool, composer: bool }
+impl AntigravityInput {
+    fn update(&mut self, text: &str) {
+        self.tail.push_str(text);
+        let on = self.tail.rfind("\x1b[?2004h");
+        let off = self.tail.rfind("\x1b[?2004l");
+        if on.is_some() || off.is_some() { self.bracketed = on > off; }
+        let shown = terminal_text(&self.tail).to_ascii_lowercase();
+        let ready = shown.rfind("? for shortcuts");
+        let protected = ["trust the contents of this project", "yes, i trust this folder", "trust this folder?"]
+            .iter().filter_map(|text| shown.rfind(text)).max();
+        if ready.is_some() || protected.is_some() { self.composer = ready > protected; }
+        let mut start = self.tail.len().saturating_sub(512);
+        while !self.tail.is_char_boundary(start) { start += 1; }
+        self.tail.drain(..start);
+    }
 }
 
 fn terminal_protocol_reply(data: &str) -> bool {
@@ -270,8 +296,11 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
     let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
     let child = pair.slave.spawn_command(command).map_err(|e| e.to_string())?;
     drop(pair.slave);
+    let antigravity = request.runtime_type == "antigravity" || Path::new(&request.executable).file_stem().and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("antigravity"));
     let mut initial_replay = Replay::new();
-    if request.args.iter().any(|arg| arg.starts_with("atris-manual-")) { initial_replay.input_ready = Some(false); }
+    if antigravity { initial_replay.agy_input = Some(AntigravityInput::default()); }
+    if antigravity || request.args.iter().any(|arg| arg.starts_with("atris-manual-")) { initial_replay.input_ready = Some(false); }
     let replay = Arc::new(Mutex::new(initial_replay));
     let output = replay.clone();
     std::thread::spawn(move || {
@@ -293,8 +322,6 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
         }
         if let Ok(mut state) = output.lock() { state.ended = true; }
     });
-    let antigravity = request.runtime_type == "antigravity" || Path::new(&request.executable).file_stem().and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("antigravity"));
     let mut terminal = Terminal { master: pair.master, writer, child, replay, closed: false, opencode, antigravity, paste_pending: Arc::new(AtomicBool::new(false)), paste_epoch: Arc::new(AtomicU64::new(0)) };
     if manager.stopping.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Application is shutting down".into()); }
     if session.closing.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Agent terminal is closing".into()); }
@@ -356,18 +383,13 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     let terminal = terminal_slot.as_mut().ok_or("Open the agent first")?;
     if terminal.closed || !matches!(terminal.child.try_wait(), Ok(None)) { return Err("Agent is not connected".into()); }
-    if paste && terminal.antigravity {
-        return Err("Send in Antigravity’s Code terminal after completing any CLI setup. Your draft is kept; nothing was pasted.".into());
-    }
-    if paste && terminal.replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready == Some(false) {
-        return Err("Codex is still starting. Your draft is kept; check CLI setup in Code.".into());
-    }
+    let antigravity = terminal.antigravity;
     let writer = terminal.writer.clone();
     let replay = terminal.replay.clone();
     let opencode = terminal.opencode;
     let paste_pending = terminal.paste_pending.clone();
     let paste_epoch = terminal.paste_epoch.clone();
-    let codex = replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready.is_some();
+    let codex = !antigravity && replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready.is_some();
     // A full PTY input buffer must not prevent Close from reaching the child.
     drop(terminal_slot);
     let mut input = writer.lock().map_err(|_| "Terminal input is unavailable")?;
@@ -376,7 +398,13 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         if paste_pending.load(Ordering::SeqCst) {
             return Err("A previous message is still pending in Code. Inspect the terminal and finish that message before sending another; nothing was pasted again.".into());
         }
-        let after = replay.lock().map_err(|_| "Terminal output is unavailable")?.sequence;
+        let after = {
+            let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
+            if state.input_ready == Some(false) {
+                return Err(if antigravity { "Antigravity is not ready. Check Code." } else { "Codex is still starting. Your draft is kept; check CLI setup in Code." }.into());
+            }
+            state.sequence
+        };
         paste_pending.store(true, Ordering::SeqCst);
         let epoch = paste_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         input.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
@@ -414,6 +442,7 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             if paste_epoch.load(Ordering::SeqCst) != epoch { return Err("Automatic submit canceled by Code input. Check the terminal; the draft is kept.".into()); }
             let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
             if state.ended { return Err("Agent disconnected before the message could be submitted.".into()); }
+            if antigravity && state.input_ready != Some(true) { return Err("Antigravity is waiting for input in Code. Message not submitted.".into()); }
             let current = state.sequence;
             let settled = !codex && paste_output_settled(&state, after, started, std::time::Instant::now());
             let next_signal = if acknowledged_at.is_none() && current != signal_sequence && (opencode || paste_labels.is_some()) {
@@ -456,8 +485,10 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         }
         // Exactly one submit key; never retry Enter against an unknown dialog.
         input = writer.lock().map_err(|_| "Terminal input is unavailable")?;
-        if slot.closing.load(Ordering::SeqCst) || replay.lock().map_err(|_| "Terminal output is unavailable")?.ended {
-            return Err("Agent disconnected before the message could be submitted.".into());
+        {
+            let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
+            if slot.closing.load(Ordering::SeqCst) || state.ended { return Err("Agent disconnected before the message could be submitted.".into()); }
+            if antigravity && state.input_ready != Some(true) { return Err("Antigravity is waiting for input in Code. Message not submitted.".into()); }
         }
         if paste_epoch.load(Ordering::SeqCst) != epoch { return Err("Automatic submit canceled by Code input. Check the terminal; the draft is kept.".into()); }
         input.write_all(b"\r").map_err(|e| e.to_string())?;
@@ -972,6 +1003,71 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn installed_antigravity_local_command_from_chat() {
+        let (Ok(executable), Ok(cwd)) = (std::env::var("ATRIS_TEST_AGY_EXECUTABLE"), std::env::var("ATRIS_TEST_AGY_TRUSTED_CWD")) else { return; };
+        use std::time::{Duration, Instant};
+        let root = std::env::temp_dir().join(format!("atris-agy-pty-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let manager = ManualTerminals::default();
+        struct Cleanup(ManualTerminals, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { self.0.shutdown(); let _ = std::fs::remove_dir_all(&self.1); }
+        }
+        let _cleanup = Cleanup(manager.clone(), root.clone());
+        let id = "00000000-0000-4000-8000-000000000041";
+        start_with_cleanup(manager.clone(), Launch { id: id.into(), executable: executable.clone(), cwd, env: HashMap::new(), runtime_type: "antigravity".into(),
+            args: vec!["--log-file".into(), root.join("cli.log").to_string_lossy().into_owned()] }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut answered_cursor = false;
+        loop {
+            let frame = snapshot(&manager, id.into(), 0, false).unwrap();
+            if !answered_cursor && frame.output.contains("\x1b[6n") {
+                write_input(&manager, id, "\x1b[1;1R", false).unwrap();
+                answered_cursor = true;
+            }
+            assert!(!output_contains_styled_text(&frame.output, "trust the contents"), "Fixture directory is not already trusted; no approval was sent");
+            if output_contains_styled_text(&frame.output, "for shortcuts") {
+                println!("Antigravity composer found (bracketed paste mode advertised: {})", frame.output.contains("\x1b[?2004h"));
+                break;
+            }
+            assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity composer did not appear");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        write_input(&manager, id, "/exit", true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if snapshot(&manager, id.into(), 0, true).unwrap().status == "exited" { break; }
+            assert!(Instant::now() < deadline, "Antigravity did not submit the local exit command");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let untrusted_id = "00000000-0000-4000-8000-000000000042";
+        let untrusted = root.join("untrusted-project");
+        std::fs::create_dir(&untrusted).unwrap();
+        start_with_cleanup(manager.clone(), Launch { id: untrusted_id.into(), executable,
+            cwd: untrusted.to_string_lossy().into_owned(), env: HashMap::new(), runtime_type: "antigravity".into(),
+            args: vec!["--log-file".into(), root.join("untrusted.log").to_string_lossy().into_owned()] }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut answered_cursor = false;
+        loop {
+            let frame = snapshot(&manager, untrusted_id.into(), 0, false).unwrap();
+            if !answered_cursor && frame.output.contains("\x1b[6n") {
+                write_input(&manager, untrusted_id, "\x1b[1;1R", false).unwrap();
+                answered_cursor = true;
+            }
+            if output_contains_styled_text(&frame.output, "trust the contents") || output_contains_styled_text(&frame.output, "Trust this folder?") {
+                assert_eq!(frame.input_ready, Some(false));
+                break;
+            }
+            assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity did not prompt for trust on the temporary folder");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(write_input(&manager, untrusted_id, "/exit", true).unwrap_err().contains("not ready"));
+        println!("Antigravity trust prompt rejected Chat input without accepting trust");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn installed_opencode_bracketed_paste_submits_local_command() {
         let Ok(executable) = std::env::var("ATRIS_TEST_OPENCODE_EXECUTABLE") else { return; };
         let root = std::env::temp_dir().join(format!("atris-opencode-enter-{}", std::process::id()));
@@ -1078,6 +1174,22 @@ mod tests {
         assert!(replay.bytes <= REPLAY_LIMIT);
         assert_eq!(replay.sequence, 200);
         assert!(replay.chunks.front().unwrap().0 > 1);
+    }
+
+    #[test]
+    fn antigravity_paste_mode_alone_does_not_make_trust_ready() {
+        let mut replay = Replay::new();
+        replay.agy_input = Some(AntigravityInput::default());
+        replay.push("\x1b[?2004hDo you trust the contents of this project?".into());
+        assert_eq!(replay.input_ready, Some(false));
+        replay.push("\x1b[2J? \x1b[36mfor short".into());
+        assert_eq!(replay.input_ready, Some(false));
+        replay.push("cuts\x1b[0m".into());
+        assert_eq!(replay.input_ready, Some(true));
+        replay.push("\x1b[2JTrust this folder?".into());
+        assert_eq!(replay.input_ready, Some(false));
+        replay.push("\x1b[?2004l\x1b[2J? for shortcuts".into());
+        assert_eq!(replay.input_ready, Some(false));
     }
 
     #[test]
@@ -1231,7 +1343,7 @@ mod tests {
         };
         wait_for(first, "native-ready"); wait_for(second, "native-ready");
         wait_for(third, "native-ready"); wait_for(fourth, "native-ready");
-        assert!(write_input(&manager, fourth, "must-not-reach-the-terminal", true).unwrap_err().contains("nothing was pasted"));
+        assert!(write_input(&manager, fourth, "must-not-reach-the-terminal", true).unwrap_err().contains("not ready"));
         write_input(&manager, fourth, "typed-explicitly\r", false).unwrap();
         assert!(!wait_for(fourth, "received:typed-explicitly").output.contains("must-not-reach-the-terminal"));
         {

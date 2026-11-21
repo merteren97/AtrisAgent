@@ -139,7 +139,6 @@ async function executeMobileRequest(method: string, params: Record<string, unkno
   }
   if (method === 'send') {
     if (params.workspaceId !== workspaceId || params.conversationId !== agent.conversationId) throw new Error('Agent context changed. Refresh the workspace.');
-    if (agent.runtimeType === 'antigravity') throw new Error('Antigravity messages must be submitted in Code on the desktop. Nothing was sent.');
     return commands.send({ id: params.id, workspaceId, conversationId: agent.conversationId, agentId: agent.id, text: params.text });
   }
   if (method === 'models') return useAccountStore.getState().discoveredModels.filter(model => model.accountProfileId === agent.accountProfileId && model.runtimeType === agent.runtimeType).map(model => ({ id: model.catalogId, name: model.name, runtime: model.runtimeType, reasoning: model.supportedReasoning, available: model.available, selected: model.catalogId === agent.catalogId }));

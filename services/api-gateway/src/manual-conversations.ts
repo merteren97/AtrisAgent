@@ -218,8 +218,8 @@ export class ManualConversationStore {
     this.saveBatch([agent]);
   }
   remove(id: string): void {
-    this.live?.stop(`manual:${id}`);
     this.sqlite.transaction(() => {
+      this.live?.removeManualConversation(id);
       this.sqlite.prepare('DELETE FROM manual_automatic_titles WHERE conversation_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id IN (SELECT id FROM manual_agent_sessions WHERE conversation_id = ?)').run(id);
       this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE conversation_id = ?').run(id);
@@ -561,9 +561,6 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     try {
       const conversation = store.conversation(id);
       if (!store.hasChangeReview(id)) directWorkspace = conversation.workspaceId;
-      if (live?.list(`manual:${id}`)?.files.some(file => file.state !== 'reverted')) {
-        return fail('Undo history is attached to this conversation. Close it without deleting it to keep the history.');
-      }
       if (!live?.get(`manual:${id}`) && store.hasChangeReview(id) && store.changeReview.list(id, store.workspace(conversation.workspaceId).path).files.length) {
         return fail('Apply or discard pending files in Changes before deleting this conversation.', 409);
       }

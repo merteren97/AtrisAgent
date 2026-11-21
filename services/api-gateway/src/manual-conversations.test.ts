@@ -509,8 +509,18 @@ try {
     const { files: finalChanges } = await (await fetch(`${base}${liveRoute}`)).json();
     assert.deepEqual(await (await post(`${liveRoute}/resolve`, { action: 'undo', files: finalChanges.filter((file: any) => file.path === 'last-save.ts') })).json(), { completed: ['last-save.ts'], conflicts: [] });
     const reopened = await post(`/conversations/${liveId}/agents`, { ...input, id: randomUUID() });
-    assert.equal((await reopened.json()).cwd, liveAgent.cwd);
+    const reopenedAgent = await reopened.json();
+    assert.equal(reopenedAgent.cwd, liveAgent.cwd);
     assert.equal(isWatching(), 1, 'Adding an agent again rearms tracking on the same copy');
+    fs.writeFileSync(path.join(reopenedAgent.cwd, 'published.ts'), 'keep published content');
+    const publishedFile = path.join(reviewProject, 'published.ts');
+    const published = () => liveChanges.list(`manual:${liveId}`)?.files.some(file => file.path === 'published.ts' && file.state === 'published');
+    for (let tries = 0; tries < 60 && !published(); tries++) await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal((await (await fetch(`${base}${liveRoute}`)).json()).files.find((file: any) => file.path === 'published.ts')?.state, 'published');
+    assert.equal((await fetch(`${base}/conversations/${liveId}`, { method: 'DELETE' })).status, 204);
+    assert.equal(fs.readFileSync(publishedFile, 'utf8'), 'keep published content');
+    assert.equal(liveChanges.get(`manual:${liveId}`), undefined);
+    assert.equal((await fetch(`${base}${liveRoute}`)).status, 404);
     assert.equal((await fetch(`${base}/conversations/${liveId}`, { method: 'DELETE' })).status, 204);
   } finally { fs.rmSync(reviewProject, { recursive: true, force: true }); }
   model.availability = 'unknown';
