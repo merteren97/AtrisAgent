@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowDown, Check, FileText, History, Loader2, Maximize2, Minimize2, MoreHorizontal, Plus, RefreshCw, RotateCcw, Sparkles, Square, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Check, FileText, History, Loader2, Maximize2, Minimize2, MoreHorizontal, Plus, RefreshCw, RotateCcw, Sparkles, Square, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { MarkdownContent } from '@/components/chat/markdown-content';
+import { CHAT_HISTORY_PAGE_SIZE, LatestMessagesButton, LoadOlderMessages, useChatHistoryScroll } from '@/components/chat/chat-history';
 import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
 import { ManualComposer, addManualFiles } from '@/components/manual/manual-composer';
 import { ArtifactPreviewDialog, AssistantTurnProcess, findMatchingArtifact } from '@/components/manual/manual-chat-content';
@@ -316,10 +317,9 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
   const [attachmentPreview, setAttachmentPreview] = useState<string>();
   const [openArtifact, setOpenArtifact] = useState<ManualToolArtifact | null>(null);
   const workspacePath = useWorkspaceStore(state => state.workspaces.find(w => w.id === workspaceId)?.path || '');
-  const [following, setFollowing] = useState(true);
+  const [historyAnchor, setHistoryAnchor] = useState<string>();
   const root = useRef<HTMLElement>(null);
-  const timeline = useRef<HTMLDivElement>(null);
-  const content = useRef<HTMLDivElement>(null);
+  const scroll = useChatHistoryScroll();
   const alive = useRef(true);
   const actionBusy = useRef(false);
   const reviewLoad = useRef(0);
@@ -408,15 +408,6 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     return () => { disposed = true; clearTimeout(timer); pollController?.abort(); observer?.disconnect(); document.removeEventListener('visibilitychange', wake); };
   }, [base, accept]);
 
-  useLayoutEffect(() => {
-    const element = timeline.current;
-    if (!element || !content.current) return;
-    const scroll = () => { if (following) element.scrollTop = element.scrollHeight; };
-    scroll();
-    const observer = new ResizeObserver(scroll);
-    observer.observe(content.current);
-    return () => observer.disconnect();
-  }, [following]);
    const send = async (retry?: PlanningChatMessage, overrideText?: string) => {
     const trimmedOverride = overrideText?.trim();
     if ((!retry && !trimmedOverride && !canSend) || !chat || running || !model || actionBusy.current) return;
@@ -444,7 +435,7 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
       // This is deliberately keyed even if the user switched plans during send.
       usePlanningChatStore.getState().acknowledge(key, input);
       usePlanningChatStore.getState().clearSentFiles(key, sentFiles);
-      if (alive.current) { accept(state); setFollowing(true); }
+      if (alive.current) { accept(state); scroll.jumpToLatest(); }
     } catch (error) {
       if (alive.current) setActionError(`${errorText(error)} Your draft is kept. Retry with the same text and model to safely check this send.`);
     } finally { actionBusy.current = false; if (alive.current) setBusy(false); }
@@ -521,33 +512,42 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
   const controlAgent = { ...conversation, name: planningCliName(conversation.runtimeType) };
   const failed = chat?.status === 'failed' || chat?.status === 'interrupted';
   const retryMessage = failed ? [...(chat?.messages || [])].reverse().find(message => message.role === 'user' && message.turnId === chat?.turnId) : undefined;
+  const tailStart = Math.max(0, (chat?.messages.length ?? 0) - CHAT_HISTORY_PAGE_SIZE);
+  const anchorIndex = historyAnchor ? chat?.messages.findIndex(message => message.id === historyAnchor) ?? -1 : -1;
+  const historyStart = anchorIndex < 0 ? tailStart : Math.min(anchorIndex, tailStart);
+  const allTools = useMemo(() => chat?.messages.flatMap(item => item.tools || []), [chat?.messages]);
   return <section ref={root} role="tabpanel" id={`planning-chat-${conversation.id}`} aria-labelledby={`planning-tab-${conversation.id}`} className="flex min-h-0 w-full min-w-0 flex-1 flex-col bg-background text-foreground">
     <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border/60 px-4 text-[11px]"><span className="flex min-w-0 items-center gap-2 text-muted-foreground"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${running ? 'animate-pulse bg-primary' : failed ? 'bg-amber-500' : chat ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} /><span className="truncate">{planningCliName(conversation.runtimeType)} · Independent context</span></span>{running ? <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[10px]" disabled={busy} aria-label="Stop response" onClick={() => void stop()}><Square className="mr-1 h-2.5 w-2.5" />Interrupt</Button> : <span className="shrink-0 text-[10px] text-muted-foreground">Plan + board</span>}</div>
-    <div ref={timeline} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain" onScroll={event => {
-      const element = event.currentTarget; setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 64);
+    <div ref={scroll.viewport} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain" onScroll={() => {
+      scroll.onScroll();
+      if (!scroll.following.current && !historyAnchor) setHistoryAnchor(chat?.messages[historyStart]?.id);
     }}>
-      <div ref={content} className="mx-auto w-full max-w-4xl space-y-6 px-4 py-5">
+      <div ref={scroll.content} className="mx-auto w-full max-w-4xl space-y-6 px-4 py-5">
         {!chat && !loadError && <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="size-3 animate-spin" />Loading conversation…</p>}
         {chat?.messages.length === 0 && <div className="py-5">
           <h3 className="text-sm font-medium">Think it through together</h3>
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground">Explore the project, clarify decisions, and refine this plan. Plan and research documents are included as context.</p>
            <div className="mt-4 flex flex-col items-start gap-2">{suggestions.map(suggestion => <button key={suggestion} type="button" onClick={() => { update(key, { draft: suggestion }); root.current?.querySelector<HTMLTextAreaElement>('textarea')?.focus(); }} className="max-w-full rounded-lg border border-border px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{suggestion}</button>)}</div>
         </div>}
-        {chat?.messages.map(message => {
+        {chat && historyStart > 0 && <LoadOlderMessages onLoad={() => {
+          scroll.preservePosition();
+          setHistoryAnchor(chat.messages[Math.max(0, historyStart - CHAT_HISTORY_PAGE_SIZE)].id);
+        }} />}
+        {chat?.messages.slice(historyStart).map(message => {
           const text = message.role === 'assistant' ? planningChatDisplayText(message.content) : message.content;
+          const images = message.role === 'assistant' ? extractChatImages(text) : [];
           const proposals = chat.proposals.filter(proposal => proposal.turnId === message.turnId);
           const hasProcess = message.role === 'assistant' && Boolean(message.thinking?.trim() || message.tools?.length);
-          const allTools = chat.messages.flatMap(item => item.tools || []);
           const handleFileLink = (path: string) => {
             const matched = findMatchingArtifact(message.tools, path) ?? findMatchingArtifact(allTools, path);
             if (matched) setOpenArtifact(matched);
           };
-          return <article key={message.id} className="min-w-0 space-y-2">
+          return <article key={message.id} data-chat-message className="min-w-0 space-y-2">
             <p className="text-[11px] font-medium text-muted-foreground">{message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Assistant' : 'Activity'}{message.partial && running && message.turnId === chat.turnId ? ' · Writing' : ''}</p>
             {hasProcess && <AssistantTurnProcess thinking={message.thinking} thinkingTokens={message.thinkingTokens} tools={message.tools} cwd={workspacePath} openArtifact={openArtifact} onOpenArtifact={setOpenArtifact} />}
             {text && (message.role === 'assistant' ? <div className="min-w-0 text-sm leading-relaxed [overflow-wrap:anywhere] [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
               <MarkdownContent content={text} cwd={workspacePath} workspaceId={workspaceId} planId={planId} onLocalFileLink={handleFileLink} />
-              {extractChatImages(text).length > 0 && <ChatImageGallery images={extractChatImages(text)} workspaceId={workspaceId} planId={planId} />}
+              {images.length > 0 && <ChatImageGallery images={images} workspaceId={workspaceId} planId={planId} />}
             </div> : <p className={`whitespace-pre-wrap [overflow-wrap:anywhere] ${message.role === 'user' ? 'rounded-xl bg-muted/60 px-3 py-2 text-sm leading-relaxed' : 'text-xs leading-relaxed text-muted-foreground'}`}>{text}</p>)}
             {!!message.attachmentPaths?.length && <div aria-label="Sent attachments" className="flex flex-wrap gap-2">{message.attachmentPaths.map(path => <button type="button" key={path} onClick={() => setAttachmentPreview(path)} className="flex max-w-full items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"><FileText className="h-3 w-3 shrink-0" /><span className="truncate">{path.split('/').pop()}</span></button>)}</div>}
             {message.role === 'assistant' && !text && !hasProcess && message.partial && running && <p className="text-xs text-muted-foreground">Preparing document update…</p>}
@@ -562,7 +562,10 @@ function PlanningChatSession({ workspaceId, planId, onDocumentChange, conversati
     </div>
     <div className="shrink-0 border-t border-border/70 px-4 pt-2">
       <div className="mx-auto w-full max-w-4xl">
-        {!following && <Button variant="ghost" size="sm" className="mb-2 w-full" onClick={() => setFollowing(true)}><ArrowDown />Latest messages</Button>}
+        {scroll.detached && <div className="mb-2 flex justify-end"><LatestMessagesButton onClick={() => {
+          setHistoryAnchor(undefined);
+          scroll.jumpToLatest();
+        }} /></div>}
         <div role="status" className="mb-2 flex min-h-4 items-center gap-2 text-[11px] text-muted-foreground">{running ? <><Loader2 className="size-3 shrink-0 animate-spin" /><span className="min-w-0 break-words">{chat?.activity || 'Working on your plan'}</span></> : chat?.status === 'cancelled' ? 'Stopped · partial response kept' : chat?.status === 'complete' ? 'Ready for your next thought' : failed ? 'Response stopped · partial reply kept' : 'Plan, board and research in context'}</div>
         {retryMessage && <div className="mb-2 flex flex-wrap items-center gap-2"><Button size="sm" variant="outline" className="h-7 text-xs" disabled={busy || !model || Boolean(loadError)} onClick={() => void send(retryMessage)}><RotateCcw className="mr-1.5 size-3" />Retry last message</Button><span className="text-[11px] text-muted-foreground">Uses the current model and saved context.</span></div>}
         {(loadError || actionError || chat?.error) && <div role="alert" className="mb-2 max-h-28 overflow-y-auto rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs leading-relaxed text-destructive [overflow-wrap:anywhere]">{[loadError, actionError, chat?.error].filter(Boolean).join('\n')}</div>}

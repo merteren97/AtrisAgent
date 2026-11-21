@@ -83,6 +83,10 @@ const translations: Record<Language, Record<string, string>> = {
     'Theme': 'Tema',
     'Save': 'Kaydet',
     'Cancel': 'İptal',
+    'Show older messages': 'Geçmiş mesajları göster',
+    'Loading older messages…': 'Geçmiş mesajlar yükleniyor…',
+    'Older messages could not be loaded. Try again.': 'Geçmiş mesajlar yüklenemedi. Tekrar deneyin.',
+    'Latest messages': 'Son mesajlara dön',
     'Close': 'Kapat',
     'Connected': 'Bağlı',
     'Not Configured': 'Yapılandırılmadı'
