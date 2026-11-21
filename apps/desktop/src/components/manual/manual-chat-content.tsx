@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertCircle, Bot, Brain, Check, ChevronRight, FileText, ImageIcon, Loader2, Wrench } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -336,7 +336,7 @@ export function AssistantTurnProcess({
   );
 }
 
-export function ManualChatContent({
+export const ManualChatContent = memo(function ManualChatContent({
   text,
   agentId,
   cwd,
@@ -345,6 +345,7 @@ export function ManualChatContent({
   thinkingTokens,
   tools,
   conversationTools,
+  findOlderArtifact,
 }: {
   text: string;
   agentId: string;
@@ -354,9 +355,11 @@ export function ManualChatContent({
   thinkingTokens?: number;
   tools?: ManualToolItem[];
   conversationTools?: ManualToolItem[];
+  findOlderArtifact?: (path: string) => Promise<ManualToolArtifact | undefined>;
 }) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [openArtifact, setOpenArtifact] = useState<ManualToolArtifact | null>(null);
+  const artifactLookup = useRef(0);
   const content = user ? displayManualPrompt(text) : { text, attachments: [] };
   const images = user ? [] : assistantProjectImages(text);
   const openImage = (path: string) => {
@@ -365,8 +368,12 @@ export function ManualChatContent({
     if (target) setSelectedPath(target.path);
   };
   const handleFileLink = (path: string) => {
+    const lookup = ++artifactLookup.current;
     const matched = findMatchingArtifact(tools, path) ?? findMatchingArtifact(conversationTools, path);
     if (matched) setOpenArtifact(matched);
+    else void findOlderArtifact?.(path).then(found => {
+      if (found && artifactLookup.current === lookup) setOpenArtifact(found);
+    }).catch(() => {});
   };
   return (
     <>
@@ -393,9 +400,9 @@ export function ManualChatContent({
       <ArtifactPreviewDialog
         artifact={openArtifact}
         cwd={cwd}
-        onClose={() => setOpenArtifact(null)}
+        onClose={() => { artifactLookup.current++; setOpenArtifact(null); }}
         onLocalFileLink={handleFileLink}
       />
     </>
   );
-}
+});

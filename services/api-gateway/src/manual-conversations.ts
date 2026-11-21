@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -624,7 +624,42 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     }
     res.json({ id: agent.id, executable: installation.path, args, cwd: launchCwd, env, ...(codexRuntimeId ? {codexRuntimeId} : {}) });
   }));
-  app.get('/api/manual/agents/:id/messages', route((req, res) => res.json(store.readMessages(idParam(req, 'id')))));
+  app.get('/api/manual/agents/:id/messages', route((req, res) => {
+    const id = idParam(req, 'id');
+    if (req.query.view !== 'chat') return res.json(store.readMessages(id));
+
+    const { anchor, older, known } = req.query;
+    if ((anchor !== undefined && (typeof anchor !== 'string' || !anchor || anchor.length > 2048))
+      || (older !== undefined && (older !== '1' || !anchor))
+      || (known !== undefined && (typeof known !== 'string' || !/^[\da-f]{64}$/.test(known)))) {
+      return fail('Invalid chat history request.');
+    }
+
+    const { messages, ...metadata } = store.readMessages(id);
+    const visible = messages.filter(message => message.role !== 'tool');
+    const latest = visible.at(-1);
+    const recentTools = latest ? messages.slice(messages.lastIndexOf(latest) + 1) : [];
+    const pageSize = 30;
+    const tailStart = Math.max(0, visible.length - pageSize);
+    // Provider journals can append, backfill, or evict old records between polls.
+    // Anchor to an ID rather than a tail offset so new replies cannot shift the page.
+    const index = anchor ? visible.findIndex(message => message.id === anchor) : -1;
+    const start = index < 0 ? tailStart : Math.min(tailStart, Math.max(0, index - (older ? pageSize : 0)));
+    const memory = createHash('sha256');
+    let hasUser = false;
+    for (const message of visible) {
+      if (message.role !== 'user') continue;
+      hasUser = true;
+      memory.update(JSON.stringify([message.id, message.text]));
+    }
+    const snapshot = { ...metadata, messages: visible.slice(start), recentTools, hasOlder: start > 0,
+      memoryRevision: hasUser ? memory.digest('hex') : undefined };
+    const serialized = JSON.stringify(snapshot);
+    const revision = createHash('sha256').update(serialized).digest('hex');
+    res.set('Cache-Control', 'no-store');
+    if (known === revision) return res.json({ revision });
+    return res.type('json').send(`{"revision":"${revision}",${serialized.slice(1)}`);
+  }));
   app.patch('/api/manual/agents/:id/permissions', route((req, res) => {
     res.json(store.updateCodexPermissions(idParam(req, 'id'), req.body?.mode, req.body?.expectedMode, req.body?.fullAccessConfirmed));
   }));
