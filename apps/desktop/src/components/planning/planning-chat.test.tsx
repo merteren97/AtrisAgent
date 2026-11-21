@@ -170,7 +170,8 @@ assert.match(manyToolsHtml, /3 tool calls/);
 assert.match(manyToolsHtml, /Read a\.ts/);
 assert.match(manyToolsHtml, /Edit c\.ts/);
 
-const { ManualQuestionCard, buildAntigravityQuestionKeystrokes } = await import('@/components/manual/manual-question');
+const { ManualQuestionCard, buildAntigravityQuestionKeystrokes, saveQuestionDraft, getSavedQuestionDraft, clearSavedQuestionDraft } = await import('@/components/manual/manual-question');
+const { findMatchingArtifact } = await import('@/components/manual/manual-chat-content');
 const questionRequest = {
   id: 'q-req-1',
   questions: [
@@ -197,7 +198,7 @@ const questionRequest = {
     },
   ],
 };
-const questionNoCodeHtml = renderToStaticMarkup(<ManualQuestionCard request={questionRequest} onReply={async () => {}} />);
+const questionNoCodeHtml = renderToStaticMarkup(<ManualQuestionCard draftScope="test" request={questionRequest} onReply={async () => {}} />);
 assert.match(questionNoCodeHtml, /Question 1\/2/);
 assert.match(questionNoCodeHtml, /Which framework should we use\?/);
 assert.match(questionNoCodeHtml, /Targets/);
@@ -207,8 +208,38 @@ assert.match(questionNoCodeHtml, /aria-label="Custom answer for Which framework 
 assert.match(questionNoCodeHtml, /Submit answers/);
 assert.doesNotMatch(questionNoCodeHtml, /Answer in Code/);
 
-const questionWithCodeHtml = renderToStaticMarkup(<ManualQuestionCard request={questionRequest} onReply={async () => {}} onOpenCode={() => {}} />);
+const questionWithCodeHtml = renderToStaticMarkup(<ManualQuestionCard draftScope="test" request={questionRequest} onReply={async () => {}} onOpenCode={() => {}} />);
 assert.match(questionWithCodeHtml, /Answer in Code/);
+
+// Question draft answers survive unmounting and remounting when switching chats/tabs
+saveQuestionDraft(questionRequest, [['React'], ['Windows', 'Custom target']], 'test');
+assert.deepEqual(getSavedQuestionDraft(questionRequest, 'test'), [['React'], ['Windows', 'Custom target']]);
+assert.deepEqual(getSavedQuestionDraft(questionRequest, 'separate-conversation'), [[], []]);
+assert.deepEqual(getSavedQuestionDraft({ ...questionRequest, id: 'new-question' }, 'test'), [[], []]);
+const remountedQuestionHtml = renderToStaticMarkup(<ManualQuestionCard draftScope="test" request={questionRequest} onReply={async () => {}} />);
+assert.match(remountedQuestionHtml, /value="Custom target"/);
+assert.doesNotMatch(remountedQuestionHtml, /disabled=""[^>]*>Submit answers/);
+clearSavedQuestionDraft(questionRequest, 'test');
+assert.deepEqual(getSavedQuestionDraft(questionRequest, 'test'), [[], []]);
+
+// Artifact file link resolution matches exact path and basename
+const matchedArtifact = findMatchingArtifact(
+  [
+    {
+      id: 'art-walkthrough',
+      name: 'write_file',
+      summary: 'Write walkthrough.md',
+      status: 'completed',
+      artifact: {
+        path: 'C:\\Users\\merte\\.gemini\\antigravity-cli\\brain\\7fd73736\\walkthrough.md',
+        title: 'walkthrough.md',
+        content: '# Walkthrough',
+      },
+    },
+  ],
+  'file:///C:/Users/merte/.gemini/antigravity-cli/brain/7fd73736/walkthrough.md',
+);
+assert.equal(matchedArtifact?.title, 'walkthrough.md');
 
 assert.deepEqual(
   buildAntigravityQuestionKeystrokes(

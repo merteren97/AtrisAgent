@@ -51,7 +51,23 @@ function numberValue(...values: unknown[]): number | undefined {
 }
 
 function recordValue(value: unknown): Record<string, any> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
+  const unwrapped = typeof value === 'string' ? unwrapAntigravityArg(value) : value;
+  return unwrapped && typeof unwrapped === 'object' && !Array.isArray(unwrapped)
+    ? unwrapped as Record<string, any>
+    : {};
+}
+
+function parseOutputRecord(rawOutput: string | undefined): Record<string, any> {
+  if (!rawOutput) return {};
+  const stripped = rawOutput.replace(/^(?:(?:Created At|Completed At):\s*[^\r\n]*\r?\n)+/i, '').trim();
+  if (!stripped) return {};
+  const direct = recordValue(stripped);
+  if (Object.keys(direct).length > 0) return direct;
+  const braceStart = stripped.indexOf('{');
+  if (braceStart > 0) {
+    return recordValue(stripped.slice(braceStart));
+  }
+  return {};
 }
 
 function nonEmptyRecord(...values: unknown[]): Record<string, any> {
@@ -165,14 +181,46 @@ export function parseAntigravityStreamLine(line: string): AntigravityParsedEvent
       nestedStep.error?.message,
       nestedStep.error,
     ) || undefined;
-    const subagentInfo = nonEmptyRecord(step.subagent_info, nestedStep.subagent_info);
+    const subagentInfo = nonEmptyRecord(
+      step.subagent_info,
+      nestedStep.subagent_info,
+      toolInfo.subagent_info,
+      nestedToolInfo.subagent_info,
+    );
+    const isSwarmAdd = toolName === 'swarm' && stringValue(args.action).toLowerCase() === 'add';
+    const outputJson = (toolName === 'invoke_subagent' || isSwarmAdd) ? parseOutputRecord(output) : {};
     let subagent: AntigravitySubagentInfo | undefined;
-    if (Object.keys(subagentInfo).length > 0 || toolName === 'invoke_subagent') {
-      const conversationId = stringValue(subagentInfo.conversation_id, subagentInfo.conversationId, args.conversationId, args.conversation_id) || undefined;
-      const role = stringValue(subagentInfo.role, args.Role, args.role) || undefined;
-      const typeName = stringValue(subagentInfo.type_name, subagentInfo.typeName, args.TypeName, args.typeName) || undefined;
-      const model = stringValue(subagentInfo.model, args.Model, args.model) || undefined;
-      const subagentState = stringValue(subagentInfo.state, subagentInfo.status) || undefined;
+    if (Object.keys(subagentInfo).length > 0 || toolName === 'invoke_subagent' || isSwarmAdd) {
+      const conversationId = stringValue(
+        subagentInfo.conversation_id,
+        subagentInfo.conversationId,
+        outputJson.conversation_id,
+        outputJson.conversationId,
+        args.conversationId,
+        args.conversation_id,
+      ) || undefined;
+      const role = stringValue(
+        subagentInfo.role,
+        args.Role,
+        args.role,
+        isSwarmAdd ? stringValue(outputJson.name, args.name) : '',
+      ) || undefined;
+      const typeName = stringValue(
+        subagentInfo.type_name,
+        subagentInfo.typeName,
+        args.TypeName,
+        args.typeName,
+        isSwarmAdd ? 'swarm' : '',
+      ) || undefined;
+      const model = stringValue(
+        subagentInfo.model,
+        outputJson.model_display_name,
+        outputJson.model,
+        args.Model,
+        args.model,
+        toolName === 'invoke_subagent' ? 'inherit' : '',
+      ) || undefined;
+      const subagentState = stringValue(subagentInfo.state, subagentInfo.status, outputJson.status) || undefined;
       subagent = {
         ...(conversationId ? { conversationId } : {}),
         ...(role ? { role } : {}),

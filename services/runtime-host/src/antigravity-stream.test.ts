@@ -190,4 +190,26 @@ if (richResult.kind === 'result') {
   assert.equal(richResult.transcriptPath, 'C:\\transcript.jsonl');
 }
 
+const swarmAddStep = parseAntigravityStreamLine(JSON.stringify({
+  event: 'step_update',
+  step_update: {
+    step_index: 8,
+    step_type: 'tool_call',
+    tool_name: 'swarm',
+    args: JSON.stringify({ action: 'add', name: 'arch-analyst', model: 'gemini-4-hydrogen-high' }),
+    output: 'Created At: 2026-11-18T10:00:00+03:00\nCompleted At: 2026-11-18T10:00:02+03:00\n{"status":"added","name":"arch-analyst","model":"gemini-4-hydrogen-high","model_display_name":"Gemini 4 Hydrogen (High)","conversation_id":"22222222-2222-4222-8222-222222222222"}',
+  },
+}));
+assert.equal(swarmAddStep.kind, 'step');
+if (swarmAddStep.kind === 'step') {
+  assert.equal(swarmAddStep.toolName, 'swarm');
+  assert.deepEqual(swarmAddStep.subagent, {
+    conversationId: '22222222-2222-4222-8222-222222222222',
+    role: 'arch-analyst',
+    typeName: 'swarm',
+    model: 'Gemini 4 Hydrogen (High)',
+    state: 'added',
+  });
+}
+
 console.log('Antigravity stream protocol tests passed');

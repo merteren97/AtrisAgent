@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { execFileSync } from 'node:child_process';
 import { WorkspaceManager, WorktreeManager } from '@atris-agent-code/workspace-manager';
 import { MergeCoordinator } from './merge-coordinator';
 
@@ -76,18 +77,18 @@ async function runTests() {
     const countCoordinator = new MergeCoordinator({
       ...mockWorkspaceManager,
       getWorktreeManager: () => ({
-        getChangedFiles: async () => [
+        getReviewChanges: async () => ({ files: [
           { path: 'small.ts', status: 'modified' },
           { path: 'large.ts', status: 'added' },
           { path: 'deleted.ts', status: 'deleted' },
           { path: 'space name.ts', status: 'added' },
         ],
-        getDiff: async () => [
+        diff: [
           '--- a/small.ts', '+++ b/small.ts', '-old', '+new',
           '--- /dev/null', '+++ b/large.ts', ...Array(201).fill('+line'),
           'diff --git a/deleted.ts b/deleted.ts', '--- a/deleted.ts', '+++ /dev/null', '-one', '-two',
           'diff --git "a/space name.ts" "b/space name.ts"', '--- /dev/null', '+++ "b/space name.ts"', '+++content',
-        ].join('\n'),
+        ].join('\n') }),
       }),
     } as unknown as WorkspaceManager);
     const counted = await countCoordinator.generateReviewPack('t1');
@@ -98,6 +99,20 @@ async function runTests() {
     assert(counted.changedFiles[3].additions === 1, 'Quoted paths and plus-prefixed content are counted');
     assert(counted.riskyOperations.filter((risk) => risk.startsWith('Large diff')).length === 1,
       'Only the genuinely large file receives a large-diff warning');
+
+    const gitProject = path.join(tmpDir, 'git-project');
+    fs.mkdirSync(gitProject);
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'user.name=Atris Test', '-c', 'user.email=atris@example.test', '-c', 'commit.gpgsign=false', ...args], { cwd, stdio: 'pipe' });
+    git(gitProject, 'init');
+    fs.writeFileSync(path.join(gitProject, 'source file.ts'), 'original\n');
+    git(gitProject, 'add', '--', 'source file.ts'); git(gitProject, 'commit', '-m', 'Start');
+    const gitWork = await worktreeManager.createWorktree(gitProject, 'atris/review-test', path.join(tmpDir, 'git-work'));
+    fs.writeFileSync(path.join(gitWork, 'source file.ts'), 'committed\n');
+    git(gitWork, 'add', '--', 'source file.ts'); git(gitWork, 'commit', '-m', 'Builder output');
+    fs.writeFileSync(path.join(gitWork, 'untracked.ts'), 'new\n');
+    const gitReview = await worktreeManager.getReviewChanges(gitWork);
+    assert(gitReview.files.some(file => file.path === 'source file.ts' && file.status === 'modified') && gitReview.diff.includes('+committed'), 'Committed Builder edits are reported against the original base');
+    assert(gitReview.files.some(file => file.path === 'untracked.ts' && file.status === 'added'), 'Untracked Builder files remain available for file preview');
 
     // Test 2: Apply Worktree & Pre-Merge Checkpoint
     const mergeResult = await coordinator.applyWorktree('t1', undefined, {

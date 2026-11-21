@@ -115,14 +115,16 @@ export class Scheduler {
         const matched = required.filter((capability) => profile.capabilitySnapshot?.[capability] === true).length;
         score += matched * 3;
         if (matched) reasons.push(`${matched}/${required.length} requested capabilities matched`);
-        if (request.role === 'orchestrator') score += model.supportedReasoning.includes('high') ? 15 : 0;
+        if (request.role === 'orchestrator' || request.role === 'reviewer') score += model.supportedReasoning.includes('high') ? 15 : 0;
+        else if (model.supportedReasoning.includes('high')) score += 8;
+        if (model.defaultReasoning === 'high') score += 4;
         if (request.role === 'builder' && ['codex', 'claude_code', 'opencode'].includes(profile.runtimeType)) score += 8;
         if (request.role === 'researcher' && model.inputModalities.includes('image')) score += 3;
 
         const requestedReasoning = useConfiguredPreferences ? request.preferredReasoning : undefined;
         const reasoningLevel = requestedReasoning && model.supportedReasoning.includes(requestedReasoning)
           ? requestedReasoning
-          : this.bestReasoning(model.supportedReasoning, request.role);
+          : this.bestReasoning(model.supportedReasoning, request.role, model.defaultReasoning);
         if (requestedReasoning && requestedReasoning !== reasoningLevel) {
           reasons.push(`requested reasoning '${requestedReasoning}' is unsupported; runtime-compatible fallback selected`);
         } else if (requestedReasoning) {
@@ -172,10 +174,15 @@ export class Scheduler {
     return [...new Set(requirements)];
   }
 
-  private bestReasoning(levels: CanonicalReasoning[], role: AgentRole): CanonicalReasoning | undefined {
-    const preference: CanonicalReasoning[] = role === 'orchestrator' || role === 'reviewer'
-      ? ['high', 'xhigh', 'max', 'medium', 'low', 'minimal', 'none']
-      : ['medium', 'high', 'low', 'minimal', 'none', 'xhigh', 'max'];
+  private bestReasoning(
+    levels: CanonicalReasoning[],
+    _role: AgentRole,
+    defaultReasoning?: CanonicalReasoning,
+  ): CanonicalReasoning | undefined {
+    if (defaultReasoning && ['high', 'xhigh', 'max'].includes(defaultReasoning) && levels.includes(defaultReasoning)) {
+      return defaultReasoning;
+    }
+    const preference: CanonicalReasoning[] = ['high', 'xhigh', 'max', 'medium', 'low', 'minimal', 'none'];
     return preference.find((level) => levels.includes(level));
   }
 }

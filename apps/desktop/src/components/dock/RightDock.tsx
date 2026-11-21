@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, Globe, Maximize2, Minimize2, X } from 'lucide-react';
+import { Activity, FileDiff, Globe, Maximize2, Minimize2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ActivityPanel } from '@/components/activity/ActivityPanel';
 import { LinkBrowser } from '@/components/browser/link-browser';
@@ -12,6 +12,8 @@ import {
 } from '@/stores/right-dock-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { cn } from '@/lib/utils';
+import { DockChanges } from './ChangesPanel';
+import { ChangesTab } from '@/components/inspector/changes-tab';
 
 export function RightDock() {
   useActivityMonitor();
@@ -125,7 +127,7 @@ export function RightDock() {
             )}
           >
             <Activity className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">Activity</span>
+            <span className={cn('truncate', isCompact && activeTab !== 'activity' && 'sr-only')}>Activity</span>
             {counts.attention > 0 ? (
               <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-amber-500/20 px-1 text-[10px] font-semibold tabular-nums text-amber-600 dark:text-amber-400">
                 {counts.attention}
@@ -150,10 +152,22 @@ export function RightDock() {
             )}
           >
             <Globe className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">Browser</span>
+            <span className={cn('truncate', isCompact && activeTab !== 'browser' && 'sr-only')}>Browser</span>
             {browserUrl && (
               <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" aria-label="Page active" />
             )}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'changes'}
+            title="Changes"
+            onClick={() => setTab('changes')}
+            className={cn('inline-flex min-w-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              activeTab === 'changes' ? 'bg-background text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground')}
+          >
+            <FileDiff className="h-3.5 w-3.5 shrink-0" />
+            <span className={cn('truncate', isCompact && activeTab !== 'changes' && 'sr-only')}>Changes</span>
           </button>
         </div>
 
@@ -185,6 +199,7 @@ export function RightDock() {
 
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         {open && activeTab === 'activity' && <ActivityPanel compact={isCompact} />}
+        {open && activeTab === 'changes' && <DockChanges orchestrator={<ChangesTab />} />}
         {keepBrowserMounted && (
           <div
             className={cn(

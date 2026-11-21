@@ -40,6 +40,34 @@ function basenameAny(filePath: string): string {
   return filePath.includes('\\') ? path.win32.basename(filePath) : path.basename(filePath);
 }
 
+export function stripAntigravityResultHeaders(content: string): string {
+  return content
+    .replace(/^(?:(?:Created At|Completed At):\s*[^\r\n]*\r?\n?)+/i, '')
+    .trim();
+}
+
+function parseGenericResultJson(content: string): Record<string, any> | undefined {
+  const cleaned = stripAntigravityResultHeaders(content);
+  if (!cleaned) return undefined;
+  const tryParse = (candidate: string): Record<string, any> | undefined => {
+    try {
+      const parsed = JSON.parse(candidate);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, any>
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const direct = tryParse(cleaned);
+  if (direct) return direct;
+  const braceIndex = cleaned.indexOf('{');
+  if (braceIndex > 0) {
+    return tryParse(cleaned.slice(braceIndex));
+  }
+  return undefined;
+}
+
 function userRequestText(content: string): string {
   // The CLI records a prompt envelope, not just what was typed. Only unwrap a
   // complete envelope with recognized trailing metadata; never strip arbitrary
@@ -132,6 +160,7 @@ export function buildAntigravityToolItem(
   let detail: string | undefined;
   let subagent: ManualToolSubagent | undefined;
   let artifact: ManualToolArtifact | undefined;
+  const resultJson = options.output ? parseGenericResultJson(options.output) : undefined;
 
   if (toolName === 'invoke_subagent') {
     const rawModel = typeof args.Model === 'string' && args.Model.trim()
@@ -146,7 +175,15 @@ export function buildAntigravityToolItem(
         ? args.TypeName.trim()
         : 'Subagent';
     const typeName = typeof args.TypeName === 'string' && args.TypeName.trim() ? args.TypeName.trim() : undefined;
+    const jsonConvId = typeof resultJson?.conversationId === 'string'
+      ? resultJson.conversationId
+      : typeof resultJson?.conversation_id === 'string'
+        ? resultJson.conversation_id
+        : typeof resultJson?.result?.conversationId === 'string'
+          ? resultJson.result.conversationId
+          : undefined;
     const conversationId = options.subagentId
+      || jsonConvId
       || (typeof args.conversationId === 'string' && args.conversationId.trim() ? args.conversationId.trim() : undefined);
     summary = `${role} (${friendlyModel})`;
     detail = typeof args.Prompt === 'string' && args.Prompt.trim() ? args.Prompt.trim().slice(0, 240) : undefined;
@@ -191,7 +228,105 @@ export function buildAntigravityToolItem(
   } else if (toolName === 'search_web') {
     summary = args.query ? `Search "${String(args.query).slice(0, 120)}"` : 'Search web';
   } else if (toolName === 'swarm') {
-    summary = args.action ? `Swarm ${String(args.action)}${args.name ? ` (${String(args.name)})` : ''}` : 'Swarm';
+    const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : '';
+    if (action === 'add') {
+      const baseName = String(resultJson?.name || args.name || 'Swarm worker').trim();
+      const count = Array.isArray(args.tasks) && args.tasks.length > 1
+        ? args.tasks.length
+        : typeof args.n === 'number' && args.n > 1
+          ? args.n
+          : undefined;
+      const role = count ? `${baseName} (×${count})` : baseName;
+      const modelDisplay = String(
+        resultJson?.model_display_name || resultJson?.model || args.model || 'inherit',
+      ).trim();
+      const workspace = typeof args.workspace === 'string' && args.workspace.trim() && args.workspace.trim() !== 'inherit'
+        ? args.workspace.trim()
+        : undefined;
+      const typeName = workspace ? `swarm · ${workspace}` : 'swarm';
+      const conversationId = options.subagentId
+        || (typeof resultJson?.conversation_id === 'string' ? resultJson.conversation_id : undefined)
+        || (typeof resultJson?.conversationId === 'string' ? resultJson.conversationId : undefined)
+        || (typeof args.conversationId === 'string' && args.conversationId.trim() ? args.conversationId.trim() : undefined);
+      summary = `${role} (${modelDisplay})`;
+      detail = typeof args.brief === 'string' && args.brief.trim() ? args.brief.trim().slice(0, 240) : undefined;
+      subagent = {
+        ...(conversationId ? { conversationId } : {}),
+        role,
+        typeName,
+        model: modelDisplay,
+      };
+    } else if (action === 'title') {
+      summary = args.title ? `Swarm title: ${String(args.title).slice(0, 120)}` : 'Swarm title';
+    } else if (action === 'status') {
+      const memberCount = Array.isArray(resultJson?.members) ? resultJson.members.length : undefined;
+      summary = memberCount !== undefined ? `Swarm status (${memberCount} members)` : 'Swarm status';
+    } else if (action === 'kill') {
+      summary = args.name ? `Swarm kill: ${String(args.name)}` : 'Swarm kill';
+    } else if (action === 'model') {
+      const target = resultJson?.name || args.name;
+      const nextModel = resultJson?.model_display_name || resultJson?.model || args.model;
+      summary = `Swarm model${target ? `: ${String(target)}` : ''}${nextModel ? ` -> ${String(nextModel)}` : ''}`;
+    } else if (action === 'models') {
+      summary = `List swarm models${args.all ? ' (all)' : ''}`;
+    } else {
+      summary = action ? `Swarm ${action}${args.name ? ` (${String(args.name)})` : ''}` : 'Swarm';
+    }
+  } else if (toolName === 'call_mcp_tool') {
+    const server = String(args.ServerName ?? args.serverName ?? args.server_name ?? '').trim();
+    const tool = String(args.ToolName ?? args.toolName ?? args.tool_name ?? '').trim();
+    summary = server && tool
+      ? `${server}: ${tool}`
+      : tool
+        ? `MCP: ${tool}`
+        : server
+          ? `MCP: ${server}`
+          : 'Call MCP tool';
+    const rawMcpArgs = unwrapAntigravityArg(args.Arguments ?? args.arguments);
+    // Only display known chat text; arbitrary tool arguments may contain credentials.
+    if (server === 'atris_workspace' && tool === 'workspace_send_message' && rawMcpArgs && typeof rawMcpArgs === 'object' && !Array.isArray(rawMcpArgs)) {
+      const mcpArgs = rawMcpArgs as Record<string, any>;
+      const preview = mcpArgs.body;
+      if (typeof preview === 'string' && preview.trim()) {
+        detail = preview.trim().slice(0, 240);
+      }
+    }
+  } else if (toolName === 'read_board') {
+    if (args.status) {
+      summary = 'Read swarm status';
+    } else if (Array.isArray(args.seqs) && args.seqs.length > 0) {
+      summary = `Read board (${args.seqs.map((s: unknown) => `#${String(s)}`).join(', ')})`;
+    } else if (args.since !== undefined) {
+      summary = `Read board (since #${String(args.since)})`;
+    } else {
+      summary = 'Read swarm board';
+    }
+  } else if (toolName === 'post_message') {
+    const text = typeof args.text === 'string' ? args.text.trim() : '';
+    const mention = /^(@[a-z0-9_-]+)/i.exec(text)?.[1];
+    summary = mention ? `Post to ${mention}` : 'Post to swarm board';
+    detail = text ? text.slice(0, 240) : undefined;
+  } else if (toolName === 'swarm_wait') {
+    summary = `Wait for board${args.since !== undefined ? ` (after #${String(args.since)})` : ''}`;
+    detail = args.mentions_only === false ? 'All board messages' : 'Waiting for @mention or @all';
+  } else if (toolName === 'run_workflow') {
+    summary = typeof args.Description === 'string' && args.Description.trim()
+      ? args.Description.trim().slice(0, 120)
+      : typeof args.ScriptPath === 'string' && args.ScriptPath.trim()
+        ? `Run workflow ${basenameAny(args.ScriptPath.trim())}`
+        : 'Run workflow';
+    detail = (typeof args.ScriptPath === 'string' && args.ScriptPath.trim())
+      || (typeof args.Cwd === 'string' && args.Cwd.trim())
+      || undefined;
+  } else if (toolName === 'list_resources') {
+    summary = args.ServerName ? `List resources (${String(args.ServerName)})` : 'List MCP resources';
+  } else if (toolName === 'read_resource') {
+    summary = args.Uri
+      ? `Read resource ${basenameAny(String(args.Uri))}`
+      : args.ServerName
+        ? `Read resource (${String(args.ServerName)})`
+        : 'Read MCP resource';
+    detail = typeof args.Uri === 'string' && args.Uri.trim() ? args.Uri.trim() : undefined;
   } else if (toolName === 'manage_subagents') {
     summary = args.Action ? `Subagents: ${String(args.Action)}` : 'Manage subagents';
   } else if (toolName === 'manage_task') {
@@ -230,6 +365,9 @@ interface ParsedTranscriptState {
 function parseTranscriptInternal(source: string, sessionId: string): ParsedTranscriptState {
   const steps = new Map<number, any>();
   const completedSubagents = new Set<string>();
+  const lastSystemSenderStep = new Map<string, number>();
+  const killedSwarmWorkers = new Set<string>();
+  const lastMentionPostStep = new Map<string, number>();
 
   for (const line of source.split('\n')) {
     let item: any;
@@ -238,12 +376,45 @@ function parseTranscriptInternal(source: string, sessionId: string): ParsedTrans
     steps.set(item.step_index, item);
     if (item.type === 'SYSTEM_MESSAGE' && typeof item.content === 'string') {
       for (const match of item.content.matchAll(/\bsender=([a-f0-9-]{36})\b/gi)) {
-        completedSubagents.add(match[1].toLowerCase());
+        const senderId = match[1].toLowerCase();
+        completedSubagents.add(senderId);
+        const prev = lastSystemSenderStep.get(senderId) ?? -1;
+        if (item.step_index > prev) lastSystemSenderStep.set(senderId, item.step_index);
       }
     }
   }
 
   const sortedSteps = [...steps.entries()].sort(([a], [b]) => a - b);
+  for (const [stepIdx, step] of sortedSteps) {
+    if (step.type !== 'PLANNER_RESPONSE' || step.source !== 'MODEL' || !Array.isArray(step.tool_calls)) continue;
+    step.tool_calls.forEach((call: any, callIdx: number) => {
+      const name = typeof call?.name === 'string' ? call.name.trim() : '';
+      const rawArgs = call?.args && typeof call.args === 'object' && !Array.isArray(call.args) ? call.args : {};
+      const args = unwrapAntigravityArgsRecord(rawArgs);
+      const resultStep = steps.get(stepIdx + 1 + callIdx);
+      if (name === 'swarm') {
+        const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : '';
+        if (action === 'kill' && typeof args.name === 'string' && args.name.trim() && resultStep?.status !== 'ERROR') {
+          killedSwarmWorkers.add(args.name.trim().toLowerCase());
+        } else if (action === 'status' && typeof resultStep?.content === 'string') {
+          const statusJson = parseGenericResultJson(resultStep.content);
+          if (Array.isArray(statusJson?.members)) {
+            for (const member of statusJson.members) {
+              if (member && typeof member === 'object' && member.killed === true && typeof member.name === 'string') {
+                killedSwarmWorkers.add(member.name.trim().toLowerCase());
+              }
+            }
+          }
+        }
+      } else if (name === 'post_message' && typeof args.text === 'string') {
+        for (const match of args.text.matchAll(/@([a-z0-9_-]+)/gi)) {
+          const mention = match[1].toLowerCase();
+          lastMentionPostStep.set(mention, stepIdx);
+        }
+      }
+    });
+  }
+
   const finalPlannerStepIndices = sortedSteps
     .filter(([, step]) => step.type === 'PLANNER_RESPONSE' && step.source === 'MODEL' && step.status === 'DONE'
       && (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0))
@@ -302,8 +473,20 @@ function parseTranscriptInternal(source: string, sessionId: string): ParsedTrans
           : undefined;
 
         const resultContent = typeof resultStep?.content === 'string' ? resultStep.content : '';
-        const subagentIdMatch = toolName === 'invoke_subagent'
-          ? (typeof args.conversationId === 'string' && UUID.test(args.conversationId) ? args.conversationId : UUID_FINDER.exec(resultContent)?.[1])
+        const cleanedResultContent = stripAntigravityResultHeaders(resultContent);
+        const resultJson = cleanedResultContent ? parseGenericResultJson(cleanedResultContent) : undefined;
+        const isSwarmAdd = toolName === 'swarm' && typeof args.action === 'string' && args.action.trim().toLowerCase() === 'add';
+        const jsonConversationId = typeof resultJson?.conversation_id === 'string'
+          ? resultJson.conversation_id
+          : typeof resultJson?.conversationId === 'string'
+            ? resultJson.conversationId
+            : typeof resultJson?.result?.conversationId === 'string'
+              ? resultJson.result.conversationId
+              : undefined;
+        const subagentIdMatch = (toolName === 'invoke_subagent' || isSwarmAdd)
+          ? (typeof args.conversationId === 'string' && UUID.test(args.conversationId)
+            ? args.conversationId
+            : (jsonConversationId && UUID.test(jsonConversationId) ? jsonConversationId : UUID_FINDER.exec(cleanedResultContent)?.[1]))
           : undefined;
 
         let status: ManualToolItem['status'];
@@ -316,12 +499,29 @@ function parseTranscriptInternal(source: string, sessionId: string): ParsedTrans
             status = 'running';
             hasRunningSubagent = true;
           }
+        } else if (isSwarmAdd) {
+          const workerName = String(resultJson?.name || args.name || '').trim().toLowerCase();
+          const lastWakeStep = Math.max(
+            stepIndex,
+            workerName ? (lastMentionPostStep.get(workerName) ?? -1) : -1,
+            lastMentionPostStep.get('all') ?? -1,
+          );
+          const senderDoneAfterWake = Boolean(
+            subagentIdMatch && (lastSystemSenderStep.get(subagentIdMatch.toLowerCase()) ?? -1) > lastWakeStep,
+          );
+          const workerKilled = Boolean(workerName && killedSwarmWorkers.has(workerName));
+          if (senderDoneAfterWake || workerKilled || hasLaterFinalPlannerResponse) {
+            status = 'completed';
+          } else {
+            status = 'running';
+            hasRunningSubagent = true;
+          }
         } else {
           status = resultStep?.status === 'DONE' ? 'completed' : 'running';
         }
 
-        const output = resultStep && (resultStep.status === 'DONE' || resultStep.status === 'ERROR') && resultContent.trim()
-          ? resultContent.trim().slice(0, 4000)
+        const output = resultStep && (resultStep.status === 'DONE' || resultStep.status === 'ERROR') && cleanedResultContent
+          ? cleanedResultContent.slice(0, 4000)
           : undefined;
         const toolId = typeof call?.id === 'string' && call.id.trim()
           ? call.id.trim()
@@ -352,16 +552,22 @@ function parseTranscriptInternal(source: string, sessionId: string): ParsedTrans
             toolName,
             failed: resultStep.status === 'ERROR',
           });
-          if (toolName === 'ask_question' && resultStep.status === 'DONE' && resultContent) {
-            const answerMatches = resultContent
-              .replace(/\r/g, '')
-              .split('\n')
-              .map((line: string) => /^A(\d+):\s*(.+)$/.exec(line.trim()))
-              .filter((match: RegExpExecArray | null): match is RegExpExecArray => Boolean(match && match[2].trim()));
-            if (answerMatches.length > 0) {
-              const formattedAnswers = answerMatches.length === 1
-                ? answerMatches[0][2].trim()
-                : answerMatches.map((match: RegExpExecArray) => `A${match[1]}: ${match[2].trim()}`).join('\n');
+          if (toolName === 'ask_question' && resultStep.status === 'DONE' && cleanedResultContent) {
+            const parsedAnswers: Array<{ index: string; value: string }> = [];
+            for (const rawLine of cleanedResultContent.replace(/\r/g, '').split('\n')) {
+              const line = rawLine.trim();
+              if (!line) continue;
+              const match = /^A(\d+):\s*(.+)$/.exec(line);
+              if (match && match[2].trim()) {
+                parsedAnswers.push({ index: match[1], value: match[2].trim() });
+              } else if (parsedAnswers.length > 0 && !/^(?:Q\d+:|Created At:|Completed At:)/i.test(line)) {
+                parsedAnswers[parsedAnswers.length - 1].value += `\n${line}`;
+              }
+            }
+            if (parsedAnswers.length > 0) {
+              const formattedAnswers = parsedAnswers.length === 1
+                ? parsedAnswers[0].value
+                : parsedAnswers.map(entry => `A${entry.index}: ${entry.value}`).join('\n');
               stepToolMessages.push({
                 id: `${sessionId}:${resultStep.step_index}:answer`,
                 role: 'user',

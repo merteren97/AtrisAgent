@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
+  buildAntigravityToolItem,
   ManualAntigravityBridge,
   parseAntigravityQuestions,
   parseAntigravityTranscript,
@@ -178,6 +179,64 @@ try {
   fs.appendFileSync(thirdLaunch[1], `2026-11-18T00:00:03Z INFO AskQuestion response for step 7\n`);
   assert.equal(bridge.pendingQuestions(third).length, 0);
   assert.equal(bridge.activity(third).state, 'completed');
+
+  // Swarm worker subagent cards, MCP tool summaries, board tools, and timestamp header stripping
+  const swarmWorkerId = randomUUID();
+  const swarmRows = [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Analyze with swarm' }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      source: 'MODEL',
+      status: 'DONE',
+      thinking: 'Spawning swarm worker and claiming workspace paths.',
+      tool_calls: [
+        { name: 'swarm', args: { action: '"title"', title: '"AtrisHub Audit"' } },
+        { name: 'swarm', args: { action: '"add"', name: '"arch-analyst"', model: '"gemini-4-hydrogen-high"', brief: '"Inspect architecture"' } },
+        { name: 'call_mcp_tool', args: { ServerName: '"atris_workspace"', ToolName: '"workspace_send_message"', Arguments: JSON.stringify({ body: 'Started audit' }) } },
+        { name: 'read_board', args: { since: '2' } },
+        { name: 'post_message', args: { text: '"@arch-analyst check routes"' } },
+      ],
+    }),
+    JSON.stringify({ step_index: 2, type: 'GENERIC', status: 'DONE', content: 'Created At: 2026-11-18T10:00:00Z\nCompleted At: 2026-11-18T10:00:01Z\n{"status":"titled","title":"AtrisHub Audit"}' }),
+    JSON.stringify({ step_index: 3, type: 'GENERIC', status: 'DONE', content: `Created At: 2026-11-18T10:00:01Z\nCompleted At: 2026-11-18T10:00:02Z\n{"status":"added","name":"arch-analyst","model":"gemini-4-hydrogen-high","model_display_name":"Gemini 4 Hydrogen (High)","conversation_id":"${swarmWorkerId}"}` }),
+    JSON.stringify({ step_index: 4, type: 'GENERIC', status: 'DONE', content: 'Created At: 2026-11-18T10:00:02Z\nCompleted At: 2026-11-18T10:00:03Z\n{"ok":true}' }),
+    JSON.stringify({ step_index: 5, type: 'GENERIC', status: 'DONE', content: 'Created At: 2026-11-18T10:00:03Z\nCompleted At: 2026-11-18T10:00:04Z\n{"messages":[]}' }),
+    JSON.stringify({ step_index: 6, type: 'GENERIC', status: 'DONE', content: 'Created At: 2026-11-18T10:00:04Z\nCompleted At: 2026-11-18T10:00:05Z\n{"seq":3}' }),
+  ].join('\n');
+  const parsedSwarmRunning = parseAntigravityTranscript(swarmRows, session);
+  const swarmTurn = parsedSwarmRunning.find(m => m.id === `${session}:1`)!;
+  assert.equal(swarmTurn.tools?.[0].summary, 'Swarm title: AtrisHub Audit');
+  assert.equal(swarmTurn.tools?.[1].summary, 'arch-analyst (Gemini 4 Hydrogen (High))');
+  assert.deepEqual(swarmTurn.tools?.[1].subagent, {
+    conversationId: swarmWorkerId,
+    role: 'arch-analyst',
+    typeName: 'swarm',
+    model: 'Gemini 4 Hydrogen (High)',
+  });
+  assert.equal(swarmTurn.tools?.[1].status, 'running', 'Swarm add stays running until worker finishes or is killed');
+  assert.equal(swarmTurn.tools?.[2].summary, 'atris_workspace: workspace_send_message');
+  assert.equal(swarmTurn.tools?.[2].detail, 'Started audit');
+  const externalTool = buildAntigravityToolItem('call_mcp_tool', {
+    ServerName: 'external', ToolName: 'lookup', Arguments: JSON.stringify({ token: 'private-fixture', query: 'private-query' }),
+  }, { id: 'external-tool', status: 'completed' });
+  assert.equal(externalTool.summary, 'external: lookup');
+  assert.equal(externalTool.detail, undefined, 'Arbitrary MCP arguments must not appear in the chat card');
+  assert.equal(swarmTurn.tools?.[3].summary, 'Read board (since #2)');
+  assert.equal(swarmTurn.tools?.[4].summary, 'Post to @arch-analyst');
+
+  const swarmKilledRows = swarmRows + '\n' + [
+    JSON.stringify({
+      step_index: 7,
+      type: 'PLANNER_RESPONSE',
+      source: 'MODEL',
+      status: 'DONE',
+      tool_calls: [{ name: 'swarm', args: { action: '"kill"', name: '"arch-analyst"' } }],
+    }),
+    JSON.stringify({ step_index: 8, type: 'GENERIC', status: 'DONE', content: '{"status":"killed","name":"arch-analyst"}' }),
+  ].join('\n');
+  const parsedSwarmKilled = parseAntigravityTranscript(swarmKilledRows, session);
+  assert.equal(parsedSwarmKilled.find(m => m.id === `${session}:1`)?.tools?.[1].status, 'completed');
 
   console.log('Antigravity transcript parsing, isolated log binding, resume and ambiguity tests passed.');
 } finally { fs.rmSync(root,{recursive:true,force:true}); }

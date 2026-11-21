@@ -10,6 +10,7 @@ const execFileAsync = promisify(execFile);
 const GIT_COMMAND_TIMEOUT_MS = 45_000;
 const NEW_SIBLING_BASELINE = '.atris-baseline';
 const NEW_SIBLING_OPERATION_MARKER = '.atris-operation.json';
+const REVIEW_BASE_MARKER = 'atris-review-base';
 
 interface NewSiblingOperationMarker {
   version: 1;
@@ -519,6 +520,11 @@ export class WorktreeManager {
           throw new Error(`Could not create Builder worktree from ${sourcePath}: ${detail}`, { cause: error });
         }
       }
+      if (worktreePath) {
+        const { stdout: gitDir } = await git(['rev-parse', '--absolute-git-dir'], targetPath);
+        const { stdout: revision } = await git(['rev-parse', 'HEAD'], targetPath);
+        fs.writeFileSync(path.join(gitDir.trim(), REVIEW_BASE_MARKER), `${revision.trim()}\n`, { flag: 'wx' });
+      }
       return targetPath;
     }
 
@@ -601,6 +607,35 @@ export class WorktreeManager {
       if (!currentFiles.has(file)) changed.push({ path: file, status: 'deleted' });
     }
     return changed;
+  }
+
+  /** Review the complete Builder result, regardless of its index or any commits it makes. */
+  async getReviewChanges(worktreePath: string): Promise<{ files: ChangedFile[]; diff: string }> {
+    if (!await this.isGitRepository(worktreePath)) {
+      return { files: await this.getChangedFiles(worktreePath), diff: await this.getDiff(worktreePath) };
+    }
+    const { stdout: gitDir } = await git(['rev-parse', '--absolute-git-dir'], worktreePath);
+    const marker = path.join(gitDir.trim(), REVIEW_BASE_MARKER);
+    let base = 'HEAD';
+    if (fs.existsSync(marker)) {
+      const recorded = fs.readFileSync(marker, 'utf8').trim();
+      if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(recorded)) base = recorded;
+    }
+    const [names, patch, untracked] = await Promise.all([
+      git(['diff', '--name-status', '-z', '--no-renames', base, '--'], worktreePath),
+      git(['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', base, '--'], worktreePath),
+      git(['ls-files', '--others', '--exclude-standard', '-z'], worktreePath),
+    ]);
+    const pairs = names.stdout.split('\0');
+    const files = new Map<string, ChangedFile>();
+    for (let i = 0; i + 1 < pairs.length; i += 2) {
+      const [status, filePath] = [pairs[i], pairs[i + 1]];
+      if (filePath) files.set(filePath, { path: filePath, status: status === 'A' ? 'added' : status === 'D' ? 'deleted' : 'modified' });
+    }
+    for (const filePath of untracked.stdout.split('\0')) {
+      if (filePath && !files.has(filePath)) files.set(filePath, { path: filePath, status: 'added' });
+    }
+    return { files: [...files.values()], diff: patch.stdout };
   }
 
   async getDiff(worktreePath: string, targetBranch?: string): Promise<string> {

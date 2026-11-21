@@ -6,6 +6,9 @@ import { Badge } from '@/components/ui/badge';
 import { useMissionStore } from '@/stores/mission-store';
 import { apiRequest } from '@/lib/api-client';
 import { cn } from '@/lib/utils';
+import { CodeReview, ReviewEmpty, ReviewFiles, ReviewLayout } from '@/components/dock/ChangesPanel';
+import { unifiedRows, textRows } from '@/components/dock/change-diff';
+import { useMemo } from 'react';
 
 interface ChangedFile { path: string; status: string; additions: number; deletions: number }
 interface ReviewPack { taskId: string; taskSpecification: string; builderSummary: string; changedFiles: ChangedFile[]; unifiedDiff: string; newDependencies: string[]; riskyOperations: string[] }
@@ -19,22 +22,26 @@ export function ChangesTab() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [mode, setMode] = useState<'files' | 'diff'>('files');
+  const [mode, setMode] = useState<'files' | 'diff'>('diff');
   const [browser, setBrowser] = useState<WorktreeResult | null>(null);
   const [browserLoading, setBrowserLoading] = useState(false);
   const [browserError, setBrowserError] = useState<string | null>(null);
   const browserRequest = useRef(0);
+  const packRequest = useRef(0);
+  const [opened, open] = useState<string>();
 
   const load = async () => {
+    const request = ++packRequest.current;
     if (!activeMissionId) { setPacks([]); return; }
     setLoading(true); setError(null);
-    const builderTasks = activeTasks.filter((task) => task.assignedRole === 'builder');
+    const builderTasks = activeTasks.filter((task) => task.missionId === activeMissionId && task.assignedRole === 'builder');
     const results = await Promise.all(builderTasks.map(async (task) => {
       try {
         const response = await apiRequest<{ diff: ReviewPack }>(`/tasks/${task.id}/diff`);
         return response.diff;
       } catch { return null; }
     }));
+    if (request !== packRequest.current || useMissionStore.getState().activeMissionId !== activeMissionId) return;
     const available = results.filter((pack): pack is ReviewPack => Boolean(pack));
     setPacks(available);
     setSelectedTaskId((current) => current && available.some((pack) => pack.taskId === current) ? current : available[0]?.taskId || null);
@@ -42,8 +49,10 @@ export function ChangesTab() {
     setLoading(false);
   };
 
-  useEffect(() => { void load(); }, [activeMissionId, activeTasks.map((task) => `${task.id}:${task.status}`).join('|')]);
-  const selected = packs.find((pack) => pack.taskId === selectedTaskId);
+  useEffect(() => { void load(); return () => { packRequest.current++; }; }, [activeMissionId, activeTasks.map((task) => `${task.id}:${task.status}`).join('|')]);
+  const selected = packs.find((pack) => pack.taskId === selectedTaskId && activeTasks.some(task => task.id === pack.taskId && task.missionId === activeMissionId));
+  const rows = useMemo(() => unifiedRows(selected?.unifiedDiff || ''), [selected?.unifiedDiff]);
+  const openedFile = selected?.changedFiles.find(file => file.path === opened);
   const inspect = async (relativePath = '') => {
     if (!selectedTaskId) return;
     const requestId = ++browserRequest.current;
@@ -55,22 +64,28 @@ export function ChangesTab() {
       if (requestId === browserRequest.current) setBrowserError(inspectError?.message || 'Worker files are not available yet.');
     } finally { if (requestId === browserRequest.current) setBrowserLoading(false); }
   };
-  useEffect(() => { setBrowser(null); if (selectedTaskId && mode === 'files') void inspect(); }, [selectedTaskId, mode]);
+  useEffect(() => { open(undefined); }, [selectedTaskId, activeMissionId]);
+  useEffect(() => {
+    browserRequest.current++; setBrowser(null); setBrowserError(null); setBrowserLoading(false);
+    if (selectedTaskId && mode === 'files') void inspect();
+    else if (openedFile?.status === 'added' && !rows.get(openedFile.path)?.length) void inspect(openedFile.path);
+    return () => { browserRequest.current++; };
+  }, [selectedTaskId, mode, openedFile?.path, rows]);
 
   if (!activeMissionId) return <Empty text="Select a mission to inspect its worktree changes." />;
   if (loading && packs.length === 0) return <div className="flex h-full items-center justify-center text-xs text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />Generating review packs…</div>;
   if (!selected) return <Empty text={error || 'No Builder change set has been produced for this mission.'} action={<Button size="sm" variant="outline" onClick={() => void load()}><RefreshCw className="mr-2 h-3.5 w-3.5" />Refresh</Button>} />;
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="@container/review flex h-full min-h-0 min-w-0 flex-col">
       <div className="flex items-center gap-2 border-b border-border p-2">
-        <select className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs" value={selected.taskId} onChange={(event) => setSelectedTaskId(event.target.value)}>
+        <select aria-label="Builder output" className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs" value={selected.taskId} onChange={(event) => setSelectedTaskId(event.target.value)}>
           {packs.map((pack) => <option key={pack.taskId} value={pack.taskId}>{pack.taskSpecification}</option>)}
         </select>
-        <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => void load()}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
+        <Button size="icon" variant="ghost" className="h-8 w-8" aria-label="Refresh Builder changes" onClick={() => void load()}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
         <div className="flex rounded-md border border-border p-0.5">
           {(['files', 'diff'] as const).map((item) => <button key={item} type="button" onClick={() => setMode(item)} aria-pressed={mode === item}
-            className={cn('rounded px-2 py-1 text-[9px] capitalize', mode === item ? 'bg-accent text-foreground' : 'text-muted-foreground')}>{item}</button>)}
+            className={cn('rounded px-2 py-1 text-[10px]', mode === item ? 'bg-accent text-foreground' : 'text-muted-foreground')}>{item === 'diff' ? 'Review' : 'Browse'}</button>)}
         </div>
       </div>
       <div className="border-b border-border bg-muted/20 p-3 text-xs">
@@ -83,9 +98,14 @@ export function ChangesTab() {
         </div>
         {(selected.riskyOperations.length > 0 || selected.newDependencies.length > 0) && <div className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 p-2 text-amber-200"><AlertTriangle className="mr-1 inline h-3.5 w-3.5" />{[...selected.riskyOperations, ...selected.newDependencies.map((item) => `New dependency: ${item}`)].join(' · ')}</div>}
       </div>
-      {mode === 'diff' ? <ScrollArea className="flex-1">
-        <pre className="min-h-full whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5 text-muted-foreground">{selected.unifiedDiff || 'No textual diff was produced.'}</pre>
-      </ScrollArea> : <div className="flex min-h-0 flex-1 flex-col">
+      {mode === 'diff' ? selected.changedFiles.length === 0 ? <ReviewEmpty>No pending file changes reported by this Builder.</ReviewEmpty> : <ReviewLayout
+        opened={openedFile?.path} onBack={() => open(undefined)}
+        list={<ReviewFiles files={selected.changedFiles} opened={openedFile?.path} onOpen={file => open(file.path)} />}
+        detail={openedFile && (rows.get(openedFile.path)?.length ? <CodeReview key={openedFile.path} rows={rows.get(openedFile.path)!} />
+          : browserLoading ? <ReviewEmpty>Loading comparison…</ReviewEmpty>
+          : browser?.kind === 'file' && browser.path === openedFile.path && browser.content !== undefined && !browser.truncated ? <CodeReview key={openedFile.path} rows={textRows(null, browser.content)} />
+          : <ReviewEmpty>{browserError || 'A textual comparison is not available for this file.'}</ReviewEmpty>)}
+      /> : <div className="flex min-h-0 flex-1 flex-col">
         {browserLoading ? <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />Loading worker files…</div>
           : browserError ? <Empty text={browserError} action={<Button size="sm" variant="outline" onClick={() => void inspect()}><RefreshCw className="mr-2 h-3.5 w-3.5" />Retry</Button>} />
             : browser?.kind === 'directory' ? <ScrollArea className="flex-1">

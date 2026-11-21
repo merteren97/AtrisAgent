@@ -71,10 +71,19 @@ function run(): void {
     routeSelectionMode: 'auto',
     preferredCatalogId: codexModel.catalogId,
     preferredAccountProfileId: codex.id,
-    preferredReasoning: 'high',
+    preferredReasoning: 'low',
   }), profiles, models);
   assert(auto.model?.catalogId === claudeModel.catalogId, 'Auto mode ignores stale configured route hints and delegates selection to scheduler scoring');
-  assert(auto.reasoningLevel === 'medium', 'Auto mode ignores configured reasoning and uses the role-compatible scheduler default');
+  assert(auto.reasoningLevel === 'high', 'Auto mode ignores configured reasoning and defaults worker/subagent routes to High reasoning');
+
+  const hydrogenModel = model('gemini-4-hydrogen', claude.id, 'claude_code', {
+    supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
+    defaultReasoning: 'high',
+  });
+  const hydrogenRoute = scheduler.resolveRoute(request({
+    routeSelectionMode: 'auto',
+  }), [claude], [hydrogenModel]);
+  assert(hydrogenRoute.reasoningLevel === 'high', 'Hydrogen family routes default to High reasoning for subagents and workers');
 
   const autoEnabled = profile('profile-auto-enabled', 'codex');
   const autoDisabled = { ...profile('profile-auto-disabled', 'claude_code'), schedulerAuto: false };

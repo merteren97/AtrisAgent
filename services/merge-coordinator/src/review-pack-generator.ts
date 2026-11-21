@@ -57,8 +57,7 @@ export class ReviewPackGenerator {
     const worktreeManager = this.workspaceManager.getWorktreeManager();
 
     // Fetch changed files and diff
-    const rawChangedFiles = await worktreeManager.getChangedFiles(worktreePath);
-    const unifiedDiff = await worktreeManager.getDiff(worktreePath);
+    const { files: rawChangedFiles, diff: unifiedDiff } = await worktreeManager.getReviewChanges(worktreePath);
 
     const counts = countFileChanges(unifiedDiff);
     // Calculate additions and deletions per changed file

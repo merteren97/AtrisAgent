@@ -157,6 +157,11 @@ function classifyAntigravityAuthStatus(output: string): AccountProfileStatus {
 
 // Last-resort fallback only. `agy models` is authoritative when the installed CLI exposes it.
 const DOCUMENTED_MODELS: DocumentedModel[] = [
+  { slug: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', provider: 'google', efforts: ['low', 'medium', 'high', 'xhigh'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-4-carbon', name: 'Gemini 4 Carbon', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-4-argon', name: 'Gemini 4 Argon', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-pro-orchestrator', name: 'Gemini Pro Orchestrator', provider: 'google', efforts: [], entitlement: 'Availability is verified by the installed Antigravity CLI' },
+  { slug: 'gemini-pro-orchestrator-argon', name: 'Gemini Pro Orchestrator (Argon)', provider: 'google', efforts: [], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
   { slug: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', provider: 'google', efforts: ['low', 'medium', 'high'], entitlement: 'Availability is verified by the installed Antigravity CLI' },
@@ -561,7 +566,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         displayName: model.name,
         description: 'Fallback Antigravity model metadata. Refresh routes to replace this with the installed CLI catalog.',
         supportedRoles: ALL_ROLES,
-        supportedReasoning: capabilities.reasoningControl ? model.efforts : [],
+        supportedReasoning: capabilities.modelSelection ? model.efforts : [],
+        defaultReasoning: capabilities.modelSelection
+          ? (model.efforts.includes('high') ? 'high' : model.efforts.includes('medium') ? 'medium' : model.efforts[0])
+          : undefined,
         inputModalities: ['text', 'image'],
         availability: capabilities.modelSelection ? 'unknown' : 'unavailable',
         source: 'documented',
@@ -833,7 +841,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       const isFinalResponseCandidate = /(?:^|[_-])(?:agent|final)[_-]?response(?:$|[_-])/.test(stepType)
         && /^(?:done|completed|success|succeeded)$/i.test(parsed.state || '');
       const isPureThoughtStep = /^(?:thought|reason|plan|thinking)$/i.test(stepType);
-      const isToolStep = Boolean(parsed.toolName) || /tool|command|shell|subagent|ask_question/i.test(stepType);
+      const isToolStep = Boolean(parsed.toolName) || /tool|command|shell|subagent|swarm|ask_question|workflow|mcp|resource|board/i.test(stepType);
       let emitted = false;
 
       if (parsed.thinking) {
