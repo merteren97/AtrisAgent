@@ -272,19 +272,19 @@ export function Sidebar() {
 
       const currentMissions = useMissionStore.getState().missions;
       const preferredMissionId = useWorkspaceStore.getState().lastMissionByWorkspace[activeWorkspaceId];
-      if (preferredMissionId && currentMissions.some((mission) => mission.id === preferredMissionId)) {
+      if (preferredMissionId && currentMissions.some((mission) => mission.id === preferredMissionId && mission.workspaceId === activeWorkspaceId)) {
         setActiveMission(preferredMissionId, false);
         return;
       }
       const currentMissionId = useMissionStore.getState().activeMissionId;
-      if (currentMissionId) rememberMission(activeWorkspaceId, currentMissionId);
+      if (currentMissionId && currentMissions.some(mission => mission.id === currentMissionId && mission.workspaceId === activeWorkspaceId)) rememberMission(activeWorkspaceId, currentMissionId);
     })();
     return () => { cancelled = true; };
   }, [activeWorkspaceId, clearActiveMission, fetchMissions, rememberMission, setActiveMission]);
 
   useEffect(() => {
-    if (activeWorkspaceId && activeMissionId) rememberMission(activeWorkspaceId, activeMissionId);
-  }, [activeMissionId, activeWorkspaceId, rememberMission]);
+    if (activeWorkspaceId && activeMissionId && missions.some(mission => mission.id === activeMissionId && mission.workspaceId === activeWorkspaceId)) rememberMission(activeWorkspaceId, activeMissionId);
+  }, [activeMissionId, activeWorkspaceId, missions, rememberMission]);
 
   const activeMissionAgents = useMemo(
     () => activeMissionId ? agents.filter((agent) => agent.missionId === activeMissionId) : [],

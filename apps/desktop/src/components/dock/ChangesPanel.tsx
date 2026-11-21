@@ -12,10 +12,10 @@ import { textRows, unifiedRows, type DiffRow } from './change-diff';
 import { t, useLanguageStore } from '@/stores/language-store';
 
 export type ReviewFile = { path: string; status: string; additions?: number; deletions?: number; state?: string; issue?: string };
-type ChangeFile = ReviewFile & { revision?: string };
-type ChangeListData = { mode: 'isolated' | 'direct' | 'live' | 'staged'; quality?: 'pending' | 'verified' | 'failed'; files: ChangeFile[]; omitted?: number; error?: string };
-type FileDiffData = { before: string | null; after: string | null } | { unavailable: 'binary' | 'large' } | { diff: string };
-type ChangeAction = 'apply' | 'discard' | 'undo';
+type ChangeFile = ReviewFile & { revision?: string; restorable?: boolean };
+type ChangeListData = { mode: 'isolated' | 'direct' | 'live' | 'staged' | 'project'; quality?: 'pending' | 'verified' | 'failed'; files: ChangeFile[]; omitted?: number; error?: string; preparing?: boolean; notice?: string };
+type FileDiffData = { before: string | null; after: string | null } | { unavailable: 'binary' | 'large' | 'history' } | { diff: string };
+type ChangeAction = 'approve' | 'apply' | 'discard' | 'undo';
 const listCache = new Map<string, ChangeListData>();
 const previewCache = new Map<string, FileDiffData>();
 function cache<T>(entries: Map<string, T>, key: string, value: T, limit: number) {
@@ -46,7 +46,10 @@ export function ReviewFiles({ files, opened, selected, onToggle, canSelect, onOp
           <span className={cn('w-3 shrink-0 text-center font-mono text-xs font-semibold', color)} aria-label={status}>{status[0]}</span>
           <span className="min-w-0 flex-1"><span className="block truncate text-xs font-medium">{file.path.slice(slash + 1)}</span>{slash >= 0 && <span className="block truncate text-[11px] text-muted-foreground">{file.path.slice(0, slash)}</span>}
             {file.state === 'conflict' && <span className="block truncate text-[11px] text-destructive">{t('Conflict')}</span>}
-            {file.state === 'reverted' && <span className="block truncate text-[11px] text-muted-foreground">{t('Undone')}</span>}
+             {file.state === 'reverted' && <span className="block truncate text-[11px] text-muted-foreground">{t('Undone')}</span>}
+             {file.state === 'pending' && <span className="block truncate text-[11px] text-muted-foreground">Needs review</span>}
+             {file.state === 'approved' && <span className="block truncate text-[11px] text-emerald-700 dark:text-emerald-400">Approved</span>}
+             {file.state === 'project' && <span className="block truncate text-[11px] text-muted-foreground">No undo history</span>}
           </span>
           {Boolean(file.additions || file.deletions) && <span className="shrink-0 font-mono text-[10px]"><span className="text-emerald-700 dark:text-emerald-400">+{file.additions || 0}</span>{' '}<span className="text-rose-700 dark:text-rose-400">−{file.deletions || 0}</span></span>}
           <ChevronRight className="size-3 shrink-0 text-muted-foreground @[820px]/review:hidden" />
@@ -132,7 +135,8 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
   const shownPreview = previewKey && current?.revision && previewCache.get(previewKey) || (preview?.key === previewKey ? preview?.data : undefined);
   const rows = useMemo(() => shownPreview && 'before' in shownPreview ? textRows(shownPreview.before, shownPreview.after)
     : shownPreview && 'diff' in shownPreview ? [...unifiedRows(shownPreview.diff).values()].flat() : [], [shownPreview]);
-  const selectable = files.filter(file => file.revision && (data?.mode !== 'live' || file.state === 'published' || file.state === 'reverting'));
+  const selectable = files.filter(file => file.revision && (data?.mode === 'project' ? file.state === 'pending' || file.restorable
+    : data?.mode !== 'live' || file.state === 'published' || file.state === 'reverting'));
   const visibleSelection = selectable.filter(file => selected.get(file.path) === file.revision);
   const selectedPaths = new Set(visibleSelection.map(file => file.path));
   const selectablePaths = new Set(selectable.map(file => file.path));
@@ -141,12 +145,16 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     let refreshInterval = 5000;
+    let forceRefresh = request > 0;
     const load = async () => {
       try {
-        const result = await apiRequest<ChangeListData>(root, { signal: controller.signal, cache: 'no-store' });
+        if (document.visibilityState === 'hidden' && !forceRefresh) return;
+        const endpoint = forceRefresh ? `${root}${root.includes('?') ? '&' : '?'}refresh=1` : root;
+        forceRefresh = false;
+        const result = await apiRequest<ChangeListData>(endpoint, { signal: controller.signal, cache: 'no-store' });
         if (!Array.isArray(result?.files)) throw new Error('Changes are unavailable in the current runtime.');
         if (!controller.signal.aborted) {
-          refreshInterval = result.mode === 'live' ? 1800 : 5000;
+          refreshInterval = result.mode === 'live' || result.mode === 'project' ? 1800 : 5000;
           const previous = listCache.get(root);
           const next = previous && JSON.stringify(previous) === JSON.stringify(result) ? previous : result;
           cache(listCache, root, next, 24);
@@ -184,11 +192,11 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
     setPending(true); setConfirm(undefined); setActionStatus(undefined);
     try {
       const result = await apiRequest<{ completed: string[]; error?: string; conflicts?: Array<{ path: string; reason: string }> }>(`${root}/resolve`, { method: 'POST', body: JSON.stringify({ action, files: targets.map(({ path, revision }) => ({ path, revision })) }) });
-      const verb = action === 'apply' ? 'Applied' : action === 'discard' ? 'Discarded' : t('Undone');
+      const verb = action === 'approve' ? 'Approved' : action === 'apply' ? 'Applied' : action === 'discard' ? 'Discarded' : t('Undone');
       const issue = result.error || result.conflicts?.map(item => `${item.path}: ${item.reason}`).join('\n');
       setActionStatus(issue ? { text: `${verb} ${result.completed.length}/${targets.length}.\n${issue}`, error: true } : { text: `${verb}: ${result.completed.length}` });
       select(new Map());
-      if (opened && result.completed.includes(opened)) open(undefined);
+      if (action !== 'approve' && opened && result.completed.includes(opened)) open(undefined);
     } catch (error) { setActionStatus({ text: error instanceof Error ? error.message : 'The selected changes could not be updated.', error: true }); }
     finally { setPending(false); refresh(value => value + 1); }
   };
@@ -198,15 +206,16 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
   return <div className="@container/review flex h-full min-h-0 min-w-0 flex-col">
     <header className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
       <div className="min-w-0">{title && <p className="truncate text-xs font-semibold" title={title}>{title}</p>}
-        <p className="truncate text-[11px] text-muted-foreground">{data?.mode === 'live' ? t('Live in project') : project ?? t('Staged changes')}</p></div>
+        <p className="truncate text-[11px] text-muted-foreground">{data?.mode === 'project' ? `Changes in ${project || 'project'}` : data?.mode === 'live' ? t('Live in project') : project ?? t('Staged changes')}</p></div>
       <Button variant="ghost" size="icon" className="size-7 shrink-0" aria-label="Refresh changes" title="Refresh changes" onClick={() => { refresh(value => value + 1); retryPreview(value => value + 1); }}><RefreshCw className="size-3.5" /></Button>
     </header>
     {builder && data?.mode === 'live' && <p role="status" className={cn('border-b px-3 py-2 text-xs', data.quality === 'failed' ? 'text-destructive' : 'text-muted-foreground')}>
       {t(data.quality === 'failed' ? 'Verification failed' : data.quality === 'verified' ? 'Verified' : 'Awaiting verification')}
     </p>}
     {(loadError || data?.error) && <p role="alert" className="border-b bg-destructive/5 px-3 py-2 text-xs text-destructive">{loadError || data?.error}</p>}
+    {data?.mode === 'project' && <p role="status" className="shrink-0 border-b px-3 py-2 text-xs text-muted-foreground">{data.preparing ? 'Recording starting versions…' : data.notice || 'Edits are already saved in the project. Approving keeps them and preserves Undo history.'}</p>}
     {actionStatus && <p role={actionStatus.error ? 'alert' : 'status'} className={cn('max-h-28 overflow-y-auto whitespace-pre-wrap break-words border-b px-3 py-2 text-xs', actionStatus.error ? 'text-destructive' : 'text-emerald-700 dark:text-emerald-400')}>{actionStatus.text}</p>}
-    {!data ? <ReviewEmpty>{!loadError && t('Loading changes…')}</ReviewEmpty> : data.mode === 'direct' ? <ReviewEmpty><strong className="text-foreground">Direct workspace session</strong><p>This older conversation does not record undo history.</p></ReviewEmpty> : !files.length ? <ReviewEmpty><strong className="text-foreground">{t('No changes yet')}</strong></ReviewEmpty> : <>
+    {!data ? <ReviewEmpty>{!loadError && t('Loading changes…')}</ReviewEmpty> : data.mode === 'direct' ? <ReviewEmpty><strong className="text-foreground">Direct workspace session</strong><p>This conversation edits the registered folder directly and does not record undo history.</p></ReviewEmpty> : !files.length ? <ReviewEmpty><strong className="text-foreground">{t('No changes yet')}</strong></ReviewEmpty> : <>
       <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] text-muted-foreground">{selectable.length > 0 && <label className="flex items-center gap-2"><input type="checkbox" className={checkboxStyle} checked={visibleSelection.length === selectable.length} ref={input => { if (input) input.indeterminate = visibleSelection.length > 0 && visibleSelection.length < selectable.length; }} onChange={event => select(event.target.checked ? new Map(selectable.map(file => [file.path, file.revision!])) : new Map())} />{t('Select all')}</label>}<span className="ml-auto tabular-nums">{visibleSelection.length ? `${visibleSelection.length} / ` : ''}{files.length}</span></div>
       <ReviewLayout opened={current?.path} onBack={() => open(undefined)} list={<ReviewFiles files={files} opened={current?.path} selected={selectedPaths} canSelect={file => selectablePaths.has(file.path)} onOpen={file => open(file.path)} onToggle={data.mode === 'staged' ? undefined : file => {
         const revision = (file as ChangeFile).revision;
@@ -214,9 +223,13 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
         select(old => { const next = new Map(old); if (next.get(file.path) === revision) next.delete(file.path); else next.set(file.path, revision); return next; });
       }} />} detail={<>
         {current?.issue && <p role="status" className="border-b px-3 py-2 text-xs text-destructive">{current.issue}</p>}
-        {current?.state === 'conflict' && !current.revision ? null : shownPreview ? 'unavailable' in shownPreview ? <ReviewEmpty>{shownPreview.unavailable === 'binary' ? 'Binary file' : 'File is too large to preview'}</ReviewEmpty> : <CodeReview key={previewKey} rows={rows} />
+         {current?.state === 'conflict' && !current.revision ? null : shownPreview ? 'unavailable' in shownPreview ? <ReviewEmpty>{shownPreview.unavailable === 'history' ? 'A saved comparison is not available for this version.' : shownPreview.unavailable === 'binary' ? 'Binary file' : 'File is too large to preview'}</ReviewEmpty> : <CodeReview key={previewKey} rows={rows} />
           : preview?.key === previewKey && preview?.error ? <ReviewEmpty>{preview.error}<Button size="sm" variant="outline" onClick={() => retryPreview(value => value + 1)}>Retry</Button></ReviewEmpty> : <ReviewEmpty>Loading comparison…</ReviewEmpty>}
-      </>} />
+       </>} />
+       {data.mode === 'project' && <footer className="flex shrink-0 flex-wrap gap-1.5 border-t p-2">
+         <Button size="sm" disabled={blocked || !(visibleSelection.some(file => file.state === 'pending') || !visibleSelection.length && current?.state === 'pending')} onClick={() => show('approve', visibleSelection.length ? visibleSelection.filter(file => file.state === 'pending') : [current!])}><Check />Approve</Button>
+         <Button size="sm" variant="outline" disabled={blocked || !(visibleSelection.some(file => file.restorable) || !visibleSelection.length && current?.restorable)} onClick={() => show('undo', visibleSelection.length ? visibleSelection.filter(file => file.restorable) : [current!])}><Undo2 />{visibleSelection.length ? t('Undo selected') : t('Undo file')}</Button>
+       </footer>}
       {data.mode === 'live' && <footer className="flex shrink-0 flex-wrap gap-1.5 border-t p-2">
         {current && selectablePaths.has(current.path) && <Button size="sm" variant="outline" disabled={blocked} onClick={() => show('undo', [current])}><Undo2 />{t('Undo file')}</Button>}
         <Button size="sm" variant="outline" disabled={blocked || !visibleSelection.length} onClick={() => show('undo', visibleSelection)}>{pending ? <Loader2 className="animate-spin" /> : <Undo2 />}{t('Undo selected')}</Button>
@@ -233,8 +246,8 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
     {Boolean(data?.omitted) && <p className="shrink-0 border-t px-3 py-1 text-[10px] text-muted-foreground">Generated files, common secret files and links are excluded.</p>}
     <Dialog open={Boolean(confirm)} onOpenChange={value => { if (!value) setConfirm(undefined); }}>
       <DialogContent className="z-[115]" showCloseButton={false}>
-        <DialogHeader><DialogTitle>{confirm?.action === 'undo' ? t('Undo project changes?') : `${confirm?.action === 'apply' ? 'Apply' : 'Discard'} ${confirm?.files.length} ${confirm?.files.length === 1 ? 'file' : 'files'}?`}</DialogTitle><DialogDescription>{confirm?.action === 'undo' ? t('Restore the previous project versions. Files edited since publication will be kept.') : confirm?.action === 'apply' ? `Write the reviewed changes to ${project}. Conflicting project edits will be kept.` : 'Restore the selected files in this conversation copy to their last approved state. The project will not be modified.'}</DialogDescription></DialogHeader>
-        <DialogFooter><Button variant="outline" onClick={() => setConfirm(undefined)}>{t('Cancel')}</Button><Button variant={confirm?.action === 'apply' ? 'default' : 'destructive'} onClick={() => void resolve()}>{confirm?.action === 'undo' ? t('Undo changes') : confirm?.action === 'apply' ? 'Apply to project' : 'Discard changes'}</Button></DialogFooter>
+        <DialogHeader><DialogTitle>{confirm?.action === 'undo' ? t('Undo project changes?') : `${confirm?.action === 'approve' ? 'Approve' : confirm?.action === 'apply' ? 'Apply' : 'Discard'} ${confirm?.files.length} ${confirm?.files.length === 1 ? 'file' : 'files'}?`}</DialogTitle><DialogDescription>{confirm?.action === 'approve' ? 'Keep these saved versions and mark them as reviewed. Undo will still be available for versions with a saved history.' : confirm?.action === 'undo' ? 'Restore the recorded previous versions. Files edited since the selected version will be kept.' : confirm?.action === 'apply' ? `Write the reviewed changes to ${project}. Conflicting project edits will be kept.` : 'Restore the selected files in this conversation copy to their last approved state. The project will not be modified.'}</DialogDescription></DialogHeader>
+        <DialogFooter><Button variant="outline" onClick={() => setConfirm(undefined)}>{t('Cancel')}</Button><Button variant={confirm?.action === 'apply' || confirm?.action === 'approve' ? 'default' : 'destructive'} onClick={() => void resolve()}>{confirm?.action === 'approve' ? 'Approve changes' : confirm?.action === 'undo' ? t('Undo changes') : confirm?.action === 'apply' ? 'Apply to project' : 'Discard changes'}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   </div>;

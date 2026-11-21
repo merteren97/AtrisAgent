@@ -11,6 +11,7 @@ const GIT_COMMAND_TIMEOUT_MS = 45_000;
 const NEW_SIBLING_BASELINE = '.atris-baseline';
 const NEW_SIBLING_OPERATION_MARKER = '.atris-operation.json';
 const REVIEW_BASE_MARKER = 'atris-review-base';
+const REVIEW_PREVIEW_BYTES = 256 * 1024;
 
 interface NewSiblingOperationMarker {
   version: 1;
@@ -78,6 +79,8 @@ export type WorktreeInspectResult = {
   kind: 'file'; path: string; sizeBytes: number; content?: string; truncated: boolean; previewUnavailable?: 'binary' | 'special';
 };
 
+type ReviewFilePreview = { diff: string } | { before: string | null; after: string | null } | { unavailable: 'binary' | 'large' };
+
 const DEFAULT_IGNORED_DIRS = new Set([
   'node_modules',
   '.git',
@@ -112,22 +115,100 @@ async function copyDirRecursive(src: string, dest: string, ignoreList: Set<strin
   }
 }
 
-function getAllFilesRelative(dir: string, baseDir: string = dir, ignoreList: Set<string> = DEFAULT_IGNORED_DIRS): string[] {
-  if (!fs.existsSync(dir)) return [];
-  let files: string[] = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (shouldIgnoreEntry(entry.name, ignoreList)) continue;
-    const fullPath = path.join(dir, entry.name);
-    const relPath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
-
-    if (entry.isDirectory()) {
-      files = files.concat(getAllFilesRelative(fullPath, baseDir, ignoreList));
-    } else if (entry.isFile()) {
-      files.push(relPath);
+async function mirrorFiles(root: string): Promise<Set<string>> {
+  const files = new Set<string>();
+  const walk = async (prefix: string) => {
+    const directory = path.join(root, prefix);
+    if (path.relative(directory, await fs.promises.realpath(directory)) !== '') return;
+    for (const entry of await fs.promises.readdir(directory, { withFileTypes: true })) {
+      if (shouldIgnoreEntry(entry.name, DEFAULT_IGNORED_DIRS)) continue;
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) await walk(relative);
+      else if (entry.isFile()) files.add(relative);
     }
-  }
+  };
+  await walk('');
   return files;
+}
+
+async function sameMirrorFile(left: string, right: string, buffers: readonly [Buffer, Buffer]): Promise<boolean> {
+  const open = async (filename: string) => {
+    if (path.relative(filename, await fs.promises.realpath(filename)) !== '') throw new Error('A review file moved during the scan.');
+    return fs.promises.open(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  };
+  const a = await open(left);
+  let b: fs.promises.FileHandle | undefined;
+  try {
+    b = await open(right);
+    const [first, second] = await Promise.all([a.stat(), b.stat()]);
+    if (!first.isFile() || !second.isFile() || first.size !== second.size) return false;
+    const read = async (file: fs.promises.FileHandle, bytes: Buffer, size: number, position: number) => {
+      let offset = 0;
+      while (offset < size) {
+        const { bytesRead } = await file.read(bytes, offset, size - offset, position + offset);
+        if (!bytesRead) return false;
+        offset += bytesRead;
+      }
+      return true;
+    };
+    for (let position = 0; position < first.size; position += buffers[0].length) {
+      const size = Math.min(first.size - position, buffers[0].length);
+      const [readA, readB] = await Promise.all([read(a, buffers[0], size, position), read(b, buffers[1], size, position)]);
+      if (!readA || !readB || !buffers[0].subarray(0, size).equals(buffers[1].subarray(0, size))) return false;
+    }
+    const [lastA, lastB] = await Promise.all([a.stat(), b.stat()]);
+    return lastA.size === first.size && lastB.size === second.size && lastA.mtimeMs === first.mtimeMs && lastB.mtimeMs === second.mtimeMs;
+  } finally { await Promise.all([a.close(), b?.close()]); }
+}
+
+async function readMirrorPreview(root: string, segments: string[]): Promise<{ content: string | null } | { unavailable: 'binary' | 'large' }> {
+  let candidate = root;
+  try {
+    const rootStat = await fs.promises.lstat(root);
+    if (rootStat.isSymbolicLink()) return { unavailable: 'binary' };
+    if (!rootStat.isDirectory()) return { content: null };
+    candidate = await fs.promises.realpath(root);
+    for (let i = 0; i < segments.length; i++) {
+      candidate = path.join(candidate, segments[i]);
+      const stat = await fs.promises.lstat(candidate);
+      if (stat.isSymbolicLink()) return { unavailable: 'binary' };
+      if (i < segments.length - 1) {
+        if (!stat.isDirectory()) return { content: null };
+      } else {
+        if (stat.isDirectory()) return { content: null };
+        if (!stat.isFile()) return { unavailable: 'binary' };
+        if (stat.size > REVIEW_PREVIEW_BYTES) return { unavailable: 'large' };
+      }
+    }
+    const resolved = await fs.promises.realpath(candidate);
+    // Reject filesystem aliases as well as link traversal in the selected path.
+    if (path.relative(candidate, resolved) !== '') return { unavailable: 'binary' };
+    const handle = await fs.promises.open(resolved, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      if (!(await handle.stat()).isFile()) return { unavailable: 'binary' };
+      const buffer = Buffer.allocUnsafe(REVIEW_PREVIEW_BYTES + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+      }
+      if (offset > REVIEW_PREVIEW_BYTES) return { unavailable: 'large' };
+      const bytes = buffer.subarray(0, offset);
+      if (bytes.includes(0)) return { unavailable: 'binary' };
+      try {
+        return { content: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) };
+      } catch {
+        return { unavailable: 'binary' };
+      }
+    } finally {
+      await handle.close();
+    }
+  } catch (error: any) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { content: null };
+    if (error?.code === 'ELOOP') return { unavailable: 'binary' };
+    throw error;
+  }
 }
 
 function normalizeProjectHint(value: string): string {
@@ -588,19 +669,25 @@ export class WorktreeManager {
       }
     }
 
-    const baselineDir = path.join(worktreePath, '.atris-baseline');
+    return this.getMirrorChanges(worktreePath);
+  }
+
+  private async getMirrorChanges(worktreePath: string): Promise<ChangedFile[]> {
+    if (!fs.existsSync(worktreePath)) return [];
+    const root = await fs.promises.realpath(worktreePath);
+    const baselineDir = path.join(root, NEW_SIBLING_BASELINE);
     if (!fs.existsSync(baselineDir)) return [];
-    const baselineFiles = new Set(getAllFilesRelative(baselineDir));
-    const currentFiles = new Set(getAllFilesRelative(worktreePath, worktreePath, new Set([...DEFAULT_IGNORED_DIRS, '.atris-baseline'])));
+    const baseline = await fs.promises.lstat(baselineDir);
+    if (!baseline.isDirectory() || baseline.isSymbolicLink()) return [];
+    const [baselineFiles, currentFiles] = await Promise.all([mirrorFiles(baselineDir), mirrorFiles(root)]);
+    const buffers = [Buffer.allocUnsafe(64 * 1024), Buffer.allocUnsafe(64 * 1024)] as const;
     const changed: ChangedFile[] = [];
 
     for (const file of currentFiles) {
       if (!baselineFiles.has(file)) {
         changed.push({ path: file, status: 'added' });
       } else {
-        const baseBuf = fs.readFileSync(path.join(baselineDir, file));
-        const currBuf = fs.readFileSync(path.join(worktreePath, file));
-        if (!baseBuf.equals(currBuf)) changed.push({ path: file, status: 'modified' });
+        if (!await sameMirrorFile(path.join(baselineDir, file), path.join(root, file), buffers)) changed.push({ path: file, status: 'modified' });
       }
     }
     for (const file of baselineFiles) {
@@ -633,13 +720,35 @@ export class WorktreeManager {
   async getReviewFileList(worktreePath: string): Promise<ChangedFile[]> {
     return await this.isGitRepository(worktreePath)
       ? this.reviewGitFiles(worktreePath, await this.reviewBase(worktreePath))
-      : this.getChangedFiles(worktreePath);
+      : this.getMirrorChanges(worktreePath);
   }
 
-  async getReviewFileDiff(worktreePath: string, relative: string): Promise<string> {
-    return await this.isGitRepository(worktreePath)
-      ? this.reviewGitDiff(worktreePath, await this.reviewBase(worktreePath), relative)
-      : this.getDiff(worktreePath, undefined, relative);
+  async getReviewFilePreview(worktreePath: string, relative: string): Promise<ReviewFilePreview> {
+    const segments = relative.split('/');
+    if (relative.length > 2048 || segments.some(part => !part || part === '.' || part === '..' || /[\\:\x00-\x1f]/.test(part))) {
+      throw Object.assign(new Error('Invalid workspace file path.'), { status: 400 });
+    }
+    if (await this.isGitRepository(worktreePath)) {
+      const diff = await this.reviewGitDiff(worktreePath, await this.reviewBase(worktreePath), relative);
+      if (diff.length > 320 * 1024) return { unavailable: 'large' };
+      if (diff) return { diff };
+      const entry = await this.inspectEntry(worktreePath, relative);
+      if (entry.kind !== 'file' || entry.previewUnavailable) return { unavailable: 'binary' };
+      if (entry.truncated) return { unavailable: 'large' };
+      return { before: null, after: entry.content || '' };
+    }
+
+    const notFound = () => Object.assign(new Error('Worktree file is unavailable.'), { status: 404 });
+    if (segments.some(part => process.platform === 'win32'
+      ? /[. ]$/.test(part) || shouldIgnoreEntry(part.toLowerCase(), DEFAULT_IGNORED_DIRS)
+      : shouldIgnoreEntry(part, DEFAULT_IGNORED_DIRS))) throw notFound();
+    // Read only the requested path from each side, including files that exist only in the baseline.
+    const after = await readMirrorPreview(worktreePath, segments);
+    if ('unavailable' in after) return after;
+    const before = await readMirrorPreview(path.join(worktreePath, NEW_SIBLING_BASELINE), segments);
+    if ('unavailable' in before) return before;
+    if (before.content === null && after.content === null) throw notFound();
+    return { before: before.content, after: after.content };
   }
 
   private async reviewGitDiff(worktreePath: string, base: string, relative?: string): Promise<string> {
@@ -648,17 +757,20 @@ export class WorktreeManager {
   }
 
   private async reviewGitFiles(worktreePath: string, base: string): Promise<ChangedFile[]> {
-    const [names, untracked] = await Promise.all([
+    // Keep a scan slot occupied until both subprocesses finish, even if one fails.
+    const [names, untracked] = await Promise.allSettled([
       git(['diff', '--name-status', '-z', '--no-renames', base, '--'], worktreePath),
       git(['ls-files', '--others', '--exclude-standard', '-z'], worktreePath),
     ]);
-    const pairs = names.stdout.split('\0');
+    if (names.status === 'rejected') throw names.reason;
+    if (untracked.status === 'rejected') throw untracked.reason;
+    const pairs = names.value.stdout.split('\0');
     const files = new Map<string, ChangedFile>();
     for (let i = 0; i + 1 < pairs.length; i += 2) {
       const [status, filePath] = [pairs[i], pairs[i + 1]];
       if (filePath) files.set(filePath, { path: filePath, status: status === 'A' ? 'added' : status === 'D' ? 'deleted' : 'modified' });
     }
-    for (const filePath of untracked.stdout.split('\0')) {
+    for (const filePath of untracked.value.stdout.split('\0')) {
       if (filePath && !files.has(filePath)) files.set(filePath, { path: filePath, status: 'added' });
     }
     return [...files.values()];

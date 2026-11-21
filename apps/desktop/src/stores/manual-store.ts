@@ -91,7 +91,7 @@ interface ManualState {
   clearSentDraft: (id: string, draft: string, files: File[]) => void;
   forgetWorkspace: (workspaceId: string, knownConversations?: ManualConversation[]) => void;
   refresh: (workspaceId: string) => Promise<void>;
-  create: (workspaceId: string, title: string | undefined, id: string) => Promise<ManualConversation>;
+  create: (workspaceId: string, title: string | undefined, id: string, isolated?: boolean) => Promise<ManualConversation>;
   rename: (conversation: ManualConversation, title: string) => Promise<void>;
   applyNaming: (naming?: ManualNamingUpdate) => void;
   addAgent: (conversationId: string, name: string | undefined, catalogId: string, id: string, reasoning?: string) => Promise<ManualAgent>;
@@ -191,8 +191,8 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       });
     } catch (error) { if (fetchVersions.get(workspaceId) === version) set({ error: error instanceof Error ? error.message : 'Could not load manual conversations.' }); }
   },
-  create: async (workspaceId, title, id) => {
-    const conversation = await apiRequest<ManualConversation>('/manual/conversations', { method: 'POST', body: JSON.stringify({ workspaceId, title, id, isolated: true, liveChanges: true }), timeoutMs: 60_000 });
+  create: async (workspaceId, title, id, isolated = false) => {
+    const conversation = await apiRequest<ManualConversation>('/manual/conversations', { method: 'POST', body: JSON.stringify({ workspaceId, title, id, isolated }), timeoutMs: 60_000 });
     // Invalidate older hydration before merging this authoritative write response.
     fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
     set(state => ({ conversations: { ...state.conversations, [workspaceId]: [conversation, ...(state.conversations[workspaceId] || []).filter(c => c.id !== conversation.id)] } }));

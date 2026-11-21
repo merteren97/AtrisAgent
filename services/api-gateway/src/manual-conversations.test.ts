@@ -293,9 +293,9 @@ try {
   } finally {
     installedStore.codexSessions.create = originalCreate;
     codexExecutable = process.execPath;
-    store.removeAgent(launchCodex.id);
+    await store.removeAgent(launchCodex.id);
   }
-  store.removeAgent(codex.id);
+  await store.removeAgent(codex.id);
   store.syncTitles(agent.id,[{id:'custom',role:'user',text:'A new task title'}]);
   assert.equal(store.agent(agent.id).name,'Agent one','Existing explicit agent names are preserved');
   assert.equal(store.list('project-a').find(c=>c.id===conversationId)!.title,'Independent work','Existing explicit conversation titles are preserved');
@@ -422,7 +422,27 @@ try {
   try {
     sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('review-project', reviewProject);
     const reviewId = randomUUID();
-    assert.equal((await post('/conversations', { workspaceId: 'review-project', id: reviewId, isolated: true })).status, 200);
+    const copy = installedStore.changeReview.initialize.bind(installedStore.changeReview);
+    let releaseCopy!: () => void, markCopyStarted!: () => void;
+    const held = new Promise<void>(resolve => { releaseCopy = resolve; });
+    const copyStarted = new Promise<void>(resolve => { markCopyStarted = resolve; });
+    let preparationCount = 0;
+    installedStore.changeReview.initialize = async (...args) => {
+      preparationCount++; markCopyStarted(); await held; return copy(...args);
+    };
+    const creationBody = { workspaceId: 'review-project', id: reviewId, isolated: true };
+    const creating = post('/conversations', creationBody);
+    let retry: Promise<Response> | undefined;
+    try {
+      await copyStarted;
+      retry = post('/conversations', creationBody);
+      const available = await fetch(`${base}/conversations?workspaceId=review-project`, { signal: AbortSignal.timeout(3000) });
+      assert.deepEqual(await available.json(), [], 'The API responds while preparing the private copy');
+      assert.equal((await post(`/conversations/${reviewId}/agents`, { ...input, id: randomUUID() })).status, 404);
+    } finally { releaseCopy(); installedStore.changeReview.initialize = copy; }
+    assert.equal((await creating).status, 200);
+    assert.equal((await retry!).status, 200);
+    assert.equal(preparationCount, 1);
     const reviewAgents = await post(`/conversations/${reviewId}/agents`, { agents: batch.slice(0, 2).map(item => ({ ...item, id: randomUUID() })) });
     assert.equal(reviewAgents.status, 200);
     const [one, two] = await reviewAgents.json();
@@ -430,7 +450,9 @@ try {
     assert.notEqual(one.cwd, fs.realpathSync(reviewProject));
     const launched = await post(`/agents/${one.id}/launch`, {});
     assert.equal(launched.status, 200);
-    assert.equal((await launched.json()).cwd, one.cwd);
+    const launch = await launched.json();
+    assert.equal(launch.cwd, one.cwd);
+    assert.equal(launch.runtimeType, 'antigravity');
     fs.writeFileSync(path.join(two.cwd, 'review.ts'), 'export {};\n');
     const changesUrl = `${base}/conversations/${reviewId}/changes`;
     const { files } = await (await fetch(changesUrl)).json();
@@ -441,9 +463,33 @@ try {
     assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'export {};\n');
     assert.deepEqual((await (await fetch(changesUrl)).json()).files, []);
 
+    const directId = randomUUID();
+    assert.equal((await post('/conversations', { workspaceId: 'review-project', id: directId, isolated: false, liveChanges: false })).status, 200);
+    const directAgent = await (await post(`/conversations/${directId}/agents`, { ...input, id: randomUUID() })).json();
+    assert.equal(directAgent.cwd, fs.realpathSync(reviewProject));
+    assert.equal((await (await fetch(`${base}/conversations/${directId}/changes`)).json()).mode, 'project');
+    const secondDirect = randomUUID();
+    assert.equal((await post('/conversations', { workspaceId: 'review-project', id: secondDirect })).status, 200);
+    const secondAgent = await (await post(`/conversations/${secondDirect}/agents`, { ...input, id: randomUUID() })).json();
+    assert.equal(secondAgent.cwd, directAgent.cwd, 'New Manual conversations never generate a new CLI directory');
+    await installedStore.projectReview.ready('review-project');
+    fs.writeFileSync(path.join(reviewProject, 'review.ts'), 'changed directly');
+    const latest = await (await fetch(`${base}/conversations/${secondDirect}/changes?refresh=1`)).json();
+    const reviewFile = latest.files.find((file: any) => file.path === 'review.ts');
+    assert.equal(reviewFile.state, 'pending');
+    const approve = await (await post(`/conversations/${directId}/changes/resolve`, { action: 'approve', files: [reviewFile] })).json();
+    assert.deepEqual(approve.completed, ['review.ts']);
+    assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'changed directly');
+    const reverted = await (await post(`/conversations/${secondDirect}/changes/resolve`, { action: 'undo', files: [reviewFile] })).json();
+    assert.deepEqual(reverted.completed, ['review.ts']);
+    assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'export {};\n');
+
     const liveId = randomUUID();
+    const isWatching = () => (sqlite.prepare('SELECT active FROM live_project_scopes WHERE id = ?').get(`manual:${liveId}`) as { active: number }).active;
     assert.equal((await post('/conversations', { workspaceId: 'review-project', id: liveId, liveChanges: true })).status, 200);
+    assert.equal(isWatching(), 0, 'An empty conversation does not start periodic scans');
     const liveAgent = await (await post(`/conversations/${liveId}/agents`, { ...input, id: randomUUID() })).json();
+    assert.equal(isWatching(), 1);
     fs.writeFileSync(path.join(liveAgent.cwd, 'live.ts'), 'export const live = true;\n');
     const liveFile = path.join(reviewProject, 'live.ts');
     for (let tries = 0; tries < 60 && !fs.existsSync(liveFile); tries++) await new Promise(resolve => setTimeout(resolve, 30));
@@ -456,6 +502,15 @@ try {
     assert.deepEqual(await (await fetch(`${base}${liveRoute}/file?${query}`)).json(), { before: null, after: 'export const live = true;\n' });
     assert.deepEqual(await (await post(`${liveRoute}/resolve`, { action: 'undo', files: liveList.files })).json(), { completed: ['live.ts'], conflicts: [] });
     assert.equal(fs.existsSync(liveFile), false);
+    fs.writeFileSync(path.join(liveAgent.cwd, 'last-save.ts'), 'final save');
+    assert.equal((await fetch(`${base}/agents/${liveAgent.id}`, { method: 'DELETE' })).status, 204);
+    assert.equal(isWatching(), 0);
+    assert.equal(fs.readFileSync(path.join(reviewProject, 'last-save.ts'), 'utf8'), 'final save');
+    const { files: finalChanges } = await (await fetch(`${base}${liveRoute}`)).json();
+    assert.deepEqual(await (await post(`${liveRoute}/resolve`, { action: 'undo', files: finalChanges.filter((file: any) => file.path === 'last-save.ts') })).json(), { completed: ['last-save.ts'], conflicts: [] });
+    const reopened = await post(`/conversations/${liveId}/agents`, { ...input, id: randomUUID() });
+    assert.equal((await reopened.json()).cwd, liveAgent.cwd);
+    assert.equal(isWatching(), 1, 'Adding an agent again rearms tracking on the same copy');
     assert.equal((await fetch(`${base}/conversations/${liveId}`, { method: 'DELETE' })).status, 204);
   } finally { fs.rmSync(reviewProject, { recursive: true, force: true }); }
   model.availability = 'unknown';
@@ -566,4 +621,4 @@ try {
   }
 
   console.log('Manual conversation persistence, isolation, idempotency, transcript and route tests passed.');
-} finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await liveChanges.close(); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }
+} finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await liveChanges.close(); await installedStore.projectReview.close(); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }

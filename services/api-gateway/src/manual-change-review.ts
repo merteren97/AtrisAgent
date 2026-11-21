@@ -11,7 +11,7 @@ const digest = (value: string | Buffer) => createHash('sha256').update(value).di
 
 export function excludedName(name: string): boolean {
   const normalized = name.toLowerCase();
-  return excluded.has(normalized) || normalized.startsWith('.atris-') || (normalized.startsWith('.env') && normalized !== '.env.example')
+  return excluded.has(normalized) || normalized === '.cargo-target' || normalized.startsWith('.cargo-target-') || normalized.startsWith('.atris-') || (normalized.startsWith('.env') && normalized !== '.env.example')
     || /\.(?:pem|key|pfx|p12|sqlite3?|db|credentials|secrets?)$/i.test(name);
 }
 
@@ -94,8 +94,35 @@ function scan(root: string, skip?: string): { files: Map<string, Version>; omitt
   return { files, omitted };
 }
 
-/** Legacy review lists still inspect both trees, but should not block chat and terminal traffic. */
-async function scanForList(root: string): Promise<{ files: Map<string, Version>; omitted: number }> {
+async function versionAsync(filename: string, budget: number): Promise<Version> {
+  const named = await fs.promises.lstat(filename, { bigint: true });
+  if (!named.isFile()) return conflict('A file changed during the scan. Refresh and try again.');
+  const fd = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const info = await fd.stat({ bigint: true });
+    if (!info.isFile() || named.ino !== info.ino || named.dev !== info.dev) return conflict('A file changed during the scan. Refresh and try again.');
+    const size = Number(info.size);
+    if (size > budget) return conflict('The working files exceed the 256 MB review limit.', 413);
+    const permissions = Number(info.mode) & 0o777;
+    const mode = process.platform === 'win32' ? 0 : permissions & 0o111;
+    const hash = createHash('sha256').update(String(mode));
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, size)));
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await fd.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      total += bytesRead;
+      if (total > size) return conflict('A file changed during the scan. Refresh and try again.');
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+    const latest = await fd.stat({ bigint: true });
+    if (total !== size || latest.mtimeNs !== info.mtimeNs || latest.ctimeNs !== info.ctimeNs) return conflict('A file changed during the scan. Refresh and try again.');
+    return { hash: hash.digest('hex'), size, mode, permissions };
+  } finally { await fd.close(); }
+}
+
+/** Inventory without monopolizing the gateway's event loop. */
+async function scanForList(root: string, skip?: string): Promise<{ files: Map<string, Version>; omitted: number }> {
   if (await fs.promises.realpath(root) !== root) return conflict('The review directory is unavailable.');
   const files = new Map<string, Version>();
   const pending = [''];
@@ -103,38 +130,19 @@ async function scanForList(root: string): Promise<{ files: Map<string, Version>;
   while (pending.length) {
     const prefix = pending.pop()!;
     const folder = path.join(root, prefix);
-    if (await fs.promises.realpath(folder) !== folder) continue;
+    if (await fs.promises.realpath(folder) !== folder) {
+      if (skip) return conflict('A project directory changed during workspace preparation. Try again.');
+      continue;
+    }
     for (const entry of await fs.promises.readdir(folder, { withFileTypes: true })) {
       if (++entries > maxFiles) return conflict('This project exceeds the entry review limit.', 413);
-      if (excludedName(entry.name) || (!entry.isFile() && !entry.isDirectory())) { omitted++; continue; }
+      if (excludedName(entry.name) || path.join(folder, entry.name) === skip || (!entry.isFile() && !entry.isDirectory())) { omitted++; continue; }
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
       parts(relative);
       if (entry.isDirectory()) { pending.push(relative); continue; }
-      const filename = path.join(folder, entry.name);
-      const fd = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-      try {
-        const info = await fd.stat({ bigint: true });
-        const named = await fs.promises.lstat(filename, { bigint: true });
-        if (!info.isFile() || !named.isFile() || named.ino !== info.ino || named.dev !== info.dev) return conflict('A file changed during the scan. Refresh and try again.');
-        const size = Number(info.size);
-        bytes += size;
-        if (bytes > maxBytes) return conflict('The working files exceed the 256 MB review limit.', 413);
-        const permissions = Number(info.mode) & 0o777;
-        const mode = process.platform === 'win32' ? 0 : permissions & 0o111;
-        const hash = createHash('sha256').update(String(mode));
-        const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, size)));
-        let total = 0;
-        for (;;) {
-          const { bytesRead } = await fd.read(chunk, 0, chunk.length, null);
-          if (!bytesRead) break;
-          total += bytesRead;
-          if (total > size) return conflict('A file changed during the scan. Refresh and try again.');
-          hash.update(chunk.subarray(0, bytesRead));
-        }
-        const latest = await fd.stat({ bigint: true });
-        if (total !== size || latest.mtimeNs !== info.mtimeNs || latest.ctimeNs !== info.ctimeNs) return conflict('A file changed during the scan. Refresh and try again.');
-        files.set(relative, { hash: hash.digest('hex'), size, mode, permissions });
-      } finally { await fd.close(); }
+      const entryVersion = await versionAsync(path.join(folder, entry.name), maxBytes - bytes);
+      bytes += entryVersion.size;
+      files.set(relative, entryVersion);
     }
   }
   return { files, omitted };
@@ -176,25 +184,42 @@ export class ManualChangeReview {
     return path.join(dir, id);
   }
 
-  initialize(id: string, project: string): void {
+  async initialize(id: string, project: string, validate: () => void = () => {}, commit: () => void = () => {}): Promise<void> {
     const root = this.directory(id);
-    if (stat(root)) { this.scope(id, project); return; }
+    if (stat(root)) { this.scope(id, project); validate(); commit(); return; }
     const source = fs.realpathSync(project);
     const storage = path.dirname(root);
     if (source === fs.realpathSync(this.dataDir) || source === storage || source.startsWith(`${storage}${path.sep}`)) return conflict('Choose a project outside AtrisAgent review storage.', 400);
-    const sourceFiles = scan(source, fs.realpathSync(this.dataDir));
-    const temp = fs.mkdtempSync(path.join(storage, '.creating-'));
+    const sourceFiles = await scanForList(source, fs.realpathSync(this.dataDir));
+    const temp = await fs.promises.mkdtemp(path.join(storage, '.creating-'));
+    let published = false;
     try {
       const baseline = path.join(temp, 'baseline');
       const work = path.join(temp, 'work');
-      fs.mkdirSync(baseline); fs.mkdirSync(work);
+      await fs.promises.mkdir(baseline); await fs.promises.mkdir(work);
       for (const [relative, entry] of sourceFiles.files) {
-        replace(baseline, relative, filePath(source, relative), undefined, entry);
-        replace(work, relative, filePath(baseline, relative), undefined, entry);
+        // The two destinations are private until publication. Keep the source path
+        // checks and verify both copies against the inventory, including mode.
+        const before = path.join(baseline, relative), after = path.join(work, relative);
+        await fs.promises.mkdir(path.dirname(before), { recursive: true });
+        await fs.promises.mkdir(path.dirname(after), { recursive: true });
+        const copy = async (from: string, to: string) => {
+          await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL);
+          if (process.platform !== 'win32') await fs.promises.chmod(to, entry.permissions);
+          if ((await versionAsync(to, maxBytes)).hash !== entry.hash) conflict(`Changed during workspace preparation: ${relative}`);
+        };
+        await copy(filePath(source, relative), before);
+        await copy(before, after);
       }
-      fs.writeFileSync(path.join(temp, 'owner.json'), JSON.stringify({ source, omitted: sourceFiles.omitted }), { flag: 'wx' });
+      await fs.promises.writeFile(path.join(temp, 'owner.json'), JSON.stringify({ source, omitted: sourceFiles.omitted }), { flag: 'wx' });
+      validate();
       fs.renameSync(temp, root);
-    } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+      published = true;
+      commit();
+    } catch (error) {
+      await fs.promises.rm(published ? root : temp, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   scope(id: string, project: string) {

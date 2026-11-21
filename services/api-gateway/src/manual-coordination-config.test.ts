@@ -25,7 +25,12 @@ try {
   const config = fs.readFileSync(path.join(anti.args[1],'.agents','mcp_config.json'),'utf8');
   assert(!config.includes(grant.token),'The grant must not be saved in the MCP config');
   assert.deepEqual(JSON.parse(config).mcpServers.atris_workspace.args,[grant.script]);
-  const secondAnti = prepareManualCoordination({...agent,runtimeType:'antigravity'},root,grant);
-  assert.notEqual(secondAnti.args[1],anti.args[1],'Each launch gets its own config directory');
+  const secondAnti = prepareManualCoordination({...agent,id:'b',runtimeType:'antigravity'},root,{...grant,token:'next-token'});
+  assert.equal(secondAnti.args[1],anti.args[1],'One execution folder keeps its overlay across launches and tabs');
+  assert.equal(secondAnti.env.ATRIS_CONTROL_PLANE_TOKEN,'next-token');
+  fs.mkdirSync(path.join(root, 'another-project'));
+  assert.notEqual(prepareManualCoordination({...agent,cwd:path.join(root,'another-project'),runtimeType:'antigravity'},root,grant).args[1],anti.args[1]);
+  fs.writeFileSync(path.join(anti.args[1],'.agents','mcp_config.json'),'{}');
+  assert.throws(() => prepareManualCoordination({...agent,runtimeType:'antigravity'},root,grant), /configuration has changed/);
   console.log('Manual provider coordination config passed');
 } finally { fs.rmSync(root,{recursive:true,force:true}); }

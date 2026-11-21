@@ -1,7 +1,9 @@
-import { useState } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useWorkspaceStore } from '../../stores/workspace-store';
+import { useManualStore } from '@/stores/manual-store';
+import { useSettingsStore } from '@/stores/settings-store';
 import {
   Dialog,
   DialogContent,
@@ -36,7 +38,7 @@ function folderName(value: string): string {
 }
 
 export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDialogProps) {
-  const { createWorkspace } = useWorkspaceStore();
+  const createWorkspace = useWorkspaceStore(state => state.createWorkspace);
   const [path, setPath] = useState('');
   const [inspection, setInspection] = useState<WorkspaceInspection | null>(null);
   const [customName, setCustomName] = useState('');
@@ -44,8 +46,11 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
   const [isInspecting, setIsInspecting] = useState(false);
   const [isOpening, setIsOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Native picker and inspect calls can finish after the path or dialog changes.
+  const requestId = useRef(0);
 
-  const reset = () => {
+  const reset = useCallback(() => {
+    requestId.current += 1;
     setPath('');
     setInspection(null);
     setCustomName('');
@@ -53,36 +58,55 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
     setError(null);
     setIsInspecting(false);
     setIsOpening(false);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) reset();
+    return () => { requestId.current += 1; };
+  }, [open, reset]);
+
+  const handleOpenChange = (value: boolean) => {
+    if (!value) reset();
+    onOpenChange(value);
   };
 
-  const inspectPath = async (candidate: string) => {
+  const inspectPath = async (candidate: string, request?: number) => {
     const trimmed = candidate.trim();
     if (!trimmed) return;
+    const current = request ?? ++requestId.current;
+    setPath(trimmed);
+    setInspection(null);
+    setEditingName(false);
     setIsInspecting(true);
     setError(null);
     try {
       const result = await invoke<WorkspaceInspection>('inspect_workspace_path', { path: trimmed });
+      if (current !== requestId.current) return;
       setInspection(result);
       setPath(result.path);
       setCustomName(result.name);
     } catch (err: any) {
-      setInspection(null);
+      if (current !== requestId.current) return;
       setCustomName(folderName(trimmed));
       setError(typeof err === 'string' ? err : err?.message || 'Could not inspect this project folder.');
     } finally {
-      setIsInspecting(false);
+      if (current === requestId.current) setIsInspecting(false);
     }
   };
 
   const handleSelectFolder = async () => {
+    const current = ++requestId.current;
+    setIsInspecting(true);
     setError(null);
     try {
       const selected = await openDialog({ directory: true, multiple: false, title: 'Open project folder' });
-      if (!selected) return;
+      if (current !== requestId.current || !selected) return;
       const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-      if (selectedPath) await inspectPath(String(selectedPath));
+      if (selectedPath) await inspectPath(String(selectedPath), current);
     } catch (err: any) {
-      setError(err?.message || 'The native folder picker could not be opened.');
+      if (current === requestId.current) setError(err?.message || 'The native folder picker could not be opened.');
+    } finally {
+      if (current === requestId.current) setIsInspecting(false);
     }
   };
 
@@ -91,6 +115,7 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
       await inspectPath(path);
       return;
     }
+    const current = ++requestId.current;
     setIsOpening(true);
     setError(null);
     try {
@@ -99,23 +124,22 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
         inspection.path,
         inspection.isGit,
       );
+      if (current !== requestId.current) return;
       if (!workspace) throw new Error(useWorkspaceStore.getState().error || 'Workspace could not be opened.');
-      onOpenChange(false);
-      reset();
+      useManualStore.setState({ creating: false, mode: 'choose' });
+      useSettingsStore.getState().setActiveView('chat');
+      handleOpenChange(false);
     } catch (err: any) {
-      setError(err?.message || 'Workspace could not be opened.');
+      if (current === requestId.current) setError(err?.message || 'Workspace could not be opened.');
     } finally {
-      setIsOpening(false);
+      if (current === requestId.current) setIsOpening(false);
     }
   };
 
   return (
     <Dialog
       open={open}
-      onOpenChange={(value) => {
-        onOpenChange(value);
-        if (!value) reset();
-      }}
+      onOpenChange={handleOpenChange}
     >
       <DialogContent className="sm:max-w-[520px] border-border bg-card shadow-2xl">
         <DialogHeader>
@@ -132,6 +156,7 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
           <button
             type="button"
             onClick={() => void handleSelectFolder()}
+            disabled={isOpening}
             className="flex w-full items-center gap-3 rounded-xl border border-dashed border-border bg-muted/15 p-4 text-left transition-colors hover:border-primary/50 hover:bg-primary/[0.03]"
           >
             <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-background">
@@ -149,7 +174,12 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
             <div className="flex items-center gap-2">
               <Input
                 value={path}
-                onChange={(event) => { setPath(event.target.value); setError(null); }}
+                onChange={(event) => {
+                  requestId.current += 1;
+                  setPath(event.target.value);
+                  setIsInspecting(false);
+                  setError(null);
+                }}
                 onKeyDown={(event) => { if (event.key === 'Enter') void inspectPath(path); }}
                 placeholder="Or paste an absolute project path…"
                 className="h-9 bg-background font-mono text-[11px]"
@@ -231,7 +261,7 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: CreateWorkspaceDia
         </div>
 
         <DialogFooter>
-          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)} disabled={isOpening}>Cancel</Button>
+          <Button variant="ghost" size="sm" onClick={() => handleOpenChange(false)} disabled={isOpening}>Cancel</Button>
           <Button size="sm" onClick={() => void handleOpen()} disabled={isOpening || isInspecting || (!inspection && !path.trim())}>
             {isOpening && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
             {inspection ? 'Open workspace' : 'Inspect folder'}

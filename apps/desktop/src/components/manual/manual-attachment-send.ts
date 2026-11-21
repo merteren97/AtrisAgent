@@ -3,6 +3,7 @@ import { useManualStore, type ManualAgent } from '@/stores/manual-store';
 interface ManualAttachmentTransport {
   stage: (id: string, file: File) => Promise<string>;
   write: (id: string, prompt: string) => Promise<void>;
+  keepDraft?: boolean;
 }
 
 const inFlight = new Map<string, Promise<void>>();
@@ -32,5 +33,5 @@ async function deliverManualDraft(agent: Pick<ManualAgent, 'id' | 'conversationI
   // Navigation is safe; deletion while staging must not send to a removed agent.
   if (!exists()) return;
   await transport.write(agent.id, prompt);
-  useManualStore.getState().clearSentDraft(agent.id, draft, files);
+  if (!transport.keepDraft) useManualStore.getState().clearSentDraft(agent.id, draft, files);
 }

@@ -1,7 +1,7 @@
 //! Manual terminals belong to the application, never to a mounted view or mission watchdog.
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, VecDeque}, io::{Read, Write}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, path::{Path, PathBuf}, fs::OpenOptions};
+use std::{collections::{HashMap, VecDeque}, io::{Read, Write}, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, path::{Path, PathBuf}, fs::OpenOptions};
 use tauri::State;
 
 const REPLAY_LIMIT: usize = 1024 * 1024;
@@ -55,6 +55,19 @@ impl Replay {
         }
         (output, resizes)
     }
+    fn recent_text_after(&self, after: u64) -> (String, bool) {
+        let mut size = 0;
+        let mut start = self.chunks.len();
+        for (seq, text, _) in self.chunks.iter().rev() {
+            if *seq <= after || size + text.len() > 32 * 1024 { break; }
+            size += text.len();
+            start -= 1;
+        }
+        let continuous = self.chunks.get(start).is_some_and(|(seq, _, _)| *seq == after + 1);
+        let mut text = String::with_capacity(size);
+        for (_, chunk, _) in self.chunks.iter().skip(start) { text.push_str(chunk); }
+        (text, continuous)
+    }
 }
 
 fn paste_output_settled(replay: &Replay, after: u64, started: std::time::Instant, now: std::time::Instant) -> bool {
@@ -93,9 +106,24 @@ fn output_contains_styled_text(output: &str, expected: &str) -> bool {
     plain.contains(expected)
 }
 
+fn terminal_protocol_reply(data: &str) -> bool {
+    if let Some(body) = data.strip_prefix("\x1b[") {
+        // xterm returns cursor positions and terminal/device attributes on the
+        // same onData channel as keystrokes. Only exact reply shapes are exempt.
+        if let Some((row, column)) = body.strip_suffix('R').and_then(|value| value.split_once(';')) {
+            return [row, column].iter().all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+        }
+        if let Some(attributes) = body.strip_suffix('c').and_then(|value| value.strip_prefix('?').or_else(|| value.strip_prefix('>'))) {
+            return !attributes.is_empty() && attributes.bytes().all(|byte| byte.is_ascii_digit() || byte == b';');
+        }
+        return body == "0n";
+    }
+    false
+}
+
 struct Terminal {
     master: Box<dyn MasterPty + Send>, writer: Arc<Mutex<Box<dyn Write + Send>>>, child: Box<dyn Child + Send + Sync>,
-    replay: Arc<Mutex<Replay>>, closed: bool, opencode: bool, paste_pending: Arc<AtomicBool>,
+    replay: Arc<Mutex<Replay>>, closed: bool, opencode: bool, antigravity: bool, paste_pending: Arc<AtomicBool>, paste_epoch: Arc<AtomicU64>,
 }
 #[derive(Default)]
 struct TerminalSlot { terminal: Mutex<Option<Terminal>>, closing: AtomicBool }
@@ -138,7 +166,7 @@ impl ManualTerminals {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Launch { id: String, executable: String, args: Vec<String>, cwd: String, #[serde(default)] env: HashMap<String, String> }
+pub struct Launch { id: String, executable: String, args: Vec<String>, cwd: String, #[serde(default)] env: HashMap<String, String>, #[serde(default)] runtime_type: String }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot { id: String, status: String, sequence: u64, output: String, reset: bool, columns: u16, rows: u16, resizes: Vec<ReplayResize>, input_ready: Option<bool> }
@@ -265,7 +293,9 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
         }
         if let Ok(mut state) = output.lock() { state.ended = true; }
     });
-    let mut terminal = Terminal { master: pair.master, writer, child, replay, closed: false, opencode, paste_pending: Arc::new(AtomicBool::new(false)) };
+    let antigravity = request.runtime_type == "antigravity" || Path::new(&request.executable).file_stem().and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("antigravity"));
+    let mut terminal = Terminal { master: pair.master, writer, child, replay, closed: false, opencode, antigravity, paste_pending: Arc::new(AtomicBool::new(false)), paste_epoch: Arc::new(AtomicU64::new(0)) };
     if manager.stopping.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Application is shutting down".into()); }
     if session.closing.load(Ordering::SeqCst) { let _ = close(&mut terminal); return Err("Agent terminal is closing".into()); }
     *terminal_slot = Some(terminal);
@@ -326,6 +356,9 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     let terminal = terminal_slot.as_mut().ok_or("Open the agent first")?;
     if terminal.closed || !matches!(terminal.child.try_wait(), Ok(None)) { return Err("Agent is not connected".into()); }
+    if paste && terminal.antigravity {
+        return Err("Send in Antigravity’s Code terminal after completing any CLI setup. Your draft is kept; nothing was pasted.".into());
+    }
     if paste && terminal.replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready == Some(false) {
         return Err("Codex is still starting. Your draft is kept; check CLI setup in Code.".into());
     }
@@ -333,10 +366,11 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     let replay = terminal.replay.clone();
     let opencode = terminal.opencode;
     let paste_pending = terminal.paste_pending.clone();
+    let paste_epoch = terminal.paste_epoch.clone();
     let codex = replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready.is_some();
     // A full PTY input buffer must not prevent Close from reaching the child.
     drop(terminal_slot);
-    let mut writer = writer.lock().map_err(|_| "Terminal input is unavailable")?;
+    let mut input = writer.lock().map_err(|_| "Terminal input is unavailable")?;
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     if paste {
         if paste_pending.load(Ordering::SeqCst) {
@@ -344,8 +378,12 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         }
         let after = replay.lock().map_err(|_| "Terminal output is unavailable")?.sequence;
         paste_pending.store(true, Ordering::SeqCst);
-        writer.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
-        writer.flush().map_err(|e| e.to_string())?;
+        let epoch = paste_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        input.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
+        input.flush().map_err(|e| e.to_string())?;
+        // Terminal replies (e.g. cursor position), manual recovery and interrupt
+        // must still reach the PTY while the CLI paints the paste.
+        drop(input);
         // Codex's Win32 input path can classify ConPTY paste as key bursts.
         // Enter inside its 120 ms suppression window becomes a newline.
         // Wait for the paste repaint to settle as well, so a long input's
@@ -363,6 +401,8 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             [format!("Pasted Content {count} chars"), format!("Pasted Content {} chars", count - 1)]
         });
         let mut acknowledged_at = None;
+        let mut signal_sequence = after;
+        let mut signal_tail = String::new();
         let open_summary = opencode.then(|| opencode_paste_summary(data)).flatten();
         let open_echo = if opencode {
             // The final line can be rendered after earlier wrapped lines.
@@ -371,31 +411,37 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(25));
             if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
+            if paste_epoch.load(Ordering::SeqCst) != epoch { return Err("Automatic submit canceled by Code input. Check the terminal; the draft is kept.".into()); }
             let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
             if state.ended { return Err("Agent disconnected before the message could be submitted.".into()); }
-            if !codex {
-                if opencode && acknowledged_at.is_none() && state.sequence != sequence {
-                    sequence = state.sequence;
-                    let rendered = state.output_after(after, false).0;
-                    if open_summary.as_deref().into_iter().chain(open_echo).any(|expected| output_contains_styled_text(&rendered, expected)) {
-                        acknowledged_at = Some(std::time::Instant::now());
-                    }
+            let current = state.sequence;
+            let settled = !codex && paste_output_settled(&state, after, started, std::time::Instant::now());
+            let next_signal = if acknowledged_at.is_none() && current != signal_sequence && (opencode || paste_labels.is_some()) {
+                let result = state.recent_text_after(signal_sequence);
+                signal_sequence = current;
+                Some(result)
+            } else { None };
+            drop(state);
+            if let Some((text, continuous)) = next_signal {
+                if !continuous { signal_tail.clear(); }
+                signal_tail.push_str(&text);
+                let expected = open_summary.as_deref().into_iter().chain(open_echo)
+                    .chain(paste_labels.iter().flatten().map(String::as_str));
+                if expected.into_iter().any(|text| output_contains_styled_text(&signal_tail, text)) {
+                    acknowledged_at = Some(std::time::Instant::now());
                 }
+                let mut trim = signal_tail.len().saturating_sub(512);
+                while !signal_tail.is_char_boundary(trim) { trim += 1; }
+                signal_tail.drain(..trim);
+            }
+            if !codex {
                 if acknowledged_at.is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_millis(90)) { break; }
-                if acknowledged_at.is_none() && paste_output_settled(&state, after, started, std::time::Instant::now()) { break; }
+                if acknowledged_at.is_none() && settled { break; }
                 if started.elapsed() >= std::time::Duration::from_secs(if opencode { 10 } else { 5 }) {
-                    return Err("The terminal did not settle after pasting. Open Code to inspect the prompt and press Enter once if it is still there; it was not submitted automatically.".into());
+                    return Err("Paste attempted, but the CLI did not confirm it. Nothing was submitted automatically. Check the active screen in Code before continuing.".into());
                 }
                 continue;
             }
-            let current = state.sequence;
-            if let Some(labels) = &paste_labels {
-                if acknowledged_at.is_none() && current != sequence {
-                    let output = state.output_after(after, false).0;
-                    if labels.iter().any(|label| output.contains(label)) { acknowledged_at = Some(std::time::Instant::now()); }
-                }
-            }
-            drop(state);
             if current != sequence { sequence = current; quiet_since = std::time::Instant::now(); }
             if paste_labels.is_some() {
                 if acknowledged_at.map(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_millis(200)).unwrap_or(false) { break; }
@@ -409,10 +455,20 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             if started.elapsed() >= std::time::Duration::from_secs(2) { break; }
         }
         // Exactly one submit key; never retry Enter against an unknown dialog.
-        writer.write_all(b"\r").map_err(|e| e.to_string())?;
-    } else { writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?; }
-    writer.flush().map_err(|e| e.to_string())?;
-    if paste || matches!(data, "\r" | "\n" | "\r\n" | "\x15") { paste_pending.store(false, Ordering::SeqCst); }
+        input = writer.lock().map_err(|_| "Terminal input is unavailable")?;
+        if slot.closing.load(Ordering::SeqCst) || replay.lock().map_err(|_| "Terminal output is unavailable")?.ended {
+            return Err("Agent disconnected before the message could be submitted.".into());
+        }
+        if paste_epoch.load(Ordering::SeqCst) != epoch { return Err("Automatic submit canceled by Code input. Check the terminal; the draft is kept.".into()); }
+        input.write_all(b"\r").map_err(|e| e.to_string())?;
+    } else {
+        let resolves_paste = matches!(data, "\r" | "\n" | "\r\n" | "\x03" | "\x15" | "\x1b");
+        if paste_pending.load(Ordering::SeqCst) && !terminal_protocol_reply(data) { paste_epoch.fetch_add(1, Ordering::SeqCst); }
+        input.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+        if resolves_paste { paste_pending.store(false, Ordering::SeqCst); }
+    }
+    input.flush().map_err(|e| e.to_string())?;
+    if paste { paste_pending.store(false, Ordering::SeqCst); }
     Ok(())
 }
 /// Stage WebView file bytes in an app-owned temporary directory so the CLI can read
@@ -930,7 +986,7 @@ mod tests {
         let env = [ ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state") ]
             .into_iter().map(|(key, dir)| (key.into(), root.join(dir).to_string_lossy().into_owned())).collect();
         start_with_cleanup(manager.clone(), Launch {
-            id: id.into(), executable, env, args: vec![], cwd: root.to_string_lossy().into_owned(),
+            id: id.into(), executable, env, args: vec![], cwd: root.to_string_lossy().into_owned(), runtime_type: "opencode".into(),
         }).unwrap();
 
         use std::time::{Duration, Instant};
@@ -1025,6 +1081,16 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reply_is_not_confused_with_keys_or_raw_paste() {
+        for reply in ["\x1b[12;4R", "\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[0n"] {
+            assert!(terminal_protocol_reply(reply));
+        }
+        for user_input in ["\x1b[1;2A", "\x1b[1;2Rtext", "\x1b[200~typed\x1b[201~", "\r", "text"] {
+            assert!(!terminal_protocol_reply(user_input));
+        }
+    }
+
+    #[test]
     fn replay_preserves_resize_boundaries_and_javascript_offsets() {
         let mut replay = Replay::new();
         replay.push("\x1b[Hready 🦀".into());
@@ -1062,7 +1128,7 @@ mod tests {
         let script = "$e=[char]27; $last=''; $end=(Get-Date).AddSeconds(5); [Console]::Write($e+'[?1049h'); while((Get-Date) -lt $end) { $w=[Console]::WindowWidth; $h=[Console]::WindowHeight; $key=$w.ToString()+'x'+$h; if($key -ne $last) { [Console]::Write($e+'[2J'+$e+'[1;1HHEADER-'+$key+$e+'[2;1H'+('TRANSCRIPT '*28)+$e+'['+$h+';1HFOOTER-'+$key); $last=$key }; Start-Sleep -Milliseconds 50 }";
         start(manager.clone(), Launch { id: id.into(), executable,
             args: vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(), script.into()],
-            cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new() }).unwrap();
+            cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new(), runtime_type: String::new() }).unwrap();
         let wait_for = |after: u64, text: &str| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
             let mut replied = false;
@@ -1120,6 +1186,7 @@ mod tests {
             args: Vec::new(),
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             env: HashMap::from([("UNSUPPORTED".into(), "value".into())]),
+            runtime_type: String::new(),
         }).unwrap_err();
         assert_eq!(error, "Unsupported CLI environment override");
         assert!(manager.slot(id).unwrap().is_none());
@@ -1141,7 +1208,7 @@ mod tests {
         for id in [first, second, third, fourth] {
             start(manager.clone(), Launch { id: id.into(), executable: executable.clone(),
                 args: vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(), "Write-Output 'native-ready'; $line=[Console]::ReadLine(); Write-Output ('received:'+$line); Start-Sleep -Seconds 30".into()],
-                cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new() }).unwrap();
+                cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new(), runtime_type: if id == fourth { "antigravity".into() } else { String::new() } }).unwrap();
         }
         let wait_for = |id: &str, text: &str| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -1164,6 +1231,9 @@ mod tests {
         };
         wait_for(first, "native-ready"); wait_for(second, "native-ready");
         wait_for(third, "native-ready"); wait_for(fourth, "native-ready");
+        assert!(write_input(&manager, fourth, "must-not-reach-the-terminal", true).unwrap_err().contains("nothing was pasted"));
+        write_input(&manager, fourth, "typed-explicitly\r", false).unwrap();
+        assert!(!wait_for(fourth, "received:typed-explicitly").output.contains("must-not-reach-the-terminal"));
         {
             let slot = manager.slot(first).unwrap().unwrap();
             let mut slot = slot.terminal.lock().unwrap();

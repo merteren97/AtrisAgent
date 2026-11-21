@@ -124,7 +124,11 @@ fn detect_project_types(workspace_path: &Path) -> Vec<String> {
 }
 
 #[tauri::command]
-fn inspect_workspace_path(path: String) -> Result<WorkspaceInspection, String> {
+async fn inspect_workspace_path(path: String) -> Result<WorkspaceInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_workspace(path)).await.map_err(|error| error.to_string())?
+}
+
+fn inspect_workspace(path: String) -> Result<WorkspaceInspection, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("Choose a project folder first.".to_string());

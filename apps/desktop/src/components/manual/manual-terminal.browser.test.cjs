@@ -8,6 +8,192 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
 
+async function testProjectAdd(page, url) {
+  await page.route(url + '/project-add-preview', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><head>
+    <link rel="stylesheet" href="/src/styles/globals.css">
+    <script type="module">import RefreshRuntime from '/@react-refresh'; RefreshRuntime.injectIntoGlobalHook(window);
+    window.$RefreshReg$=()=>{}; window.$RefreshSig$=()=>type=>type; window.__vite_plugin_react_preamble_installed__=true;</script>
+    </head><body><div id="project-root"></div></body></html>` }));
+  await page.goto(url + '/project-add-preview');
+  await page.evaluate(async origin => {
+    const { default: React } = await import('/node_modules/.vite/deps/react.js');
+    const client = await import('/node_modules/.vite/deps/react-dom_client.js');
+    const { createRoot } = client.default || client;
+    const { CreateWorkspaceDialog } = await import('/src/components/workspace/create-workspace-dialog.tsx');
+    const { configureApiRuntime } = await import('/src/lib/api-client.ts');
+    const { useWorkspaceStore } = await import('/src/stores/workspace-store.ts');
+    configureApiRuntime({ origin });
+    const inspections = new Map(), gets = [], posts = [];
+    window.__TAURI_INTERNALS__ = { invoke(command, args) {
+      if (command === 'inspect_workspace_path') return new Promise((resolve, reject) => inspections.set(args.path, { resolve, reject }));
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    } };
+    const nativeFetch = window.fetch;
+    window.fetch = async (input, init) => {
+      const pathname = new URL(input).pathname;
+      if (pathname === '/api/workspaces' && init?.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posts.push(body);
+        return Response.json({ id: 'new', ...body });
+      }
+      if (pathname === '/api/workspaces') return new Promise(resolve => gets.push(resolve));
+      if (pathname === '/api/manual/conversations') return Response.json([]);
+      if (pathname === '/api/workspaces/new' && init?.method === 'DELETE') return new Response(null, { status: 204 });
+      return nativeFetch(input, init);
+    };
+    const refreshes = [];
+    window.projectAddTest = {
+      inspections, posts,
+      startRefresh: () => { refreshes.push(useWorkspaceStore.getState().fetchWorkspaces()); },
+      async finishRefresh(index, payload) { gets[index](Response.json(payload)); await refreshes[index]; },
+      removeNewProject: () => useWorkspaceStore.getState().removeWorkspace('new'),
+    };
+    function ProjectPreview() {
+      const [open, setOpen] = React.useState(false);
+      const { workspaces, activeWorkspaceId } = useWorkspaceStore();
+      return React.createElement('main', null,
+        React.createElement('button', { onClick: () => setOpen(true) }, 'Add a project'),
+        React.createElement('ul', { 'aria-label': 'Projects' }, workspaces.map(workspace => React.createElement('li', {
+          key: workspace.id, 'aria-current': workspace.id === activeWorkspaceId ? 'true' : undefined,
+        }, workspace.name))),
+        React.createElement(CreateWorkspaceDialog, { open, onOpenChange: setOpen }),
+      );
+    }
+    createRoot(document.getElementById('project-root')).render(React.createElement(ProjectPreview));
+    window.projectAddTest.startRefresh();
+  }, url);
+  const openDialog = page.getByRole('button', { name: 'Add a project' });
+  const dialog = page.getByRole('dialog');
+  const input = dialog.getByRole('textbox');
+  const inspect = async pathname => {
+    await input.fill(pathname);
+    await dialog.getByRole('button', { name: 'Inspect', exact: true }).click();
+    await page.waitForFunction(path => window.projectAddTest.inspections.has(path), pathname);
+  };
+  await openDialog.click();
+  await inspect('C:/closed');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await openDialog.click();
+  assert.equal(await input.inputValue(), '', 'reopening must reset the cancelled inspection');
+  await inspect('C:/old');
+  await inspect('C:/chosen');
+  await page.evaluate(() => {
+    const { inspections } = window.projectAddTest;
+    inspections.get('C:/closed').reject('Stale inspection error');
+    inspections.get('C:/old').resolve({ path: 'C:/old', name: 'Old project', isGit: false, dirty: false, projectTypes: [] });
+  });
+  const inspectButton = dialog.getByRole('button', { name: 'Inspect', exact: true });
+  assert.equal(await inspectButton.isDisabled(), true, 'older responses must not finish the current inspection');
+  assert.equal(await input.inputValue(), 'C:/chosen');
+  assert.equal(await dialog.getByText('Stale inspection error').count(), 0);
+  await page.evaluate(() => window.projectAddTest.inspections.get('C:/chosen').resolve({
+    path: 'C:/canonical', name: 'New project', isGit: true, branch: 'main', dirty: false, projectTypes: [],
+  }));
+  await dialog.getByRole('button', { name: 'Open workspace' }).click();
+  await dialog.waitFor({ state: 'hidden' });
+  const items = page.getByRole('list', { name: 'Projects' }).getByRole('listitem');
+  await items.filter({ hasText: 'New project' }).waitFor();
+  const created = { name: 'New project', path: 'C:/canonical', gitInitialized: true };
+  assert.deepEqual(await page.evaluate(() => window.projectAddTest.posts), [created]);
+  const existing = { id: 'existing', name: 'Existing project', path: 'C:/existing' };
+  await page.evaluate(existing => window.projectAddTest.finishRefresh(0, [existing]), existing);
+  await items.filter({ hasText: 'Existing project' }).waitFor();
+  assert.deepEqual(await items.allTextContents(), ['New project', 'Existing project'], 'late GET must preserve the created project and hydrate other projects');
+  assert.equal(await items.filter({ hasText: 'New project' }).getAttribute('aria-current'), 'true');
+  await page.evaluate(async ([created, existing]) => {
+    const test = window.projectAddTest;
+    test.startRefresh();
+    await test.removeNewProject();
+    await test.finishRefresh(1, [{ id: 'new', ...created }, existing]);
+  }, [created, existing]);
+  await page.waitForFunction(() => document.querySelector('[aria-current="true"]')?.textContent === 'Existing project');
+  assert.deepEqual(await items.allTextContents(), ['Existing project'], 'late GET must not resurrect a deleted project');
+  console.log('PASS: project add, stale folder inspections, and late workspace GET across create/delete');
+}
+
+async function testManualTrustAndChanges(page, url) {
+  await page.route(url + '/manual-review-preview', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><head>
+    <link rel="stylesheet" href="/src/styles/globals.css">
+    <script type="module">import RefreshRuntime from '/@react-refresh'; RefreshRuntime.injectIntoGlobalHook(window);
+    window.$RefreshReg$=()=>{}; window.$RefreshSig$=()=>type=>type; window.__vite_plugin_react_preamble_installed__=true;</script>
+    </head><body><div id="manual-root" style="display:flex;height:65vh"></div><div id="review-root" style="height:35vh"></div></body></html>` }));
+  await page.goto(url + '/manual-review-preview');
+  await page.evaluate(async origin => {
+    const { default: React } = await import('/node_modules/.vite/deps/react.js');
+    const client = await import('/node_modules/.vite/deps/react-dom_client.js');
+    const { createRoot } = client.default || client;
+    const { configureApiRuntime } = await import('/src/lib/api-client.ts');
+    const { useManualStore } = await import('/src/stores/manual-store.ts');
+    const { useWorkspaceStore } = await import('/src/stores/workspace-store.ts');
+    const { ManualWorkspace } = await import('/src/components/manual/manual-workspace.tsx');
+    const { ChangesList } = await import('/src/components/dock/ChangesPanel.tsx');
+    configureApiRuntime({ origin });
+    const workspace = { id: 'sample', name: 'Fixture', path: 'C:/fixture' };
+    const agent = { id: 'agy-fixture', conversationId: 'review', runtimeType: 'antigravity', name: 'Antigravity 1', cwd: workspace.path };
+    useWorkspaceStore.setState({ workspaces: [workspace], activeWorkspaceId: workspace.id });
+    useManualStore.setState({ mode: 'manual', activeByWorkspace: {sample: 'review'}, conversations: { sample: [{ id: 'review', workspaceId: 'sample', title: 'Fixture conversation', agents: [agent] }] } });
+    const recorded = window.manualReview = { writes: [], refreshes: [], actions: [], copied: null, cwd: null };
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async text => { recorded.copied = text; } } });
+    let started = false;
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      if (command === 'manual_terminal_start') { started = true; recorded.cwd = args.request.cwd; return; }
+      if (command === 'manual_terminal_snapshot') return { id: agent.id, status: started ? 'open' : 'disconnected', sequence: started ? 1 : 0,
+        output: started && !args.after && !args.statusOnly ? 'Do you trust the contents of this project?\r\n> Yes, I trust this folder' : '', reset: !started, rows: 30, columns: 120, resizes: [], inputReady: null };
+      if (command === 'manual_terminal_write') recorded.writes.push(args);
+    } };
+    let reviewState = 'pending';
+    const fetch = window.fetch;
+    window.fetch = async (input, options) => {
+      const u = new URL(input);
+      if (u.origin !== origin) throw new Error('Unexpected external request');
+      if (u.pathname.endsWith('/launch')) return Response.json({ id: agent.id, cwd: agent.cwd, runtimeType: agent.runtimeType });
+      if (u.pathname.endsWith('/changes/resolve')) {
+        const action = JSON.parse(options.body); recorded.actions.push(action);
+        reviewState = action.action === 'approve' ? 'approved' : 'reverted';
+        return Response.json({ completed: ['a.ts'], conflicts: [] });
+      }
+      if (u.pathname.endsWith('/changes/file')) return Response.json({ before: 'before\n', after: 'after\n' });
+      if (u.pathname.endsWith('/changes')) {
+        recorded.refreshes.push(u.searchParams.get('refresh'));
+        return Response.json({ mode: 'project', files: [{ path: 'a.ts', state: reviewState, revision: 'fixture-revision', status: 'modified', restorable: reviewState !== 'reverted' }] });
+      }
+      if (u.pathname.endsWith('/messages')) return Response.json({ revision: 'fixture', messages: [], supported: true, bound: false });
+      if (u.pathname.startsWith('/api/')) return Response.json({});
+      return fetch(input, options);
+    };
+    createRoot(document.getElementById('manual-root')).render(React.createElement(ManualWorkspace));
+    createRoot(document.getElementById('review-root')).render(React.createElement(ChangesList, { root: '/manual/conversations/review/changes' }));
+  }, url);
+  await page.getByRole('button', { name: 'Open agent', exact: true }).click();
+  const code = page.getByRole('button', { name: 'Code', exact: true });
+  const chat = page.getByRole('button', { name: 'Chat', exact: true });
+  await page.waitForFunction(() => document.querySelector('button[aria-pressed="true"]')?.textContent.includes('Code'));
+  await chat.click();
+  const draft = page.getByRole('textbox', { name: 'Message Antigravity 1' });
+  await draft.fill('Keep this draft during folder setup');
+  await page.getByRole('button', { name: 'Copy draft & open Code' }).click();
+  await page.getByText('Draft copied.', { exact: false }).waitFor();
+  assert.equal(await code.getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(await page.evaluate(() => ({ copied: window.manualReview.copied, cwd: window.manualReview.cwd, writes: window.manualReview.writes })), {
+    copied: 'Keep this draft during folder setup', cwd: 'C:/fixture', writes: [],
+  });
+  await chat.click();
+  assert.equal(await draft.inputValue(), 'Keep this draft during folder setup');
+  const review = page.locator('#review-root');
+  await review.getByRole('button', { name: 'Refresh changes' }).click();
+  await page.waitForFunction(() => window.manualReview.refreshes.includes('1'));
+  await review.getByRole('button', { name: /a\.ts/ }).click();
+  await review.getByText('after', { exact: true }).waitFor();
+  await review.getByRole('button', { name: 'Approve', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve changes', exact: true }).click();
+  await review.getByText('Approved', { exact: true }).waitFor();
+  await review.getByRole('button', { name: 'Undo file', exact: true }).click();
+  await page.getByRole('button', { name: 'Undo changes', exact: true }).click();
+  await review.getByText('Undone', { exact: true }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.manualReview.actions), ['approve', 'undo'].map(action => ({ action, files: [{ path: 'a.ts', revision: 'fixture-revision' }] })));
+  console.log('PASS: Antigravity keeps the project path and draft; an approved project change can still be undone by revision');
+}
+
 (async () => {
   const browser = await chromium.launch({ headless: true, ...(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {}) });
   const page = await browser.newPage({ viewport: { width: 1000, height: 850 } });
@@ -33,6 +219,11 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
     await page.goto(url + '/');
     const result = await page.evaluate(async () => {
       const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const until = async (predicate, timeout) => {
+        const deadline = performance.now() + timeout;
+        while (!predicate() && performance.now() < deadline) await sleep(15);
+        return predicate();
+      };
       let sequence = 0;
       let status = 'open';
       let geometry = { columns: 120, rows: 30 };
@@ -100,6 +291,27 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
       pendingSnapshot?.();
       await sleep(1700);
       const raced = screen();
+      const snapshotCount = () => calls.filter(call => call.command === 'manual_terminal_snapshot' && !call.statusOnly).length;
+      const sampleMs = 1450;
+      const visibleStart = snapshotCount();
+      await sleep(sampleMs);
+      const visiblePolls = snapshotCount() - visibleStart;
+      const parkedStart = snapshotCount();
+      engine.park();
+      // The detached CLI still needs the emulator to parse output and answer a DSR.
+      append('\x1b[3;1H\x1b[2KPARKED-output\x1b[6n');
+      await sleep(sampleMs);
+      const parkedPolls = snapshotCount() - parkedStart;
+      const parkedOutput = screen().lines[2];
+      const parkedCursorReply = calls.some(call => call.command === 'manual_terminal_write' && /^\x1b\[3;\d+R$/.test(call.data));
+      // Reveal just after a parked snapshot, while the next slow tick is far away.
+      const beforeLastParkedPoll = snapshotCount();
+      if (!await until(() => snapshotCount() > beforeLastParkedPoll, 1500)) throw new Error('Parked snapshots stopped');
+      append('\x1b[4;1H\x1b[2KREVEAL-output');
+      const revealStart = performance.now();
+      engine.attach(document.querySelector('#host'));
+      const revealCaughtUp = await until(() => screen().lines[3] === 'REVEAL-output', 400);
+      const revealCatchUpMs = Math.round(performance.now() - revealStart);
       // A reset must wait for the actual xterm parse callback, not just snapshot IPC.
       let deferredWrite, writePending = true, resetsDuringWrite = 0;
       const originalWrite = engine.terminal.write.bind(engine.terminal);
@@ -120,15 +332,22 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
       document.querySelector('#host').style.height = '450px'; engine.resize(); await sleep(200);
       const closedRows = engine.terminal.rows;
       const closedResizes = calls.filter(call => call.command === 'manual_terminal_resize').length - beforeClosedFit;
-      window.terminalTestResult = { live, replayed, raced, revealResizes, resetsDuringWrite, closedRows, closedResizes, speculativeResizes, calls };
+      window.terminalTestResult = { live, replayed, raced, revealResizes, resetsDuringWrite, closedRows, closedResizes, speculativeResizes,
+        sampleMs, visiblePolls, parkedPolls, parkedOutput, parkedCursorReply, revealCaughtUp, revealCatchUpMs };
       window.disposeTerminalTest = () => disposeManualTerminal('replay-test');
       return window.terminalTestResult;
     });
-    console.log(JSON.stringify({ grid: `${result.live.cols}x${result.live.rows}`, revealResizes: result.revealResizes, resetsDuringWrite: result.resetsDuringWrite }));
+    console.log(JSON.stringify({ grid: `${result.live.cols}x${result.live.rows}`, revealResizes: result.revealResizes,
+      resetsDuringWrite: result.resetsDuringWrite, sampleMs: result.sampleMs, visiblePolls: result.visiblePolls,
+      parkedPolls: result.parkedPolls, revealCatchUpMs: result.revealCatchUpMs }));
     if (process.env.TERMINAL_SCREENSHOT) await page.screenshot({ path: process.env.TERMINAL_SCREENSHOT });
     assert.deepEqual(result.replayed, result.live, 'replaying a resized TUI must reproduce its live screen');
     assert.deepEqual(result.raced, result.live, 'an old in-flight snapshot must not contaminate restart');
     assert.equal(result.revealResizes, 0, 'same-size reveal must not resize/reprint the PTY');
+    assert.ok(result.parkedPolls >= 1 && result.parkedPolls * 3 <= result.visiblePolls, 'parked full snapshots must continue at no more than one third of the visible cadence');
+    assert.equal(result.parkedOutput, 'PARKED-output', 'parked output must reach the real xterm buffer');
+    assert.equal(result.parkedCursorReply, true, 'the parked emulator must still send cursor replies to the PTY');
+    assert.equal(result.revealCaughtUp, true, 'revealing must catch up without waiting for the next parked tick');
     assert.equal(result.speculativeResizes, 0, 'unread old-grid output must precede the emulator resize');
     assert.equal(result.resetsDuringWrite, 0, 'restart must not reset xterm while a previous frame is still parsing');
     assert.equal(result.closedRows, 30, 'an exited terminal must still fit its visible pane');
@@ -138,7 +357,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
     assert.deepEqual(errors, []);
     await page.evaluate(() => window.disposeTerminalTest());
     assert.equal(await page.locator('#host').evaluate(host => host.children.length), 0, 'dispose must remove the attached full-height container');
-    console.log('PASS: real xterm replay, restart race, same-size reveal, header/footer geometry');
+    console.log('PASS: real xterm replay, restart race, parked cadence and cursor replies, instant same-size reveal, header/footer geometry');
     if (process.env.TERMINAL_OPENCODE_REPLAY) {
       const fixture = JSON.parse(fs.readFileSync(process.env.TERMINAL_OPENCODE_REPLAY, 'utf8'));
       const rendered = await page.evaluate(async fixture => {
@@ -209,5 +428,8 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core')
       await page.evaluate(() => window.disposeTerminalTest());
       console.log('PASS: captured Windows ConPTY TUI bytes; former text-only replay fails, geometry-aware replay matches live');
     }
+    await testProjectAdd(page, url);
+    await testManualTrustAndChanges(page, url);
+    assert.deepEqual(errors, []);
   } finally { await browser.close(); if(server)server.kill(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

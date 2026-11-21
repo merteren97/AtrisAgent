@@ -41,6 +41,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
   const [runtime, setRuntime] = useState('claude_code'); const [catalogId, setCatalogId] = useState('');
   const [count, setCount] = useState(1);
+  const [isolated, setIsolated] = useState(false);
   const existingCount = useManualStore(s => Object.values(s.conversations).flat().find(c => c.id === conversationId)?.agents.length || 0);
   const remaining = 30 - existingCount;
   const [pending, setPending] = useState(false); const [error, setError] = useState<string | null>(null);
@@ -53,7 +54,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
     setPending(true); setError(null);
     try {
       if (!createdConversation.current) {
-        const conversation = await useManualStore.getState().create(workspaceId, undefined, conversationKey.current);
+        const conversation = await useManualStore.getState().create(workspaceId, undefined, conversationKey.current, isolated);
         createdConversation.current = conversation.id;
       }
       const agents = await useManualStore.getState().addAgents(createdConversation.current, Array.from({ length: count }, (_, index) => ({
@@ -99,7 +100,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
             <span className="block text-xl font-semibold">{amount}</span><span className="mt-1 block text-xs text-muted-foreground">{amount === 1 ? 'agent' : 'agents'}</span>
           </label>)}</div>
           <p className="mt-3 text-xs leading-5 text-muted-foreground">Opens {count} independent CLI {count === 1 ? 'session' : 'sessions'}. Terminals arrange automatically. Add more later, up to 30 per conversation.</p>
-          {!conversationId && <p className="mt-2 text-xs leading-5 text-muted-foreground">Edits from these tabs appear in your project as they are saved. Review or undo them in the Changes panel.</p>}
+           {!conversationId && <label className="mt-4 flex items-start gap-2 text-xs leading-5"><input type="checkbox" className="mt-1 accent-primary" checked={isolated} disabled={Boolean(createdConversation.current)} onChange={event => setIsolated(event.target.checked)} /><span><strong>Work in a separate review copy</strong><span className="block text-muted-foreground">{isolated ? 'Edits stay in the copy until you select Apply. The CLI may ask you to trust the new folder.' : 'Agents use the registered project folder. Review saved edits and undo recorded versions in Changes.'}</span></span></label>}
         </fieldset>
         {!isTauriRuntime() && <p className="text-xs text-muted-foreground">Use the desktop app to launch interactive terminals.</p>}
         {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
@@ -119,6 +120,7 @@ export function ManualWorkspace() {
   const orders = useManualStore(state => state.orderByConversation);
   const order = conversation ? orders[conversation.id] || [] : [];
   const [pending, setPending] = useState<string | null>(null); const [error, setError] = useState<string | null>(null);
+  const [copiedFor, setCopiedFor] = useState<string>();
   const actionPending = useRef(false);
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [inputReady, setInputReady] = useState<Record<string, boolean | null | undefined>>({});
@@ -170,10 +172,11 @@ export function ManualWorkspace() {
   useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
+    const ids = agentIds.split(',');
     let disposed = false; let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       const epoch = lifecycleEpoch.current;
-      const results = await Promise.allSettled(agentIds.split(',').map(async id => {
+      const results = await Promise.allSettled(ids.map(async id => {
         const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after: 0, statusOnly: true });
         if (!disposed && snapshot.status === 'open') ensureManualTerminal(id);
         return [id, snapshot.status, snapshot.inputReady] as const;
@@ -181,13 +184,19 @@ export function ManualWorkspace() {
       if (disposed) return;
       if (epoch !== lifecycleEpoch.current) { timer = setTimeout(poll, 1500); return; }
       setStatuses(previous => {
-        const next = { ...previous };
-        results.forEach((result, index) => { next[agentIds.split(',')[index]] = result.status === 'fulfilled' ? result.value[1] : 'disconnected'; });
+        let next = previous;
+        results.forEach((result, index) => {
+          const value = result.status === 'fulfilled' ? result.value[1] : 'disconnected';
+          if (previous[ids[index]] !== value) { if (next === previous) next = { ...previous }; next[ids[index]] = value; }
+        });
         return next;
       });
       setInputReady(previous => {
-        const next = {...previous};
-        results.forEach((result, index) => { next[agentIds.split(',')[index]] = result.status === 'fulfilled' ? result.value[2] : undefined; });
+        let next = previous;
+        results.forEach((result, index) => {
+          const value = result.status === 'fulfilled' ? result.value[2] : undefined;
+          if (previous[ids[index]] !== value) { if (next === previous) next = { ...previous }; next[ids[index]] = value; }
+        });
         return next;
       });
       timer = setTimeout(poll, 1500);
@@ -208,7 +217,7 @@ export function ManualWorkspace() {
     ensureManualTerminal(target.id, true);
     setStatuses(previous => ({ ...previous, [target.id]: 'open' })); setGeneration(value => value + 1);
     setInputReady(previous => ({...previous, [target.id]: target.runtimeType === 'codex' ? false : null}));
-    if (showCode) setSurface(target.conversationId, 'code');
+    if (showCode || target.runtimeType === 'antigravity') setSurface(target.conversationId, 'code');
   };
   const action = async (label: string, run: () => Promise<unknown>, propagate = false): Promise<boolean> => {
     if (actionPending.current) return false;
@@ -285,13 +294,7 @@ export function ManualWorkspace() {
   const activity = recentTools[recentTools.length - 1];
   const replyQuestion = async (question: ManualQuestion, answers: string[][]) => {
     if (agent?.runtimeType === 'antigravity') {
-      if (!live || !native) throw new Error('Open the agent first to submit answers, or answer in Code.');
-      const steps = buildAntigravityQuestionKeystrokes(question, answers);
-      for (const step of steps) {
-        await invoke('manual_terminal_write', { id: agent.id, data: step, paste: false });
-        await new Promise(r => setTimeout(r, 45));
-      }
-      return;
+      throw new Error('Answer this question in Antigravity’s Code terminal.');
     }
     await apiRequest(`/manual/agents/${agentId}/questions/${encodeURIComponent(question.id)}/reply`, { method: 'POST', body: JSON.stringify({ answers }) });
   };
@@ -305,10 +308,13 @@ export function ManualWorkspace() {
   const send = () => agent && action('send', async () => {
     if (!live || !native) return;
     if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) throw new Error('Codex is still starting. Your draft is kept; check CLI setup in Code.');
+    const useCode = agent.runtimeType === 'antigravity';
     await sendManualDraft(agent, {
       stage: async (id, file) => invoke<string>('manual_stage_attachment', { id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }),
-      write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
+      keepDraft: useCode,
+      write: (id, prompt) => useCode ? navigator.clipboard.writeText(prompt) : invoke('manual_terminal_write', { id, data: prompt, paste: true }),
     });
+    if (useCode) { setCopiedFor(agent.id); setSurface(agent.conversationId, 'code'); }
   });
 
   if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
@@ -359,6 +365,7 @@ export function ManualWorkspace() {
       </div>
     </header>
     {pending?.startsWith('Opening') && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs text-muted-foreground">{pending}</p>}
+    {copiedFor && copiedFor === agentId && surface === 'code' && <div role="status" className="flex items-center gap-2 border-b px-4 py-2 text-xs text-muted-foreground">Draft copied. Complete any CLI setup, then paste it into the Antigravity message field and submit it there.<button aria-label="Dismiss draft notice" onClick={() => setCopiedFor(undefined)}><X className="h-4 w-4" /></button></div>}
     {(error || connectionError) && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error || connectionError}</span><button aria-label="Dismiss error" onClick={() => { setError(null); dismissConnectionError(); }}><X className="h-4 w-4" /></button></div>}
     {!conversation || !agent ? <div className="flex flex-1 items-center justify-center p-6"><div className="max-w-md text-center"><Bot className="mx-auto mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-lg font-medium">Your agents, your workflow</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">Group independent agents in a conversation. Each agent keeps its own context and stays under your control.</p><Button className="mt-5" disabled={!workspaceId} onClick={() => conversation ? setAdding(true) : setCreating(true)}><Plus className="mr-2 h-4 w-4" />{conversation ? 'Add first agent' : 'New manual conversation'}</Button></div></div> : <>
        {surface === 'code' ? native ? visibleAgents.length ? <TerminalCanvas agents={visibleAgents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={setDeleteTarget} onRestart={restart} onHandoff={setHandoff} onMove={(source, target) => useManualStore.getState().moveAgent(conversation.id, source, target)} /> : <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6"><Bot className="h-8 w-8 text-muted-foreground" /><h2 className="text-base font-medium">All terminal panes closed</h2><p className="text-sm text-muted-foreground">No terminals are running. Open an offline agent in Chat or add a new one.</p><Button variant="outline" onClick={() => setSurface(conversation.id, 'chat')}>View agents</Button></div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : (
@@ -400,8 +407,8 @@ export function ManualWorkspace() {
                           </article>
                         );
                     })}
-                    {unresolvedQuestion && !questions.length && <ManualQuestionCard key={`${agent.id}:${unresolvedQuestion.id}`} draftScope={`manual:${agent.id}`} request={unresolvedQuestion} onReply={agent.runtimeType === 'antigravity' && live ? answers => replyQuestion(unresolvedQuestion, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />}
-                    {questions.map(question => <ManualQuestionCard key={`${agent.id}:${question.id}`} draftScope={`manual:${agent.id}`} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
+                     {unresolvedQuestion && !questions.length && <ManualQuestionCard key={`${agent.id}:${unresolvedQuestion.id}`} draftScope={`manual:${agent.id}`} request={unresolvedQuestion} onOpenCode={() => setSurface(conversation.id, 'code')} />}
+                     {questions.map(question => <ManualQuestionCard key={`${agent.id}:${question.id}`} draftScope={`manual:${agent.id}`} request={question} onReply={live && agent.runtimeType !== 'antigravity' ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
                    {live && observations[agent.id]?.state !== 'completed' && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
                 </>}
               </div>
@@ -409,12 +416,14 @@ export function ManualWorkspace() {
             {scroll.detached && <div className="absolute bottom-3 right-4"><LatestMessagesButton onClick={scroll.jumpToLatest} /></div>}
             </div>
             <ChatChangeSummary endpoint={`/manual/conversations/${encodeURIComponent(conversation.id)}/changes?summary=1`} />
-            {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
+             {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} sendLabel={agent.runtimeType === 'antigravity' ? 'Copy draft & open Code' : undefined} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
           </div>
         </div>
       )}
     </>}
-    {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
+    {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} onCopiedForCode={target => {
+      selectAgent(conversation.id, target.id); setSurface(conversation.id, 'code'); setCopiedFor(target.id);
+    }} />}
     {memory && conversation && <ManualMemory key={conversation.id+':'+(memory.message?.id||'notes')} conversation={conversation} agent={agent} message={memory.message} onClose={()=>setMemory(null)}/>}
     {deleteTarget && <Dialog open onOpenChange={open => { if (!open && !pending) setDeleteTarget(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete agent?</DialogTitle><DialogDescription>This agent’s CLI will stop and its AtrisAgent record will be removed. Provider-owned history and saved project memory are retained.</DialogDescription></DialogHeader><div className="break-words rounded-xl border border-border bg-muted/30 p-4 text-sm font-medium">{deleteTarget.name}</div><DialogFooter><Button variant="outline" disabled={Boolean(pending)} onClick={() => setDeleteTarget(null)}>Cancel</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => close(deleteTarget)}><Trash2 className="mr-2 h-4 w-4" />{pending ? 'Removing…' : 'Delete agent'}</Button></DialogFooter></DialogContent></Dialog>}
   </section>;
