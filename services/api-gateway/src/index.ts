@@ -55,6 +55,7 @@ import { claimUnappliedSiblingRetry, LEGACY_FAILURE } from './retry-unapplied-si
 import { DeletionOperationStore, type DeletionHandlers, type DeletionOperation } from './deletion-operation';
 import { installManualConversations } from './manual-conversations';
 import { LiveProjectChanges, liveGitBase, liveUndoSelection } from './live-project-changes';
+import { StagedChanges } from './staged-changes';
 import { PlanningStore } from './planning-store';
 import { createPlanningMediaAccess, installPlanningRoutes } from './planning-routes';
 import { installPlanningChatRoutes } from './planning-chat';
@@ -382,6 +383,7 @@ try {
 // 2. Core Service Setup
 const eventBus = new LocalEventBus();
 const workspaceManager = new WorkspaceManager(db, eventBus);
+const stagedChanges = new StagedChanges(worktreePath => workspaceManager.getWorktreeManager().getReviewFileList(worktreePath));
 const mergeCoordinator = new MergeCoordinator(workspaceManager);
 const applyVerificationStore = new ApplyVerificationOperationStore(sqlite);
 const actionBroker = new ActionBroker();
@@ -404,7 +406,12 @@ const publishOrApplyBuilder = async (taskId: string, operation?: { operationId?:
     await liveProjectChanges.finalize(id);
     return { success: true, output: 'Live project changes are ready for verification.', checkpointId: undefined };
   }
-  return mergeCoordinator.applyWorktree(taskId, undefined, operation);
+  const worktree = await workspaceManager.getWorktreeForTask(taskId);
+  try {
+    return await mergeCoordinator.applyWorktree(taskId, undefined, operation);
+  } finally {
+    if (worktree) stagedChanges.invalidate(worktree.path);
+  }
 };
 const orchestrator = new Orchestrator(
   {
@@ -574,7 +581,7 @@ const authService = new AtrisAuthService();
 const PORT = resolveGatewayPort();
 const server = http.createServer(app);
 const shutdownCoordinator = createRuntimeShutdownCoordinator({
-  stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); await liveProjectChanges.close(); },
+  stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); await liveProjectChanges.close(); await manualConversationStore.projectReview.close(); },
   closeServer: () => new Promise<void>((resolve) => {
     if (!server.listening) {
       resolve();
@@ -605,7 +612,7 @@ installEditorMcpRoutes(app, sqlite);
 installUnityCliRoutes(app, sqlite);
 installGithubConnectionRoutes(app);
 installAutoSetupRoutes(app, sqlite, gatewayDataPath.dataDir);
-export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir, liveProjectChanges);
+export const manualConversationStore = installManualConversations(app, sqlite, runtimeHost, gatewayDataPath.dataDir, liveProjectChanges, planningFence);
 installPlanningRoutes(app, planningStore, { fenced: planningFence, mediaAccess: planningMedia });
 export const planningChat = installPlanningChatRoutes(app, {
   store: planningStore,
@@ -2275,31 +2282,30 @@ app.get('/api/tasks/:id/changes', async (req: Request, res: Response) => {
     const live = liveProjectChanges.list(`builder:${id}`);
     if (live) return void res.json(live);
     const worktree = await workspaceManager.getWorktreeForTask(id);
-    return void res.json({ mode: 'staged', files: worktree ? await workspaceManager.getWorktreeManager().getReviewFileList(worktree.path) : [] });
+    res.set('Cache-Control', 'no-store');
+    const files = worktree && worktree.status !== 'abandoned' ? await stagedChanges.list(worktree.path, req.query.refresh === '1') : [];
+    res.json({ mode: 'staged', files });
   } catch (error: any) { res.status(error.status || 500).json({ error: error.message || 'Could not list Builder changes.' }); }
 });
 
-const missionChangeFileCache = new Map<string, { at: number; files: Array<{ path: string; status: string }> }>();
 app.get('/api/missions/:id/changes', async (req: Request, res: Response) => {
   try {
     const id = routeParam(req.params.id);
     const mission = await workspaceManager.getMission(id);
     if (!mission) return void res.status(404).json({ error: 'Mission not found.' });
+    res.set('Cache-Control', 'no-store');
+    const refresh = req.query.refresh === '1';
     const builders = (await workspaceManager.listTasks(id)).filter(task => task.assignedRole === 'builder' && task.planId === mission.planId).slice(0, 12);
     const summaries = await Promise.all(builders.map(async task => {
       const live = liveProjectChanges.list(`builder:${task.id}`);
       if (live) return { quality: live.quality, files: live.files.map(({ path, status, state }) => ({ path, status, state, taskId: task.id })) };
-      let cached = missionChangeFileCache.get(task.id);
-      if (!cached || Date.now() - cached.at > 10_000) {
-        const worktree = await workspaceManager.getWorktreeForTask(task.id);
-        if (!worktree) return { files: [] };
-        const files = await workspaceManager.getWorktreeManager().getReviewFileList(worktree.path).catch(() => cached?.files || []);
-        cached = { files, at: Date.now() };
-        missionChangeFileCache.delete(task.id);
-        missionChangeFileCache.set(task.id, cached);
-        if (missionChangeFileCache.size > 24) missionChangeFileCache.delete(missionChangeFileCache.keys().next().value!);
-      }
-      return { files: cached.files.map(({ path, status }) => ({ path, status, taskId: task.id })) };
+      const worktree = await workspaceManager.getWorktreeForTask(task.id);
+      if (!worktree || worktree.status === 'abandoned') return { files: [] };
+      const files = await stagedChanges.list(worktree.path, refresh).catch(error => {
+        if (refresh) throw error;
+        return stagedChanges.lastKnown(worktree.path, 15_000) || [];
+      });
+      return { files: files.map(({ path, status }) => ({ path, status, taskId: task.id })) };
     }));
     const files = summaries.flatMap(summary => summary.files as Array<{ path: string; status: string }>);
     res.json({ files, quality: summaries.some(summary => summary.quality === 'failed') ? 'failed' : undefined });
@@ -2319,15 +2325,10 @@ app.get('/api/tasks/:id/changes/file', async (req: Request, res: Response) => {
       return void res.json(liveProjectChanges.preview(`builder:${id}`, relative, typeof req.query.revision === 'string' ? req.query.revision : ''));
     }
     const worktree = await workspaceManager.getWorktreeForTask(id);
-    if (!worktree) return void res.status(404).json({ error: 'Builder worktree is unavailable.' });
-    const manager = workspaceManager.getWorktreeManager();
-    const diff = await manager.getReviewFileDiff(worktree.path, relative);
-    if (diff.length > 320 * 1024) return void res.json({ unavailable: 'large' });
-    if (diff) return void res.json({ diff });
-    const entry = await manager.inspectEntry(worktree.path, relative);
-    if (entry.kind !== 'file' || entry.previewUnavailable) return void res.json({ unavailable: 'binary' });
-    if (entry.truncated) return void res.json({ unavailable: 'large' });
-    res.json({ before: null, after: entry.content || '' });
+    if (!worktree || worktree.status === 'abandoned') return void res.status(404).json({ error: 'Builder worktree is unavailable.' });
+    res.set('Cache-Control', 'no-store');
+    stagedChanges.invalidate(worktree.path);
+    res.json(await workspaceManager.getWorktreeManager().getReviewFilePreview(worktree.path, relative));
   } catch (error: any) { res.status(error.status || 500).json({ error: error.message || 'Could not load this comparison.' }); }
 });
 

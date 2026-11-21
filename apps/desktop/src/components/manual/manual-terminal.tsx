@@ -16,6 +16,10 @@ export interface TerminalSnapshot {
 // The emulator, including device/cursor replies, lives beyond any React view.
 // A background CLI must not wait for a user to reopen its Code pane.
 const engines = new Map<string, ReturnType<typeof createEngine>>();
+const VISIBLE_POLL_MS = 120;
+const PARKED_POLL_MS = 600;
+const INACTIVE_POLL_MS = 1500;
+
 function createEngine(id: string) {
   const container = document.createElement('div');
   container.className = 'h-full w-full';
@@ -30,7 +34,8 @@ function createEngine(id: string) {
     windowsPty: /Windows/i.test(navigator.userAgent) ? { backend: 'conpty' } : undefined });
   const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
   let disposed = false; let after = 0; let status = 'disconnected'; let size = ''; let epoch = 0;
-  let error: string | null = null; let timer: ReturnType<typeof setTimeout>;
+  let error: string | null = null; let timer: ReturnType<typeof setTimeout> | undefined;
+  let pollingEpoch: number | undefined;
   let writes = Promise.resolve();
   let frame = 0;
   let operations = Promise.resolve();
@@ -97,8 +102,17 @@ function createEngine(id: string) {
     const inputEpoch = epoch;
     writes = writes.then(() => disposed || inputEpoch !== epoch ? undefined : invoke<void>('manual_terminal_write', { id, data, paste: false })).catch(e => { if (!disposed) update(String(e)); });
   });
+  const clearPollTimer = () => { clearTimeout(timer); timer = undefined; };
+  const schedulePoll = () => {
+    clearPollTimer();
+    const delay = status !== 'open' ? INACTIVE_POLL_MS : container.parentElement === parking ? PARKED_POLL_MS : VISIBLE_POLL_MS;
+    timer = setTimeout(() => void poll(), delay);
+  };
   const poll = async () => {
+    if (disposed || pollingEpoch === epoch) return;
+    clearPollTimer();
     const pollEpoch = epoch;
+    pollingEpoch = pollEpoch;
     try {
       await enqueue(async () => {
         if (disposed || pollEpoch !== epoch) return;
@@ -108,21 +122,36 @@ function createEngine(id: string) {
         resize();
       });
     } catch (e) { if (!disposed) update(String(e)); }
-    finally { if (!disposed && pollEpoch === epoch) timer = setTimeout(poll, status === 'open' ? 120 : 1500); }
+    finally {
+      if (pollingEpoch === pollEpoch) pollingEpoch = undefined;
+      if (!disposed && pollEpoch === epoch) schedulePoll();
+    }
   };
   void poll();
   void document.fonts?.ready.then(() => resize());
   return { terminal, container, resize,
-    attach(root: HTMLElement) { if (disposed) return; root.appendChild(container); resize(); },
-    park() { if (disposed) return; parking.style.width = `${container.clientWidth || 960}px`; parking.style.height = `${container.clientHeight || 600}px`; parking.appendChild(container); },
+    attach(root: HTMLElement) {
+      if (disposed) return;
+      const wasParked = container.parentElement === parking;
+      root.appendChild(container);
+      if (wasParked) void poll();
+      resize();
+    },
+    park() {
+      if (disposed || container.parentElement === parking) return;
+      parking.style.width = `${container.clientWidth || 960}px`;
+      parking.style.height = `${container.clientHeight || 600}px`;
+      parking.appendChild(container);
+      if (timer !== undefined) schedulePoll();
+    },
     restart() {
-      epoch += 1; after = 0; status = 'disconnected'; size = ''; clearTimeout(timer);
+      epoch += 1; after = 0; status = 'disconnected'; size = ''; clearPollTimer();
       const restartEpoch = epoch;
       void enqueue(() => { if (!disposed && restartEpoch === epoch) { outputFrames.reset(); terminal.reset(); update(null); } });
       void poll();
     },
     subscribe(listener: (error: string | null) => void) { listeners.add(listener); listener(error); return () => { listeners.delete(listener); }; },
-    dispose() { disposed = true; clearTimeout(timer); cancelAnimationFrame(frame); input.dispose(); terminal.dispose(); container.remove(); parking.remove(); listeners.clear(); },
+    dispose() { disposed = true; clearPollTimer(); cancelAnimationFrame(frame); input.dispose(); terminal.dispose(); container.remove(); parking.remove(); listeners.clear(); },
   };
 }
 

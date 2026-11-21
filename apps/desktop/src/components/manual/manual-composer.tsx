@@ -62,14 +62,14 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }) {
   </div>;
 }
 
-export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, routeStatus, permissionControl, setupPending, onOpenCode, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply, surface = 'manual', sendDisabled = false, statusText }: {
+export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, routeStatus, permissionControl, setupPending, onOpenCode, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply, surface = 'manual', sendDisabled = false, statusText, sendLabel = 'Send' }: {
   agent: ChatControlAgent & { name: string }; agents: readonly unknown[]; live: boolean; native: boolean; pending: boolean;
   autoApprove?: OpenCodeAutoApprove; onAutoApprove?: (enabled: boolean) => Promise<void>;
   routeStatus?: {pending: boolean; error?: string};
   permissionControl?: ReactNode; setupPending?: boolean; onOpenCode?: () => void;
   draft: string; files: File[]; onDraft: (value: string) => void; onAddFiles: (files: File[]) => void; onRemoveFile: (file: File) => void;
   onSend: () => void; onMemory?: () => void; onApply: (model: DiscoveredModel, independent: boolean, reasoning?: string) => Promise<boolean>;
-  surface?: 'manual' | 'planning'; sendDisabled?: boolean; statusText?: string;
+  surface?: 'manual' | 'planning'; sendDisabled?: boolean; statusText?: string; sendLabel?: string;
 }) {
   const input = useRef<HTMLInputElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -121,7 +121,7 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
         {agent.runtimeType === 'opencode' && <Button type="button" variant={autoApprove?.enabled ? 'secondary' : 'ghost'} size="icon" aria-label={autoApprove?.enabled ? 'Disable OpenCode auto-approve' : 'Enable OpenCode auto-approve'} aria-pressed={Boolean(autoApprove?.enabled)} title={autoApprove?.enabled ? 'Auto-approve on · click to turn off' : 'Auto-approve future permissions · explicit deny rules still apply'} disabled={!native || !live || pending || !autoApprove?.available || requestedMode !== null} onClick={toggleAutoApprove}>{requestedMode !== null ? <Loader2 className="h-4 w-4 animate-spin" /> : autoApprove?.enabled ? <ShieldCheck className="h-4 w-4 text-primary" /> : <Shield className="h-4 w-4" />}</Button>}
         {permissionControl}
          {onMemory && <Button type="button" variant="ghost" size="icon" aria-label="Open memory and references" onClick={onMemory}><Brain className="h-4 w-4" /></Button>}
-        <Button type="submit" size="sm" disabled={!canSend}>{pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">Send</span></Button>
+         <Button type="submit" size="sm" disabled={!canSend}>{pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">{sendLabel}</span></Button>
       </div></div>
     </div>
     {setupPending && <p role="status" className="mx-auto mt-2 max-w-3xl px-2 text-xs text-muted-foreground">Codex is starting. Your draft is kept until the CLI is ready. <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={onOpenCode}>View CLI setup</button></p>}

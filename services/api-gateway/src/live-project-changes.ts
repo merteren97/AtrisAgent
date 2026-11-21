@@ -33,7 +33,7 @@ export function liveUndoSelection(value: unknown): Array<{ path: string; revisio
   });
 }
 type StoredScope = { config: string; quality: Quality; active: number };
-type FileBytes = { bytes: Buffer; mode: number };
+export type FileBytes = { bytes: Buffer; mode: number };
 type Change = {
   path: string; revision: string; state: FileState; expected: string;
   before: Buffer | null; before_mode: number; after: Buffer | null; after_mode: number;
@@ -44,6 +44,7 @@ type Tracker = { scope: LiveScope; watcher?: fs.FSWatcher; timer?: NodeJS.Timeou
 
 const value = (bytes: Buffer | null, mode: number): FileBytes | null => bytes === null ? null : { bytes, mode };
 const hash = (file: FileBytes | null) => file === null ? '-' : createHash('sha256').update(`${modeOf(file.mode)}:`).update(file.bytes).digest('hex');
+export { hash as reviewFileHash, replace as replaceReviewedFile };
 function safeRelative(raw: string): string | undefined {
   const relative = raw.split(path.sep).join('/');
   try { parts(relative); return relative; } catch { return undefined; }
@@ -161,14 +162,17 @@ export class LiveProjectChanges {
   private state(id: string, relative: string, state: FileState) {
     this.db.prepare('UPDATE live_project_files SET state = ? WHERE scope_id = ? AND path = ?').run(state, id, relative);
   }
-  start(scope: LiveScope) {
+  register(scope: LiveScope) {
     if (!this.allowed(scope)) throw rejected('The project is unavailable.');
     const config = JSON.stringify(scope);
     const existing = this.record(scope.id);
     if (existing && existing.config !== config) throw rejected('Live change ownership has changed.');
-    if (!existing) this.db.prepare('INSERT INTO live_project_scopes (id, config) VALUES (?, ?)').run(scope.id, config);
-    else if (!existing.active) this.db.prepare("UPDATE live_project_scopes SET active = 1, quality = 'pending' WHERE id = ?").run(scope.id);
+    if (!existing) this.db.prepare('INSERT INTO live_project_scopes (id, config, active) VALUES (?, ?, 0)').run(scope.id, config);
+  }
+  start(scope: LiveScope) {
+    this.register(scope);
     if (this.trackers.has(scope.id)) return;
+    this.db.prepare("UPDATE live_project_scopes SET active = 1, quality = 'pending' WHERE id = ? AND active = 0").run(scope.id);
     const tracker: Tracker = { scope, pending: new Set(), full: true, stopped: false, fingerprints: new Map(), issues: new Map(),
       interval: setInterval(() => { tracker.full = true; this.schedule(tracker); }, 25_000).unref() };
     this.trackers.set(scope.id, tracker);
@@ -314,6 +318,21 @@ export class LiveProjectChanges {
       }
     }
     this.stop(id);
+  }
+
+  async pauseManualWhenEmpty(id: string, stillEmpty: () => boolean) {
+    const tracker = this.trackers.get(id);
+    if (!tracker || tracker.scope.kind !== 'manual' || !stillEmpty()) return;
+    await tracker.running;
+    if (this.trackers.get(id) !== tracker || !stillEmpty()) return;
+    tracker.full = true;
+    for (let pass = 0; pass < 3; pass++) {
+      await this.drain(tracker);
+      // A conflict still needs to be visible in Changes. A concurrent add must
+      // not lose the watcher created/retained for that agent.
+      if (this.trackers.get(id) !== tracker || !stillEmpty() || tracker.error || tracker.issues.size) return;
+      if (!tracker.full && !tracker.pending.size) { this.stop(id); return; }
+    }
   }
   list(id: string) {
     const row = this.record(id);

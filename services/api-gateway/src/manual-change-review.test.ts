@@ -6,7 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { ManualChangeReview } from './manual-change-review';
 
-function fixture(run: (review: ManualChangeReview, project: string, id: string, work: string, data: string) => void) {
+async function fixture(run: (review: ManualChangeReview, project: string, id: string, work: string, data: string) => void | Promise<void>) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-review-test-'));
   try {
     const project = path.join(root, 'project'), data = path.join(root, 'data');
@@ -14,24 +14,27 @@ function fixture(run: (review: ManualChangeReview, project: string, id: string, 
     fs.writeFileSync(path.join(project, '.env'), 'private fixture');
     fs.writeFileSync(path.join(project, 'a.ts'), 'dirty at start\n');
     fs.writeFileSync(path.join(project, 'b.ts'), 'keep\n');
+    fs.mkdirSync(path.join(project, '.cargo-target-debug'));
+    fs.writeFileSync(path.join(project, '.cargo-target-debug', 'build-output'), 'generated');
     const review = new ManualChangeReview(data), id = randomUUID();
-    review.initialize(id, project);
-    run(review, project, id, review.scope(id, project).work, data);
+    await review.initialize(id, project);
+    await run(review, project, id, review.scope(id, project).work, data);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 
-test('keeps changes private, shares the copy by conversation ID, and applies only the selected files', () => fixture((review, project, id, work, data) => {
+test('keeps changes private, shares the copy by conversation ID, and applies only the selected files', () => fixture(async (review, project, id, work, data) => {
   assert.equal(fs.existsSync(path.join(work, '.env')), false);
+  assert.equal(fs.existsSync(path.join(work, '.cargo-target-debug')), false);
   assert.deepEqual(review.list(id, project).files, []);
   fs.writeFileSync(path.join(work, 'a.ts'), 'new\n');
   fs.unlinkSync(path.join(work, 'b.ts'));
   fs.mkdirSync(path.join(work, 'src'));
   fs.writeFileSync(path.join(work, 'src', 'new file.ts'), 'export {};\n');
   const other = randomUUID();
-  review.initialize(other, project);
+  await review.initialize(other, project);
   assert.deepEqual(review.list(other, project).files, []);
   const afterRestart = new ManualChangeReview(data);
-  afterRestart.initialize(id, project);
+  await afterRestart.initialize(id, project);
   const files = afterRestart.list(id, project).files;
   assert.deepEqual(files.map(file => file.status), ['modified', 'deleted', 'added']);
   assert.deepEqual(afterRestart.preview(id, project, files[0].path, files[0].revision), { before: 'dirty at start\n', after: 'new\n' });
@@ -100,4 +103,12 @@ test('reviews deletions and refuses writes through redirected directories', () =
   fs.writeFileSync(path.join(work, 'alias', 'new.ts'), 'must not escape');
   assert.throws(() => review.resolve(id, project, 'apply', review.list(id, project).files), /parent path has changed/i);
   assert.deepEqual(fs.readdirSync(external), []);
+}));
+
+test('failed conversation registration does not leave a published or partial copy', () => fixture(async (review, project, _id, _work, data) => {
+  const failed = randomUUID();
+  const storage = path.join(data, 'manual-change-workspaces');
+  const before = fs.readdirSync(storage);
+  await assert.rejects(review.initialize(failed, project, () => {}, () => { throw new Error('Project is being deleted'); }), /being deleted/);
+  assert.deepEqual(fs.readdirSync(storage), before);
 }));

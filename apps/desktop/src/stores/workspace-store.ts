@@ -32,6 +32,22 @@ interface WorkspaceState {
   clearError: () => void;
 }
 
+// Keep only the latest GET and replay mutations it overlapped. This keeps
+// unrelated projects from the refresh without undoing a confirmed local write.
+let pendingFetch: { changes: Map<string, Workspace | null>; canReportError: boolean } | undefined;
+let pendingMutations = 0;
+
+function recordWorkspaceChange(id: string, workspace: Workspace | null) {
+  if (!pendingFetch) return;
+  pendingFetch.changes.delete(id);
+  pendingFetch.changes.set(id, workspace);
+}
+
+function beginWorkspaceMutation() {
+  pendingMutations += 1;
+  if (pendingFetch) pendingFetch.canReportError = false;
+}
+
 export const useWorkspaceStore = create<WorkspaceState>()(
   persist(
     (set, get) => ({
@@ -44,35 +60,48 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       clearError: () => set({ error: null }),
 
       fetchWorkspaces: async () => {
+        const request = { changes: new Map<string, Workspace | null>(), canReportError: pendingMutations === 0 };
+        pendingFetch = request;
         set({ loading: true, error: null });
         try {
-          const workspaces = await apiRequest<Workspace[]>('/workspaces');
+          const fetched = await apiRequest<Workspace[]>('/workspaces');
+          if (pendingFetch !== request) return;
+          const workspaces = [
+            ...Array.from(request.changes.values()).reverse().filter((workspace) => workspace !== null),
+            ...fetched.filter((workspace) => !request.changes.has(workspace.id)),
+          ];
           const current = get().activeWorkspaceId;
+          pendingFetch = undefined;
           set({
             workspaces,
             activeWorkspaceId: current && workspaces.some((workspace) => workspace.id === current)
               ? current
               : workspaces[0]?.id || null,
-            loading: false,
+            loading: pendingMutations > 0,
           });
         } catch (error: any) {
+          if (pendingFetch !== request) return;
+          pendingFetch = undefined;
           // A temporary gateway restart must never make a user's projects appear
           // deleted. Keep the last known navigation state and surface a degraded
           // status until the runtime supervisor reconnects and refreshes it.
           set({
-            loading: false,
-            error: error?.message || 'Could not refresh workspaces from the local service. Showing the last known workspace list.',
+            loading: pendingMutations > 0,
+            ...(request.canReportError && {
+              error: error?.message || 'Could not refresh workspaces from the local service. Showing the last known workspace list.',
+            }),
           });
         }
       },
 
       createWorkspace: async (name, workspacePath, gitInitialized = false) => {
+        beginWorkspaceMutation();
         set({ loading: true, error: null });
         try {
           const normalizedPath = workspacePath.trim();
           const duplicate = get().workspaces.find((workspace) => workspace.path.toLowerCase() === normalizedPath.toLowerCase());
           if (duplicate) {
-            set({ activeWorkspaceId: duplicate.id, loading: false });
+            set({ activeWorkspaceId: duplicate.id });
             return duplicate;
           }
 
@@ -80,21 +109,27 @@ export const useWorkspaceStore = create<WorkspaceState>()(
             method: 'POST',
             body: JSON.stringify({ name: name.trim(), path: normalizedPath, gitInitialized }),
           });
+          recordWorkspaceChange(workspace.id, workspace);
           set((state) => ({
             workspaces: [workspace, ...state.workspaces.filter((item) => item.id !== workspace.id)],
             activeWorkspaceId: workspace.id,
-            loading: false,
           }));
           return workspace;
         } catch (error: any) {
-          set({ loading: false, error: error?.message || 'Workspace creation failed.' });
+          set({ error: error?.message || 'Workspace creation failed.' });
           return null;
+        } finally {
+          pendingMutations -= 1;
+          if (!pendingFetch && pendingMutations === 0) set({ loading: false });
         }
       },
 
-      addWorkspace: (workspace) => set((state) => ({
-        workspaces: [workspace, ...state.workspaces.filter((item) => item.id !== workspace.id)],
-      })),
+      addWorkspace: (workspace) => {
+        recordWorkspaceChange(workspace.id, workspace);
+        set((state) => ({
+          workspaces: [workspace, ...state.workspaces.filter((item) => item.id !== workspace.id)],
+        }));
+      },
 
       setActiveWorkspace: (id) => set({ activeWorkspaceId: id }),
       rememberMission: (workspaceId, missionId) => set((state) => ({
@@ -107,6 +142,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       }),
 
       removeWorkspace: async (id, removeMemory = false) => {
+        beginWorkspaceMutation();
         set({ loading: true, error: null });
         try {
           const manual = await apiRequest<ManualConversation[]>(`/manual/conversations?workspaceId=${encodeURIComponent(id)}`);
@@ -120,6 +156,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
             method: 'DELETE',
             body: JSON.stringify({ removeMemory }),
           });
+          recordWorkspaceChange(id, null);
           useManualStore.getState().forgetWorkspace(id, manual);
           set((state) => {
             const workspaces = state.workspaces.filter((workspace) => workspace.id !== id);
@@ -128,13 +165,15 @@ export const useWorkspaceStore = create<WorkspaceState>()(
               workspaces,
               lastMissionByWorkspace,
               activeWorkspaceId: state.activeWorkspaceId === id ? workspaces[0]?.id || null : state.activeWorkspaceId,
-              loading: false,
             };
           });
         } catch (error: any) {
           const message = error?.message || 'Workspace removal failed.';
-          set({ loading: false, error: message });
+          set({ error: message });
           throw new Error(message);
+        } finally {
+          pendingMutations -= 1;
+          if (!pendingFetch && pendingMutations === 0) set({ loading: false });
         }
       },
     }),

@@ -432,6 +432,36 @@ async function runTests() {
     const diffText = await worktreeManager.getDiff(wtPath);
     assert(diffText.includes('+export const x = 42;'), 'getDiff includes added line');
 
+    // Throw if a file preview falls back to enumerating or diffing the whole mirror.
+    const targetedPreview = new WorktreeManager();
+    targetedPreview.getDiff = async () => { throw new Error('Unexpected full diff'); };
+    targetedPreview.getChangedFiles = async () => { throw new Error('Unexpected full scan'); };
+    const modified = await targetedPreview.getReviewFilePreview(wtPath, 'index.ts');
+    assert('before' in modified && modified.before === 'console.log("hello world");' && modified.after === 'console.log("hello updated world");', 'Mirror review previews both versions of a modified file');
+    const added = await targetedPreview.getReviewFilePreview(wtPath, 'newfile.ts');
+    assert('before' in added && added.before === null && added.after === 'export const x = 42;', 'Mirror review previews added file without a baseline copy');
+    fs.rmSync(path.join(wtPath, 'package.json'));
+    const deleted = await targetedPreview.getReviewFilePreview(wtPath, 'package.json');
+    assert('before' in deleted && deleted.before?.includes('test-app') === true && deleted.after === null, 'Mirror review previews deleted file from baseline');
+    fs.copyFileSync(path.join(wsPath, 'package.json'), path.join(wtPath, 'package.json'));
+    fs.writeFileSync(path.join(wtPath, 'large.txt'), Buffer.alloc(256 * 1024 + 1, 97));
+    const large = await targetedPreview.getReviewFilePreview(wtPath, 'large.txt');
+    assert('unavailable' in large && large.unavailable === 'large', 'Mirror review bounds the file preview read');
+    fs.rmSync(path.join(wtPath, 'large.txt'));
+    for (const [relative, status] of [['.atris-baseline/index.ts', 404], ['../index.ts', 400]] as const) {
+      let rejected = false;
+      try { await targetedPreview.getReviewFilePreview(wtPath, relative); } catch (error: any) { rejected = error.status === status; }
+      assert(rejected, `Mirror review rejects disallowed path ${relative}`);
+    }
+    const outsideLink = path.join(wtPath, 'outside');
+    fs.symlinkSync(wsPath, outsideLink, 'junction');
+    try {
+      const linkedFile = await targetedPreview.getReviewFilePreview(wtPath, 'outside/index.ts');
+      assert('unavailable' in linkedFile && linkedFile.unavailable === 'binary', 'Mirror review will not follow directory links');
+    } finally {
+      fs.unlinkSync(outsideLink);
+    }
+
     const worktreeRoot = await worktreeManager.inspectEntry(wtPath);
     assert(worktreeRoot.kind === 'directory' && worktreeRoot.entries.some((entry) => entry.path === 'index.ts'), 'read-only worktree inspector lists relative entries');
     const worktreeFile = await worktreeManager.inspectEntry(wtPath, 'index.ts');
@@ -442,6 +472,8 @@ async function runTests() {
     fs.writeFileSync(path.join(wtPath, 'binary.bin'), Buffer.from([0, 1, 2, 3]));
     const binaryPreview = await worktreeManager.inspectEntry(wtPath, 'binary.bin');
     assert(binaryPreview.kind === 'file' && binaryPreview.previewUnavailable === 'binary' && !binaryPreview.content, 'read-only worktree inspector does not expose binary content');
+    const stagedBinary = await targetedPreview.getReviewFilePreview(wtPath, 'binary.bin');
+    assert('unavailable' in stagedBinary && stagedBinary.unavailable === 'binary', 'Mirror review does not display binary file data');
 
     const nestedSourceDir = path.join(wsPath, 'src');
     fs.mkdirSync(nestedSourceDir, { recursive: true });
@@ -706,6 +738,8 @@ async function runTests() {
     assert(!fs.existsSync(path.join(projectContainer, '.atris-baseline')), 'Parent project container is never copied into a fallback baseline');
 
     fs.writeFileSync(path.join(nestedTaskWorktree, 'tracker.ts'), 'export const usage = "fixed";\n');
+    const gitPreview = await worktreeManager.getReviewFilePreview(nestedTaskWorktree, 'tracker.ts');
+    assert('diff' in gitPreview && gitPreview.diff.includes('-export const usage = "old";') && gitPreview.diff.includes('+export const usage = "fixed";'), 'Git review still returns a path-specific unified diff');
     const mergeBase = await worktreeManager.resolveMergeBasePath(nestedTaskWorktree, projectContainer);
     assert(path.resolve(mergeBase) === path.resolve(atrisTracker), 'Nested Builder worktree resolves its actual source repository for apply');
 
