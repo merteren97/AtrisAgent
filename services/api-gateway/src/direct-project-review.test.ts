@@ -31,13 +31,13 @@ test('approval only marks the revision; approved files can be restored after res
   const beforeApproval = fs.statSync(filename, { bigint: true }).mtimeNs;
   assert.deepEqual(await review.resolve('project', 'approve', [change]), { completed: ['login.ts'], conflicts: [] });
   assert.equal(fs.statSync(filename, { bigint: true }).mtimeNs, beforeApproval);
-  assert.equal(fs.readFileSync(filename, 'utf8'), 'agent saved directly\r\n');
+  assert.equal((await review.preview('project', change.path, change.revision) as {after: string}).after, 'agent saved directly\r\n');
   await review.close();
   const reopened = new DirectProjectReview(db, data, () => project);
   try {
     assert.equal((await reopened.list('project', true)).files[0].state, 'approved');
     assert.deepEqual(await reopened.resolve('project', 'undo', [change]), { completed: ['login.ts'], conflicts: [] });
-    assert.equal(fs.readFileSync(filename, 'utf8'), 'saved before agent\r\n');
+    assert.equal(fs.readFileSync(path.join(project, 'login.ts'), 'utf8'), 'saved before agent\r\n');
     assert.equal((await reopened.list('project', true)).files[0].state, 'reverted');
   } finally { await reopened.close(); }
 }));

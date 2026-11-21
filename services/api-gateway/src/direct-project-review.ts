@@ -185,12 +185,12 @@ export class DirectProjectReview {
     let fd: fs.promises.FileHandle | undefined;
     try {
       const filename = filePath(project.root, relative);
-      const named = await fs.promises.lstat(filename, { bigint: true });
-      const mode = Number(named.mode) & 0o777;
-      if (!named.isFile() || named.nlink !== 1n || named.size > BigInt(fileLimit)) return { digest: `opaque:${stamp(named)}`, stamp: stamp(named), mode };
       fd = await fs.promises.open(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       const start = await fd.stat({ bigint: true });
-      if (!start.isFile() || stamp(named) !== stamp(start)) throw fail('The file changed during capture.');
+      const mode = Number(start.mode) & 0o777;
+      const named = await fs.promises.lstat(filePath(project.root, relative), { bigint: true });
+      if (!start.isFile() || !named.isFile() || stamp(named) !== stamp(start)) throw fail('The file changed during capture.');
+      if (start.nlink !== 1n || start.size > BigInt(fileLimit)) return { digest: `opaque:${stamp(start)}`, stamp: stamp(start), mode };
       const bytes = Buffer.alloc(Number(start.size));
       for (let offset = 0; offset < bytes.length;) {
         const { bytesRead } = await fd.read(bytes, offset, bytes.length - offset, offset);

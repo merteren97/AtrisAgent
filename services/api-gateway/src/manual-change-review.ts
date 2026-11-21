@@ -95,12 +95,11 @@ function scan(root: string, skip?: string): { files: Map<string, Version>; omitt
 }
 
 async function versionAsync(filename: string, budget: number): Promise<Version> {
-  const named = await fs.promises.lstat(filename, { bigint: true });
-  if (!named.isFile()) return conflict('A file changed during the scan. Refresh and try again.');
-  const fd = await fs.promises.open(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const fd = await fs.promises.open(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const info = await fd.stat({ bigint: true });
-    if (!info.isFile() || named.ino !== info.ino || named.dev !== info.dev) return conflict('A file changed during the scan. Refresh and try again.');
+    const named = await fs.promises.lstat(filename, { bigint: true });
+    if (!info.isFile() || !named.isFile() || named.ino !== info.ino || named.dev !== info.dev) return conflict('A file changed during the scan. Refresh and try again.');
     const size = Number(info.size);
     if (size > budget) return conflict('The working files exceed the 256 MB review limit.', 413);
     const permissions = Number(info.mode) & 0o777;
@@ -217,7 +216,14 @@ export class ManualChangeReview {
       published = true;
       commit();
     } catch (error) {
-      await fs.promises.rm(published ? root : temp, { recursive: true, force: true });
+      // Roll back only the directory this job published, inside the app-owned
+      // storage root. The caller-provided conversation ID never selects an
+      // arbitrary recursive removal target.
+      if (published) {
+        const candidate = path.resolve(storage, id);
+        if (!candidate.startsWith(`${storage}${path.sep}`) || path.dirname(candidate) !== storage || candidate !== root) throw error;
+        await fs.promises.rm(candidate, { recursive: true, force: true });
+      } else await fs.promises.rm(temp, { recursive: true, force: true });
       throw error;
     }
   }

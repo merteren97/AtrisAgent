@@ -167,9 +167,12 @@ async function readMirrorPreview(root: string, segments: string[]): Promise<{ co
     const rootStat = await fs.promises.lstat(root);
     if (rootStat.isSymbolicLink()) return { unavailable: 'binary' };
     if (!rootStat.isDirectory()) return { content: null };
-    candidate = await fs.promises.realpath(root);
+    const canonicalRoot = await fs.promises.realpath(root);
+    candidate = canonicalRoot;
+    const parentPrefix = canonicalRoot.endsWith(path.sep) ? canonicalRoot : `${canonicalRoot}${path.sep}`;
     for (let i = 0; i < segments.length; i++) {
-      candidate = path.join(candidate, segments[i]);
+      candidate = path.resolve(candidate, segments[i]);
+      if (!candidate.startsWith(parentPrefix) || candidate === canonicalRoot) return { unavailable: 'binary' };
       const stat = await fs.promises.lstat(candidate);
       if (stat.isSymbolicLink()) return { unavailable: 'binary' };
       if (i < segments.length - 1) {
@@ -182,7 +185,7 @@ async function readMirrorPreview(root: string, segments: string[]): Promise<{ co
     }
     const resolved = await fs.promises.realpath(candidate);
     // Reject filesystem aliases as well as link traversal in the selected path.
-    if (path.relative(candidate, resolved) !== '') return { unavailable: 'binary' };
+    if (!resolved.startsWith(parentPrefix) || path.relative(candidate, resolved) !== '') return { unavailable: 'binary' };
     const handle = await fs.promises.open(resolved, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
       if (!(await handle.stat()).isFile()) return { unavailable: 'binary' };

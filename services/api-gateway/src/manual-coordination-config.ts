@@ -46,8 +46,17 @@ export function prepareManualCoordination(agent: ManualAgent, dataDir: string, g
     if (![configDir, agents].every(dir => fs.lstatSync(dir).isDirectory() && fs.realpathSync.native(dir) === dir)) {
       throw new Error('The Antigravity coordination directory has changed.');
     }
-    const stat = fs.lstatSync(filename);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== Buffer.byteLength(content) || fs.readFileSync(filename,'utf8') !== content
+    const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    let matches: boolean;
+    try {
+      const stat = fs.fstatSync(fd, { bigint: true });
+      const named = fs.lstatSync(filename, { bigint: true });
+      const expected = Buffer.from(content);
+      const bytes = Buffer.alloc(expected.length + 1);
+      matches = stat.isFile() && named.isFile() && stat.ino === named.ino && stat.dev === named.dev && stat.size === BigInt(expected.length)
+        && fs.readSync(fd, bytes) === expected.length && bytes.subarray(0, expected.length).equals(expected);
+    } finally { fs.closeSync(fd); }
+    if (!matches
       || fs.readdirSync(configDir).some(entry => entry !== '.agents') || fs.readdirSync(agents).some(entry => entry !== 'mcp_config.json')) {
       throw new Error('The Antigravity coordination configuration has changed.');
     }

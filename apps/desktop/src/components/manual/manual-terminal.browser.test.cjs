@@ -183,7 +183,7 @@ async function testManualTrustAndChanges(page, url) {
   await review.getByRole('button', { name: 'Refresh changes' }).click();
   await page.waitForFunction(() => window.manualReview.refreshes.includes('1'));
   await review.getByRole('button', { name: /a\.ts/ }).click();
-  await review.getByText('after', { exact: true }).waitFor();
+  await review.getByLabel('Code comparison').getByText('after', { exact: true }).filter({ visible: true }).waitFor();
   await review.getByRole('button', { name: 'Approve', exact: true }).click();
   await page.getByRole('button', { name: 'Approve changes', exact: true }).click();
   await review.getByText('Approved', { exact: true }).waitFor();
