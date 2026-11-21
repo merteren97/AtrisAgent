@@ -183,6 +183,7 @@ async function readMirrorPreview(root: string, segments: string[]): Promise<{ co
         if (stat.size > REVIEW_PREVIEW_BYTES) return { unavailable: 'large' };
       }
     }
+    if (!candidate.startsWith(parentPrefix) || candidate === canonicalRoot) return { unavailable: 'binary' };
     const resolved = await fs.promises.realpath(candidate);
     // Reject filesystem aliases as well as link traversal in the selected path.
     if (!resolved.startsWith(parentPrefix) || path.relative(candidate, resolved) !== '') return { unavailable: 'binary' };
