@@ -68,11 +68,9 @@ function version(filename: string, info = stat(filename)): Version | undefined {
   } finally { fs.closeSync(fd); }
 }
 
-type ScanCache = Map<string, { stamp: string; version: Version }>;
-function scan(root: string, skip?: string, previous?: ScanCache): { files: Map<string, Version>; omitted: number; cache: ScanCache } {
+function scan(root: string, skip?: string): { files: Map<string, Version>; omitted: number } {
   if (!stat(root)?.isDirectory() || fs.realpathSync(root) !== root) return conflict('The review directory is unavailable.');
   const files = new Map<string, Version>();
-  const cache: ScanCache = new Map();
   const queue = [''];
   let omitted = 0, bytes = 0, entries = 0;
   while (queue.length) {
@@ -88,14 +86,12 @@ function scan(root: string, skip?: string, previous?: ScanCache): { files: Map<s
       if (!info?.isFile()) return conflict('A file changed during the scan. Refresh and try again.');
       bytes += info.size;
       if (bytes > maxBytes) return conflict('The working files exceed the 256 MB review limit.', 413);
-      const stamp = `${info.dev}:${info.ino}:${info.size}:${info.mode}:${info.mtimeMs}:${info.ctimeMs}`;
-      const cached = previous?.get(relative);
-      const value = cached?.stamp === stamp ? cached : { stamp, version: version(filename, info)! };
-      files.set(relative, value.version);
-      if (previous) cache.set(relative, value);
+      // Equal-length writes can share timestamps. Always hash the bytes so the
+      // revision offered by the list agrees with preview and approval.
+      files.set(relative, version(filename, info)!);
     }
   }
-  return { files, omitted, cache };
+  return { files, omitted };
 }
 
 function replace(root: string, relative: string, from: string | undefined, expected: Version | undefined, source?: Version): void {
@@ -121,9 +117,6 @@ function replace(root: string, relative: string, from: string | undefined, expec
 }
 
 export class ManualChangeReview {
-  // The visible conversation polls for additions. Keep at most one directory
-  // pair cached and rehash all requested file contents before any mutation.
-  private lastScan?: { root: string; baseline: ScanCache; work: ScanCache };
   constructor(private dataDir: string) {}
 
   private directory(id: string): string {
@@ -163,12 +156,9 @@ export class ManualChangeReview {
     return { root, project: owner.source, omitted: owner.omitted, work: path.join(root, 'work'), baseline: path.join(root, 'baseline') };
   }
 
-  private changes(scope: ReturnType<ManualChangeReview['scope']>, allowCache = false) {
-    const previous = this.lastScan?.root === scope.root ? this.lastScan : undefined;
-    const baseline = scan(scope.baseline, undefined, allowCache ? previous?.baseline || new Map() : undefined);
-    const current = scan(scope.work, undefined, allowCache ? previous?.work || new Map() : undefined);
-    if (allowCache) this.lastScan = { root: scope.root, baseline: baseline.cache, work: current.cache };
-    const base = baseline.files;
+  private changes(scope: ReturnType<ManualChangeReview['scope']>) {
+    const base = scan(scope.baseline).files;
+    const current = scan(scope.work);
     const files = [...new Set([...base.keys(), ...current.files.keys()])].sort().flatMap(relative => {
       const before = base.get(relative), after = current.files.get(relative);
       if (before?.hash === after?.hash) return [];
@@ -180,7 +170,7 @@ export class ManualChangeReview {
 
   list(id: string, project: string) {
     const scope = this.scope(id, project);
-    const result = this.changes(scope, true);
+    const result = this.changes(scope);
     return { mode: 'isolated' as const, omitted: Math.max(scope.omitted, result.omitted),
       files: result.files.map(({ before: _before, after: _after, ...file }) => file) };
   }

@@ -65,6 +65,30 @@ test('rejects stale approvals and preflights all selected files before any overw
   assert.throws(() => review.preview(id, project, '../owner.json', ''), /outside the review scope/);
 }));
 
+test('refreshes the revision even when an equal-length edit leaves metadata unchanged', t => fixture((review, project, id, work) => {
+  const filename = path.join(work, 'b.ts');
+  fs.writeFileSync(filename, 'agent b');
+  const stat = fs.lstatSync;
+  const fstat = fs.fstatSync;
+  const original = stat(filename);
+  const sameTimes = (current: fs.Stats) => Object.assign(current, { mtimeMs: original.mtimeMs, ctimeMs: original.ctimeMs });
+  const mock = t.mock.method(fs, 'lstatSync', (file: fs.PathLike, ...args: unknown[]) => {
+    const current: fs.Stats = Reflect.apply(stat, fs, [file, ...args]);
+    return file === filename ? sameTimes(current) : current;
+  });
+  const descriptorMock = t.mock.method(fs, 'fstatSync', (fd: number, ...args: unknown[]) => {
+    const current: fs.Stats = Reflect.apply(fstat, fs, [fd, ...args]);
+    return current.ino === original.ino && current.dev === original.dev ? sameTimes(current) : current;
+  });
+  try {
+    const [before] = review.list(id, project).files;
+    fs.writeFileSync(filename, 'later b');
+    const [after] = review.list(id, project).files;
+    assert.notEqual(after.revision, before.revision);
+    assert.deepEqual(review.preview(id, project, after.path, after.revision), { before: 'keep\n', after: 'later b' });
+  } finally { descriptorMock.mock.restore(); mock.mock.restore(); }
+}));
+
 test('reviews deletions and refuses writes through redirected directories', () => fixture((review, project, id, work, data) => {
   fs.unlinkSync(path.join(work, 'a.ts'));
   assert.deepEqual(review.resolve(id, project, 'apply', review.list(id, project).files), { completed: ['a.ts'] });
