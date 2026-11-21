@@ -120,7 +120,6 @@ export function ManualWorkspace() {
   const orders = useManualStore(state => state.orderByConversation);
   const order = conversation ? orders[conversation.id] || [] : [];
   const [pending, setPending] = useState<string | null>(null); const [error, setError] = useState<string | null>(null);
-  const [copiedFor, setCopiedFor] = useState<string>();
   const actionPending = useRef(false);
   const [statuses, setStatuses] = useState<Record<string, TerminalSnapshot['status']>>({});
   const [inputReady, setInputReady] = useState<Record<string, boolean | null | undefined>>({});
@@ -217,7 +216,7 @@ export function ManualWorkspace() {
     ensureManualTerminal(target.id, true);
     setStatuses(previous => ({ ...previous, [target.id]: 'open' })); setGeneration(value => value + 1);
     setInputReady(previous => ({...previous, [target.id]: target.runtimeType === 'codex' ? false : null}));
-    if (showCode || target.runtimeType === 'antigravity') setSurface(target.conversationId, 'code');
+    if (showCode) setSurface(target.conversationId, 'code');
   };
   const action = async (label: string, run: () => Promise<unknown>, propagate = false): Promise<boolean> => {
     if (actionPending.current) return false;
@@ -308,13 +307,10 @@ export function ManualWorkspace() {
   const send = () => agent && action('send', async () => {
     if (!live || !native) return;
     if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) throw new Error('Codex is still starting. Your draft is kept; check CLI setup in Code.');
-    const useCode = agent.runtimeType === 'antigravity';
     await sendManualDraft(agent, {
       stage: async (id, file) => invoke<string>('manual_stage_attachment', { id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }),
-      keepDraft: useCode,
-      write: (id, prompt) => useCode ? navigator.clipboard.writeText(prompt) : invoke('manual_terminal_write', { id, data: prompt, paste: true }),
+      write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
     });
-    if (useCode) { setCopiedFor(agent.id); setSurface(agent.conversationId, 'code'); }
   });
 
   if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
@@ -365,7 +361,6 @@ export function ManualWorkspace() {
       </div>
     </header>
     {pending?.startsWith('Opening') && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs text-muted-foreground">{pending}</p>}
-    {copiedFor && copiedFor === agentId && surface === 'code' && <div role="status" className="flex items-center gap-2 border-b px-4 py-2 text-xs text-muted-foreground">Draft copied. Complete any CLI setup, then paste it into the Antigravity message field and submit it there.<button aria-label="Dismiss draft notice" onClick={() => setCopiedFor(undefined)}><X className="h-4 w-4" /></button></div>}
     {(error || connectionError) && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error || connectionError}</span><button aria-label="Dismiss error" onClick={() => { setError(null); dismissConnectionError(); }}><X className="h-4 w-4" /></button></div>}
     {!conversation || !agent ? <div className="flex flex-1 items-center justify-center p-6"><div className="max-w-md text-center"><Bot className="mx-auto mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-lg font-medium">Your agents, your workflow</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">Group independent agents in a conversation. Each agent keeps its own context and stays under your control.</p><Button className="mt-5" disabled={!workspaceId} onClick={() => conversation ? setAdding(true) : setCreating(true)}><Plus className="mr-2 h-4 w-4" />{conversation ? 'Add first agent' : 'New manual conversation'}</Button></div></div> : <>
        {surface === 'code' ? native ? visibleAgents.length ? <TerminalCanvas agents={visibleAgents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={setDeleteTarget} onRestart={restart} onHandoff={setHandoff} onMove={(source, target) => useManualStore.getState().moveAgent(conversation.id, source, target)} /> : <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6"><Bot className="h-8 w-8 text-muted-foreground" /><h2 className="text-base font-medium">All terminal panes closed</h2><p className="text-sm text-muted-foreground">No terminals are running. Open an offline agent in Chat or add a new one.</p><Button variant="outline" onClick={() => setSurface(conversation.id, 'chat')}>View agents</Button></div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : (
@@ -416,14 +411,12 @@ export function ManualWorkspace() {
             {scroll.detached && <div className="absolute bottom-3 right-4"><LatestMessagesButton onClick={scroll.jumpToLatest} /></div>}
             </div>
             <ChatChangeSummary endpoint={`/manual/conversations/${encodeURIComponent(conversation.id)}/changes?summary=1`} />
-             {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} sendLabel={agent.runtimeType === 'antigravity' ? 'Copy draft & open Code' : undefined} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
+             {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
           </div>
         </div>
       )}
     </>}
-    {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} onCopiedForCode={target => {
-      selectAgent(conversation.id, target.id); setSurface(conversation.id, 'code'); setCopiedFor(target.id);
-    }} />}
+    {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
     {memory && conversation && <ManualMemory key={conversation.id+':'+(memory.message?.id||'notes')} conversation={conversation} agent={agent} message={memory.message} onClose={()=>setMemory(null)}/>}
     {deleteTarget && <Dialog open onOpenChange={open => { if (!open && !pending) setDeleteTarget(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete agent?</DialogTitle><DialogDescription>This agent’s CLI will stop and its AtrisAgent record will be removed. Provider-owned history and saved project memory are retained.</DialogDescription></DialogHeader><div className="break-words rounded-xl border border-border bg-muted/30 p-4 text-sm font-medium">{deleteTarget.name}</div><DialogFooter><Button variant="outline" disabled={Boolean(pending)} onClick={() => setDeleteTarget(null)}>Cancel</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => close(deleteTarget)}><Trash2 className="mr-2 h-4 w-4" />{pending ? 'Removing…' : 'Delete agent'}</Button></DialogFooter></DialogContent></Dialog>}
   </section>;

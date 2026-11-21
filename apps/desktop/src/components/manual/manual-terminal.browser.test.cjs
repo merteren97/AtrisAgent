@@ -132,14 +132,17 @@ async function testManualTrustAndChanges(page, url) {
     const agent = { id: 'agy-fixture', conversationId: 'review', runtimeType: 'antigravity', name: 'Antigravity 1', cwd: workspace.path };
     useWorkspaceStore.setState({ workspaces: [workspace], activeWorkspaceId: workspace.id });
     useManualStore.setState({ mode: 'manual', activeByWorkspace: {sample: 'review'}, conversations: { sample: [{ id: 'review', workspaceId: 'sample', title: 'Fixture conversation', agents: [agent] }] } });
-    const recorded = window.manualReview = { writes: [], refreshes: [], actions: [], copied: null, cwd: null };
-    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async text => { recorded.copied = text; } } });
+    const recorded = window.manualReview = { writes: [], refreshes: [], actions: [], cwd: null, ready: false };
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('Send must not use the clipboard'); } } });
     let started = false;
     window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
       if (command === 'manual_terminal_start') { started = true; recorded.cwd = args.request.cwd; return; }
       if (command === 'manual_terminal_snapshot') return { id: agent.id, status: started ? 'open' : 'disconnected', sequence: started ? 1 : 0,
-        output: started && !args.after && !args.statusOnly ? 'Do you trust the contents of this project?\r\n> Yes, I trust this folder' : '', reset: !started, rows: 30, columns: 120, resizes: [], inputReady: null };
-      if (command === 'manual_terminal_write') recorded.writes.push(args);
+        output: '', reset: !started, rows: 30, columns: 120, resizes: [], inputReady: recorded.ready };
+      if (command === 'manual_terminal_write') {
+        if (!recorded.ready) throw new Error('Antigravity is not ready. Check Code.');
+        recorded.writes.push(args);
+      }
     } };
     let reviewState = 'pending';
     const fetch = window.fetch;
@@ -167,18 +170,22 @@ async function testManualTrustAndChanges(page, url) {
   await page.getByRole('button', { name: 'Open agent', exact: true }).click();
   const code = page.getByRole('button', { name: 'Code', exact: true });
   const chat = page.getByRole('button', { name: 'Chat', exact: true });
-  await page.waitForFunction(() => document.querySelector('button[aria-pressed="true"]')?.textContent.includes('Code'));
-  await chat.click();
   const draft = page.getByRole('textbox', { name: 'Message Antigravity 1' });
-  await draft.fill('Keep this draft during folder setup');
-  await page.getByRole('button', { name: 'Copy draft & open Code' }).click();
-  await page.getByText('Draft copied.', { exact: false }).waitFor();
-  assert.equal(await code.getAttribute('aria-pressed'), 'true');
-  assert.deepEqual(await page.evaluate(() => ({ copied: window.manualReview.copied, cwd: window.manualReview.cwd, writes: window.manualReview.writes })), {
-    copied: 'Keep this draft during folder setup', cwd: 'C:/fixture', writes: [],
+  const testPrompt = 'First line of a prompt\nSecond line of a prompt';
+  await draft.fill(testPrompt);
+  const send = page.getByRole('button', { name: 'Send', exact: true });
+  await send.click();
+  await page.getByRole('alert').getByText('Antigravity is not ready. Check Code.').waitFor();
+  assert.equal(await draft.inputValue(), testPrompt);
+  assert.deepEqual(await page.evaluate(() => window.manualReview.writes), []);
+  await page.evaluate(() => { window.manualReview.ready = true; });
+  await send.click();
+  await page.waitForFunction(() => document.querySelector('textarea[aria-label="Message Antigravity 1"]')?.value === '');
+  assert.equal(await chat.getAttribute('aria-pressed'), 'true');
+  assert.equal(await code.getAttribute('aria-pressed'), 'false');
+  assert.deepEqual(await page.evaluate(() => ({ cwd: window.manualReview.cwd, writes: window.manualReview.writes })), {
+    cwd: 'C:/fixture', writes: [{ id: 'agy-fixture', data: testPrompt, paste: true }],
   });
-  await chat.click();
-  assert.equal(await draft.inputValue(), 'Keep this draft during folder setup');
   const review = page.locator('#review-root');
   await review.getByRole('button', { name: 'Refresh changes' }).click();
   await page.waitForFunction(() => window.manualReview.refreshes.includes('1'));
@@ -191,7 +198,7 @@ async function testManualTrustAndChanges(page, url) {
   await page.getByRole('button', { name: 'Undo changes', exact: true }).click();
   await review.getByText('Undone', { exact: true }).waitFor();
   assert.deepEqual(await page.evaluate(() => window.manualReview.actions), ['approve', 'undo'].map(action => ({ action, files: [{ path: 'a.ts', revision: 'fixture-revision' }] })));
-  console.log('PASS: Antigravity keeps the project path and draft; an approved project change can still be undone by revision');
+  console.log('PASS: Antigravity sends from Chat, preserves input on failure, and Undo still works after approval');
 }
 
 (async () => {

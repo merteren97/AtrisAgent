@@ -212,6 +212,15 @@ export class LiveProjectChanges {
     }
     this.db.prepare('UPDATE live_project_scopes SET active = 0 WHERE id = ?').run(id);
   }
+  removeManualConversation(conversationId: string) {
+    const id = `manual:${conversationId}`;
+    const scope = this.get(id);
+    if (scope?.kind !== 'manual' || scope.owner !== conversationId) return;
+    this.stop(id);
+    // Removing the conversation retires its journal, never its project files.
+    this.db.prepare('DELETE FROM live_project_files WHERE scope_id = ?').run(id);
+    this.db.prepare('DELETE FROM live_project_scopes WHERE id = ?').run(id);
+  }
   async close() {
     const ongoing = [...this.trackers.values()];
     for (const tracker of ongoing) {
