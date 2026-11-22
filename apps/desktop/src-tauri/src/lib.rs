@@ -147,18 +147,18 @@ fn inspect_workspace(path: String) -> Result<WorkspaceInspection, String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Workspace".to_string());
 
-    let git_root = git_output(&workspace_path, &["rev-parse", "--show-toplevel"])
+    let git_root = git_output(&workspace_path, &["--no-optional-locks", "rev-parse", "--show-toplevel"])
         .filter(|value| !value.is_empty());
     let is_git = git_root.is_some();
     let branch = if is_git {
-        git_output(&workspace_path, &["branch", "--show-current"])
+        git_output(&workspace_path, &["--no-optional-locks", "branch", "--show-current"])
             .filter(|value| !value.is_empty())
-            .or_else(|| git_output(&workspace_path, &["rev-parse", "--short", "HEAD"]))
+            .or_else(|| git_output(&workspace_path, &["--no-optional-locks", "rev-parse", "--short", "HEAD"]))
     } else {
         None
     };
     let dirty = is_git
-        && git_output(&workspace_path, &["status", "--porcelain"])
+        && git_output(&workspace_path, &["--no-optional-locks", "status", "--porcelain", "-uno"])
             .map(|value| !value.is_empty())
             .unwrap_or(false);
 

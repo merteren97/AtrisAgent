@@ -106,6 +106,7 @@ function createEngine(id: string) {
   const clearPollTimer = () => { clearTimeout(timer); timer = undefined; };
   const schedulePoll = () => {
     clearPollTimer();
+    if (status === 'closed' || status === 'exited') return;
     const delay = status !== 'open' ? INACTIVE_POLL_MS : (container.parentElement === parking && inputReady !== false) ? PARKED_POLL_MS : VISIBLE_POLL_MS;
     timer = setTimeout(() => void poll(), delay);
   };
@@ -117,10 +118,11 @@ function createEngine(id: string) {
     try {
       await enqueue(async () => {
         if (disposed || pollEpoch !== epoch) return;
+        const previousStatus = status;
         const snapshot = await invoke<TerminalSnapshot>('manual_terminal_snapshot', { id, after });
         if (disposed || pollEpoch !== epoch) return;
         await applySnapshot(snapshot, pollEpoch);
-        resize();
+        if (snapshot.status === 'open' && (previousStatus !== 'open' || snapshot.reset)) resize();
       });
     } catch (e) { if (!disposed) update(String(e)); }
     finally {

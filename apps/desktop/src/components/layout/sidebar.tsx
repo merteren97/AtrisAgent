@@ -200,7 +200,20 @@ function SidebarAgentTree({
 }
 
 export function Sidebar() {
-  const manual = useManualStore();
+  const manualMode = useManualStore(state => state.mode);
+  const manualConversations = useManualStore(state => state.conversations);
+  const manualActiveByWorkspace = useManualStore(state => state.activeByWorkspace);
+  const manualError = useManualStore(state => state.error);
+  const manual = {
+    mode: manualMode,
+    conversations: manualConversations,
+    activeByWorkspace: manualActiveByWorkspace,
+    error: manualError,
+    setMode: useManualStore.getState().setMode,
+    setCreating: useManualStore.getState().setCreating,
+    select: useManualStore.getState().select,
+    refresh: useManualStore.getState().refresh,
+  };
   const planning = usePlanningStore();
   const manualActivity = useManualActivity(state => state.agents);
   const { theme, resolvedTheme, setTheme } = useTheme();

@@ -13,14 +13,20 @@ export function useChatHistoryScroll(scope?: string) {
   const anchor = useRef<{ element: HTMLElement; top: number } | null>(null);
   const [detached, setDetached] = useState(false);
 
+  const lastScrollHeight = useRef(0);
+
   useLayoutEffect(() => {
     following.current = true;
     anchor.current = null;
+    lastScrollHeight.current = 0;
     setDetached(false);
     const node = viewport.current;
     if (!node || !content.current) return;
     const observer = new ResizeObserver(() => {
-      if (following.current) node.scrollTop = node.scrollHeight;
+      if (following.current) {
+        lastScrollHeight.current = node.scrollHeight;
+        node.scrollTop = node.scrollHeight;
+      }
     });
     observer.observe(content.current);
     observer.observe(node);
@@ -34,7 +40,9 @@ export function useChatHistoryScroll(scope?: string) {
     if (!node) return;
     if (saved && node.contains(saved.element)) {
       node.scrollTop += saved.element.getBoundingClientRect().top - saved.top;
-    } else if (following.current) {
+      lastScrollHeight.current = node.scrollHeight;
+    } else if (following.current && node.scrollHeight !== lastScrollHeight.current) {
+      lastScrollHeight.current = node.scrollHeight;
       node.scrollTop = node.scrollHeight;
     }
   });

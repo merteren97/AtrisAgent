@@ -18,7 +18,7 @@ type State = 'pending' | 'approved' | 'reverted';
 type Entry = { path: string; revision: string; state: State; before_key: string; after_key: string; before_mode: number; previous: string | null; undoing: number };
 type Head = { digest: string; stamp: string; mode: number; revision: string | null };
 type Snapshot = { digest: string; stamp: string; mode: number; bytes?: Buffer };
-type Project = { id: string; root: string; ready: Promise<void>; settled: boolean; seeded: boolean; bytes: number; tracked: number;
+type Project = { id: string; root: string; gitRootPath?: string; ready: Promise<void>; settled: boolean; seeded: boolean; bytes: number; tracked: number;
   queue: Promise<unknown>; pending: Set<string>; full: boolean; watcher?: fs.FSWatcher; timer?: NodeJS.Timeout;
   interval?: NodeJS.Timeout; closed: boolean; issue?: string; gitAt: number; gitFiles: Map<string, string>; gitRead?: Promise<void> };
 type Selection = Array<{ path: string; revision: string }>;
@@ -80,21 +80,24 @@ export class DirectProjectReview {
       project.watcher = fs.watch(root, { recursive: true, persistent: false }, (_event, name) => {
         if (!name) project.full = true;
         else {
-          const relative = relativePath(name.split(path.sep).join('/'));
+          const normalized = name.split(path.sep).join('/');
+          if (normalized.split('/').some(segment => segment && excludedName(segment))) return;
+          const relative = relativePath(normalized);
           if (!relative || this.isAppData(project, relative)) return;
           project.pending.add(relative);
           if (project.pending.size > 512) { project.pending.clear(); project.full = true; }
         }
         this.schedule(project);
       });
-      project.watcher.on('error', () => { project.watcher?.close(); project.full = true; this.schedule(project); });
+      project.watcher.on('error', () => { project.watcher?.close(); project.watcher = undefined; project.full = true; this.schedule(project); });
     } catch { /* Reconcile on a timer where recursive notifications are unavailable. */ }
     project.ready = this.enqueue(project, async () => {
       try { await this.reconcile(project, !project.seeded); }
       catch (error) { if (!project.closed) project.issue = error instanceof Error ? error.message : 'File history is limited.'; }
       finally { project.settled = true; this.schedule(project); }
     });
-    project.interval = setInterval(() => { project.full = true; this.schedule(project); }, 30_000).unref();
+    const intervalMs = project.watcher ? 180_000 : 30_000;
+    project.interval = setInterval(() => { project.full = true; this.schedule(project); }, intervalMs).unref();
     return project;
   }
 
@@ -102,17 +105,14 @@ export class DirectProjectReview {
   async prepareLaunch(id: string) {
     const project = await this.project(id);
     let timer: NodeJS.Timeout | undefined;
-    try { await Promise.race([project.ready, new Promise<void>(resolve => { timer = setTimeout(resolve, 3000); })]); }
+    try { await Promise.race([project.ready, new Promise<void>(resolve => { timer = setTimeout(resolve, 1500); })]); }
     finally { clearTimeout(timer); }
   }
   async deactivate(id: string, stillIdle: () => boolean) {
     const project = this.projects.get(id);
-    if (!project) return;
-    await this.enqueue(project, async () => {
-      if (project.closed || !stillIdle()) return;
-      try { await this.reconcile(project, false); }
-      finally { if (stillIdle()) this.stop(project); }
-    });
+    if (!project || project.closed || !stillIdle()) return;
+    // Stop immediately so deletion never blocks behind a queued 20k-file reconcile.
+    this.stop(project);
   }
   async close() {
     this.closed = true;
@@ -209,6 +209,22 @@ export class DirectProjectReview {
   private async reconcile(project: Project, seed: boolean) {
     this.guard(project);
     project.issue = undefined;
+    const headRows = this.db.prepare('SELECT path, digest, stamp, mode, revision FROM direct_review_head WHERE project = ?').all(project.id) as Array<Head & { path: string }>;
+    const headCache = new Map<string, Head>(headRows.map(row => [row.path, { digest: row.digest, stamp: row.stamp, mode: row.mode, revision: row.revision }]));
+    const undoingRevisions = new Set<string>(
+      (this.db.prepare('SELECT revision FROM direct_review_entry WHERE project = ? AND undoing = 1').all(project.id) as Array<{ revision: string }>).map(row => row.revision),
+    );
+    const pendingWrites: Array<{ relative: string; old: Head | undefined; next: Snapshot; seed: boolean }> = [];
+    const flushWrites = () => {
+      if (!pendingWrites.length || project.closed) { pendingWrites.length = 0; return; }
+      this.guard(project);
+      this.db.transaction(() => {
+        for (const item of pendingWrites) {
+          this.commitObserved(project, item.relative, item.old, item.next, item.seed);
+        }
+      })();
+      pendingWrites.length = 0;
+    };
     const dirs = [''], seen = new Set<string>();
     let entries = 0;
     while (dirs.length && !project.closed) {
@@ -216,26 +232,51 @@ export class DirectProjectReview {
       const folder = path.join(project.root, dir);
       if (path.relative(folder, await fs.promises.realpath(folder)) !== '') continue;
       for (const item of await fs.promises.readdir(folder, { withFileTypes: true })) {
+        if (project.closed) break;
         if (excludedName(item.name)) continue;
         const relative = relativePath(dir ? `${dir}/${item.name}` : item.name);
         if (!relative || this.isAppData(project, relative)) continue;
         if (++entries > entryLimit) throw fail('This project exceeds the file history limit. Only captured versions can be undone.');
+        if (entries % 100 === 0) {
+          flushWrites();
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (project.closed) break;
+        }
         if (item.isDirectory()) dirs.push(relative);
         else if (item.isFile()) {
           seen.add(relative);
-          try { await this.observe(project, relative, seed, true); }
-          catch { project.issue = 'Some files could not be recorded. Only captured versions can be undone.'; }
-        } else if (seed && !this.head(project, relative) && project.tracked < entryLimit) {
-          this.writeHead(project, relative, { digest: 'unavailable', stamp: '', mode: 0 }, null);
+          try {
+            const old = headCache.get(relative);
+            if (old && (!old.revision || !undoingRevisions.has(old.revision))) {
+              const current = await fs.promises.lstat(path.join(project.root, relative), { bigint: true });
+              if (stamp(current) === old.stamp) continue;
+            }
+            const next = await this.readFile(project, relative);
+            if (project.closed) break;
+            if (!old && next.digest === missing) continue;
+            if (!old && project.tracked + pendingWrites.length >= entryLimit) {
+              project.issue = 'The project history limit was reached. Only captured versions can be undone.';
+              continue;
+            }
+            if (old?.digest === next.digest && old.stamp === next.stamp) continue;
+            pendingWrites.push({ relative, old, next, seed });
+            if (pendingWrites.length >= 128) flushWrites();
+          } catch { project.issue = 'Some files could not be recorded. Only captured versions can be undone.'; }
+        } else if (seed && !headCache.has(relative) && project.tracked + pendingWrites.length < entryLimit) {
+          pendingWrites.push({ relative, old: undefined, next: { digest: 'unavailable', stamp: '', mode: 0 }, seed: true });
+          if (pendingWrites.length >= 128) flushWrites();
         }
       }
     }
+    flushWrites();
     if (project.closed) return;
     if (!seed) {
-      const heads = this.db.prepare("SELECT path FROM direct_review_head WHERE project=? AND digest<>'-'").all(project.id) as {path: string}[];
-      for (const { path: relative } of heads) if (!seen.has(relative)) {
-        try { await this.observe(project, relative, false); }
-        catch { project.issue = 'Some files could not be recorded. Only captured versions can be undone.'; }
+      for (const [relative, old] of headCache) {
+        if (project.closed) break;
+        if (old.digest !== missing && !seen.has(relative)) {
+          try { await this.observe(project, relative, false); }
+          catch { project.issue = 'Some files could not be recorded. Only captured versions can be undone.'; }
+        }
       }
     }
     if (seed && !project.issue) {
@@ -243,6 +284,25 @@ export class DirectProjectReview {
       project.seeded = true;
     }
     this.trim(project);
+  }
+
+  private commitObserved(project: Project, relative: string, old: Head | undefined, next: Snapshot, seed: boolean) {
+    this.storeBlob(project, next);
+    if (old?.revision) {
+      const interrupted = this.entry(project, relative, old.revision);
+      if (interrupted?.undoing) {
+        this.db.prepare("UPDATE direct_review_entry SET undoing=0, state=CASE WHEN before_key=? THEN 'reverted' ELSE state END WHERE project=? AND revision=?")
+          .run(next.digest, project.id, interrupted.revision);
+        if (next.digest === interrupted.before_key) { this.writeHead(project, relative, next, this.undoHead(project, interrupted)); return; }
+      }
+    }
+    if ((seed && !old) || old?.digest === next.digest) { this.writeHead(project, relative, next, old?.revision ?? null); return; }
+    // Missing history after a partial baseline is unknown, not proof of a new file.
+    const before = old?.digest ?? (project.seeded ? missing : 'unavailable');
+    const revision = randomUUID();
+    this.db.prepare('INSERT INTO direct_review_entry (project,revision,path,before_key,after_key,before_mode,previous) VALUES (?,?,?,?,?,?,?)')
+      .run(project.id, revision, relative, before, next.digest, old?.mode ?? 0, old?.revision ?? null);
+    this.writeHead(project, relative, next, revision);
   }
 
   private async observe(project: Project, relative: string, seed: boolean, skipUnchanged = false) {
@@ -257,22 +317,7 @@ export class DirectProjectReview {
     if (!old && project.tracked >= entryLimit) { project.issue = 'The project history limit was reached. Only captured versions can be undone.'; return; }
     if (old?.digest === next.digest && old.stamp === next.stamp) return;
     this.db.transaction(() => {
-      this.storeBlob(project, next);
-      if (old?.revision) {
-        const interrupted = this.entry(project, relative, old.revision);
-        if (interrupted?.undoing) {
-          this.db.prepare("UPDATE direct_review_entry SET undoing=0, state=CASE WHEN before_key=? THEN 'reverted' ELSE state END WHERE project=? AND revision=?")
-            .run(next.digest, project.id, interrupted.revision);
-          if (next.digest === interrupted.before_key) { this.writeHead(project, relative, next, this.undoHead(project, interrupted)); return; }
-        }
-      }
-      if ((seed && !old) || old?.digest === next.digest) { this.writeHead(project, relative, next, old?.revision ?? null); return; }
-      // Missing history after a partial baseline is unknown, not proof of a new file.
-      const before = old?.digest ?? (project.seeded ? missing : 'unavailable');
-      const revision = randomUUID();
-      this.db.prepare('INSERT INTO direct_review_entry (project,revision,path,before_key,after_key,before_mode,previous) VALUES (?,?,?,?,?,?,?)')
-        .run(project.id, revision, relative, before, next.digest, old?.mode ?? 0, old?.revision ?? null);
-      this.writeHead(project, relative, next, revision);
+      this.commitObserved(project, relative, old, next, seed);
     })();
   }
 
@@ -294,7 +339,7 @@ export class DirectProjectReview {
     project.gitRead = git('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '-z', '-uall', '--no-renames', '--ignore-submodules=all', '--', '.'],
       { cwd: project.root, windowsHide: true, timeout: 5000, maxBuffer: 2 * 1024 * 1024 }).then(({ stdout }) => {
       const files = new Map<string, string>();
-      const gitRoot = this.gitRoot(project.root);
+      const gitRoot = project.gitRootPath ?? (project.gitRootPath = this.gitRoot(project.root));
       for (const item of stdout.split('\0')) {
         const relative = relativePath(path.relative(project.root, path.resolve(gitRoot, item.slice(3))).split(path.sep).join('/'));
         if (item.length < 4 || !relative || this.isAppData(project, relative)) continue;

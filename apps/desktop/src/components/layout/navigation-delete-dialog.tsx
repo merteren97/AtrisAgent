@@ -22,10 +22,15 @@ export function NavigationDeleteDialog({ target, onClose }: { target: Navigation
       else {
         // Native ownership must be relinquished before deleting its durable identities.
         if (target.conversation.agents.length && !isTauriRuntime()) throw new Error('Delete this conversation in the desktop app so its CLI sessions can be closed safely.');
-        for (const agent of target.conversation.agents) {
-          await invoke('manual_terminal_close', { id: agent.id });
-          markManualClosed(agent.id);
-          useManualStore.getState().hideAgent(agent.id, true);
+        if (target.conversation.agents.length) {
+          const results = await Promise.allSettled(
+            target.conversation.agents.map(async agent => {
+              await invoke('manual_terminal_close', { id: agent.id });
+              markManualClosed(agent.id);
+            }),
+          );
+          const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+          if (failure) throw failure.reason;
         }
         await useManualStore.getState().remove(target.conversation);
         const { disposeManualTerminal } = await import('@/components/manual/manual-terminal');

@@ -49,7 +49,11 @@ export function useManualActivityMonitor() {
     if (!ids || !isTauriRuntime()) return;
     let disposed = false; let timer: ReturnType<typeof setTimeout>;
     async function poll() {
+      clearTimeout(timer);
+      if (disposed) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       const agentIds = ids.split(',');
+      const updates: Record<string, AgentActivity> = {};
       for (let start = 0; start < agentIds.length && !disposed; start += 4) {
         await Promise.all(agentIds.slice(start, start + 4).map(async id => {
           const epoch = useManualActivity.getState().launched[id];
@@ -59,12 +63,38 @@ export function useManualActivityMonitor() {
             if (disposed || epoch !== useManualActivity.getState().launched[id] || !Object.values(useManualStore.getState().conversations).flat().some(c => c.agents.some(a => a.id === id))) return;
             useManualStore.getState().applyNaming(activity.naming);
             const verified = activity.at && Date.parse(activity.at) >= (epoch || 0) && Date.parse(activity.at) <= Date.now() + 5000;
-            useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: snapshot.status, state: verified ? activity.state : 'unknown', at: verified ? activity.at : undefined, checkedAt: Date.now() } } }));
-          } catch { if (!disposed && Object.values(useManualStore.getState().conversations).flat().some(c => c.agents.some(a => a.id === id))) useManualActivity.setState(state => ({ agents: { ...state.agents, [id]: { lifecycle: 'disconnected', state: 'unknown', checkedAt: Date.now() } } })); }
+            updates[id] = { lifecycle: snapshot.status, state: verified ? activity.state : 'unknown', at: verified ? activity.at : undefined, checkedAt: Date.now() };
+          } catch {
+            if (!disposed && Object.values(useManualStore.getState().conversations).flat().some(c => c.agents.some(a => a.id === id))) {
+              updates[id] = { lifecycle: 'disconnected', state: 'unknown', checkedAt: Date.now() };
+            }
+          }
         }));
+      }
+      if (!disposed && Object.keys(updates).length) {
+        useManualActivity.setState(state => {
+          let changed = false;
+          const next = { ...state.agents };
+          for (const [id, entry] of Object.entries(updates)) {
+            const prev = state.agents[id];
+            const meaningful = !prev || prev.lifecycle !== entry.lifecycle || prev.state !== entry.state || prev.at !== entry.at;
+            const stale = !prev || entry.checkedAt - prev.checkedAt >= 8000;
+            if (meaningful || stale) {
+              next[id] = entry;
+              changed = true;
+            }
+          }
+          return changed ? { agents: next } : state;
+        });
       }
       if (!disposed) timer = setTimeout(poll, 3000);
     }
-    void poll(); return () => { disposed = true; clearTimeout(timer); };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') void poll();
+      else clearTimeout(timer);
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    void poll();
+    return () => { disposed = true; clearTimeout(timer); document.removeEventListener('visibilitychange', onVisibility); };
   }, [ids]);
 }

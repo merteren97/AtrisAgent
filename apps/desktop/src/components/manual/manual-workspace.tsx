@@ -29,6 +29,7 @@ import type { CodexPermissionMode } from '@atris-agent-code/domain';
 
 export { buildAntigravityQuestionKeystrokes };
 
+const EMPTY_FILES: File[] = [];
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode', 'antigravity'].includes(kind || '');
 const cliName = (kind: string) => ({ claude_code: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', antigravity: 'Antigravity' }[kind] || kind);
@@ -40,6 +41,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
   const models = useAccountStore(s => s.discoveredModels);
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
   const [runtime, setRuntime] = useState('claude_code'); const [catalogId, setCatalogId] = useState('');
+  const [reasoning, setReasoning] = useState<string | undefined>(undefined);
   const [count, setCount] = useState(1);
   const [isolated, setIsolated] = useState(false);
   const existingCount = useManualStore(s => Object.values(s.conversations).flat().find(c => c.id === conversationId)?.agents.length || 0);
@@ -48,7 +50,12 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
   const conversationKey = useRef(crypto.randomUUID()); const agentKeys = useRef(Array.from({ length: 30 }, () => crypto.randomUUID()));
   const createdConversation = useRef<string | undefined>(conversationId);
   const options = useMemo(() => models.filter(m => m.runtimeType === runtime && m.available), [models, runtime]);
-  const selected = options.find(m => m.catalogId === catalogId) || options[0];
+  const selected = options.find(m => m.catalogId === catalogId)
+    || options.find(m => m.availability === 'available' && m.supportedReasoning?.length)
+    || options[0];
+  const selectedEffort = selected?.supportedReasoning?.length
+    ? (reasoning && selected.supportedReasoning.includes(reasoning as any) ? reasoning : (selected.defaultReasoning || selected.supportedReasoning[0]))
+    : undefined;
   const submit = async () => {
     if (!workspaceId || !selected || pending) return;
     setPending(true); setError(null);
@@ -58,7 +65,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
         createdConversation.current = conversation.id;
       }
       const agents = await useManualStore.getState().addAgents(createdConversation.current, Array.from({ length: count }, (_, index) => ({
-        id: agentKeys.current[index], catalogId: selected.catalogId,
+        id: agentKeys.current[index], catalogId: selected.catalogId, ...(selectedEffort ? { reasoning: selectedEffort } : {}),
       })));
       // Creation is durable before launch. A failed launch remains visible and can be retried explicitly.
       await onCreated(agents);
@@ -76,7 +83,7 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
             {RUNTIME_BRANDS.map(provider => {
               const count = models.filter(model => model.runtimeType === provider.id && model.available).length;
               return <label key={provider.id} className={`relative flex cursor-pointer flex-col rounded-2xl border p-4 transition-colors focus-within:ring-2 focus-within:ring-ring ${runtime === provider.id ? 'border-primary bg-primary/5 shadow-sm' : 'border-border bg-card hover:border-primary/40 hover:bg-accent/30'}`}>
-                <input type="radio" name="provider" value={provider.id} checked={runtime === provider.id} onChange={() => { setRuntime(provider.id); setCatalogId(''); }} className="absolute right-4 top-4 h-4 w-4 accent-primary" />
+                <input type="radio" name="provider" value={provider.id} checked={runtime === provider.id} onChange={() => { setRuntime(provider.id); setCatalogId(''); setReasoning(undefined); }} className="absolute right-4 top-4 h-4 w-4 accent-primary" />
                 <RuntimeBrandIcon runtimeId={provider.id} className="mb-5 h-8 w-8 text-foreground" />
                 <span className="text-sm font-semibold">{cliName(provider.id)}</span>
                 <span className="mt-1 text-xs leading-5 text-muted-foreground">{count ? `${count} available model${count === 1 ? '' : 's'}` : 'Connect in Accounts'}</span>
@@ -87,7 +94,19 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
         <div className="rounded-2xl border border-border bg-card p-5 sm:p-6">
           <h2 className="text-sm font-medium">2. Choose a model</h2>
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
-            <label className="grid min-w-0 gap-2 text-xs font-medium sm:col-span-2">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => setCatalogId(e.target.value)} disabled={!options.length}>{!options.length && <option value="">No verified model available</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label>
+            <label className="grid min-w-0 gap-2 text-xs font-medium sm:col-span-2">Model<select className={selectStyle} value={selected?.catalogId || ''} onChange={e => { setCatalogId(e.target.value); setReasoning(undefined); }} disabled={!options.length}>{!options.length && <option value="">No verified model available</option>}{options.map(model => <option key={model.catalogId} value={model.catalogId}>{model.name} · {model.accountName}</option>)}</select></label>
+            {!!selected?.supportedReasoning?.length && (
+              <fieldset className="sm:col-span-2">
+                <legend className="mb-2 text-xs font-medium">Reasoning level</legend>
+                <div className="flex flex-wrap gap-2">
+                  {selected.supportedReasoning.map(level => (
+                    <Button key={level} type="button" size="sm" variant={selectedEffort === level ? 'secondary' : 'outline'} aria-pressed={selectedEffort === level} onClick={() => setReasoning(level)} className="h-8 px-3 text-xs capitalize">
+                      {level}
+                    </Button>
+                  ))}
+                </div>
+              </fieldset>
+            )}
           </div>
           <p className="mt-3 text-xs leading-5 text-muted-foreground">Conversation and terminal titles are created automatically from your first task, in Chat or Code.</p>
           {runtime === 'codex' && <p className="mt-3 text-xs leading-5 text-muted-foreground">Codex starts in the selected project with Ask for approval. Chat connects through an AtrisAgent-managed history hook. Change permissions beside Send.</p>}
@@ -112,7 +131,16 @@ function ManualAgentSetup({ conversationId, onClose, onCreated }: { conversation
 
 export function ManualWorkspace() {
   const workspaceId = useWorkspaceStore(s => s.activeWorkspaceId);
-  const { conversations, activeByWorkspace, agentByConversation, surfaceByConversation, creating, setCreating, selectAgent, setSurface, drafts, setDraft, attachments, updateAttachments } = useManualStore();
+  const conversations = useManualStore(s => s.conversations);
+  const activeByWorkspace = useManualStore(s => s.activeByWorkspace);
+  const agentByConversation = useManualStore(s => s.agentByConversation);
+  const surfaceByConversation = useManualStore(s => s.surfaceByConversation);
+  const creating = useManualStore(s => s.creating);
+  const setCreating = useManualStore(s => s.setCreating);
+  const selectAgent = useManualStore(s => s.selectAgent);
+  const setSurface = useManualStore(s => s.setSurface);
+  const setDraft = useManualStore(s => s.setDraft);
+  const updateAttachments = useManualStore(s => s.updateAttachments);
   const conversation = (workspaceId ? conversations[workspaceId] || [] : []).find(c => c.id === activeByWorkspace[workspaceId!]);
   const surface = conversation ? surfaceByConversation[conversation.id] || 'chat' : 'chat';
   const [adding, setAdding] = useState(false); const [handoff, setHandoff] = useState<ManualAgent | null>(null);
@@ -135,6 +163,8 @@ export function ManualWorkspace() {
   const [generation, setGeneration] = useState(0);
   const native = isTauriRuntime();
   const agentId = agent?.id;
+  const draft = useManualStore(state => (agentId ? state.drafts[agentId] || '' : ''));
+  const files = useManualStore(state => (agentId ? state.attachments[agentId] || EMPTY_FILES : EMPTY_FILES));
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
   const scroll = useChatHistoryScroll(`${agentId}:${surface}`);
   const { snapshot, messages, recentTools, questions, status, loadOlder, dismissConnectionError } = useManualChatHistory(
@@ -168,7 +198,7 @@ export function ManualWorkspace() {
   }, [agentId, surface]);
 
   useEffect(() => { setError(null); }, [agentId]);
-  useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); }, [conversation?.id]);
+  useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); setDeleteTarget(null); }, [conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
     const ids = agentIds.split(',');
@@ -249,7 +279,13 @@ export function ManualWorkspace() {
     void action('interrupt', run);
   };
   const close = (target: ManualAgent) => void action('close', async () => {
-    await invoke('manual_terminal_close', { id: target.id });
+    if (native) {
+      try { await invoke('manual_terminal_close', { id: target.id }); }
+      catch (err) {
+        // Only abort deletion if a live process refused to close; already-closed/disconnected sessions can be removed.
+        if (statuses[target.id] === 'open') throw err;
+      }
+    }
     lifecycleEpoch.current += 1;
     markManualClosed(target.id); setStatuses(previous => ({ ...previous, [target.id]: 'closed' }));
     await useManualStore.getState().removeAgent(target);
@@ -292,8 +328,6 @@ export function ManualWorkspace() {
     }, true);
   };
   const live = agent && statuses[agent.id] === 'open';
-  const draft = agent ? drafts[agent.id] || '' : '';
-  const files = agent ? attachments[agent.id] || [] : [];
   const lastVisible = messages[messages.length - 1];
   const questionIndex = recentTools.map(message => Boolean(message.question)).lastIndexOf(true);
   const unresolvedQuestion = questionIndex >= 0 && !recentTools.slice(questionIndex + 1).some(message => !message.toolName) ? recentTools[questionIndex].question : undefined;
@@ -426,6 +460,6 @@ export function ManualWorkspace() {
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
     {memory && conversation && <ManualMemory key={conversation.id+':'+(memory.message?.id||'notes')} conversation={conversation} agent={agent} message={memory.message} onClose={()=>setMemory(null)}/>}
-    {deleteTarget && <Dialog open onOpenChange={open => { if (!open && !pending) setDeleteTarget(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete agent?</DialogTitle><DialogDescription>This agent’s CLI will stop and its AtrisAgent record will be removed. Provider-owned history and saved project memory are retained.</DialogDescription></DialogHeader><div className="break-words rounded-xl border border-border bg-muted/30 p-4 text-sm font-medium">{deleteTarget.name}</div><DialogFooter><Button variant="outline" disabled={Boolean(pending)} onClick={() => setDeleteTarget(null)}>Cancel</Button><Button variant="destructive" disabled={Boolean(pending)} onClick={() => close(deleteTarget)}><Trash2 className="mr-2 h-4 w-4" />{pending ? 'Removing…' : 'Delete agent'}</Button></DialogFooter></DialogContent></Dialog>}
+    {deleteTarget && <Dialog open onOpenChange={open => { if (!open && pending !== 'close') setDeleteTarget(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete agent?</DialogTitle><DialogDescription>This agent’s CLI will stop and its AtrisAgent record will be removed. Provider-owned history and saved project memory are retained.</DialogDescription></DialogHeader><div className="break-words rounded-xl border border-border bg-muted/30 p-4 text-sm font-medium">{deleteTarget.name}</div>{error && <p role="alert" className="break-words text-xs text-destructive">{error}</p>}<DialogFooter><Button variant="outline" disabled={pending === 'close'} onClick={() => setDeleteTarget(null)}>Cancel</Button><Button variant="destructive" disabled={pending === 'close'} onClick={() => close(deleteTarget)}><Trash2 className="mr-2 h-4 w-4" />{pending === 'close' ? 'Removing…' : 'Delete agent'}</Button></DialogFooter></DialogContent></Dialog>}
   </section>;
 }
