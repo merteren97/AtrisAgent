@@ -33,7 +33,7 @@ function createEngine(id: string) {
     // Use ConPTY's row-growth policy. Width reflow still follows xterm's defaults.
     windowsPty: /Windows/i.test(navigator.userAgent) ? { backend: 'conpty' } : undefined });
   const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
-  let disposed = false; let after = 0; let status = 'disconnected'; let size = ''; let epoch = 0;
+  let disposed = false; let after = 0; let status = 'disconnected'; let size = ''; let epoch = 0; let inputReady: boolean | null | undefined = undefined;
   let error: string | null = null; let timer: ReturnType<typeof setTimeout> | undefined;
   let pollingEpoch: number | undefined;
   let writes = Promise.resolve();
@@ -51,6 +51,7 @@ function createEngine(id: string) {
   const applySnapshot = async (snapshot: TerminalSnapshot, snapshotEpoch: number) => {
     if (disposed || snapshotEpoch !== epoch) return;
     status = snapshot.status;
+    inputReady = snapshot.inputReady;
     if (snapshot.reset) { outputFrames.reset(); terminal.reset(); }
     const write = async (text: string) => { if (text) await new Promise<void>(resolve => terminal.write(text, resolve)); };
     let offset = 0;
@@ -105,7 +106,7 @@ function createEngine(id: string) {
   const clearPollTimer = () => { clearTimeout(timer); timer = undefined; };
   const schedulePoll = () => {
     clearPollTimer();
-    const delay = status !== 'open' ? INACTIVE_POLL_MS : container.parentElement === parking ? PARKED_POLL_MS : VISIBLE_POLL_MS;
+    const delay = status !== 'open' ? INACTIVE_POLL_MS : (container.parentElement === parking && inputReady !== false) ? PARKED_POLL_MS : VISIBLE_POLL_MS;
     timer = setTimeout(() => void poll(), delay);
   };
   const poll = async () => {
@@ -145,7 +146,7 @@ function createEngine(id: string) {
       if (timer !== undefined) schedulePoll();
     },
     restart() {
-      epoch += 1; after = 0; status = 'disconnected'; size = ''; clearPollTimer();
+      epoch += 1; after = 0; status = 'disconnected'; size = ''; inputReady = undefined; clearPollTimer();
       const restartEpoch = epoch;
       void enqueue(() => { if (!disposed && restartEpoch === epoch) { outputFrames.reset(); terminal.reset(); update(null); } });
       void poll();

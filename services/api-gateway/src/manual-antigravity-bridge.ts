@@ -715,7 +715,14 @@ export class ManualAntigravityBridge {
     const filename = path.join(this.directory(agent),'antigravity-binding.json');
     const temporary = `${filename}.${randomUUID()}.tmp`;
     fs.writeFileSync(temporary,JSON.stringify(binding),{mode:0o600,flag:'wx'});
-    fs.renameSync(temporary,filename);
+    try {
+      fs.renameSync(temporary,filename);
+    } catch (error) {
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+      const existing = this.binding(agent);
+      if (existing && existing.launchId === binding.launchId && existing.sessionId === binding.sessionId) return;
+      throw error;
+    }
   }
   prepare(agent: ManualAgent): string[] {
     const sessionId = this.session(agent);
@@ -827,6 +834,10 @@ export class ManualAntigravityBridge {
       if (allDone && hasFeedbackArtifact) {
         return { state: 'completed', at };
       }
+    }
+
+    if (latestStep?.status === 'ERROR' || latestStep?.status === 'CANCELLED' || latestStep?.status === 'CANCELED') {
+      return { state: 'completed', at };
     }
 
     return { state: 'working', at };

@@ -307,7 +307,7 @@ export class ManualProviderBridge {
       } catch { return {state:'unknown'}; }
     }
     if (agent.runtimeType === 'antigravity') {
-      return new ManualAntigravityBridge(this.dataDir).activity(agent);
+      return new ManualAntigravityBridge(this.dataDir, this.antigravityTranscriptRoot).activity(agent);
     }
     if (!['claude_code', 'codex'].includes(agent.runtimeType)) return { state: 'unknown' };
     const bindings = agent.runtimeType === 'claude_code' ? this.claudeBindings(agent) : this.codexBindings(agent, 'activity');
@@ -468,7 +468,7 @@ export class ManualProviderBridge {
   }
   pendingQuestions(agent: ManualAgent): ManualQuestion[] {
     if (agent.runtimeType === 'antigravity') {
-      return new ManualAntigravityBridge(this.dataDir).pendingQuestions(agent);
+      return new ManualAntigravityBridge(this.dataDir, this.antigravityTranscriptRoot).pendingQuestions(agent);
     }
     if (agent.runtimeType !== 'opencode') return [];
     const sessionId = this.openCodeHistory(agent).sessionId;
