@@ -171,7 +171,7 @@ async function testManualTrustAndChanges(page, url) {
   const code = page.getByRole('button', { name: 'Code', exact: true });
   const chat = page.getByRole('button', { name: 'Chat', exact: true });
   const draft = page.getByRole('textbox', { name: 'Message Antigravity 1' });
-  const testPrompt = 'First line of a prompt\nSecond line of a prompt';
+  const testPrompt = Array.from({ length: 120 }, (_, index) => `Fixture line ${index}: Çok satırlı bir mesajı Chat üzerinden gönder.`).join('\n');
   await draft.fill(testPrompt);
   const send = page.getByRole('button', { name: 'Send', exact: true });
   await send.click();

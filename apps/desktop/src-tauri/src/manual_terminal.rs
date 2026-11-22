@@ -114,7 +114,7 @@ fn terminal_text(output: &str) -> String {
 }
 
 #[derive(Default)]
-struct AntigravityInput { tail: String, bracketed: bool, composer: bool }
+struct AntigravityInput { tail: String, bracketed: bool, composer: bool, ready_since: Option<std::time::Instant> }
 impl AntigravityInput {
     fn update(&mut self, text: &str) {
         self.tail.push_str(text);
@@ -126,10 +126,45 @@ impl AntigravityInput {
         let protected = ["trust the contents of this project", "yes, i trust this folder", "trust this folder?"]
             .iter().filter_map(|text| shown.rfind(text)).max();
         if ready.is_some() || protected.is_some() { self.composer = ready > protected; }
+        if self.bracketed && self.composer { self.ready_since.get_or_insert_with(std::time::Instant::now); }
+        else { self.ready_since = None; }
         let mut start = self.tail.len().saturating_sub(512);
         while !self.tail.is_char_boundary(start) { start += 1; }
         self.tail.drain(..start);
     }
+}
+
+fn wait_for_antigravity_startup(replay: &Mutex<Replay>) -> Result<(), String> {
+    use std::time::Duration;
+    // The composer is painted before agy finishes its startup redraw on
+    // Windows. Input sent in that interval can disappear from the composer.
+    let warmup = Duration::from_millis(700);
+    loop {
+        let remaining = {
+            let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
+            if state.ended { return Err("Agent is not connected".into()); }
+            let since = state.agy_input.as_ref().and_then(|input| input.ready_since).ok_or("Antigravity is not ready. Check Code.")?;
+            warmup.saturating_sub(since.elapsed())
+        };
+        if remaining.is_zero() { return Ok(()); }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
+fn antigravity_paste_acknowledged(output: &str, data: &str) -> bool {
+    let screen = terminal_text(output);
+    let lines = data.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    // Large pastes are collapsed by agy (e.g. `[Pasted text #2 +120 lines]`).
+    let collapsed = screen.split("[Pasted text #").skip(1).any(|label| {
+        label.split_once(" +").is_some_and(|(id, remainder)| {
+            !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                && remainder.split_once(" lines]").is_some_and(|(count, _)| count.parse::<usize>() == Ok(lines))
+        })
+    });
+    let Some(last) = data.trim_end().lines().last() else { return false; };
+    let mut start = if last.len() <= 96 { 0 } else { last.len().saturating_sub(32) };
+    while !last.is_char_boundary(start) { start += 1; }
+    collapsed || screen.contains(&last[start..])
 }
 
 fn terminal_protocol_reply(data: &str) -> bool {
@@ -392,6 +427,7 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     let codex = !antigravity && replay.lock().map_err(|_| "Terminal output is unavailable")?.input_ready.is_some();
     // A full PTY input buffer must not prevent Close from reaching the child.
     drop(terminal_slot);
+    if paste && antigravity { wait_for_antigravity_startup(&replay)?; }
     let mut input = writer.lock().map_err(|_| "Terminal input is unavailable")?;
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     if paste {
@@ -445,7 +481,7 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             if antigravity && state.input_ready != Some(true) { return Err("Antigravity is waiting for input in Code. Message not submitted.".into()); }
             let current = state.sequence;
             let settled = !codex && paste_output_settled(&state, after, started, std::time::Instant::now());
-            let next_signal = if acknowledged_at.is_none() && current != signal_sequence && (opencode || paste_labels.is_some()) {
+            let next_signal = if acknowledged_at.is_none() && current != signal_sequence && (antigravity || opencode || paste_labels.is_some()) {
                 let result = state.recent_text_after(signal_sequence);
                 signal_sequence = current;
                 Some(result)
@@ -456,7 +492,7 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
                 signal_tail.push_str(&text);
                 let expected = open_summary.as_deref().into_iter().chain(open_echo)
                     .chain(paste_labels.iter().flatten().map(String::as_str));
-                if expected.into_iter().any(|text| output_contains_styled_text(&signal_tail, text)) {
+                if (antigravity && antigravity_paste_acknowledged(&signal_tail, data)) || expected.into_iter().any(|text| output_contains_styled_text(&signal_tail, text)) {
                     acknowledged_at = Some(std::time::Instant::now());
                 }
                 let mut trim = signal_tail.len().saturating_sub(512);
@@ -465,8 +501,8 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             }
             if !codex {
                 if acknowledged_at.is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_millis(90)) { break; }
-                if acknowledged_at.is_none() && settled { break; }
-                if started.elapsed() >= std::time::Duration::from_secs(if opencode { 10 } else { 5 }) {
+                if !antigravity && acknowledged_at.is_none() && settled { break; }
+                if started.elapsed() >= std::time::Duration::from_secs(if antigravity || opencode { 10 } else { 5 }) {
                     return Err("Paste attempted, but the CLI did not confirm it. Nothing was submitted automatically. Check the active screen in Code before continuing.".into());
                 }
                 continue;
@@ -1015,24 +1051,24 @@ mod tests {
         }
         let _cleanup = Cleanup(manager.clone(), root.clone());
         let id = "00000000-0000-4000-8000-000000000041";
-        start_with_cleanup(manager.clone(), Launch { id: id.into(), executable: executable.clone(), cwd, env: HashMap::new(), runtime_type: "antigravity".into(),
-            args: vec!["--log-file".into(), root.join("cli.log").to_string_lossy().into_owned()] }).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut answered_cursor = false;
-        loop {
-            let frame = snapshot(&manager, id.into(), 0, false).unwrap();
-            if !answered_cursor && frame.output.contains("\x1b[6n") {
-                write_input(&manager, id, "\x1b[1;1R", false).unwrap();
-                answered_cursor = true;
+        let start_trusted = |id: &str| {
+            start_with_cleanup(manager.clone(), Launch { id: id.into(), executable: executable.clone(), cwd: cwd.clone(), env: HashMap::new(), runtime_type: "antigravity".into(),
+                args: vec!["--log-file".into(), root.join(format!("{id}.log")).to_string_lossy().into_owned()] }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut answered_cursor = false;
+            loop {
+                let frame = snapshot(&manager, id.into(), 0, false).unwrap();
+                if !answered_cursor && frame.output.contains("\x1b[6n") {
+                    write_input(&manager, id, "\x1b[1;1R", false).unwrap();
+                    answered_cursor = true;
+                }
+                assert!(!output_contains_styled_text(&frame.output, "trust the contents"), "Fixture directory is not already trusted; no approval was sent");
+                if frame.input_ready == Some(true) { break; }
+                assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity composer did not appear");
+                std::thread::sleep(Duration::from_millis(25));
             }
-            assert!(!output_contains_styled_text(&frame.output, "trust the contents"), "Fixture directory is not already trusted; no approval was sent");
-            if output_contains_styled_text(&frame.output, "for shortcuts") {
-                println!("Antigravity composer found (bracketed paste mode advertised: {})", frame.output.contains("\x1b[?2004h"));
-                break;
-            }
-            assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity composer did not appear");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        };
+        start_trusted(id);
         write_input(&manager, id, "/exit", true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
@@ -1040,6 +1076,25 @@ mod tests {
             assert!(Instant::now() < deadline, "Antigravity did not submit the local exit command");
             std::thread::sleep(Duration::from_millis(50));
         }
+
+        let long_id = "00000000-0000-4000-8000-000000000043";
+        start_trusted(long_id);
+        let slot = manager.slot(long_id).unwrap().unwrap();
+        let replay = slot.terminal.lock().unwrap().as_ref().unwrap().replay.clone();
+        wait_for_antigravity_startup(&replay).unwrap();
+        let prompt = (0..120).map(|i| format!("Fixture line {i}: abcdefghijklmnopqrstuvwxyz 0123456789 Türkçe test")).collect::<Vec<_>>().join("\n");
+        let before = snapshot(&manager, long_id.into(), 0, true).unwrap().sequence;
+        // Use the production startup gate and verify agy's acknowledgement, without
+        // sending this fixture text to the model.
+        write_input(&manager, long_id, &format!("\x1b[200~{prompt}\x1b[201~"), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame = snapshot(&manager, long_id.into(), before, false).unwrap();
+            if antigravity_paste_acknowledged(&frame.output, &prompt) { break; }
+            assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity did not accept the 120-line fixture");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        close_session(&manager, long_id).unwrap();
 
         let untrusted_id = "00000000-0000-4000-8000-000000000042";
         let untrusted = root.join("untrusted-project");
@@ -1174,6 +1229,15 @@ mod tests {
         assert!(replay.bytes <= REPLAY_LIMIT);
         assert_eq!(replay.sequence, 200);
         assert!(replay.chunks.front().unwrap().0 > 1);
+    }
+
+    #[test]
+    fn antigravity_paste_requires_echo_or_matching_collapsed_line_count() {
+        let prompt = "İlk satır\nBir orta satır\nSon satır";
+        assert!(!antigravity_paste_acknowledged("\x1b[?25lThinking…\x1b[?25h", prompt));
+        assert!(!antigravity_paste_acknowledged("[Pasted text #2 +2 lines]", prompt));
+        assert!(antigravity_paste_acknowledged("[Pasted text #\x1b[36m2\x1b[0m +3 lines]", prompt));
+        assert!(antigravity_paste_acknowledged("> Son \x1b[36msatır\x1b[0m", prompt));
     }
 
     #[test]
