@@ -9,6 +9,7 @@ import {
   parseAntigravityQuestions,
   parseAntigravityTranscript,
 } from './manual-antigravity-bridge';
+import { ManualProviderBridge } from './manual-provider-bridge';
 import type { ManualAgent } from './manual-conversations';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(),'atris-manual-agy-'));
@@ -237,6 +238,16 @@ try {
   ].join('\n');
   const parsedSwarmKilled = parseAntigravityTranscript(swarmKilledRows, session);
   assert.equal(parsedSwarmKilled.find(m => m.id === `${session}:1`)?.tools?.[1].status, 'completed');
+
+  // Cancelled/errored final step must not stay stuck in 'working', and ManualProviderBridge must forward custom transcriptRoot
+  const interruptedRows = [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Long task' }),
+    JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'CANCELLED', content: '' }),
+  ].join('\n');
+  fs.writeFileSync(fullTranscript, interruptedRows);
+  const providerBridge = new ManualProviderBridge(path.join(root, 'app'), provider);
+  assert.equal(providerBridge.activity(third).state, 'completed');
+  assert.deepEqual(providerBridge.pendingQuestions(third), []);
 
   console.log('Antigravity transcript parsing, isolated log binding, resume and ambiguity tests passed.');
 } finally { fs.rmSync(root,{recursive:true,force:true}); }

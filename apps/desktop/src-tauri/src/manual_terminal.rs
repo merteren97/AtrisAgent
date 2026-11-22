@@ -96,21 +96,89 @@ fn output_contains_styled_text(output: &str, expected: &str) -> bool {
 }
 
 fn terminal_text(output: &str) -> String {
-    // Drop style codes (not cursor movements) so fragments of separate screen
-    // locations cannot form a false acknowledgement.
-    let mut remaining = output;
+    // Parse ECMA-48 escape sequences properly: drop SGR/mode/OSC/DCS sequences,
+    // convert CUF cursor-forward (\x1b[nC) into spaces (ConPTY emits CUF for spaces),
+    // and turn cursor-positioning/erase-display codes into '\n' so fragments of
+    // separate screen locations cannot fuse into a false acknowledgement.
+    let bytes = output.as_bytes();
     let mut plain = String::with_capacity(output.len());
-    while let Some(index) = remaining.find("\x1b[") {
-        plain.push_str(&remaining[..index]);
-        let code = &remaining[index + 2..];
-        if let Some(end) = code.bytes().position(|byte| !(b'0'..=b'9').contains(&byte) && !matches!(byte, b';' | b':')) {
-            if code.as_bytes()[end] != b'm' { plain.push('\n'); }
-            if !code.is_char_boundary(end + 1) { return plain; }
-            remaining = &code[end + 1..];
-        } else { return plain; }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if i + 1 >= bytes.len() { break; }
+            match bytes[i + 1] {
+                b'[' => {
+                    let param_start = i + 2;
+                    let mut j = param_start;
+                    while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) { j += 1; }
+                    let param_end = j;
+                    while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) { j += 1; }
+                    if j >= bytes.len() || !(0x40..=0x7e).contains(&bytes[j]) { break; }
+                    let final_byte = bytes[j];
+                    let params = &output[param_start..param_end];
+                    match final_byte {
+                        b'C' if !params.starts_with(|c: char| !c.is_ascii_digit() && c != ';') => {
+                            let count = params.split(';').next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 32);
+                            for _ in 0..count { plain.push(' '); }
+                        }
+                        b'm' | b'h' | b'l' | b'q' | b'r' | b's' | b'u' | b'K' | b'n' | b'c' | b't' => {}
+                        _ => plain.push('\n'),
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                b']' => {
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x07 { j += 1; break; }
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' { j += 2; break; }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                b'P' | b'_' | b'^' => {
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' { j += 2; break; }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                b'(' | b')' | b'*' | b'+' => {
+                    i = (i + 3).min(bytes.len());
+                    continue;
+                }
+                _ => {
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+            }
+        }
+        let ch = output[i..].chars().next().unwrap();
+        plain.push(ch);
+        i += ch.len_utf8();
     }
-    plain.push_str(remaining);
     plain
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_ws = false;
+    for ch in text.chars() {
+        if ch.is_ascii_whitespace() {
+            if !in_ws && !out.is_empty() {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    if out.ends_with(' ') { out.pop(); }
+    out
 }
 
 #[derive(Default)]
@@ -128,7 +196,7 @@ impl AntigravityInput {
         if ready.is_some() || protected.is_some() { self.composer = ready > protected; }
         if self.bracketed && self.composer { self.ready_since.get_or_insert_with(std::time::Instant::now); }
         else { self.ready_since = None; }
-        let mut start = self.tail.len().saturating_sub(512);
+        let mut start = self.tail.len().saturating_sub(8192);
         while !self.tail.is_char_boundary(start) { start += 1; }
         self.tail.drain(..start);
     }
@@ -153,33 +221,129 @@ fn wait_for_antigravity_startup(replay: &Mutex<Replay>) -> Result<(), String> {
 
 fn antigravity_paste_acknowledged(output: &str, data: &str) -> bool {
     let screen = terminal_text(output);
-    let lines = data.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let normalized = data.replace("\r\n", "\n");
+    let raw_lines = normalized.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let trimmed_lines = normalized.trim_end_matches('\n').bytes().filter(|byte| *byte == b'\n').count() + 1;
     // Large pastes are collapsed by agy (e.g. `[Pasted text #2 +120 lines]`).
     let collapsed = screen.split("[Pasted text #").skip(1).any(|label| {
         label.split_once(" +").is_some_and(|(id, remainder)| {
             !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
-                && remainder.split_once(" lines]").is_some_and(|(count, _)| count.parse::<usize>() == Ok(lines))
+                && remainder.split_once(" lines]").is_some_and(|(count, _)| {
+                    count.parse::<usize>().ok().is_some_and(|n| n == raw_lines || (normalized.ends_with('\n') && n == trimmed_lines))
+                })
         })
     });
-    let Some(last) = data.trim_end().lines().last() else { return false; };
-    let mut start = if last.len() <= 96 { 0 } else { last.len().saturating_sub(32) };
-    while !last.is_char_boundary(start) { start += 1; }
-    collapsed || screen.contains(&last[start..])
+    if collapsed { return true; }
+    let non_empty: Vec<String> = normalized
+        .lines()
+        .map(collapse_whitespace)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(last) = non_empty.last() else { return false; };
+    // Avoid false positives from very short trailing delimiters like "---" or "}"
+    // when an earlier substantive line exists in the same prompt.
+    let anchor = if last.chars().count() < 8 {
+        non_empty.iter().rev().find(|line| line.chars().count() >= 8).unwrap_or(last)
+    } else {
+        last
+    };
+    let mut start = if anchor.len() <= 96 { 0 } else { anchor.len().saturating_sub(48) };
+    while !anchor.is_char_boundary(start) { start += 1; }
+    let needle = &anchor[start..];
+    if screen.contains(needle) { return true; }
+    let flat_screen = collapse_whitespace(&screen);
+    if flat_screen.contains(needle) { return true; }
+    // Long unbroken tokens (such as staged attachment paths) can wrap mid-token in
+    // narrow ConPTY panes, inserting a newline without a space.
+    if needle.chars().count() >= 12 {
+        let unwrapped: String = screen.chars().filter(|&ch| ch != '\r' && ch != '\n').collect();
+        if unwrapped.contains(needle) { return true; }
+    }
+    false
+}
+
+fn consume_terminal_protocol_reply(data: &str) -> Option<&str> {
+    if let Some(rest) = data.strip_prefix("\x1b[") {
+        // Focus in/out (\x1b[I, \x1b[O)
+        if let Some(after) = rest.strip_prefix('I').or_else(|| rest.strip_prefix('O')) {
+            return Some(after);
+        }
+        // DSR (\x1b[0n)
+        if let Some(after) = rest.strip_prefix("0n") {
+            return Some(after);
+        }
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && (0x30..=0x3f).contains(&bytes[i]) { i += 1; }
+        let param_end = i;
+        while i < bytes.len() && (0x20..=0x2f).contains(&bytes[i]) { i += 1; }
+        if i >= bytes.len() { return None; }
+        let params = &rest[..param_end];
+        let inter = &rest[param_end..i];
+        let final_byte = bytes[i];
+        let after = &rest[i + 1..];
+        // Cursor Position Report (\x1b[row;colR)
+        if final_byte == b'R' && inter.is_empty() {
+            if let Some((row, col)) = params.split_once(';') {
+                if [row, col].iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
+                    return Some(after);
+                }
+            }
+        }
+        // Device Attributes (\x1b[?...c or \x1b[>...c)
+        if final_byte == b'c' && inter.is_empty() {
+            if let Some(attrs) = params.strip_prefix('?').or_else(|| params.strip_prefix('>')) {
+                if !attrs.is_empty() && attrs.bytes().all(|b| b.is_ascii_digit() || b == b';') {
+                    return Some(after);
+                }
+            }
+        }
+        // DECRPM Mode Report (\x1b[?2004;1$y or \x1b[2004;1$y)
+        if final_byte == b'y' && inter == "$" {
+            let body = params.strip_prefix('?').unwrap_or(params);
+            if let Some((mode, val)) = body.split_once(';') {
+                if [mode, val].iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
+                    return Some(after);
+                }
+            }
+        }
+        return None;
+    }
+    // OSC replies (e.g. OSC 10/11 color queries)
+    if let Some(rest) = data.strip_prefix("\x1b]") {
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+        if i == 0 || i >= bytes.len() || bytes[i] != b';' { return None; }
+        let mut j = i + 1;
+        while j < bytes.len() {
+            if bytes[j] == 0x07 { return Some(&rest[j + 1..]); }
+            if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' { return Some(&rest[j + 2..]); }
+            j += 1;
+        }
+        return None;
+    }
+    // DCS replies (e.g. XTVERSION \x1bP>|...\x1b\\)
+    if let Some(rest) = data.strip_prefix("\x1bP") {
+        if let Some(end) = rest.find("\x1b\\") {
+            return Some(&rest[end + 2..]);
+        }
+        return None;
+    }
+    None
 }
 
 fn terminal_protocol_reply(data: &str) -> bool {
-    if let Some(body) = data.strip_prefix("\x1b[") {
-        // xterm returns cursor positions and terminal/device attributes on the
-        // same onData channel as keystrokes. Only exact reply shapes are exempt.
-        if let Some((row, column)) = body.strip_suffix('R').and_then(|value| value.split_once(';')) {
-            return [row, column].iter().all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
-        }
-        if let Some(attributes) = body.strip_suffix('c').and_then(|value| value.strip_prefix('?').or_else(|| value.strip_prefix('>'))) {
-            return !attributes.is_empty() && attributes.bytes().all(|byte| byte.is_ascii_digit() || byte == b';');
-        }
-        return body == "0n";
+    // xterm returns cursor positions, device attributes, focus events, DECRPM,
+    // OSC color and DCS version replies on the same onData channel as keystrokes.
+    // Only exact reply shapes (single or batched) are exempt.
+    if data.is_empty() { return false; }
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let Some(next) = consume_terminal_protocol_reply(remaining) else { return false; };
+        remaining = next;
     }
-    false
+    true
 }
 
 struct Terminal {
@@ -410,6 +574,12 @@ pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String
     tauri::async_runtime::spawn_blocking(move || write_input(&manager, &id, &data, paste)).await.map_err(|e| e.to_string())?
 }
 fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> Result<(), String> {
+    let normalized: std::borrow::Cow<'_, str> = if paste && data.contains("\r\n") {
+        std::borrow::Cow::Owned(data.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    };
+    let data = normalized.as_ref();
     if data.len() > 65536 { return Err("Terminal input is too large".into()); }
     if paste && data.chars().any(|c| c.is_control() && c != '\n' && c != '\t') { return Err("Message contains unsupported control characters".into()); }
     let slot = manager.slot(id)?.ok_or("Open the agent first")?;
@@ -431,9 +601,14 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     let mut input = writer.lock().map_err(|_| "Terminal input is unavailable")?;
     if slot.closing.load(Ordering::SeqCst) { return Err("Agent is closing".into()); }
     if paste {
-        if paste_pending.load(Ordering::SeqCst) {
+        if paste_pending.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return Err("A previous message is still pending in Code. Inspect the terminal and finish that message before sending another; nothing was pasted again.".into());
         }
+        struct ClearPastePending(Arc<AtomicBool>);
+        impl Drop for ClearPastePending {
+            fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+        }
+        let _paste_guard = ClearPastePending(paste_pending.clone());
         let after = {
             let state = replay.lock().map_err(|_| "Terminal output is unavailable")?;
             if state.input_ready == Some(false) {
@@ -441,7 +616,6 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             }
             state.sequence
         };
-        paste_pending.store(true, Ordering::SeqCst);
         let epoch = paste_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         input.write_all(format!("\x1b[200~{}\x1b[201~", data).as_bytes()).map_err(|e| e.to_string())?;
         input.flush().map_err(|e| e.to_string())?;
@@ -495,7 +669,7 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
                 if (antigravity && antigravity_paste_acknowledged(&signal_tail, data)) || expected.into_iter().any(|text| output_contains_styled_text(&signal_tail, text)) {
                     acknowledged_at = Some(std::time::Instant::now());
                 }
-                let mut trim = signal_tail.len().saturating_sub(512);
+                let mut trim = signal_tail.len().saturating_sub(16384);
                 while !signal_tail.is_char_boundary(trim) { trim += 1; }
                 signal_tail.drain(..trim);
             }
@@ -528,6 +702,8 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         }
         if paste_epoch.load(Ordering::SeqCst) != epoch { return Err("Automatic submit canceled by Code input. Check the terminal; the draft is kept.".into()); }
         input.write_all(b"\r").map_err(|e| e.to_string())?;
+        input.flush().map_err(|e| e.to_string())?;
+        return Ok(());
     } else {
         let resolves_paste = matches!(data, "\r" | "\n" | "\r\n" | "\x03" | "\x15" | "\x1b");
         if paste_pending.load(Ordering::SeqCst) && !terminal_protocol_reply(data) { paste_epoch.fetch_add(1, Ordering::SeqCst); }
@@ -535,7 +711,6 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
         if resolves_paste { paste_pending.store(false, Ordering::SeqCst); }
     }
     input.flush().map_err(|e| e.to_string())?;
-    if paste { paste_pending.store(false, Ordering::SeqCst); }
     Ok(())
 }
 /// Stage WebView file bytes in an app-owned temporary directory so the CLI can read
@@ -1082,6 +1257,27 @@ mod tests {
         let slot = manager.slot(long_id).unwrap().unwrap();
         let replay = slot.terminal.lock().unwrap().as_ref().unwrap().replay.clone();
         wait_for_antigravity_startup(&replay).unwrap();
+        // Verify narrow-pane wrapped Turkish prompt, attachment path, and tab prompt against real agy.
+        resize(&manager, long_id, 72, 24).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        for fixture in [
+            "Bu uzun Türkçe tek satırlı prompt 72 sütunluk dar bir terminal panelinde otomatik olarak satır saracaktır ve yine de doğrulanmalıdır.",
+            "Ekli dosyayı incele\n\nAttached files (read these local paths to inspect their contents, including images):\n- \"screenshot.png\": \"C:\\Users\\merte\\AppData\\Local\\Temp\\atris-agent-attachments\\00000000-0000-4000-8000-000000000043\\0123456789abcdef0123456789abcdef.png\"",
+            "İlk satır\tsekme ile\nİkinci satır\nÜçüncü Türkçe satır",
+        ] {
+            let before = snapshot(&manager, long_id.into(), 0, true).unwrap().sequence;
+            write_input(&manager, long_id, &format!("\x1b[200~{fixture}\x1b[201~"), false).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = snapshot(&manager, long_id.into(), before, false).unwrap();
+                if antigravity_paste_acknowledged(&frame.output, fixture) { break; }
+                assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity did not confirm fixture in 72-col pane: {fixture:?}\nscreen: {:?}", terminal_text(&frame.output));
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            // Clear the composer line before the next fixture without submitting to the model.
+            write_input(&manager, long_id, "\x15\x1b", false).unwrap();
+            std::thread::sleep(Duration::from_millis(120));
+        }
         let prompt = (0..120).map(|i| format!("Fixture line {i}: abcdefghijklmnopqrstuvwxyz 0123456789 Türkçe test")).collect::<Vec<_>>().join("\n");
         let before = snapshot(&manager, long_id.into(), 0, true).unwrap().sequence;
         // Use the production startup gate and verify agy's acknowledgement, without
@@ -1095,6 +1291,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         close_session(&manager, long_id).unwrap();
+
+        // Verify --add-dir coordination directory (production launch shape) does not block trusted workspace startup.
+        let coord_id = "00000000-0000-4000-8000-000000000044";
+        let coord_dir = root.join("coord-dir");
+        std::fs::create_dir_all(coord_dir.join(".agents")).unwrap();
+        std::fs::write(coord_dir.join(".agents").join("mcp_config.json"), r#"{"mcpServers":{}}"#).unwrap();
+        start_with_cleanup(manager.clone(), Launch { id: coord_id.into(), executable: executable.clone(), cwd: cwd.clone(), env: HashMap::new(), runtime_type: "antigravity".into(),
+            args: vec!["--log-file".into(), root.join("coord.log").to_string_lossy().into_owned(), "--add-dir".into(), coord_dir.to_string_lossy().into_owned()] }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut answered_cursor = false;
+        loop {
+            let frame = snapshot(&manager, coord_id.into(), 0, false).unwrap();
+            if !answered_cursor && frame.output.contains("\x1b[6n") {
+                write_input(&manager, coord_id, "\x1b[1;1R", false).unwrap();
+                answered_cursor = true;
+            }
+            if frame.input_ready == Some(true) { break; }
+            assert!(frame.status == "open" && Instant::now() < deadline, "Antigravity with --add-dir did not become ready: {:?}", terminal_text(&frame.output));
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        println!("Antigravity with --add-dir coordination directory became input-ready cleanly");
+        close_session(&manager, coord_id).unwrap();
 
         let untrusted_id = "00000000-0000-4000-8000-000000000042";
         let untrusted = root.join("untrusted-project");
@@ -1238,6 +1456,20 @@ mod tests {
         assert!(!antigravity_paste_acknowledged("[Pasted text #2 +2 lines]", prompt));
         assert!(antigravity_paste_acknowledged("[Pasted text #\x1b[36m2\x1b[0m +3 lines]", prompt));
         assert!(antigravity_paste_acknowledged("> Son \x1b[36msatır\x1b[0m", prompt));
+        // Wrapped single-line prompt and CUF cursor-forward spaces.
+        let wrapped = "Bu uzun tek satırlı mesaj dar bir terminalde iki satıra bölünerek sarıldı";
+        assert!(antigravity_paste_acknowledged("> Bu\x1b[1Cuzun tek satırlı mesaj dar bir\x1b[2;3Hterminalde iki satıra bölünerek sarıldı", wrapped));
+        // Long attachment path wrapped mid-token in a narrow pane.
+        let attach = "Bak\n- \"shot.png\": \"C:\\Users\\merte\\AppData\\Local\\Temp\\atris-agent-attachments\\00000000-0000-4000-8000-000000000043\\0123456789abcdef0123456789abcdef.png\"";
+        assert!(antigravity_paste_acknowledged("00000000-0000-4000-8000-000000000043\\0123456789abc\r\ndef0123456789abcdef.png\"", attach));
+        // Tab-expanded prompt echo.
+        assert!(antigravity_paste_acknowledged("> hello   world", "hello\tworld"));
+        // Context transfer ending with "---" must not false-match an unrelated screen divider.
+        let transfer = "Use this context.\n---\nActual substantive context line\n---";
+        assert!(!antigravity_paste_acknowledged("─────────\n---\n? for shortcuts", transfer));
+        assert!(antigravity_paste_acknowledged("> Actual substantive context line\n---", transfer));
+        // Private CSI modes (?2026h, ?25l) and OSC sequences must not leak parameter garbage.
+        assert_eq!(terminal_text("\x1b[?2026h\x1b]0;agy\x07?\x1b[1Cfor\x1b[1Cshortcuts\x1b[?25l\x1b[?2026l"), "? for shortcuts");
     }
 
     #[test]
@@ -1254,15 +1486,27 @@ mod tests {
         assert_eq!(replay.input_ready, Some(false));
         replay.push("\x1b[?2004l\x1b[2J? for shortcuts".into());
         assert_eq!(replay.input_ready, Some(false));
+        // Heavy ANSI + CUF spaces + private mode codes must still detect readiness.
+        let mut heavy = Replay::new();
+        heavy.agy_input = Some(AntigravityInput::default());
+        let padding = "\x1b[38;2;122;162;247mstatus\x1b[0m ".repeat(60);
+        heavy.push(format!("\x1b[?2004h\x1b[?2026h?\x1b[1Cfor\x1b[1Cshortcuts{padding}\x1b[?2026l"));
+        assert_eq!(heavy.input_ready, Some(true));
     }
 
     #[test]
     fn terminal_reply_is_not_confused_with_keys_or_raw_paste() {
-        for reply in ["\x1b[12;4R", "\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[0n"] {
-            assert!(terminal_protocol_reply(reply));
+        for reply in [
+            "\x1b[12;4R", "\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[0n",
+            "\x1b[I", "\x1b[O", "\x1b[?2004;1$y",
+            "\x1b]11;rgb:1010/1111/1414\x07", "\x1b]10;rgb:e4e4/e4e4/e7e7\x1b\\",
+            "\x1bP>|xterm.js(5.3.0)\x1b\\",
+            "\x1b[12;4R\x1b[?1;2c\x1b[I",
+        ] {
+            assert!(terminal_protocol_reply(reply), "expected protocol reply: {reply:?}");
         }
-        for user_input in ["\x1b[1;2A", "\x1b[1;2Rtext", "\x1b[200~typed\x1b[201~", "\r", "text"] {
-            assert!(!terminal_protocol_reply(user_input));
+        for user_input in ["", "\x1b[1;2A", "\x1b[1;2Rtext", "\x1b[200~typed\x1b[201~", "\r", "text", "\x1b[Ihello"] {
+            assert!(!terminal_protocol_reply(user_input), "must not classify user input as reply: {user_input:?}");
         }
     }
 

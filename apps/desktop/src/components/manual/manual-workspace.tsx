@@ -215,7 +215,7 @@ export function ManualWorkspace() {
     useManualStore.getState().hideAgent(target.id, false); markManualLaunch(target.id);
     ensureManualTerminal(target.id, true);
     setStatuses(previous => ({ ...previous, [target.id]: 'open' })); setGeneration(value => value + 1);
-    setInputReady(previous => ({...previous, [target.id]: target.runtimeType === 'codex' ? false : null}));
+    setInputReady(previous => ({...previous, [target.id]: target.runtimeType === 'codex' || target.runtimeType === 'antigravity' ? false : null}));
     if (showCode) setSurface(target.conversationId, 'code');
   };
   const action = async (label: string, run: () => Promise<unknown>, propagate = false): Promise<boolean> => {
@@ -240,7 +240,14 @@ export function ManualWorkspace() {
     if (failures.length) setError(`Agents saved. ${failures.join(' · ')}. Select the offline agent in Chat and use Open agent to retry.`);
   };
   const closeDialog = () => { if (creating) useManualStore.getState().setMode('choose'); setCreating(false); setAdding(false); };
-  const interrupt = (target: ManualAgent) => void action('interrupt', () => invoke('manual_terminal_write', { id: target.id, data: target.runtimeType === 'claude_code' ? '\u001b' : '\u0003', paste: false }));
+  const interrupt = (target: ManualAgent) => {
+    const run = () => invoke('manual_terminal_write', { id: target.id, data: target.runtimeType === 'claude_code' ? '\u001b' : '\u0003', paste: false });
+    if (pending === 'send') {
+      void run().catch(e => setError(errorText(e)));
+      return;
+    }
+    void action('interrupt', run);
+  };
   const close = (target: ManualAgent) => void action('close', async () => {
     await invoke('manual_terminal_close', { id: target.id });
     lifecycleEpoch.current += 1;
@@ -368,7 +375,7 @@ export function ManualWorkspace() {
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-sm">
             <div className="mx-auto flex w-full max-w-3xl shrink-0 items-center justify-between gap-3 px-6 py-1.5 border-b border-border/40">
                <span className="flex items-center gap-2 text-xs text-muted-foreground"><span className={`h-1.5 w-1.5 rounded-full ${observations[agent.id]?.state === 'attention' && live ? 'bg-amber-500' : live ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} />{pending === 'model' ? 'Applying model…' : live && observations[agent.id]?.state === 'attention' ? 'Needs your response' : live && observations[agent.id]?.state === 'completed' ? 'Turn finished' : live ? 'CLI connected' : 'CLI closed'}<span className="hidden sm:inline">· Independent session</span></span>
-              {!live ? <Button size="sm" variant="ghost" disabled={!native || Boolean(pending)} onClick={() => void action('open', () => launch(agent))}><RotateCcw className="mr-1 h-3 w-3" />Open agent</Button> : <Button size="sm" variant="ghost" disabled={Boolean(pending)} onClick={() => interrupt(agent)}><Square className="mr-1 h-3 w-3" />Interrupt</Button>}
+              {!live ? <Button size="sm" variant="ghost" disabled={!native || Boolean(pending)} onClick={() => void action('open', () => launch(agent))}><RotateCcw className="mr-1 h-3 w-3" />Open agent</Button> : <Button size="sm" variant="ghost" disabled={Boolean(pending) && pending !== 'send'} onClick={() => interrupt(agent)}><Square className="mr-1 h-3 w-3" />Interrupt</Button>}
             </div>
             <div className="relative flex min-h-0 flex-1 flex-col">
             <div ref={scroll.viewport} onScroll={scroll.onScroll} className="min-h-0 flex-1 overflow-y-auto select-text">
@@ -412,6 +419,7 @@ export function ManualWorkspace() {
             </div>
             <ChatChangeSummary endpoint={`/manual/conversations/${encodeURIComponent(conversation.id)}/changes?summary=1`} />
              {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
+             {Boolean(live) && agent.runtimeType === 'antigravity' && inputReady[agent.id] === false && <p role="status" className="mx-auto mb-2 max-w-3xl px-6 text-xs text-muted-foreground">Antigravity is starting or waiting for input in Code. Your draft is kept until the CLI is ready. <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>View CLI setup</button></p>}
           </div>
         </div>
       )}
