@@ -218,6 +218,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       description: 'Official Claude Code model alias. Exact backing model and entitlement are resolved by the connected account at run time.',
       supportedRoles: ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'],
       supportedReasoning: reasoning,
+      defaultReasoning: capabilities.reasoningControl ? 'high' : undefined,
       inputModalities: ['text', 'image'],
       availability: 'available',
       source: 'documented',

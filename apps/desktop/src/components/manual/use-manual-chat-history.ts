@@ -52,6 +52,7 @@ export function useManualChatHistory(agentId: string | undefined, conversationId
     };
     const poll = async () => {
       if (polling || signal.aborted) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden' && !queuedOlder) return;
       clearTimeout(timer);
       polling = true;
       const older = queuedOlder;
@@ -104,8 +105,18 @@ export function useManualChatHistory(agentId: string | undefined, conversationId
       updateStatus({ loading: true, pageError: false });
       void poll();
     };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible' && !signal.aborted) void poll();
+      else clearTimeout(timer);
+    };
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
     void poll();
-    return () => { abort.abort(); clearTimeout(timer); load.current = undefined; };
+    return () => {
+      abort.abort();
+      clearTimeout(timer);
+      load.current = undefined;
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [agentId, conversationId, following, preservePosition]);
 
   return {

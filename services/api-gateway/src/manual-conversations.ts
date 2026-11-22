@@ -228,13 +228,17 @@ export class ManualConversationStore {
   }
   async removeAgent(id: string): Promise<void> {
     const row = this.sqlite.prepare('SELECT conversation_id FROM manual_agent_sessions WHERE id = ?').get(id) as { conversation_id: string } | undefined;
+    const workspaceId = row && !this.hasChangeReview(row.conversation_id)
+      ? (this.sqlite.prepare('SELECT workspace_id FROM manual_conversations WHERE id = ?').get(row.conversation_id) as { workspace_id: string } | undefined)?.workspace_id
+      : undefined;
     this.sqlite.transaction(() => {
       this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE id = ?').run(id);
     })();
+    void this.codexSessions.get(id)?.close().catch(() => {});
+    if (workspaceId) await this.pauseProjectReview(workspaceId);
     if (row && this.live) await this.live.pauseManualWhenEmpty(`manual:${row.conversation_id}`, () =>
       !this.sqlite.prepare('SELECT 1 FROM manual_agent_sessions WHERE conversation_id = ? LIMIT 1').get(row.conversation_id));
-    if (row && !this.hasChangeReview(row.conversation_id)) await this.pauseProjectReview(this.conversation(row.conversation_id).workspaceId);
   }
   async pauseProjectReview(workspaceId: string) {
     await this.projectReview.deactivate(workspaceId, () => !this.sqlite.prepare(`SELECT 1 FROM manual_agent_sessions a
@@ -256,10 +260,10 @@ export class ManualConversationStore {
     const antigravityResult = agent.runtimeType === 'antigravity'
       ? { supported: true, ...new ManualAntigravityBridge(this.dataDir).read(agent) }
       : undefined;
-    const result = antigravityResult ?? readAgentMessages(agent, new ManualProviderBridge(this.dataDir));
     const bridge = new ManualProviderBridge(this.dataDir);
+    const result = antigravityResult ?? readAgentMessages(agent, bridge);
     const questions = antigravityResult
-      ? (antigravityResult.questions?.length ? antigravityResult.questions : bridge.pendingQuestions(agent))
+      ? antigravityResult.questions
       : bridge.pendingQuestions(agent);
     return { ...result, questions, autoApprove: agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined, routeStatus:bridge.openCodeRouteStatus(agent), naming: this.syncTitles(id, result.bound ? result.messages : []) };
   }
@@ -561,10 +565,13 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     try {
       const conversation = store.conversation(id);
       if (!store.hasChangeReview(id)) directWorkspace = conversation.workspaceId;
-      if (!live?.get(`manual:${id}`) && store.hasChangeReview(id) && store.changeReview.list(id, store.workspace(conversation.workspaceId).path).files.length) {
+      if (!live?.get(`manual:${id}`) && store.hasChangeReview(id) && (await store.changeReview.listAsync(id, store.workspace(conversation.workspaceId).path)).files.length) {
         return fail('Apply or discard pending files in Changes before deleting this conversation.', 409);
       }
-      for (const agent of store.list(conversation.workspaceId).find(item => item.id === id)?.agents || []) manualCoordination.revoke(agent.id);
+      for (const agent of store.list(conversation.workspaceId).find(item => item.id === id)?.agents || []) {
+        manualCoordination.revoke(agent.id);
+        void store.codexSessions.get(agent.id)?.close().catch(() => {});
+      }
     } catch (error: any) { if (error.status !== 404) throw error; }
     store.remove(id);
     if (directWorkspace) await store.pauseProjectReview(directWorkspace);

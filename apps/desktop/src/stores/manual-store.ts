@@ -99,7 +99,7 @@ interface ManualState {
   removeAgent: (agent: ManualAgent) => Promise<void>;
   updateModel: (agent: ManualAgent, catalogId: string, reasoning?: string, live?: boolean) => Promise<ManualAgent>;
   updateCodexPermissions: (agent: ManualAgent, mode: CodexPermissionMode, fullAccessConfirmed: boolean) => Promise<ManualAgent>;
-  addAgents: (conversationId: string, agents: Array<{id: string; name?: string; catalogId: string}>) => Promise<ManualAgent[]>;
+  addAgents: (conversationId: string, agents: Array<{id: string; name?: string; catalogId: string; reasoning?: string}>) => Promise<ManualAgent[]>;
 }
 const fetchVersions = new Map<string, number>();
 function withoutAgentDrafts(state: ManualState, ids: Set<string>) {
@@ -233,8 +233,16 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     return updated;
   },
   removeAgent: async agent => {
-    await apiRequest(`/manual/agents/${agent.id}`, { method: 'DELETE' });
     const workspaceId = Object.keys(get().conversations).find(key => get().conversations[key].some(c => c.id === agent.conversationId));
+    try {
+      await apiRequest(`/manual/agents/${agent.id}`, { method: 'DELETE' });
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'status' in error ? (error as { status?: number }).status : undefined;
+      if (status !== 404) {
+        if (workspaceId) void get().refresh(workspaceId);
+        throw error;
+      }
+    }
     if (!workspaceId) {
       set(state => {
         const { [agent.id]: _draft, ...drafts } = state.drafts;
@@ -262,7 +270,15 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
     });
   },
   remove: async conversation => {
-    await apiRequest(`/manual/conversations/${conversation.id}`, { method: 'DELETE' });
+    try {
+      await apiRequest(`/manual/conversations/${conversation.id}`, { method: 'DELETE' });
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'status' in error ? (error as { status?: number }).status : undefined;
+      if (status !== 404) {
+        void get().refresh(conversation.workspaceId);
+        throw error;
+      }
+    }
     fetchVersions.set(conversation.workspaceId, (fetchVersions.get(conversation.workspaceId) || 0) + 1);
     set(state => {
       const { [conversation.workspaceId]: selected, ...others } = state.activeByWorkspace;

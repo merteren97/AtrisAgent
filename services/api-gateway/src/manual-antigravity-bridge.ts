@@ -35,6 +35,34 @@ export interface ManualToolItem {
 const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 const UUID_FINDER = /\b([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\b/i;
 interface Binding { launchId: string; sessionId?: string }
+interface CachedTranscript { mtimeMs: number; size: number; truncated: boolean; parsed: ParsedTranscriptState }
+const TRANSCRIPT_CACHE = new Map<string, CachedTranscript>();
+const TRANSCRIPT_CACHE_LIMIT = 32;
+
+function readParsedTranscript(filename: string, sessionId: string): { parsed: ParsedTranscriptState; truncated: boolean; mtimeIso?: string } {
+  let stat: fs.Stats | undefined;
+  try { stat = fs.statSync(filename); } catch {}
+  const key = `${filename}\u0000${sessionId}`;
+  if (stat) {
+    const cached = TRANSCRIPT_CACHE.get(key);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      TRANSCRIPT_CACHE.delete(key);
+      TRANSCRIPT_CACHE.set(key, cached);
+      return { parsed: cached.parsed, truncated: cached.truncated, mtimeIso: stat.mtime.toISOString() };
+    }
+  }
+  const tail = readTail(filename);
+  const parsed = parseTranscriptInternal(tail.source, sessionId);
+  if (stat) {
+    TRANSCRIPT_CACHE.delete(key);
+    TRANSCRIPT_CACHE.set(key, { mtimeMs: stat.mtimeMs, size: stat.size, truncated: tail.truncated, parsed });
+    if (TRANSCRIPT_CACHE.size > TRANSCRIPT_CACHE_LIMIT) {
+      const oldest = TRANSCRIPT_CACHE.keys().next().value;
+      if (oldest) TRANSCRIPT_CACHE.delete(oldest);
+    }
+  }
+  return { parsed, truncated: tail.truncated, mtimeIso: stat?.mtime.toISOString() };
+}
 
 function basenameAny(filePath: string): string {
   return filePath.includes('\\') ? path.win32.basename(filePath) : path.basename(filePath);
@@ -738,9 +766,8 @@ export class ManualAntigravityBridge {
     const sessionId = this.session(agent); if (!sessionId) return empty;
     const filename = this.resolveTranscriptFile(sessionId);
     if (!filename) return empty;
-    const tail = readTail(filename);
-    const parsed = parseTranscriptInternal(tail.source, sessionId);
-    return {messages:parsed.messages, questions:parsed.questions, truncated:tail.truncated, bound:true};
+    const { parsed, truncated } = readParsedTranscript(filename, sessionId);
+    return {messages:parsed.messages, questions:parsed.questions, truncated, bound:true};
   }
   pendingQuestions(agent: ManualAgent): ManualQuestion[] {
     return this.read(agent).questions;
@@ -769,10 +796,7 @@ export class ManualAntigravityBridge {
       return { state: 'unknown' };
     }
 
-    let fileMtime: string | undefined;
-    try { fileMtime = fs.statSync(filename).mtime.toISOString(); } catch {}
-    const tail = readTail(filename);
-    const parsed = parseTranscriptInternal(tail.source, sessionId);
+    const { parsed, mtimeIso: fileMtime } = readParsedTranscript(filename, sessionId);
     const latestStep = parsed.sortedSteps.at(-1)?.[1];
     const at = stepTimestamp(latestStep) || fileMtime || logInfo.latestAt;
 
