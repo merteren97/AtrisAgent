@@ -48,7 +48,7 @@ export class AccountProfileManager {
       version: 1,
       profiles: Array.from(this.profilesMap.values()),
     };
-    const temporaryPath = `${this.cacheFilePath}.${process.pid}.${Date.now()}.tmp`;
+    const temporaryPath = `${this.cacheFilePath}.${process.pid}.${globalThis.crypto.randomUUID()}.tmp`;
     try {
       fs.writeFileSync(temporaryPath, JSON.stringify(payload, null, 2), { encoding: 'utf-8', mode: 0o600 });
       fs.renameSync(temporaryPath, this.cacheFilePath);

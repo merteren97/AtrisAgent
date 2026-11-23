@@ -153,7 +153,12 @@ export function LandingLanguageProvider({ children }: { children: React.ReactNod
   const [language, setLanguageState] = useState<LandingLanguage>("tr");
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("atris_language");
+    let saved: string | null = null;
+    try {
+      saved = window.localStorage.getItem("atris_language");
+    } catch {
+      // Ignore storage access failures.
+    }
     const next = saved === "tr" || saved === "en" ? saved : window.navigator.language.toLowerCase().startsWith("tr") ? "tr" : "en";
     setLanguageState(next);
     document.documentElement.lang = next;
@@ -162,7 +167,11 @@ export function LandingLanguageProvider({ children }: { children: React.ReactNod
   const value = useMemo<LandingLanguageContextValue>(() => ({
     language,
     setLanguage: (nextLanguage) => {
-      window.localStorage.setItem("atris_language", nextLanguage);
+      try {
+        window.localStorage.setItem("atris_language", nextLanguage);
+      } catch {
+        // Ignore storage access failures.
+      }
       document.documentElement.lang = nextLanguage;
       setLanguageState(nextLanguage);
     },

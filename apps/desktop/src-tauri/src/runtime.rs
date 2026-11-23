@@ -335,21 +335,13 @@ impl RuntimeState {
             })?;
 
             #[cfg(windows)]
-            {
-                let job = match create_process_job(&child) {
-                    Ok(job) => job,
-                    Err(error) => {
-                        terminate_child(&mut child);
-                        return Err(error);
-                    }
-                };
-                if let Ok(mut job_state) = self.job.lock() {
-                    *job_state = job;
-                } else {
+            let job = match create_process_job(&child) {
+                Ok(job) => job,
+                Err(error) => {
                     terminate_child(&mut child);
-                    return Err("Could not retain the packaged runtime job state.".to_string());
+                    return Err(error);
                 }
-            }
+            };
 
             let stdout = match child.stdout.take() {
                 Some(stdout) => stdout,
@@ -395,10 +387,8 @@ impl RuntimeState {
                     ));
                 }
             };
-            match child.try_wait().map_err(|error| {
-                format!("Could not inspect the packaged runtime process: {error}")
-            })? {
-                Some(status) => {
+            match child.try_wait() {
+                Ok(Some(status)) => {
                     return Err(startup_error_with_diagnostics(
                         &format!(
                             "The packaged AtrisAgent runtime exited immediately after becoming ready ({status})."
@@ -407,12 +397,31 @@ impl RuntimeState {
                         &runtime_token,
                     ));
                 }
-                None => {}
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_child(&mut child);
+                    return Err(format!(
+                        "Could not inspect the packaged runtime process: {error}"
+                    ));
+                }
             }
 
+            #[cfg(windows)]
+            {
+                if let Ok(mut job_state) = self.job.lock() {
+                    *job_state = job;
+                } else {
+                    terminate_child(&mut child);
+                    return Err("Could not retain the packaged runtime job state.".to_string());
+                }
+            }
             if let Ok(mut child_state) = self.child.lock() {
                 *child_state = Some(child);
             } else {
+                #[cfg(windows)]
+                {
+                    let _ = self.job.lock().ok().and_then(|mut job_state| job_state.take());
+                }
                 terminate_child(&mut child);
                 return Err("Could not retain the packaged runtime process state.".to_string());
             }

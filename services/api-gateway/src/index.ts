@@ -491,6 +491,29 @@ function redactEventValue(value: unknown): unknown {
   return value;
 }
 
+// Cache per-mission event sequence counters in memory to avoid a MAX(sequence) query per delta.
+const MAX_SEQUENCE_CACHE_ENTRIES = 2_000;
+const missionSequenceCounters = new Map<string, number>();
+
+function recordMissionSequence(missionId: string, sequence: number): void {
+  missionSequenceCounters.delete(missionId);
+  missionSequenceCounters.set(missionId, sequence);
+  if (missionSequenceCounters.size > MAX_SEQUENCE_CACHE_ENTRIES) {
+    const oldestKey = missionSequenceCounters.keys().next().value;
+    if (oldestKey !== undefined) missionSequenceCounters.delete(oldestKey);
+  }
+}
+
+function nextMissionSequence(missionId: string): number {
+  let current = missionSequenceCounters.get(missionId);
+  if (current === undefined) {
+    current = Number((sqlite.prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM mission_events WHERE mission_id = ?')
+      .get(missionId) as { sequence: number }).sequence);
+    recordMissionSequence(missionId, current);
+  }
+  return current + 1;
+}
+
 // Persist normalized events so the timeline, checks and artifacts can be restored after restart.
 eventBus.on('*', (event: AgentEvent) => {
   if (!event.missionId) return;
@@ -528,13 +551,13 @@ eventBus.on('*', (event: AgentEvent) => {
     const persisted = sqlite.transaction(() => {
       const duplicate = sqlite.prepare('SELECT payload FROM mission_events WHERE id = ?').get(event.id) as { payload: string } | undefined;
       if (duplicate) return JSON.parse(duplicate.payload) as AgentEvent;
-      const sequence = Number((sqlite.prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM mission_events WHERE mission_id = ?')
-        .get(event.missionId) as { sequence: number }).sequence);
+      const sequence = nextMissionSequence(event.missionId!);
       const enriched = { ...payload, sequence, schemaVersion: 1 } as unknown as AgentEvent;
       sqlite.prepare(`INSERT INTO mission_events
         (id, mission_id, task_id, agent_instance_id, type, payload, sequence, schema_version, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`)
         .run(event.id, event.missionId, taskId, agentInstanceId, event.type, JSON.stringify(enriched), sequence, event.timestamp);
+      recordMissionSequence(event.missionId!, sequence);
       return enriched;
     })();
     Object.assign(event, persisted);
@@ -580,6 +603,9 @@ app.use(express.json({ limit: '2mb' }));
 const authService = new AtrisAuthService();
 const PORT = resolveGatewayPort();
 const server = http.createServer(app);
+server.requestTimeout = 120_000;
+server.headersTimeout = 35_000;
+server.keepAliveTimeout = 65_000;
 const shutdownCoordinator = createRuntimeShutdownCoordinator({
   stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); await liveProjectChanges.close(); await manualConversationStore.projectReview.close(); },
   closeServer: () => new Promise<void>((resolve) => {
@@ -1804,14 +1830,25 @@ export async function configureMissionRouting(missionId: string, body: Record<st
 
 // 4. REST API Routes
 app.get('/health', async (_req: Request, res: Response) => {
-  const accounts = await runtimeHost.discoverAccounts();
-  res.json({
-    status: 'ok',
-    version: gatewayVersion(),
-    localOnly: true,
-    connectedAccounts: accounts.filter((profile) => profile.authStatus === 'connected').length,
-    timestamp: new Date().toISOString(),
-  });
+  try {
+    const accounts = await runtimeHost.discoverAccounts();
+    res.json({
+      status: 'ok',
+      version: gatewayVersion(),
+      localOnly: true,
+      connectedAccounts: accounts.filter((profile) => profile.authStatus === 'connected').length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[API Gateway] Health check failed:', error);
+    res.status(503).json({
+      status: 'degraded',
+      version: gatewayVersion(),
+      localOnly: true,
+      error: error?.message || 'Health check failed',
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 app.post('/api/workspaces', async (req: Request, res: Response) => {
@@ -2066,6 +2103,11 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       }
     }
     const priorityPending = active && delivery === 'steer';
+    const activeRun = priorityPending
+      ? (sqlite.prepare("SELECT id, turn_id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running') ORDER BY started_at DESC LIMIT 1")
+          .get(missionId) as { id: string; turn_id: string } | undefined)
+      : undefined;
+    if (priorityPending && !activeRun) throw new Error('Active run metadata is unavailable for steering.');
     const turnStatus = priorityPending ? 'pending_priority' : 'queued';
     sqlite.transaction(() => {
       sqlite.prepare(`INSERT INTO conversation_turns
@@ -2078,10 +2120,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     })();
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content,
       delivery: delivery as any, priorityPending, clientMessageId: idempotencyKey || undefined, timestamp: now });
-    if (priorityPending) {
-      const activeRun = sqlite.prepare("SELECT id, turn_id FROM mission_runs WHERE mission_id = ? AND status IN ('starting', 'running') ORDER BY started_at DESC LIMIT 1")
-        .get(missionId) as { id: string; turn_id: string } | undefined;
-      if (!activeRun) throw new Error('Active run metadata is unavailable for steering.');
+    if (priorityPending && activeRun) {
       sqlite.prepare("UPDATE mission_commands SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1 WHERE id = ? AND status = 'pending'")
         .run(now, commandId);
       emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
@@ -3299,6 +3338,7 @@ const deletionHandlers: DeletionHandlers = {
   relational: async (operation) => {
     if (operation.targetType === 'workspace') attachmentStore.cleanupWorkspace(operation.targetId);
     sqlite.prepare(`DELETE FROM ${operation.targetType === 'workspace' ? 'workspaces' : 'missions'} WHERE id = ?`).run(operation.targetId);
+    for (const missionId of deletionMissionIds(operation)) missionSequenceCounters.delete(missionId);
   },
 };
 
@@ -3523,13 +3563,17 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   const heartbeat = setInterval(() => {
     if (!closed && !res.writableEnded && !res.writableNeedDrain) res.write(': heartbeat\n\n');
   }, 15_000);
-  req.on('close', () => {
+  heartbeat.unref?.();
+  const cleanup = () => {
+    if (closed) return;
     closed = true;
     clearInterval(heartbeat);
     res.off('drain', onDrain);
     queue.clear();
     unsubscribe();
-  });
+  };
+  req.on('close', cleanup);
+  res.on('error', cleanup);
   if (missionId) void (async () => {
     for (const rows of replayPages(lastSequence, highWaterSequence, (afterSequence, throughSequence) =>
       sqlite.prepare(`SELECT payload, sequence, schema_version FROM mission_events
@@ -3543,19 +3587,23 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
             const done = () => {
               res.off('drain', done);
               req.off('close', done);
+              res.off('error', done);
               resolve();
             };
             res.once('drain', done);
             req.once('close', done);
+            res.once('error', done);
           });
         }
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    if (closed || res.writableEnded) return;
     replaying = false;
     flush();
   })().catch((error) => {
     console.warn('[API Gateway] Failed to replay mission event stream:', error);
+    cleanup();
     if (!res.writableEnded) res.end();
   });
 });
@@ -3603,6 +3651,11 @@ function rejectWebSocketUpgrade(socket: import('stream').Duplex, status: 400 | 4
 }
 
 server.on('upgrade', async (request, socket, head) => {
+  const onSocketError = () => {
+    if (!socket.destroyed) socket.destroy();
+  };
+  socket.on('error', onSocketError);
+
   let pathname = '';
   try {
     pathname = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`).pathname;
@@ -3631,15 +3684,17 @@ server.on('upgrade', async (request, socket, head) => {
 
   try {
     const authorization = await authService.authorizeWebSocket(token);
+    if (socket.destroyed) return;
     if (!authorization.allowed) {
       rejectWebSocketUpgrade(socket, authorization.status as 401 | 403 | 503);
       return;
     }
     wss.handleUpgrade(request, socket, head, (ws) => {
+      socket.off('error', onSocketError);
       wss.emit('connection', ws, request);
     });
   } catch {
-    rejectWebSocketUpgrade(socket, 503);
+    if (!socket.destroyed) rejectWebSocketUpgrade(socket, 503);
   }
 });
 

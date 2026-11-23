@@ -543,18 +543,26 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     this.markSessionCancelled(sessionId);
     const context = this.sessionContext.get(sessionId);
     if (context) {
-      const server = this.getServer(context.serverKey);
-      const aborted = await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`, { method: 'POST' }, 2_000)
-        .then((response) => response.ok, () => false);
-      if (server.dedicated) await terminateProcessTree(server.process);
-      else if (!aborted) throw new Error('OpenCode did not confirm session cancellation; retry before cleaning its worktree.');
+      const server = this.servers.get(context.serverKey);
+      if (server && server.process.exitCode === null && !server.process.killed) {
+        const aborted = await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`, { method: 'POST' }, 2_000)
+          .then((response) => response.ok, () => false);
+        if (server.dedicated) await terminateProcessTree(server.process);
+        else if (!aborted) throw new Error('OpenCode did not confirm session cancellation; retry before cleaning its worktree.');
+      }
     }
     this.cleanupSession(sessionId);
   }
 
   override async shutdown(): Promise<void> {
-    for (const sessionId of [...this.activeSessions.keys()]) await this.cancel(sessionId);
-    for (const server of this.servers.values()) await terminateProcessTree(server.process);
+    for (const sessionId of [...this.activeSessions.keys()]) {
+      try {
+        await this.cancel(sessionId);
+      } catch {
+        this.cleanupSession(sessionId);
+      }
+    }
+    await Promise.all([...this.servers.values()].map((server) => terminateProcessTree(server.process).catch(() => undefined)));
     this.servers.clear();
     this.reusableSessions.clear();
     await super.shutdown();
@@ -652,7 +660,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         await waitForHttp(`${existing.url}/global/health`, { headers: { Authorization: basicAuthHeader(existing.username, existing.password) } }, 1_000);
         return existing;
       } catch {
-        existing.process.kill('SIGKILL');
+        await terminateProcessTree(existing.process).catch(() => undefined);
         this.servers.delete(key);
       }
     }
@@ -711,6 +719,10 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         waitForHttp(`${instance.url}/global/health`, { headers: { Authorization: basicAuthHeader(username, password) }, signal: startupController.signal }, 15_000),
         exited,
       ]);
+    } catch (error) {
+      if (this.servers.get(key)?.process === child) this.servers.delete(key);
+      await terminateProcessTree(child).catch(() => undefined);
+      throw error;
     } finally {
       startupController.abort();
     }
@@ -755,18 +767,29 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     ready?.();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    const MAX_SSE_BUFFER_CHARS = 2 * 1024 * 1024;
     let buffer = '';
-    while (!controller.signal.aborted) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split(/\r?\n\r?\n/);
-      buffer = frames.pop() || '';
-      for (const frame of frames) {
-        const data = frame.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
-        if (!data) continue;
-        try { this.handleServerEvent(sessionId, JSON.parse(data)); } catch { /* ignore malformed SSE */ }
+    try {
+      while (!controller.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() || '';
+        if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+          buffer = buffer.slice(-MAX_SSE_BUFFER_CHARS);
+        }
+        for (const frame of frames) {
+          const data = frame.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
+          if (!data) continue;
+          try { this.handleServerEvent(sessionId, JSON.parse(data)); } catch { /* ignore malformed SSE */ }
+        }
       }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      throw error;
+    } finally {
+      try { await reader.cancel(); } catch { /* ignore already-closed stream */ }
     }
     if (!controller.signal.aborted && this.activeSessions.has(sessionId)) {
       throw new Error('OpenCode event stream ended before the session reported a terminal result.');
@@ -817,6 +840,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         ? { ...question, id: crypto.randomUUID(), type: 'question_replied', answers: properties.answers || [], timestamp }
         : { ...question, id: crypto.randomUUID(), type: 'question_rejected', reason: 'OpenCode rejected the question', outcome: 'rejected', timestamp });
     } else if (type === 'message.part.updated') {
+      if (relatedSessionId !== context.runtimeSessionId) return;
       const part = properties.part || {};
       const text = properties.delta || part.text;
       if (part.type === 'text' && text) this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: text, timestamp });
@@ -827,8 +851,10 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         if (['completed', 'error'].includes(part.state?.status)) this.emitEvent({ id: crypto.randomUUID(), type: 'tool_call_completed', missionId: context.missionId, agentInstanceId: sessionId, toolName: part.tool || 'tool', result: JSON.stringify(part.state?.output || part.state?.error || ''), success: part.state?.status === 'completed', ...correlation, timestamp });
       }
     } else if (type === 'message.updated') {
+      if (relatedSessionId !== context.runtimeSessionId) return;
       this.recordProviderUsage(sessionId, properties.info || properties.message || properties);
     } else if (type === 'permission.updated' || type === 'permission.asked') {
+      if (relatedSessionId !== context.runtimeSessionId) return;
       const permission = properties.permission || properties;
       const input = permission.input || permission.metadata || {};
       this.emitEvent({
@@ -854,6 +880,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       if (session) session.endedAt = timestamp;
       this.cleanupSession(sessionId);
     } else if (type === 'session.error') {
+      if (relatedSessionId !== context.runtimeSessionId) return;
       this.emitFailure(sessionId, properties.error?.message || properties.error || 'OpenCode session failed');
       this.cleanupSession(sessionId);
     }

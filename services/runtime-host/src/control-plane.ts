@@ -84,7 +84,8 @@ export function removeTemporaryDirectory(
       }
       const delay = Math.min(1000, TEMP_DIRECTORY_RETRY_DELAY_MS * 2 ** retries);
       retries += 1;
-      setTimeout(attempt, delay);
+      const timer = setTimeout(attempt, delay);
+      timer.unref?.();
     }
   };
 
@@ -226,9 +227,9 @@ export function createAntigravityMcpOverlay(
   workspacePath: string,
 ): { cwd: string; extraArgs: string[]; cleanup: () => void } | undefined {
   if (!session) return undefined;
-  const root = path.join(os.tmpdir(), 'AtrisAgent', 'antigravity-control-plane', agentInstanceId);
+  const uniqueOverlayId = `${agentInstanceId}-${crypto.randomUUID().slice(0, 8)}`;
+  const root = path.join(os.tmpdir(), 'AtrisAgent', 'antigravity-control-plane', uniqueOverlayId);
   const agentsDir = path.join(root, '.agents');
-  removeTemporaryDirectory(root);
   fs.mkdirSync(agentsDir, { recursive: true });
   fs.writeFileSync(path.join(agentsDir, 'mcp_config.json'), JSON.stringify({
     mcpServers: {

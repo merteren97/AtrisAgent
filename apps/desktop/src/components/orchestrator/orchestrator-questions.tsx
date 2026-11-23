@@ -25,11 +25,38 @@ export function OrchestratorQuestions({ className }: { className?: string }) {
   const load = useQuestionStore(state => state.load);
   useEffect(() => {
     if (!missionId) return;
-    void load(missionId);
-    const timer = window.setInterval(() => { if (!document.hidden) void load(missionId); }, 2_000);
-    const refresh = () => { if (!document.hidden) void load(missionId); };
+    const controller = new AbortController();
+    let timer: number | undefined;
+    let pollSeq = 0;
+    const schedule = () => {
+      if (controller.signal.aborted || document.hidden) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => { timer = undefined; void poll(); }, 2_000);
+    };
+    const poll = async () => {
+      if (controller.signal.aborted || document.hidden) return;
+      const mySeq = ++pollSeq;
+      try {
+        await load(missionId);
+      } finally {
+        if (mySeq === pollSeq) schedule();
+      }
+    };
+    const refresh = () => {
+      if (document.hidden) {
+        if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
+      } else if (!controller.signal.aborted) {
+        if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
+        void poll();
+      }
+    };
     document.addEventListener('visibilitychange', refresh);
-    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', refresh); };
+    if (!document.hidden) void poll();
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', refresh);
+    };
   }, [missionId, load]);
   if (!missionId) return null;
   if (!questions?.length && !error) return loading && !questions ? <p className="px-4 py-2 text-xs text-muted-foreground" role="status">Checking worker questions…</p> : null;

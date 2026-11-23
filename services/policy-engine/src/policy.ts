@@ -170,7 +170,12 @@ export class PolicyEngine {
   canExecuteTool(agentRole: string, toolName: string): boolean {
     const role = agentRole.trim().toLowerCase();
     const tool = toolName.trim().toLowerCase().replace(/[.\s-]+/g, '_');
-    const writeMarkers = ['write', 'edit', 'replace', 'patch', 'delete', 'remove', 'move', 'rename', 'apply'];
+    const writeMarkers = [
+      'write', 'edit', 'replace', 'patch', 'delete', 'remove', 'move', 'rename', 'apply',
+      'create_file', 'create_dir', 'append_file', 'mkdir', 'make_dir', 'touch', 'chmod', 'chown',
+      'truncate', 'symlink', 'save_file', 'copy_file',
+      'git_reset', 'git_checkout', 'git_merge', 'git_rebase', 'git_clean', 'git_revert', 'git_cherry_pick',
+    ];
     const shellMarkers = ['shell', 'terminal', 'command', 'exec', 'spawn'];
     const releaseMarkers = ['commit', 'push', 'pull_request', 'publish', 'deploy', 'migration', 'package_install'];
     const containsAny = (markers: string[]) => markers.some((marker) => tool.includes(marker));
@@ -201,6 +206,10 @@ export class PolicyEngine {
 
     // Forbidden sensitive files check
     const lowerPath = normalized.toLowerCase();
+    const lowerBase = path.posix.basename(lowerPath);
+    if (lowerBase === '.env' || lowerBase.startsWith('.env.')) {
+      return { allowed: false, reason: `Access to sensitive file blocked: ${targetPath}` };
+    }
     for (const forbidden of this.forbiddenPaths) {
       const lowerForbidden = forbidden.toLowerCase();
       if (lowerPath.endsWith(lowerForbidden) || lowerPath.includes(`/${lowerForbidden}`)) {
@@ -249,7 +258,9 @@ export class PolicyEngine {
           const physicalTarget = realPathWithExistingParent(
             isAbsolute ? normalized : path.join(workspacePath, normalized),
           );
-          if (!physicalRoot || !physicalTarget) return { allowed: true };
+          if (!physicalRoot || !physicalTarget) {
+            return { allowed: false, reason: `Unable to verify workspace path boundary: ${targetPath}` };
+          }
           const root = normalizeComparable(physicalRoot);
           const target = normalizeComparable(physicalTarget);
           if (target !== root && !target.startsWith(`${root}/`)) {
@@ -257,7 +268,7 @@ export class PolicyEngine {
           }
         }
       } catch {
-        // A not-yet-created file is covered by the lexical boundary check.
+        return { allowed: false, reason: `Path boundary verification failed: ${targetPath}` };
       }
     }
 
@@ -277,20 +288,38 @@ export class PolicyEngine {
   validateCommand(command: string): { allowed: boolean; reason?: string } {
     if (!command) return { allowed: true };
     const trimmed = command.trim();
-    const lowerCmd = trimmed.toLowerCase();
+    const normalizedCmd = trimmed.replace(/\s+/g, ' ').toLowerCase();
 
-    // 1. Denylist check
+    // 1. Block shell chaining, command substitution, and subshell bypasses
+    if (/(&&|\|\||[;|`]|\$\(|\r|\n)/.test(trimmed)) {
+      return { allowed: false, reason: `Command execution blocked due to shell chaining or substitution: ${command}` };
+    }
+    if (/\b(?:ba|z|da|k)?sh\s+-[a-z]*c\b|\bcmd(?:\.exe)?\s+\/c\b|\b(?:powershell|pwsh)(?:\.exe)?\s+-(?:c|command|enc|encodedcommand)\b/i.test(normalizedCmd)) {
+      return { allowed: false, reason: `Command execution blocked due to subshell invocation: ${command}` };
+    }
+
+    // 2. Denylist check (using whitespace-normalized command + split-flag rm check)
     for (const denied of this.commandDenylist) {
-      if (lowerCmd.includes(denied.toLowerCase())) {
+      const normalizedDenied = denied.trim().replace(/\s+/g, ' ').toLowerCase();
+      if (normalizedCmd.includes(normalizedDenied)) {
         return { allowed: false, reason: `Command execution blocked by denylist (${denied}): ${command}` };
       }
     }
+    if (/\brm\s+(?:.*?\s)?(?:-[a-z]*r[a-z]*\s+-[a-z]*f[a-z]*|-[a-z]*f[a-z]*\s+-[a-z]*r[a-z]*|-[a-z]*(?:rf|fr)[a-z]*|--recursive\b.*--force\b|--force\b.*--recursive\b)/i.test(normalizedCmd)) {
+      return { allowed: false, reason: `Command execution blocked by denylist (rm -rf): ${command}` };
+    }
 
-    // 2. Allowlist check if packageInstall policy is allowlisted
+    // 3. Allowlist check if packageInstall policy is allowlisted
     if (this.config.packageInstall === 'allowlisted') {
-      const isPackageCmd = lowerCmd.startsWith('npm install') || lowerCmd.startsWith('yarn add') || lowerCmd.startsWith('pnpm add');
+      const isPackageCmd = /^(?:npm\s+(?:install|i)|yarn\s+add|pnpm\s+(?:add|install|i)|bun\s+(?:add|install|i)|pip3?\s+install)(?:\s|$)/.test(normalizedCmd);
       if (isPackageCmd) {
-        const allowedPrefixMatch = this.commandPrefixAllowlist.some(prefix => lowerCmd.startsWith(prefix.toLowerCase()));
+        // Require a specific multi-token prefix (e.g. "npm install lodash"),
+        // not a bare tool name like "npm" or "yarn" in commandPrefixAllowlist.
+        const allowedPrefixMatch = this.commandPrefixAllowlist.some((prefix) => {
+          const normalizedPrefix = prefix.trim().replace(/\s+/g, ' ').toLowerCase();
+          return normalizedPrefix.includes(' ')
+            && (normalizedCmd === normalizedPrefix || normalizedCmd.startsWith(`${normalizedPrefix} `));
+        });
         if (!allowedPrefixMatch) {
           return { allowed: false, reason: `Command execution blocked by allowlist policy: ${command}` };
         }

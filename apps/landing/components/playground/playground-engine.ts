@@ -39,9 +39,15 @@ export function usePlaygroundEngine(initialScenarioId = "fullstack-refactor") {
     initialLoadedEvents.find((e) => e.type === "approval_request")?.approvalData ||
     null;
 
-  const [status, setStatus] = useState<PlaygroundStatus>(
-    initialHasApproval ? "waiting_for_approval" : "running"
-  );
+  const initialStatus: PlaygroundStatus = initialHasApproval
+    ? "waiting_for_approval"
+    : "running";
+  const [status, setStatusState] = useState<PlaygroundStatus>(initialStatus);
+  const statusRef = useRef<PlaygroundStatus>(initialStatus);
+  const setStatus = useCallback((next: PlaygroundStatus) => {
+    statusRef.current = next;
+    setStatusState(next);
+  }, []);
   const [currentEventIndex, setCurrentEventIndex] = useState<number>(
     initialEventsCount - 1
   );
@@ -263,7 +269,7 @@ export function usePlaygroundEngine(initialScenarioId = "fullstack-refactor") {
             });
 
             // Schedule next event if running
-            if (status === "running") {
+            if (statusRef.current === "running") {
               playbackTimerRef.current = window.setTimeout(() => {
                 executeEventAtIndex(index + 1);
               }, SPEED_MS[speed]);
@@ -283,7 +289,7 @@ export function usePlaygroundEngine(initialScenarioId = "fullstack-refactor") {
           setActiveAgents((prev) =>
             prev.map((a) => ({ ...a, status: "done" }))
           );
-        } else if (status === "running") {
+        } else if (statusRef.current === "running") {
           playbackTimerRef.current = window.setTimeout(() => {
             executeEventAtIndex(index + 1);
           }, SPEED_MS[speed]);
@@ -292,8 +298,8 @@ export function usePlaygroundEngine(initialScenarioId = "fullstack-refactor") {
     },
     [
       scenario,
+      setStatus,
       speed,
-      status,
       updateAgentsForRole,
       updatePlanTasksForEvent,
     ]

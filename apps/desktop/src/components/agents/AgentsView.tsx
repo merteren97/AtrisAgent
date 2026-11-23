@@ -250,6 +250,10 @@ export function AgentsView() {
   const [bindingBusyRole, setBindingBusyRole] = useState<AgentRole | null>(null);
   const [bindingError, setBindingError] = useState<string | null>(null);
   const bindingRequest = useRef(0);
+  const templateRequest = useRef(0);
+  const templateAbort = useRef<AbortController | null>(null);
+  const profileRequest = useRef(0);
+  const profileAbort = useRef<AbortController | null>(null);
 
   const loadBindings = async (scope: ProfileBindingScope, scopeId: string) => {
     const request = ++bindingRequest.current;
@@ -322,36 +326,52 @@ export function AgentsView() {
   };
 
   const loadTemplates = async () => {
+    const request = ++templateRequest.current;
+    templateAbort.current?.abort();
+    const controller = new AbortController();
+    templateAbort.current = controller;
     setIsLoading(true);
     setError(null);
     try {
-      const items = await apiRequest<TeamTemplate[]>('/team-templates');
+      const items = await apiRequest<TeamTemplate[]>('/team-templates', { signal: controller.signal });
+      if (request !== templateRequest.current || controller.signal.aborted) return;
       setTemplates(normalizeTeamTemplates(items));
     } catch (cause: any) {
+      if (request !== templateRequest.current || controller.signal.aborted) return;
       setTemplates([]);
       setError(cause?.message || 'Team templates could not be loaded from the local service.');
     } finally {
-      setIsLoading(false);
+      if (request === templateRequest.current && !controller.signal.aborted) setIsLoading(false);
     }
   };
 
   const loadProfiles = async () => {
+    const request = ++profileRequest.current;
+    profileAbort.current?.abort();
+    const controller = new AbortController();
+    profileAbort.current = controller;
     setProfileLoading(true);
     setProfileError(null);
     try {
-      const response = await apiRequest<unknown>('/agent-profiles');
+      const response = await apiRequest<unknown>('/agent-profiles', { signal: controller.signal });
+      if (request !== profileRequest.current || controller.signal.aborted) return;
       setProfiles(normalizeAgentProfiles(response));
     } catch (cause: any) {
+      if (request !== profileRequest.current || controller.signal.aborted) return;
       setProfiles([]);
       setProfileError(cause?.message || 'Named profiles could not be loaded from the local service.');
     } finally {
-      setProfileLoading(false);
+      if (request === profileRequest.current && !controller.signal.aborted) setProfileLoading(false);
     }
   };
 
   useEffect(() => {
     void loadTemplates();
     void loadProfiles();
+    return () => {
+      templateAbort.current?.abort();
+      profileAbort.current?.abort();
+    };
   }, []);
 
   useEffect(() => {

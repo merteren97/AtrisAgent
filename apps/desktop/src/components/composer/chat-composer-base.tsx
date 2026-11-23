@@ -65,6 +65,10 @@ export function ChatComposer() {
     if (locked || !serviceOnline || !hasModel || route.error || (!message.trim() && !attachmentState.files.length)) return;
     setSending(true); setLocalError(null);
     const submittedKey = scopeKey;
+    const submittedMissionId = missionId;
+    const submittedWorkspaceId = workspaceId;
+    const submittedDelivery = delivery;
+    const submittedBusy = busy;
     const submittedPreferences = preferences;
     const submittedMessage = message;
     try {
@@ -73,24 +77,27 @@ export function ChatComposer() {
       const liveRoute = resolveOrchestratorRoute(parseAgentDirective(submittedMessage, liveModels, 'Orchestrator'), submittedPreferences, liveModels);
       if (liveRoute.error) throw new Error(liveRoute.error);
       const options: StartMissionOptions = {
-        teamTemplate: preferences.teamTemplate, agentProfileIds: preferences.agentProfileIds,
-        trustMode: preferences.trustMode, automationSettings: preferences.automationSettings,
+        teamTemplate: submittedPreferences.teamTemplate, agentProfileIds: submittedPreferences.agentProfileIds,
+        trustMode: submittedPreferences.trustMode, automationSettings: submittedPreferences.automationSettings,
         ...liveRoute.options, ...uploaded,
         // Pure guidance must not create a new turn just because defaults are serialized.
-        ...(!busy || delivery !== 'steer' || uploaded.attachmentIds.length ? { workMode: preferences.workMode, teamLaunch: preferences.teamLaunch } : {}),
+        ...(!submittedBusy || submittedDelivery !== 'steer' || uploaded.attachmentIds.length ? { workMode: submittedPreferences.workMode, teamLaunch: submittedPreferences.teamLaunch } : {}),
       };
       const store = useMissionStore.getState();
-      if (missionId && busy) await store.sendMissionCommand(missionId, message, delivery, options);
-      else if (missionId) await store.continueMission(missionId, message, options);
-      else await store.startMission(message, workspaceId || undefined, options);
+      if (submittedMissionId && submittedBusy) await store.sendMissionCommand(submittedMissionId, submittedMessage, submittedDelivery, options);
+      else if (submittedMissionId) await store.continueMission(submittedMissionId, submittedMessage, options);
+      else await store.startMission(submittedMessage, submittedWorkspaceId || undefined, options);
       const result = useMissionStore.getState();
       if (result.error) throw new Error(result.error);
       const prefStore = useOrchestratorPreferencesStore.getState();
-      const destination = missionId || result.activeMissionId;
+      const destination = submittedMissionId || result.activeMissionId;
       const destinationKey = destination ? `conversation:${destination}` : submittedKey;
-      if (!missionId && !prefStore.conversations[destinationKey]) prefStore.setConversation(destinationKey, submittedPreferences);
+      if (!submittedMissionId && !prefStore.conversations[destinationKey]) prefStore.setConversation(destinationKey, submittedPreferences);
       if (prefStore.drafts[submittedKey] === submittedMessage) prefStore.setDraft(submittedKey, '');
-      attachmentState.clearFiles();
+      const activeScopeKey = result.activeMissionId ? `conversation:${result.activeMissionId}` : submittedKey;
+      if (activeScopeKey === submittedKey || (!submittedMissionId && activeScopeKey === destinationKey)) {
+        attachmentState.clearFiles();
+      }
       setPicker(null);
       setIntegrationNotice(false);
     } catch (cause) {

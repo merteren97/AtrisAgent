@@ -252,6 +252,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   private readonly pendingSteers = new Map<string, string[]>();
   private readonly emittedUserMessageTurns = new Set<string>();
   private readonly cancelledRunIds = new Set<string>();
+  private readonly missionPlanIds = new Map<string, Set<string>>();
+  private readonly missionTurnIds = new Map<string, Set<string>>();
+  private readonly missionRunIds = new Map<string, Set<string>>();
 
   constructor(
     config: OrchestratorConfig,
@@ -300,6 +303,72 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     return `${missionId}:${planId}`;
   }
 
+  private trackMissionPlan(missionId: string, planId: string): void {
+    if (!missionId || !planId) return;
+    let plans = this.missionPlanIds.get(missionId);
+    if (!plans) {
+      plans = new Set();
+      this.missionPlanIds.set(missionId, plans);
+    }
+    plans.add(planId);
+  }
+
+  private trackMissionTurn(missionId: string, turnId: string): void {
+    if (!missionId || !turnId) return;
+    let turns = this.missionTurnIds.get(missionId);
+    if (!turns) {
+      turns = new Set();
+      this.missionTurnIds.set(missionId, turns);
+    }
+    turns.add(turnId);
+  }
+
+  private trackMissionRun(missionId: string, runId: string): void {
+    if (!missionId || !runId) return;
+    let runs = this.missionRunIds.get(missionId);
+    if (!runs) {
+      runs = new Set();
+      this.missionRunIds.set(missionId, runs);
+    }
+    runs.add(runId);
+  }
+
+  private static readonly MAX_BOUNDED_IDEMPOTENCY_KEYS = 500;
+
+  private addBoundedSetKey(set: Set<string>, key: string): void {
+    set.delete(key);
+    set.add(key);
+    while (set.size > OrchestratorV2.MAX_BOUNDED_IDEMPOTENCY_KEYS) {
+      const oldest = set.values().next().value;
+      if (oldest === undefined) break;
+      set.delete(oldest);
+    }
+  }
+
+  private evictTerminalMissionState(missionId: string): void {
+    if (!missionId) return;
+    const planIds = this.missionPlanIds.get(missionId);
+    if (planIds) {
+      for (const planId of planIds) {
+        const isPlanOnly = this.planActions.get(planId) === 'plan_only';
+        if (!isPlanOnly || this.planActions.size > 64) {
+          this.planActions.delete(planId);
+        }
+        if (!isPlanOnly || this.planRequestOptions.size > 64) {
+          this.planRequestOptions.delete(planId);
+        }
+      }
+      this.missionPlanIds.delete(missionId);
+    }
+    // Keep synthesizedPlans, emittedUserMessageTurns, and cancelledRunIds bounded via FIFO cap
+    // rather than clearing immediately on completion so duplicate terminal/turn events remain idempotent.
+    this.missionTurnIds.delete(missionId);
+    this.missionRunIds.delete(missionId);
+    this.lifecycleByMission.delete(missionId);
+    this.deferredCompletions.delete(missionId);
+    this.deferredCompletionMissions.delete(missionId);
+  }
+
   override emitEvent(event: AgentEvent): void {
     if (event.type === 'plan_generated') {
       const requestOptions = this.planRequestOptions.get(event.planId);
@@ -323,7 +392,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       const turnId = event.turnId || lifecycle?.turnId;
       if (turnId && this.emittedUserMessageTurns.has(turnId)) return;
       if (turnId) {
-        this.emittedUserMessageTurns.add(turnId);
+        this.addBoundedSetKey(this.emittedUserMessageTurns, turnId);
+        this.trackMissionTurn(event.missionId, turnId);
         event = { ...event, turnId };
       }
     }
@@ -336,7 +406,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
   cancelRun(missionId: string, runId?: string): void {
     const id = runId || this.lifecycleByMission.get(missionId)?.runId;
-    if (id) this.cancelledRunIds.add(id);
+    if (id) {
+      this.addBoundedSetKey(this.cancelledRunIds, id);
+      this.trackMissionRun(missionId, id);
+    }
   }
 
   private async ensureRunIsCurrent(missionId: string, runId?: string): Promise<void> {
@@ -462,6 +535,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         completedAt: new Date().toISOString(),
       });
     }
+    this.evictTerminalMissionState(missionId);
   }
 
   private async ensureTurnUserMessage(missionId: string, turnId: string, content: string, previousPlanId?: string | null): Promise<void> {
@@ -470,7 +544,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       const existing = await this.v2Db.select({ payload: missionEvents.payload }).from(missionEvents)
         .where(and(eq(missionEvents.missionId, missionId), eq(missionEvents.type, 'user_message')));
       if (existing.some((row) => typeof row.payload?.turnId === 'string' && row.payload.turnId === turnId)) {
-        this.emittedUserMessageTurns.add(turnId);
+        this.addBoundedSetKey(this.emittedUserMessageTurns, turnId);
+        this.trackMissionTurn(missionId, turnId);
         return;
       }
     }
@@ -605,6 +680,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.v2EventBus?.emit({ id: crypto.randomUUID(), type: 'mission_completed', missionId, ...lifecycle,
       summary: params.summary, tasksCompleted: params.tasksCompleted, totalTasks: params.totalTasks, timestamp: new Date().toISOString() });
+    this.evictTerminalMissionState(missionId);
   }
 
   private emitDurableCompletion(params: { missionId: string; planId: string; summary: string;
@@ -694,7 +770,8 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         eq(missionCompletions.missionId, params.missionId),
         eq(missionCompletions.planId, params.planId),
       ));
-    this.synthesizedPlans.add(this.completionKey(params.missionId, params.planId));
+    this.addBoundedSetKey(this.synthesizedPlans, this.completionKey(params.missionId, params.planId));
+    this.evictTerminalMissionState(params.missionId);
   }
 
   private async completeWithSynthesis(params: { missionId: string; planId: string; tasksCompleted: number;
@@ -793,6 +870,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.v2EventBus?.emit({ id: crypto.randomUUID(), type: 'mission_failed', missionId, ...lifecycle,
       reason: params.reason, failedTaskId: params.failedTaskId ?? null, timestamp: new Date().toISOString() });
+    this.evictTerminalMissionState(missionId);
   }
 
   private enqueueMission<T>(missionId: string, work: () => Promise<T>): Promise<T> {
@@ -1078,6 +1156,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     const planId = crypto.randomUUID();
     this.planRequestOptions.set(planId, params.options || {});
+    this.trackMissionPlan(params.missionId, planId);
     const fileContext = attachmentContext(params.options?.attachments);
     const taskSpecs = decisionToTaskPlan(params.decision).map((task) => ({ ...task,
       description: [task.description, fileContext].filter(Boolean).join('\n\n'),
@@ -1169,6 +1248,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
 
     this.planActions.set(planId, autoContinue && builderTasks.length > 0 ? 'execute' : 'plan_only');
+    this.trackMissionPlan(params.missionId, planId);
     this.emitPlanGenerated({
       missionId: params.missionId,
       planId,
@@ -1368,6 +1448,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     }
     const normalizedPlanId = crypto.randomUUID();
     this.planRequestOptions.set(normalizedPlanId, options);
+    this.trackMissionPlan(missionId, normalizedPlanId);
     const lifecycle = this.lifecycleByMission.get(missionId);
     this.trace('plan-normalized', {
       missionId,
@@ -1429,6 +1510,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       throw error;
     }
     this.planActions.set(result.planId, decision.action);
+    this.trackMissionPlan(missionId, result.planId);
     const materializedTasks = (await manager.listTasks(missionId)).filter((task) => task.planId === result.planId);
     this.trace('plan-materialized', {
       missionId,
@@ -2264,6 +2346,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     if (payload?.requestOptions && typeof payload.requestOptions === 'object') {
       const policy = payload.requestOptions as StartMissionOptionsV2;
       this.planRequestOptions.set(planId, policy);
+      this.trackMissionPlan(missionId, planId);
       return policy;
     }
     return undefined;

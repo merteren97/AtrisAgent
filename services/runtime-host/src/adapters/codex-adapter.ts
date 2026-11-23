@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'child_process';
+import { StringDecoder } from 'node:string_decoder';
 import readline from 'readline';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
@@ -37,7 +38,11 @@ import {
   runCommand,
   runtimeProfileEnv,
   spawnHidden,
+  terminateProcessTree,
 } from '../runtime-utils';
+
+const MAX_AUTH_OUTPUT_CHARS = 32_768;
+const MAX_STREAM_BUFFER_CHARS = 2 * 1024 * 1024;
 
 interface PendingAuth {
   process?: ChildProcess;
@@ -172,8 +177,14 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     });
     const flow: PendingAuth = { process: child, profileId, output: '' };
     this.authFlows.set(authId, flow);
-    child.stdout?.on('data', (chunk) => { flow.output += redactSecrets(chunk.toString()); });
-    child.stderr?.on('data', (chunk) => { flow.output += redactSecrets(chunk.toString()); });
+    const appendAuthOutput = (chunk: Buffer | string) => {
+      flow.output += redactSecrets(chunk.toString());
+      if (flow.output.length > MAX_AUTH_OUTPUT_CHARS) {
+        flow.output = flow.output.slice(-MAX_AUTH_OUTPUT_CHARS);
+      }
+    };
+    child.stdout?.on('data', appendAuthOutput);
+    child.stderr?.on('data', appendAuthOutput);
     child.on('error', (error) => { flow.error = error.message; });
     child.on('close', (code) => {
       if (code !== 0 && !flow.error) flow.error = `Codex login exited with code ${code}`;
@@ -197,7 +208,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     if (!flow) return { authId, status: 'error', message: 'Authentication flow not found.' };
     const status = await this.verifyAuthentication(flow.profileId);
     if (status === 'connected') {
-      flow.process?.kill('SIGTERM');
+      if (flow.process) await terminateProcessTree(flow.process).catch(() => undefined);
       this.authFlows.delete(authId);
       return { authId, status, message: 'Codex login is connected.' };
     }
@@ -206,6 +217,13 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       status: flow.error ? 'error' : 'awaiting_browser',
       message: flow.error || flow.output.trim().slice(-1_500) || 'Waiting for the official Codex login flow.',
     };
+  }
+
+  override async shutdown(): Promise<void> {
+    const flows = [...this.authFlows.values()];
+    this.authFlows.clear();
+    await Promise.all(flows.map((flow) => (flow.process ? terminateProcessTree(flow.process).catch(() => undefined) : Promise.resolve())));
+    await super.shutdown();
   }
 
   async verifyAuthentication(profileId?: string): Promise<AccountProfileStatus> {
@@ -263,36 +281,45 @@ export class CodexAdapter extends BaseRuntimeAdapter {
         env: { ...process.env, ...this.env(profileId) },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
+      let settled = false;
+      const rl = readline.createInterface({ input: child.stdout! });
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        rl.close();
+        fn();
+      };
       const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error('Codex app-server model discovery timed out.'));
+        settle(() => {
+          void terminateProcessTree(child).catch(() => undefined);
+          reject(new Error('Codex app-server model discovery timed out.'));
+        });
       }, 15_000);
       let stderr = '';
-      child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
-      const rl = readline.createInterface({ input: child.stdout! });
+      child.stderr?.on('data', (chunk) => {
+        stderr += chunk.toString();
+        if (stderr.length > MAX_AUTH_OUTPUT_CHARS) stderr = stderr.slice(-MAX_AUTH_OUTPUT_CHARS);
+      });
       rl.on('line', (line) => {
         try {
           const message = JSON.parse(line);
           if (message.id === 2) {
-            clearTimeout(timer);
-            rl.close();
-            child.kill('SIGTERM');
-            const result = message.result || {};
-            resolve(result.data || result.models || result.items || []);
+            settle(() => {
+              void terminateProcessTree(child).catch(() => undefined);
+              const result = message.result || {};
+              resolve(result.data || result.models || result.items || []);
+            });
           }
         } catch {
           // Ignore non-JSON diagnostic lines.
         }
       });
       child.on('error', (error) => {
-        clearTimeout(timer);
-        reject(error);
+        settle(() => reject(error));
       });
       child.on('close', (code) => {
-        if (code && code !== 0) {
-          clearTimeout(timer);
-          reject(new Error(stderr || `Codex app-server exited with code ${code}`));
-        }
+        settle(() => reject(new Error(stderr || `Codex app-server exited with code ${code ?? 'null'} before returning model list.`)));
       });
       child.stdin?.write(`${JSON.stringify({ id: 1, method: 'initialize', params: { clientInfo: { name: 'AtrisAgent', version: '0.2.0' } } })}\n`);
       child.stdin?.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`);
@@ -405,22 +432,30 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       model: model || 'Codex default', timestamp: new Date().toISOString(),
     });
 
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
     let buffer = '';
     child.stdout?.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
+      buffer += stdoutDecoder.write(chunk);
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || '';
+      if (buffer.length > MAX_STREAM_BUFFER_CHARS) buffer = buffer.slice(-MAX_STREAM_BUFFER_CHARS);
       for (const line of lines) this.handleJsonLine(sessionId, line);
     });
     let stderrBuffer = '';
     child.stderr?.on('data', (chunk: Buffer) => {
-      stderrBuffer += chunk.toString('utf8');
+      stderrBuffer += stderrDecoder.write(chunk);
       const lines = stderrBuffer.split(/\r?\n/);
       stderrBuffer = lines.pop() || '';
+      if (stderrBuffer.length > MAX_STREAM_BUFFER_CHARS) stderrBuffer = stderrBuffer.slice(-MAX_STREAM_BUFFER_CHARS);
       for (const line of lines) this.handleDiagnosticLine(sessionId, line);
     });
     child.on('error', (error) => this.emitFailure(sessionId, error.message));
     child.on('close', (code, signal) => {
+      const stdoutTail = stdoutDecoder.end();
+      if (stdoutTail) buffer += stdoutTail;
+      const stderrTail = stderrDecoder.end();
+      if (stderrTail) stderrBuffer += stderrTail;
       if (buffer.trim()) this.handleJsonLine(sessionId, buffer);
       if (stderrBuffer.trim()) this.handleDiagnosticLine(sessionId, stderrBuffer);
       this.unregisterProcess(sessionId);

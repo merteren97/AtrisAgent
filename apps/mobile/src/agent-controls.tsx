@@ -20,7 +20,21 @@ export function AgentControls({ agentId }: { agentId: string }) {
   const [mode, setMode] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const load = () => api.controls(agentId).then(setControls).catch(cause => setError(cause.message));
-  useEffect(() => { let active = true; const refresh = () => { void api.controls(agentId).then(value => { if (active) setControls(value); }).catch(cause => { if (active) setError(cause.message); }); }; refresh(); const timer = setInterval(refresh, 3000); return () => { active = false; clearInterval(timer); }; }, [agentId]);
+  useEffect(() => {
+    let active = true;
+    let inFlight = false;
+    const refresh = () => {
+      if (inFlight) return;
+      inFlight = true;
+      void api.controls(agentId)
+        .then(value => { if (active) setControls(value); })
+        .catch(cause => { if (active) setError(cause.message); })
+        .finally(() => { inFlight = false; });
+    };
+    refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => { active = false; clearInterval(timer); };
+  }, [agentId]);
   const apply = async (action: () => Promise<unknown>) => { setBusy(true); setError(''); try { await action(); setNotice('Request sent. The state below reflects the desktop confirmation.'); await load(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not apply the change.'); } finally { setBusy(false); } };
   return <div className="remote-controls">{error && <p role="alert" className="sheet-error">{error}</p>}{notice && <p role="status" className="account-note">{notice}</p>}{!controls && !error && <p>Loading desktop controls…</p>}
     {!!controls?.questions.length && <section><h3>Agent needs your answer</h3>{controls.questions.map(question => <QuestionForm key={question.id} agentId={agentId} question={question} done={() => { void load(); }} />)}</section>}

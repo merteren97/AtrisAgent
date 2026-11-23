@@ -19,17 +19,45 @@ export function OrchestratorWorkCard() {
   const status = mission?.status;
   useEffect(() => {
     let cancelled = false;
+    let timer: number | undefined;
+    let controller: AbortController | null = null;
     setApproval(null); setError(null);
     if (!activeMissionId || status !== 'waiting_for_approval') return;
-    const load = async () => {
-      try {
-        const approvals = await apiRequest<Approval[]>(`/missions/${encodeURIComponent(activeMissionId)}/approvals`);
-        if (!cancelled) { setApproval(approvals.find(item => item.type === 'plan' && item.status === 'pending') || null); setError(null); }
-      } catch (cause) { if (!cancelled) setError(cause instanceof Error ? cause.message : 'Could not load the team approval.'); }
+    const schedule = () => {
+      if (cancelled || document.hidden) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => { timer = undefined; void load(); }, 4000);
     };
-    void load();
-    const timer = window.setInterval(() => void load(), 4000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    const load = async () => {
+      if (cancelled || document.hidden) return;
+      controller?.abort();
+      const myController = new AbortController();
+      controller = myController;
+      try {
+        const approvals = await apiRequest<Approval[]>(`/missions/${encodeURIComponent(activeMissionId)}/approvals`, { signal: myController.signal });
+        if (!cancelled && controller === myController) { setApproval(approvals.find(item => item.type === 'plan' && item.status === 'pending') || null); setError(null); }
+      } catch (cause) {
+        if (!cancelled && controller === myController && !myController.signal.aborted) setError(cause instanceof Error ? cause.message : 'Could not load the team approval.');
+      } finally {
+        if (controller === myController) schedule();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
+      } else if (!cancelled) {
+        if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
+        void load();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    if (!document.hidden) void load();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      controller?.abort();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [activeMissionId, status]);
   if (!mission || !activeTasks.length) return null;
   const tasks = activeTasks.filter(task => !mission.planId || !task.planId || task.planId === mission.planId);

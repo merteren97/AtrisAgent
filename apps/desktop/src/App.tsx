@@ -21,6 +21,7 @@ import { useMissionStore } from '@/stores/mission-store';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useManualStore } from '@/stores/manual-store';
 import { ThemeProvider } from '@/components/theme-provider';
+import { ErrorBoundary } from '@/components/error-boundary';
 import { CommandPalette } from '@/components/search/CommandPalette';
 import { UpdateManager } from '@/components/update/UpdateManager';
 import { useAccountStore } from '@/stores/account-store';
@@ -185,36 +186,38 @@ function WorkspaceApp() {
                </Tabs>
              ) : null}
              {activeView === 'chat' && orchestrated && missionSurface === 'chat' ? <MissionStateStrip /> : null}
-             <Suspense fallback={<ViewLoading />}>
-               {activeView === 'dashboard' ? (
-                 <AnalyticsDashboard />
-               ) : activeView === 'settings' ? (
-                 <SettingsView />
-                ) : activeView === 'accounts' ? (
-                  <AccountsView />
-                ) : activeView === 'integrations' ? (
-                  <IntegrationsView />
-               ) : activeView === 'agents' ? (
-                 <AgentsView />
-                ) : conversationMode === 'planning' ? (
-                  <PlanningWorkspace />
-                ) : conversationMode === 'manual' ? (
-                 <ManualWorkspace />
-               ) : conversationMode === 'choose' ? (
-                 <ConversationChoice />
-               ) : (
-                  missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : (
-                    <div className="flex min-h-0 min-w-0 flex-1 flex-col p-2 sm:p-2.5">
-                      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card/60 shadow-sm">
-                        <ChatTimeline />
-                        {activeMissionId && <ChatChangeSummary endpoint={`/missions/${encodeURIComponent(activeMissionId)}/changes`} />}
-                        <ChatComposer />
+             <ErrorBoundary scope="view" resetKey={`${activeView}:${conversationMode}:${missionSurface}:${activeMissionId || ''}`}>
+               <Suspense fallback={<ViewLoading />}>
+                 {activeView === 'dashboard' ? (
+                   <AnalyticsDashboard />
+                 ) : activeView === 'settings' ? (
+                   <SettingsView />
+                  ) : activeView === 'accounts' ? (
+                    <AccountsView />
+                  ) : activeView === 'integrations' ? (
+                    <IntegrationsView />
+                 ) : activeView === 'agents' ? (
+                   <AgentsView />
+                  ) : conversationMode === 'planning' ? (
+                    <PlanningWorkspace />
+                  ) : conversationMode === 'manual' ? (
+                   <ManualWorkspace />
+                 ) : conversationMode === 'choose' ? (
+                   <ConversationChoice />
+                 ) : (
+                    missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : (
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col p-2 sm:p-2.5">
+                        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card/60 shadow-sm">
+                          <ChatTimeline />
+                          {activeMissionId && <ChatChangeSummary endpoint={`/missions/${encodeURIComponent(activeMissionId)}/changes`} />}
+                          <ChatComposer />
+                        </div>
                       </div>
-                    </div>
-                  )
-               )}
-             </Suspense>
-             {devMode ? <Suspense fallback={null}><DeveloperConsole /></Suspense> : null}
+                    )
+                 )}
+               </Suspense>
+             </ErrorBoundary>
+             {devMode ? <ErrorBoundary scope="developer-console" fallback={null}><Suspense fallback={null}><DeveloperConsole /></Suspense></ErrorBoundary> : null}
           </main>
         }
         inspector={activeView === 'chat' && orchestrated && activeMissionId ? <InspectorPanel /> : null}
@@ -256,17 +259,19 @@ export default function App({ runtime }: { runtime: RuntimeBootstrap }) {
   }, [closeBehavior]);
 
   return (
-    <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
-      <TooltipProvider>
-        <UpdateManager />
-        {runtime.status === 'failed' ? (
-          <RuntimeStartupFailure error={runtime.error} />
-        ) : (
-          <AuthSessionProvider>
-            <WorkspaceApp />
-          </AuthSessionProvider>
-        )}
-      </TooltipProvider>
-    </ThemeProvider>
+    <ErrorBoundary scope="root">
+      <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
+        <TooltipProvider>
+          <UpdateManager />
+          {runtime.status === 'failed' ? (
+            <RuntimeStartupFailure error={runtime.error} />
+          ) : (
+            <AuthSessionProvider>
+              <WorkspaceApp />
+            </AuthSessionProvider>
+          )}
+        </TooltipProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }

@@ -13,6 +13,20 @@ export default defineConfig({
     },
   },
   clearScreen: false,
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return;
+          if (/[/\\]node_modules[/\\](react|react-dom|scheduler)[/\\]/.test(id)) return 'vendor-react';
+          if (/[/\\]node_modules[/\\](@radix-ui|radix-ui)[/\\]/.test(id)) return 'vendor-radix';
+          if (/[/\\]node_modules[/\\]lucide-react[/\\]/.test(id)) return 'vendor-icons';
+          if (/[/\\]node_modules[/\\]@xterm[/\\]/.test(id)) return 'vendor-xterm';
+          if (/[/\\]node_modules[/\\]@tauri-apps[/\\]/.test(id)) return 'vendor-tauri';
+        },
+      },
+    },
+  },
   server: {
     port: 1420,
     strictPort: true,

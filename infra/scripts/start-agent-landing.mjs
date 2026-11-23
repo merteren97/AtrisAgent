@@ -15,8 +15,28 @@ const child = spawn(npmCommand, ["run", "start", "-w", "@atris-agent-code/public
     PORT: process.env.PORT || "3003",
   },
   shell: process.platform === "win32",
+  detached: process.platform !== "win32",
   stdio: "inherit",
 });
+
+let shuttingDown = false;
+function forwardTermination(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (!child.pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+    } else {
+      process.kill(-child.pid, signal);
+    }
+  } catch {
+    try { child.kill(signal); } catch { /* ignore already exited */ }
+  }
+}
+
+process.on("SIGINT", () => forwardTermination("SIGINT"));
+process.on("SIGTERM", () => forwardTermination("SIGTERM"));
 
 child.on("error", (error) => {
   startupFailed = true;

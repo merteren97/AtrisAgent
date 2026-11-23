@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'node:child_process';
 import type { ReviewPack, ChangedFile, CheckResult } from '@atris-agent-code/domain';
 import type { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 
@@ -79,9 +80,33 @@ export class ReviewPackGenerator {
       try {
         const wtPkg = JSON.parse(fs.readFileSync(path.join(worktreePath, pkgJsonChanged.path), 'utf-8'));
         const baselinePkgPath = path.join(worktreePath, '.atris-baseline', pkgJsonChanged.path);
-        const basePkg = fs.existsSync(baselinePkgPath)
-          ? JSON.parse(fs.readFileSync(baselinePkgPath, 'utf-8'))
-          : { dependencies: {}, devDependencies: {} };
+        let basePkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> } = { dependencies: {}, devDependencies: {} };
+        if (fs.existsSync(baselinePkgPath)) {
+          basePkg = JSON.parse(fs.readFileSync(baselinePkgPath, 'utf-8'));
+        } else {
+          try {
+            const gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], {
+              cwd: worktreePath,
+              encoding: 'utf-8',
+              stdio: ['ignore', 'pipe', 'ignore'],
+            }).trim();
+            const markerPath = path.join(gitDir, 'atris-review-base');
+            let reviewBase = 'HEAD';
+            if (fs.existsSync(markerPath)) {
+              const recorded = fs.readFileSync(markerPath, 'utf-8').trim();
+              if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(recorded)) reviewBase = recorded;
+            }
+            const gitRelPath = pkgJsonChanged.path.replace(/\\/g, '/');
+            const baseContent = execFileSync('git', ['show', `${reviewBase}:${gitRelPath}`], {
+              cwd: worktreePath,
+              encoding: 'utf-8',
+              stdio: ['ignore', 'pipe', 'ignore'],
+            });
+            basePkg = JSON.parse(baseContent);
+          } catch {
+            // New file or non-Git worktree: fall back safely to empty dependencies
+          }
+        }
 
         const baseDeps = { ...basePkg.dependencies, ...basePkg.devDependencies };
         const wtDeps = { ...wtPkg.dependencies, ...wtPkg.devDependencies };

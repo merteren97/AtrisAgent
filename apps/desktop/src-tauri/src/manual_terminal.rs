@@ -148,10 +148,16 @@ fn terminal_text(output: &str) -> String {
                 }
                 b'(' | b')' | b'*' | b'+' => {
                     i = (i + 3).min(bytes.len());
+                    while i < bytes.len() && !output.is_char_boundary(i) {
+                        i += 1;
+                    }
                     continue;
                 }
                 _ => {
                     i = (i + 2).min(bytes.len());
+                    while i < bytes.len() && !output.is_char_boundary(i) {
+                        i += 1;
+                    }
                     continue;
                 }
             }

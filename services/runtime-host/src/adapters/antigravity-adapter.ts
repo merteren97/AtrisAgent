@@ -1,6 +1,7 @@
 import os from 'os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type {
@@ -90,6 +91,7 @@ interface AntigravityCliOptions {
 
 const ALL_ROLES: AgentRole[] = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'];
 const MAX_STDERR_CHARS = 8_000;
+const MAX_STREAM_LINE_CHARS = 2 * 1024 * 1024;
 const TERMINAL_EXIT_GRACE_MS = 750;
 const TERMINAL_FORCE_KILL_MS = 3_000;
 const PROCESS_EXIT_STREAM_DRAIN_MS = 150;
@@ -186,6 +188,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
   private softTerminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private softTerminalResultsBySession = new Map<string, string>();
   private terminalReleaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private sessionOverlays = new Map<string, () => void>();
+  private sessionReleaseHandlers = new Map<string, () => void>();
   private liveModelFamilies: AntigravityCliModelFamily[] = [];
   private cliOptions: AntigravityCliOptions = {
     supportsSandbox: false,
@@ -311,7 +315,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const flow = this.authFlows.get(authId);
     if (!flow) return { authId, status: 'error', message: 'Authentication flow not found. Start the Antigravity sign-in flow again.' };
 
-    const status = await this.verifyAuthentication();
+    const status = await this.verifyAuthentication(true);
     const verification = this.lastVerification;
     if (status === 'connected') {
       this.authFlows.delete(authId);
@@ -333,8 +337,9 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     };
   }
 
-  async verifyAuthentication(): Promise<AccountProfileStatus> {
-    if (this.lastVerification && Date.now() - this.lastVerification.checkedAt < 120_000 && this.lastVerification.status === 'connected') {
+  async verifyAuthentication(profileIdOrForce?: string | boolean, force = false): Promise<AccountProfileStatus> {
+    const shouldForce = typeof profileIdOrForce === 'boolean' ? profileIdOrForce : force;
+    if (!shouldForce && this.lastVerification && Date.now() - this.lastVerification.checkedAt < 120_000 && this.lastVerification.status === 'connected') {
       return this.lastVerification.status;
     }
 
@@ -727,12 +732,28 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       timestamp: new Date().toISOString(),
     });
 
+    if (overlay) this.sessionOverlays.set(sessionId, () => overlay.cleanup());
+
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
     let buffer = '';
     let finalized = false;
     let exitFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
 
+    const appendStderrChunk = (text: string) => {
+      if (!text) return;
+      const previous = this.stderrBuffers.get(sessionId) || '';
+      const next = `${previous}${redactSecrets(text)}`;
+      this.stderrBuffers.set(sessionId, next.slice(-MAX_STDERR_CHARS));
+    };
+
     const flushBufferedOutput = () => {
-      if (!buffer.trim()) return;
+      buffer += stdoutDecoder.end();
+      appendStderrChunk(stderrDecoder.end());
+      if (!buffer.trim()) {
+        buffer = '';
+        return;
+      }
       this.handleStreamLine(sessionId, buffer);
       buffer = '';
     };
@@ -752,6 +773,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
+      this.sessionOverlays.delete(sessionId);
+      this.sessionReleaseHandlers.delete(sessionId);
       overlay?.cleanup();
       revokeControlPlaneAgent(sessionId);
       this.sessionContext.delete(sessionId);
@@ -769,17 +792,23 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       this.clearSessionCancellation(sessionId);
       this.publishedTerminalSessions.delete(sessionId);
     };
+    this.sessionReleaseHandlers.set(sessionId, () => finalizeNativeSession(0, null));
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
+      buffer += stdoutDecoder.write(chunk);
+      if (buffer.length > MAX_STREAM_LINE_CHARS && !buffer.includes('\n')) {
+        buffer = buffer.slice(-MAX_STREAM_LINE_CHARS);
+        return;
+      }
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || '';
+      if (buffer.length > MAX_STREAM_LINE_CHARS) {
+        buffer = buffer.slice(-MAX_STREAM_LINE_CHARS);
+      }
       for (const line of lines) this.handleStreamLine(sessionId, line);
     });
     child.stderr?.on('data', (chunk: Buffer) => {
-      const previous = this.stderrBuffers.get(sessionId) || '';
-      const next = `${previous}${redactSecrets(chunk.toString('utf8'))}`;
-      this.stderrBuffers.set(sessionId, next.slice(-MAX_STDERR_CHARS));
+      appendStderrChunk(stderrDecoder.write(chunk));
     });
     child.on('error', (error) => {
       this.recordTerminalOutcome(sessionId, {
@@ -919,12 +948,17 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.lastOutputBySession.delete(sessionId);
     this.stdoutBuffers.delete(sessionId);
     this.stderrBuffers.delete(sessionId);
+    const overlayCleanup = this.sessionOverlays.get(sessionId);
+    this.sessionOverlays.delete(sessionId);
+    this.sessionReleaseHandlers.delete(sessionId);
+    overlayCleanup?.();
     revokeControlPlaneAgent(sessionId);
   }
 
   private cleanupAllSessionState(): void {
     for (const timer of this.softTerminalTimers.values()) clearTimeout(timer);
     for (const timer of this.terminalReleaseTimers.values()) clearTimeout(timer);
+    for (const overlayCleanup of this.sessionOverlays.values()) overlayCleanup();
     for (const sessionId of this.sessionContext.keys()) revokeControlPlaneAgent(sessionId);
     this.sessionContext.clear();
     this.terminalSessions.clear();
@@ -934,6 +968,8 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.softTerminalTimers.clear();
     this.softTerminalResultsBySession.clear();
     this.terminalReleaseTimers.clear();
+    this.sessionOverlays.clear();
+    this.sessionReleaseHandlers.clear();
     this.stdoutBuffers.clear();
     this.stderrBuffers.clear();
   }
@@ -1004,9 +1040,15 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     this.clearTerminalRelease(sessionId);
     const timer = setTimeout(() => {
       this.terminalReleaseTimers.delete(sessionId);
+      const releaseHandler = this.sessionReleaseHandlers.get(sessionId);
+      if (releaseHandler) {
+        releaseHandler();
+        return;
+      }
       const context = this.sessionContext.get(sessionId);
       const outcome = this.pendingTerminalBySession.get(sessionId);
       if (context && outcome) this.emitTerminalOutcome(sessionId, context, outcome);
+      this.cleanupSessionState(sessionId);
     }, TERMINAL_RELEASE_GRACE_MS);
     timer.unref?.();
     this.terminalReleaseTimers.set(sessionId, timer);

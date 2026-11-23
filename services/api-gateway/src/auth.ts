@@ -275,9 +275,16 @@ export class AtrisAuthService {
     }
   }
 
+  private static readonly MAX_CACHE_ENTRIES = 500;
+
   private prune(now: number): void {
     for (const [key, entry] of this.cache) {
       if (entry.staleUntil <= now) this.cache.delete(key);
+    }
+    while (this.cache.size > AtrisAuthService.MAX_CACHE_ENTRIES) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.cache.delete(oldestKey);
     }
   }
 
@@ -302,12 +309,14 @@ export class AtrisAuthService {
           !['FREE', 'PREVIEW', 'PREMIUM'].includes(String(policy.payload.access.mode))) throw new HubAuthUnavailableError();
       session.appAccess = policy.payload.access as NonNullable<AtrisSession['appAccess']>;
       const now = this.now();
+      this.cache.delete(tokenHash);
       this.cache.set(tokenHash, {
         session,
         validatedAt: now,
         freshUntil: now + this.cacheTtlMs,
         staleUntil: now + this.cacheTtlMs + this.staleCacheTtlMs,
       });
+      this.prune(now);
       return { session, stale: false };
     } catch (error) {
       if (error instanceof HubAuthRejectedError) throw error;

@@ -136,11 +136,33 @@ async function assertPortClosed(origin) {
 
 async function terminate(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill();
-  await Promise.race([
-    once(child, 'exit'),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('Runtime did not exit after shutdown.')), SHUTDOWN_TIMEOUT_MS)),
-  ]);
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+    } catch {
+      child.kill();
+    }
+  } else {
+    child.kill();
+  }
+  try {
+    await Promise.race([
+      once(child, 'exit'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Runtime did not exit after shutdown.')), SHUTDOWN_TIMEOUT_MS)),
+    ]);
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) {
+      if (process.platform === 'win32' && child.pid) {
+        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+      } else if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+      } else {
+        child.kill('SIGKILL');
+      }
+      await Promise.race([once(child, 'exit'), new Promise((resolve) => setTimeout(resolve, 1_000))]);
+    }
+    throw error;
+  }
 }
 
 export async function runRuntimeSidecarSmoke({ runtimeDir = DEFAULT_RUNTIME_DIR } = {}) {
@@ -179,6 +201,7 @@ export async function runRuntimeSidecarSmoke({ runtimeDir = DEFAULT_RUNTIME_DIR 
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      ...(process.platform !== 'win32' ? { detached: true } : {}),
     });
     const ready = await waitForReady(child, stdoutLines, stderrLines, runtimeToken);
     if (!/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(ready.origin ?? '')) {
@@ -204,15 +227,18 @@ export async function runRuntimeSidecarSmoke({ runtimeDir = DEFAULT_RUNTIME_DIR 
       + `stdout=${redact(stdoutLines.join('\n'), runtimeToken)} `
       + `stderr=${redact(stderrLines.join('\n'), runtimeToken)}`);
   } finally {
-    if (child) await terminate(child);
-    if (origin) await assertPortClosed(origin);
-    const resolvedSmokeRoot = resolve(smokeRoot);
-    const resolvedTemp = resolve(tmpdir());
-    const relativeSmoke = relative(resolvedTemp, resolvedSmokeRoot);
-    if (!relativeSmoke || relativeSmoke.startsWith('..') || isAbsolute(relativeSmoke)) {
-      throw new Error('Refusing to remove a smoke directory outside the system temp directory.');
+    try {
+      if (child) await terminate(child);
+      if (origin) await assertPortClosed(origin);
+    } finally {
+      const resolvedSmokeRoot = resolve(smokeRoot);
+      const resolvedTemp = resolve(tmpdir());
+      const relativeSmoke = relative(resolvedTemp, resolvedSmokeRoot);
+      if (!relativeSmoke || relativeSmoke.startsWith('..') || isAbsolute(relativeSmoke)) {
+        throw new Error('Refusing to remove a smoke directory outside the system temp directory.');
+      }
+      await rm(resolvedSmokeRoot, { recursive: true, force: true });
     }
-    await rm(resolvedSmokeRoot, { recursive: true, force: true });
   }
   console.log('[AtrisAgent] runtime smoke child cleanup=ok');
 }

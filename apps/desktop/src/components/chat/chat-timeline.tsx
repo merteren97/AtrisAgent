@@ -70,19 +70,31 @@ function isDuplicateTerminalDiagnostic(items: TimelineItem[], index: number): bo
   // RuntimeHost may attach an agent-level diagnostic while propagating the same
   // task_failed event. Keep that diagnostic in the Activity inspector for deep
   // telemetry, but show one authoritative failure in the conversational timeline.
-  return items.slice(index + 1, index + 4).some((candidate) => (
-    candidate.eventType === 'task_failed'
-    && metadataString(candidate, 'taskId') === taskId
-    && metadataString(candidate, 'error') === error
-  ));
+  const limit = Math.min(items.length, index + 4);
+  for (let i = index + 1; i < limit; i++) {
+    const candidate = items[i];
+    if (
+      candidate.eventType === 'task_failed'
+      && metadataString(candidate, 'taskId') === taskId
+      && metadataString(candidate, 'error') === error
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function prepareTimeline(items: TimelineItem[], showLiveThinking: boolean): RenderEntry[] {
   const conversationalItems = items.filter((_, index) => !isDuplicateTerminalDiagnostic(items, index));
   const coalesced: TimelineItem[] = [];
-  const latestThinking = [...conversationalItems]
-    .filter((item) => item.eventType === 'agent_thought' && item.content.trim())
-    .slice(-1)[0];
+  let latestThinking: TimelineItem | undefined;
+  for (let i = conversationalItems.length - 1; i >= 0; i--) {
+    const candidate = conversationalItems[i];
+    if (candidate.eventType === 'agent_thought' && candidate.content.trim()) {
+      latestThinking = candidate;
+      break;
+    }
+  }
 
   for (const item of conversationalItems) {
     if (item.eventType === 'agent_thought' && showLiveThinking) continue;
@@ -195,16 +207,19 @@ export function ChatTimeline() {
   };
 
   useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
+    const frameId = requestAnimationFrame(() => {
+      const viewport = viewportRef.current;
+      if (!viewport) return;
 
-    if (shouldFollowRef.current) {
-      viewport.scrollTop = viewport.scrollHeight;
-    } else if (isNearBottom(viewport)) {
-      shouldFollowRef.current = true;
-      setIsDetached(false);
-    }
-  }, [renderTimeline, timeline]);
+      if (shouldFollowRef.current) {
+        viewport.scrollTop = viewport.scrollHeight;
+      } else if (isNearBottom(viewport)) {
+        shouldFollowRef.current = true;
+        setIsDetached(false);
+      }
+    });
+    return () => cancelAnimationFrame(frameId);
+  }, [renderTimeline]);
 
   const jumpToLatest = () => {
     const viewport = viewportRef.current;

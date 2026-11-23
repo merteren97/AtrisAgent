@@ -192,7 +192,15 @@ export class RuntimeHost {
     attemptId?: string;
     role?: AgentRole | string;
     lastProtocolResponseAt: number;
+    lastHeartbeatAt?: number;
     probeFailures: number;
+  }>();
+  private static readonly ACTIVITY_HEARTBEAT_THROTTLE_MS = 5_000;
+  private inFlightTaskSpawns = new Set<{
+    missionId: string;
+    runId?: string;
+    cancelled: boolean;
+    done: Promise<unknown>;
   }>();
   private scheduler: Scheduler;
   private profileManager: AccountProfileManager;
@@ -543,6 +551,9 @@ export class RuntimeHost {
           });
           void this.emitRuntimeTelemetry(event, active, 'completed').catch(() => undefined);
           this.activeSessions.delete(sessionId);
+        } catch (error) {
+          console.error('[RuntimeHost] Failed to finalize completed task session:', sessionId, error);
+          this.activeSessions.delete(sessionId);
         } finally {
           this.finishingSessions.delete(sessionId);
         }
@@ -568,6 +579,9 @@ export class RuntimeHost {
           });
           void this.emitRuntimeTelemetry(event, active, 'failed').catch(() => undefined);
           this.activeSessions.delete(sessionId);
+        } catch (error) {
+          console.error('[RuntimeHost] Failed to finalize failed task session:', sessionId, error);
+          this.activeSessions.delete(sessionId);
         } finally {
           this.finishingSessions.delete(sessionId);
         }
@@ -576,12 +590,15 @@ export class RuntimeHost {
     this.unsubscribeTaskTerminal = () => { taskCompleted(); taskFailed(); };
     this.unsubscribeRuntimeActivity = eventBus.on('*', (event) => {
       if (!('agentInstanceId' in event) || typeof event.agentInstanceId !== 'string') return;
-      if (!this.activeSessions.has(event.agentInstanceId)) return;
       const active = this.activeSessions.get(event.agentInstanceId);
-      if (active) {
-        active.lastProtocolResponseAt = Date.now();
-        active.probeFailures = 0;
+      if (!active) return;
+      const nowMs = Date.now();
+      active.lastProtocolResponseAt = nowMs;
+      active.probeFailures = 0;
+      if (active.lastHeartbeatAt && nowMs - active.lastHeartbeatAt < RuntimeHost.ACTIVITY_HEARTBEAT_THROTTLE_MS) {
+        return;
       }
+      active.lastHeartbeatAt = nowMs;
       void this.heartbeatSession(event.agentInstanceId).catch(() => undefined);
     });
   }
@@ -867,6 +884,26 @@ export class RuntimeHost {
   }
 
   async handleTaskCreated(event: TaskCreated): Promise<AgentSession> {
+    let resolveDone!: () => void;
+    const spawnToken = {
+      missionId: event.missionId,
+      runId: event.runId,
+      cancelled: false,
+      done: new Promise<void>((resolve) => { resolveDone = resolve; }),
+    };
+    this.inFlightTaskSpawns.add(spawnToken);
+    try {
+      return await this.handleTaskCreatedInner(event, spawnToken);
+    } finally {
+      this.inFlightTaskSpawns.delete(spawnToken);
+      resolveDone();
+    }
+  }
+
+  private async handleTaskCreatedInner(
+    event: TaskCreated,
+    spawnToken: { missionId: string; runId?: string; cancelled: boolean },
+  ): Promise<AgentSession> {
     const missionPreference = this.missionRouting.get(event.missionId);
     const task = this.workspaceManager ? await this.workspaceManager.getTask(event.taskId) : null;
     if (this.workspaceManager && !task) {
@@ -1093,6 +1130,12 @@ export class RuntimeHost {
       profileSource: profileResolution.source,
       route: routeSnapshot,
     });
+    if (spawnToken.cancelled) {
+      if (attempt && this.workspaceManager) {
+        await this.workspaceManager.finishTaskAttempt(attempt.id, 'cancelled').catch(() => undefined);
+      }
+      throw new Error(`Mission ${event.missionId} was cancelled before task ${event.taskId} spawned.`);
+    }
     let session: AgentSession;
     try {
       session = await adapter.spawnAgent({
@@ -1126,6 +1169,13 @@ export class RuntimeHost {
         }).catch(() => undefined);
       }
       throw error;
+    }
+    if (spawnToken.cancelled) {
+      await adapter.cancel(session.id).catch(() => undefined);
+      if (attempt && this.workspaceManager) {
+        await this.workspaceManager.finishTaskAttempt(attempt.id, 'cancelled').catch(() => undefined);
+      }
+      throw new Error(`Mission ${event.missionId} was cancelled while task ${event.taskId} was starting.`);
     }
     const startedAt = Date.now();
     if (attempt && this.workspaceManager) {
@@ -1336,9 +1386,15 @@ export class RuntimeHost {
   async stopSession(sessionId: string): Promise<void> {
     const active = this.activeSessions.get(sessionId);
     if (!active) return;
-    await this.adapters.get(active.adapterId)?.cancel(sessionId);
-    await this.finishAttempt(active, 'cancelled');
-    this.activeSessions.delete(sessionId);
+    if (this.finishingSessions.has(sessionId)) return;
+    this.finishingSessions.add(sessionId);
+    try {
+      await this.adapters.get(active.adapterId)?.cancel(sessionId);
+      await this.finishAttempt(active, 'cancelled');
+    } finally {
+      this.activeSessions.delete(sessionId);
+      this.finishingSessions.delete(sessionId);
+    }
   }
 
   async heartbeatSession(sessionId: string, now = new Date()): Promise<boolean> {
@@ -1521,6 +1577,14 @@ export class RuntimeHost {
   }
 
   async stopMission(missionId: string, runId?: string): Promise<void> {
+    const matchingSpawns = [...this.inFlightTaskSpawns].filter(
+      (entry) => entry.missionId === missionId && (!runId || entry.runId === runId),
+    );
+    for (const entry of matchingSpawns) entry.cancelled = true;
+    if (matchingSpawns.length) {
+      await Promise.allSettled(matchingSpawns.map((entry) => entry.done));
+    }
+
     const sessionIds = [...this.activeSessions.entries()]
       .filter(([, active]) => active.missionId === missionId && (!runId || active.runId === runId))
       .map(([sessionId]) => sessionId);
