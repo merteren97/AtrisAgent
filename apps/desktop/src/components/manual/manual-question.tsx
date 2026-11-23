@@ -140,6 +140,15 @@ export function ManualQuestionCard({
     setError(undefined);
   }, [draftKey]);
 
+  useEffect(() => {
+    if (!submitted || request.deliveryError) return;
+    const timer = setTimeout(() => {
+      setSubmitted(false);
+      setError('Answer was sent, but the prompt is still open. Retry or switch to Code.');
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [submitted, request.deliveryError]);
+
   const updateAnswers = (updater: (previous: string[][]) => string[][]) => {
     const next = updater(answers);
     setAnswers(next);
@@ -249,18 +258,22 @@ export function ManualQuestionCard({
           <Button
             type="button"
             size="sm"
-            disabled={busy || (submitted && !request.deliveryError) || answers.some(answer => !answer.length)}
+            disabled={busy || (submitted && !request.deliveryError) || answers.some(answer => !answer.some(value => value.trim()))}
             onClick={() => {
+              const cleaned = answers.map(group => group.map(value => value.trim()).filter(Boolean));
               setBusy(true);
               setError(undefined);
-              void onReply(answers)
-                .then(() => setSubmitted(true))
+              void onReply(cleaned)
+                .then(() => {
+                  clearSavedQuestionDraft(request, draftScope);
+                  setSubmitted(true);
+                })
                 .catch(e => setError(e instanceof Error ? e.message : String(e)))
                 .finally(() => setBusy(false));
             }}
           >
             {busy && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
-            {submitted && !request.deliveryError ? 'Delivering…' : request.deliveryError ? 'Retry answer' : 'Submit answers'}
+            {submitted && !request.deliveryError ? 'Delivering…' : (error || request.deliveryError) ? 'Retry answer' : 'Submit answers'}
           </Button>
         )}
         {onOpenCode && (

@@ -334,7 +334,14 @@ export function ManualWorkspace() {
   const activity = recentTools[recentTools.length - 1];
   const replyQuestion = async (question: ManualQuestion, answers: string[][]) => {
     if (agent?.runtimeType === 'antigravity') {
-      throw new Error('Answer this question in Antigravity’s Code terminal.');
+      if (!live || !native) throw new Error('Open the agent first to submit answers, or answer in Code.');
+      void apiRequest(`/manual/agents/${agent.id}/turn-started`, { method: 'POST' }).catch(() => {});
+      const steps = buildAntigravityQuestionKeystrokes(question, answers);
+      for (const step of steps) {
+        await invoke('manual_terminal_write', { id: agent.id, data: step, paste: false });
+        await new Promise(r => setTimeout(r, 65));
+      }
+      return;
     }
     await apiRequest(`/manual/agents/${agentId}/questions/${encodeURIComponent(question.id)}/reply`, { method: 'POST', body: JSON.stringify({ answers }) });
   };
@@ -348,6 +355,7 @@ export function ManualWorkspace() {
   const send = () => agent && action('send', async () => {
     if (!live || !native) return;
     if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) throw new Error('Codex is still starting. Your draft is kept; check CLI setup in Code.');
+    void apiRequest(`/manual/agents/${agent.id}/turn-started`, { method: 'POST' }).catch(() => {});
     await sendManualDraft(agent, {
       stage: async (id, file) => invoke<string>('manual_stage_attachment', { id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }),
       write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
@@ -443,17 +451,17 @@ export function ManualWorkspace() {
                           </article>
                         );
                     })}
-                     {unresolvedQuestion && !questions.length && <ManualQuestionCard key={`${agent.id}:${unresolvedQuestion.id}`} draftScope={`manual:${agent.id}`} request={unresolvedQuestion} onOpenCode={() => setSurface(conversation.id, 'code')} />}
-                     {questions.map(question => <ManualQuestionCard key={`${agent.id}:${question.id}`} draftScope={`manual:${agent.id}`} request={question} onReply={live && agent.runtimeType !== 'antigravity' ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
+                     {unresolvedQuestion && !questions.length && <ManualQuestionCard key={`${agent.id}:${unresolvedQuestion.id}`} draftScope={`manual:${agent.id}`} request={unresolvedQuestion} onReply={agent.runtimeType === 'antigravity' && live ? answers => replyQuestion(unresolvedQuestion, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />}
+                     {questions.map(question => <ManualQuestionCard key={`${agent.id}:${question.id}`} draftScope={`manual:${agent.id}`} request={question} onReply={live ? answers => replyQuestion(question, answers) : undefined} onOpenCode={() => setSurface(conversation.id, 'code')} />)}
                    {live && observations[agent.id]?.state !== 'completed' && !questions.length && !unresolvedQuestion && (activity || lastVisible?.role === 'user') && <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" /><span className="truncate">{activity ? `${activity.toolName || 'Tool'}${activity.failed ? ' failed' : ' · working…'}` : 'Thinking…'}</span></div>}
                 </>}
               </div>
             </div>
-            {scroll.detached && <div className="absolute bottom-3 right-4"><LatestMessagesButton onClick={scroll.jumpToLatest} /></div>}
+            {scroll.detached && <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center"><div className="pointer-events-auto"><LatestMessagesButton onClick={scroll.jumpToLatest} /></div></div>}
             </div>
             <ChatChangeSummary endpoint={`/manual/conversations/${encodeURIComponent(conversation.id)}/changes?summary=1`} />
              {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
-             {Boolean(live) && agent.runtimeType === 'antigravity' && inputReady[agent.id] === false && <p role="status" className="mx-auto mb-2 max-w-3xl px-6 text-xs text-muted-foreground">Antigravity is starting or waiting for input in Code. Your draft is kept until the CLI is ready. <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>View CLI setup</button></p>}
+             {Boolean(live) && agent.runtimeType === 'antigravity' && inputReady[agent.id] === false && !questions.length && !unresolvedQuestion && <p role="status" className="mx-auto mb-2 max-w-3xl px-6 text-xs text-muted-foreground">Antigravity is starting or waiting for input in Code. Your draft is kept until the CLI is ready. <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>View CLI setup</button></p>}
           </div>
         </div>
       )}

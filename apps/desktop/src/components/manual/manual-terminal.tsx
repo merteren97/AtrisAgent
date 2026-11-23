@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { useTheme } from 'next-themes';
 import '@xterm/xterm/css/xterm.css';
+import { apiRequest } from '@/lib/api-client';
 import { TerminalOutputFrames } from './terminal-output-frames';
 
 export interface TerminalSnapshot {
@@ -98,8 +99,16 @@ function createEngine(id: string) {
       });
     });
   };
+  let lastTurnHintAt = 0;
   const input = terminal.onData(data => {
     if (status !== 'open') return;
+    if ((data.includes('\r') || data.includes('\n')) && !data.startsWith('\u001b')) {
+      const now = Date.now();
+      if (now - lastTurnHintAt >= 3000) {
+        lastTurnHintAt = now;
+        void apiRequest(`/manual/agents/${encodeURIComponent(id)}/turn-started`, { method: 'POST' }).catch(() => {});
+      }
+    }
     const inputEpoch = epoch;
     writes = writes.then(() => disposed || inputEpoch !== epoch ? undefined : invoke<void>('manual_terminal_write', { id, data, paste: false })).catch(e => { if (!disposed) update(String(e)); });
   });

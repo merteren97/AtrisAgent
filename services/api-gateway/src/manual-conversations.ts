@@ -96,10 +96,16 @@ export class ManualConversationStore {
   readonly changeReview: ManualChangeReview;
   readonly projectReview: DirectProjectReview;
   private preparations = new Map<string, { workspaceId: string; job: Promise<ManualConversation> }>();
+  private turnHints = new Map<string, { conversationId: string; workspaceId: string; at: number }>();
   constructor(private sqlite: Database.Database, private dataDir = path.dirname(sqlite.name), private live?: LiveProjectChanges, private fenced: (id: string) => boolean = () => false) {
     this.changeReview = new ManualChangeReview(dataDir);
-    this.projectReview = new DirectProjectReview(sqlite, dataDir, id => this.fenced(id) ? undefined
-      : (this.sqlite.prepare('SELECT path FROM workspaces WHERE id=?').get(id) as {path: string} | undefined)?.path);
+    this.projectReview = new DirectProjectReview(
+      sqlite,
+      dataDir,
+      id => this.fenced(id) ? undefined
+        : (this.sqlite.prepare('SELECT path FROM workspaces WHERE id=?').get(id) as {path: string} | undefined)?.path,
+      (workspaceId, relativePath) => this.resolveChangeAttribution(workspaceId, relativePath),
+    );
     sqlite.exec(`CREATE TABLE IF NOT EXISTS manual_conversations (
       id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
       title TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -218,15 +224,113 @@ export class ManualConversationStore {
     this.saveBatch([agent]);
   }
   remove(id: string): void {
+    const agentIds = (this.sqlite.prepare('SELECT id FROM manual_agent_sessions WHERE conversation_id = ?').all(id) as Array<{ id: string }>).map(row => row.id);
+    for (const agentId of agentIds) this.turnHints.delete(agentId);
     this.sqlite.transaction(() => {
       this.live?.removeManualConversation(id);
+      this.projectReview.clearConversation(id);
       this.sqlite.prepare('DELETE FROM manual_automatic_titles WHERE conversation_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_memory_receipts WHERE agent_id IN (SELECT id FROM manual_agent_sessions WHERE conversation_id = ?)').run(id);
       this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE conversation_id = ?').run(id);
       this.sqlite.prepare('DELETE FROM manual_conversations WHERE id = ?').run(id);
     })();
   }
+  markTurnStarted(agentId: string, paths?: string[]): void {
+    const agent = this.agent(agentId);
+    const conversation = this.conversation(agent.conversationId);
+    this.turnHints.set(agentId, { conversationId: agent.conversationId, workspaceId: conversation.workspaceId, at: Date.now() });
+    if (!this.hasChangeReview(agent.conversationId)) {
+      void this.projectReview.prepareLaunch(conversation.workspaceId).catch(() => {});
+      if (paths?.length) {
+        const root = this.workspace(conversation.workspaceId).path;
+        const normalized = this.normalizeRelativePaths(root, paths);
+        if (normalized.length) void this.projectReview.ensureBaseline(conversation.workspaceId, normalized);
+      }
+    }
+  }
+  private normalizeRelativePaths(workspacePath: string, rawPaths: string[]): string[] {
+    let root: string;
+    try { root = fs.realpathSync(workspacePath); } catch { root = path.resolve(workspacePath); }
+    const out: string[] = [];
+    for (const raw of rawPaths) {
+      if (typeof raw !== 'string' || !raw.trim()) continue;
+      const candidate = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(root, raw);
+      const rel = path.relative(root, candidate).split(path.sep).join('/');
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      out.push(rel);
+    }
+    return out;
+  }
+  private resolveChangeAttribution(workspaceId: string, relativePath: string): { conversationId: string; agentId?: string } | undefined {
+    const conversations = this.list(workspaceId).filter(conv => !this.hasChangeReview(conv.id));
+    if (!conversations.length) return undefined;
+    let workspaceRoot: string;
+    try { workspaceRoot = fs.realpathSync(this.workspace(workspaceId).path); } catch { return undefined; }
+    const targetNorm = process.platform === 'win32' ? relativePath.toLowerCase() : relativePath;
+    const now = Date.now();
+    const bridge = new ManualProviderBridge(this.dataDir);
+
+    // 1. Highest precision: exact file path touched by a tab's CLI tool call in this workspace.
+    let bestExact: { conversationId: string; agentId: string; at: number; isWrite: boolean } | undefined;
+    for (const conv of conversations) {
+      for (const agent of conv.agents) {
+        const touches = bridge.recentFileTouches(agent, now - 120_000);
+        for (const touch of touches) {
+          const rels = this.normalizeRelativePaths(workspaceRoot, [touch.path]);
+          const matched = rels.some(rel => (process.platform === 'win32' ? rel.toLowerCase() : rel) === targetNorm);
+          if (!matched) continue;
+          const isWrite = touch.kind === 'write';
+          if (
+            !bestExact
+            || (isWrite && !bestExact.isWrite)
+            || (isWrite === bestExact.isWrite && touch.at >= bestExact.at)
+          ) {
+            bestExact = { conversationId: conv.id, agentId: agent.id, at: touch.at, isWrite };
+          }
+        }
+      }
+    }
+    if (bestExact) return { conversationId: bestExact.conversationId, agentId: bestExact.agentId };
+
+    // 2. Active-turn attribution (catches shell commands, Bash, run_command, subagents, codegen).
+    let bestActive: { conversationId: string; agentId: string; priority: number; at: number } | undefined;
+    for (const conv of conversations) {
+      for (const agent of conv.agents) {
+        const hint = this.turnHints.get(agent.id);
+        const hintAge = hint && hint.workspaceId === workspaceId ? now - hint.at : Infinity;
+        const liveCodex = this.codexSessions.get(agent.id)?.activity();
+        const act = liveCodex || bridge.activity(agent);
+        const actAt = act.at ? Date.parse(act.at) : NaN;
+        const actAge = Number.isFinite(actAt) ? now - actAt : Infinity;
+
+        let priority = 0;
+        let at = 0;
+        if (act.state === 'working') {
+          priority = 3;
+          at = Number.isFinite(actAt) ? actAt : (hint?.at || now);
+        } else if (hintAge <= 45_000 && act.state !== 'completed') {
+          priority = 2;
+          at = hint!.at;
+        } else if (act.state === 'completed' && actAge <= 15_000) {
+          priority = 1;
+          at = actAt;
+        } else if (hintAge <= 15_000) {
+          priority = 1;
+          at = hint!.at;
+        }
+
+        if (priority > 0 && (!bestActive || priority > bestActive.priority || (priority === bestActive.priority && at > bestActive.at))) {
+          bestActive = { conversationId: conv.id, agentId: agent.id, priority, at };
+        }
+      }
+    }
+    if (bestActive) return { conversationId: bestActive.conversationId, agentId: bestActive.agentId };
+
+    // 3. No active agent in any conversation -> external/human edit; do not pollute any chat.
+    return undefined;
+  }
   async removeAgent(id: string): Promise<void> {
+    this.turnHints.delete(id);
     const row = this.sqlite.prepare('SELECT conversation_id FROM manual_agent_sessions WHERE id = ?').get(id) as { conversation_id: string } | undefined;
     const workspaceId = row && !this.hasChangeReview(row.conversation_id)
       ? (this.sqlite.prepare('SELECT workspace_id FROM manual_conversations WHERE id = ?').get(row.conversation_id) as { workspace_id: string } | undefined)?.workspace_id
@@ -261,6 +365,14 @@ export class ManualConversationStore {
       ? { supported: true, ...new ManualAntigravityBridge(this.dataDir).read(agent) }
       : undefined;
     const bridge = new ManualProviderBridge(this.dataDir);
+    if (!this.hasChangeReview(agent.conversationId)) {
+      const touches = bridge.recentFileTouches(agent, Date.now() - 30_000);
+      if (touches.length) {
+        const conv = this.conversation(agent.conversationId);
+        const rels = this.normalizeRelativePaths(this.workspace(conv.workspaceId).path, touches.map(t => t.path));
+        if (rels.length) void this.projectReview.ensureBaseline(conv.workspaceId, rels);
+      }
+    }
     const result = antigravityResult ?? readAgentMessages(agent, bridge);
     const questions = antigravityResult
       ? antigravityResult.questions
@@ -529,12 +641,12 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   app.get('/api/manual/conversations', route((req, res) => res.json(store.list(required(req.query.workspaceId, 'project')))));
   app.get('/api/manual/conversations/:conversationId/changes', route(async (req, res) => {
     const { id, workspaceId, project } = reviewTarget(req);
-    res.json({ workspaceId, ...(live?.list(`manual:${id}`) ?? (store.hasChangeReview(id) ? await store.changeReview.listAsync(id, project, req.query.summary === '1') : await store.projectReview.list(workspaceId, req.query.refresh === '1'))) });
+    res.json({ workspaceId, ...(live?.list(`manual:${id}`) ?? (store.hasChangeReview(id) ? await store.changeReview.listAsync(id, project, req.query.summary === '1') : await store.projectReview.listForConversation(workspaceId, id, req.query.refresh === '1'))) });
   }));
   app.get('/api/manual/conversations/:conversationId/changes/file', route(async (req, res) => {
     const { id, project, workspaceId } = reviewTarget(req);
     if (live?.get(`manual:${id}`)) return res.json(live.preview(`manual:${id}`, required(req.query.path, 'file path', 2048), required(req.query.revision, 'file revision', 64)));
-    if (!store.hasChangeReview(id)) return res.json(await store.projectReview.preview(workspaceId,
+    if (!store.hasChangeReview(id)) return res.json(await store.projectReview.previewForConversation(workspaceId, id,
       required(req.query.path, 'file path', 2048), req.query.revision === '' || req.query.revision === undefined ? '' : required(req.query.revision, 'file revision', 64)));
     res.json(store.changeReview.preview(id, project, required(req.query.path, 'file path', 2048), required(req.query.revision, 'file revision', 64)));
   }));
@@ -547,13 +659,19 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     const { action, files } = req.body || {};
     if (!store.hasChangeReview(id)) {
       if (action !== 'approve' && action !== 'undo') return fail('Choose Approve or Undo for project changes.');
-      return res.json(await store.projectReview.resolve(workspaceId, action, liveUndoSelection(files)));
+      return res.json(await store.projectReview.resolveForConversation(workspaceId, id, action, liveUndoSelection(files)));
     }
     if (action !== 'apply' && action !== 'discard') return fail('Invalid review action.');
     if (!Array.isArray(files) || !files.length || files.length > 20_000) return fail('Select files to review.');
     const selection = files.map(item => ({ path: required(item?.path, 'file path', 2048), revision: required(item?.revision, 'file revision', 64) }));
     if (new Set(selection.map(item => item.path)).size !== selection.length) return fail('Duplicate file selection.');
     res.json(store.changeReview.resolve(id, project, action, selection));
+  }));
+  app.post('/api/manual/agents/:id/turn-started', route((req, res) => {
+    const id = idParam(req, 'id');
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter((p: unknown): p is string => typeof p === 'string').slice(0, 64) : undefined;
+    store.markTurnStarted(id, paths);
+    res.status(204).end();
   }));
   app.post('/api/manual/image-preview', route((req, res) => res.json(store.readAllowedImagePreview(typeof req.body?.cwd === 'string' ? req.body.cwd : undefined, required(req.body?.path, 'image path', 2048)))));
   app.patch('/api/manual/conversations/:conversationId', route((req, res) => {
