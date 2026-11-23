@@ -381,25 +381,27 @@ export class WorkspaceManager {
     const archivedAt = input.archivedAt ?? null;
     const isDefault = Boolean(input.isDefault) && !archivedAt;
 
-    if (isDefault) {
-      await this.db.update(agentProfiles)
-        .set({ isDefault: false })
-        .where(and(eq(agentProfiles.role, normalized.role), eq(agentProfiles.isDefault, true)));
-    }
-    await this.db.insert(agentProfiles).values({
-      id: normalized.id,
-      name: normalized.name,
-      role: normalized.role,
-      instructions: normalized.instructions,
-      capabilities: normalized.capabilities,
-      specialty: normalized.specialty ?? null,
-      description: normalized.description ?? null,
-      routePolicy: normalized.routePolicy ?? null,
-      allowedRoutePolicy: normalized.allowedRoutePolicy ?? null,
-      isDefault,
-      archivedAt,
-      createdAt: now,
-      updatedAt: now,
+    this.db.transaction((tx) => {
+      if (isDefault) {
+        (tx.update(agentProfiles)
+          .set({ isDefault: false })
+          .where(and(eq(agentProfiles.role, normalized.role), eq(agentProfiles.isDefault, true))) as any).run();
+      }
+      (tx.insert(agentProfiles).values({
+        id: normalized.id,
+        name: normalized.name,
+        role: normalized.role,
+        instructions: normalized.instructions,
+        capabilities: normalized.capabilities,
+        specialty: normalized.specialty ?? null,
+        description: normalized.description ?? null,
+        routePolicy: normalized.routePolicy ?? null,
+        allowedRoutePolicy: normalized.allowedRoutePolicy ?? null,
+        isDefault,
+        archivedAt,
+        createdAt: now,
+        updatedAt: now,
+      }) as any).run();
     });
     const created = await this.getAgentProfile(id, { includeArchived: true });
     if (!created) throw new Error(`Failed to retrieve newly created agent profile "${id}"`);
@@ -452,24 +454,26 @@ export class WorkspaceManager {
     }, existing.role);
     const archivedAt = updates.archivedAt === undefined ? existing.archivedAt : updates.archivedAt;
     const isDefault = archivedAt ? false : updates.isDefault === undefined ? existing.isDefault : Boolean(updates.isDefault);
-    if (isDefault) {
-      await this.db.update(agentProfiles)
-        .set({ isDefault: false })
-        .where(and(eq(agentProfiles.role, existing.role), eq(agentProfiles.isDefault, true)));
-    }
     const updatedAt = new Date().toISOString();
-    await this.db.update(agentProfiles).set({
-      name: candidate.name,
-      instructions: candidate.instructions,
-      capabilities: candidate.capabilities,
-      specialty: candidate.specialty ?? null,
-      description: candidate.description ?? null,
-      routePolicy: candidate.routePolicy ?? null,
-      allowedRoutePolicy: candidate.allowedRoutePolicy ?? null,
-      isDefault,
-      archivedAt: archivedAt ?? null,
-      updatedAt,
-    }).where(eq(agentProfiles.id, existing.id));
+    this.db.transaction((tx) => {
+      if (isDefault) {
+        (tx.update(agentProfiles)
+          .set({ isDefault: false })
+          .where(and(eq(agentProfiles.role, existing.role), eq(agentProfiles.isDefault, true))) as any).run();
+      }
+      (tx.update(agentProfiles).set({
+        name: candidate.name,
+        instructions: candidate.instructions,
+        capabilities: candidate.capabilities,
+        specialty: candidate.specialty ?? null,
+        description: candidate.description ?? null,
+        routePolicy: candidate.routePolicy ?? null,
+        allowedRoutePolicy: candidate.allowedRoutePolicy ?? null,
+        isDefault,
+        archivedAt: archivedAt ?? null,
+        updatedAt,
+      }).where(eq(agentProfiles.id, existing.id)) as any).run();
+    });
     const result = await this.getAgentProfile(existing.id, { includeArchived: true });
     if (!result) throw new Error(`Failed to retrieve updated agent profile "${existing.id}"`);
     return result;
@@ -567,21 +571,23 @@ export class WorkspaceManager {
       if (existing.role !== role) throw new Error('Agent profile binding role is immutable.');
       return this.updateAgentProfileBinding(existing.id, { override, isDefault });
     }
-    if (isDefault) {
-      await this.db.update(agentProfileBindings).set({ isDefault: false, updatedAt: new Date().toISOString() })
-        .where(and(eq(agentProfileBindings.scopeType, scopeType), eq(agentProfileBindings.scopeId, scopeId), eq(agentProfileBindings.role, role)));
-    }
     const now = new Date().toISOString();
-    await this.db.insert(agentProfileBindings).values({
-      id: nonEmpty(input.id) ?? crypto.randomUUID(),
-      scopeType,
-      scopeId,
-      role,
-      profileId,
-      override: override ?? null,
-      isDefault,
-      createdAt: now,
-      updatedAt: now,
+    this.db.transaction((tx) => {
+      if (isDefault) {
+        (tx.update(agentProfileBindings).set({ isDefault: false, updatedAt: now })
+          .where(and(eq(agentProfileBindings.scopeType, scopeType), eq(agentProfileBindings.scopeId, scopeId), eq(agentProfileBindings.role, role))) as any).run();
+      }
+      (tx.insert(agentProfileBindings).values({
+        id: nonEmpty(input.id) ?? crypto.randomUUID(),
+        scopeType,
+        scopeId,
+        role,
+        profileId,
+        override: override ?? null,
+        isDefault,
+        createdAt: now,
+        updatedAt: now,
+      }) as any).run();
     });
     const createdRows = await this.db.select().from(agentProfileBindings).where(and(
       eq(agentProfileBindings.scopeType, scopeType),
@@ -618,19 +624,21 @@ export class WorkspaceManager {
       ? normalizeBindingOverride(rawOverride, profile)
       : existing.override;
     const isDefault = updates.isDefault === undefined ? existing.isDefault : Boolean(updates.isDefault);
-    if (isDefault) {
-      await this.db.update(agentProfileBindings).set({ isDefault: false, updatedAt: new Date().toISOString() })
-        .where(and(eq(agentProfileBindings.scopeType, scopeType), eq(agentProfileBindings.scopeId, scopeId), eq(agentProfileBindings.role, existing.role)));
-    }
     const updatedAt = new Date().toISOString();
-    await this.db.update(agentProfileBindings).set({
-      scopeType,
-      scopeId,
-      profileId,
-      override: override ?? null,
-      isDefault,
-      updatedAt,
-    }).where(eq(agentProfileBindings.id, existing.id));
+    this.db.transaction((tx) => {
+      if (isDefault) {
+        (tx.update(agentProfileBindings).set({ isDefault: false, updatedAt })
+          .where(and(eq(agentProfileBindings.scopeType, scopeType), eq(agentProfileBindings.scopeId, scopeId), eq(agentProfileBindings.role, existing.role))) as any).run();
+      }
+      (tx.update(agentProfileBindings).set({
+        scopeType,
+        scopeId,
+        profileId,
+        override: override ?? null,
+        isDefault,
+        updatedAt,
+      }).where(eq(agentProfileBindings.id, existing.id)) as any).run();
+    });
     const updated = await this.getAgentProfileBinding(existing.id);
     if (!updated) throw new Error(`Failed to retrieve updated agent profile binding "${existing.id}"`);
     return updated;

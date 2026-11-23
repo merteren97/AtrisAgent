@@ -89,7 +89,12 @@ export function LandingPage() {
   }, [downloadsDisabled]);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("atris_theme");
+    let saved: string | null = null;
+    try {
+      saved = window.localStorage.getItem("atris_theme");
+    } catch {
+      // Ignore storage access failures.
+    }
     const next = saved === "dark" ? "dark" : "light";
     setTheme(next);
     document.documentElement.classList.toggle("dark", next === "dark");
@@ -98,7 +103,11 @@ export function LandingPage() {
   const toggleTheme = () => {
     const next = theme === "light" ? "dark" : "light";
     setTheme(next);
-    window.localStorage.setItem("atris_theme", next);
+    try {
+      window.localStorage.setItem("atris_theme", next);
+    } catch {
+      // Ignore storage access failures.
+    }
     document.documentElement.classList.toggle("dark", next === "dark");
   };
 

@@ -80,9 +80,13 @@ export class LocalEventBus {
    * ingestion. Raw credential-bearing objects are never delivered downstream.
    */
   emit(event: AgentEvent): void {
+    const handlers = this.subscribers.get(event.type);
+    if ((!handlers || handlers.size === 0) && this.wildcardSubscribers.size === 0) {
+      return;
+    }
+
     const safeEvent = redactSensitiveValue(event) as AgentEvent;
 
-    const handlers = this.subscribers.get(safeEvent.type);
     if (handlers) {
       for (const handler of handlers) {
         this.invokeSubscriber(handler, safeEvent, `event "${safeEvent.type}"`);

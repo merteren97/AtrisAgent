@@ -897,6 +897,10 @@ export class WorktreeManager {
         ], rootPath);
         return { success: true, output: stdout };
       } catch (error: any) {
+        // Ensure a failed `git merge --no-ff` never leaves rootPath stuck in MERGING state.
+        await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], rootPath)
+          .then(() => git(['merge', '--abort'], rootPath))
+          .catch(() => undefined);
         return { success: false, output: error?.stderr || error?.message || 'Git merge failed' };
       }
     }

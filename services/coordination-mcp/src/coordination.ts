@@ -4,7 +4,7 @@ import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type { AgentMessage, AgentRole, AgentSpawnRequest, AgentStatus, AgentWorkspaceMode } from '@atris-agent-code/domain';
 import { agentInstances, agentMessages, approvals, artifacts, type AtrisDatabase } from '@atris-agent-code/database';
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { ResourceLeaseManager } from './resource-lease-manager';
 
 export interface CoordinationOptions {
@@ -52,6 +52,7 @@ export class CoordinationMCP {
   private leaseManager = new ResourceLeaseManager();
   private agentRegistry = new Map<string, RuntimeAgentState>();
   private mailboxes = new Map<string, AgentMessage[]>();
+  private eventBusUnsubscribe?: () => void;
 
   private async requireTask(taskId: string) {
     const task = await this.workspaceManager?.getTask(taskId);
@@ -66,7 +67,16 @@ export class CoordinationMCP {
     this.db = options.db;
     this.workspacePath = options.workspacePath || process.cwd();
     this.hydrateDurableState();
-    this.eventBus?.on('*', (event) => this.syncAgentEvent(event));
+    this.eventBusUnsubscribe = this.eventBus?.on('*', (event) => this.syncAgentEvent(event));
+  }
+
+  close(): void {
+    this.eventBusUnsubscribe?.();
+    this.eventBusUnsubscribe = undefined;
+  }
+
+  dispose(): void {
+    this.close();
   }
 
   private hydrateDurableState(): void {
@@ -511,9 +521,7 @@ export class CoordinationMCP {
     const readIds = new Set(selected.map((message) => message.id));
     const readAt = new Date().toISOString();
     if (this.db) {
-      for (const message of selected) {
-        (this.db.update(agentMessages).set({ readAt }).where(eq(agentMessages.id, message.id)) as any).run();
-      }
+      (this.db.update(agentMessages).set({ readAt }).where(inArray(agentMessages.id, [...readIds])) as any).run();
     }
     this.mailboxes.set(agentId, mailbox.map((message) => readIds.has(message.id) ? { ...message, readAt } : message));
     for (const message of selected) {
@@ -596,6 +604,9 @@ export class CoordinationMCP {
 
   async claimTask(taskId: string, agentId: string, role?: string): Promise<{ success: boolean; taskId: string }> {
     const task = await this.requireTask(taskId);
+    if (task.status !== 'planned' && task.status !== 'ready') {
+      throw new Error(`Task ${taskId} cannot be claimed in status '${task.status}'.`);
+    }
     await this.workspaceManager!.updateTask(taskId, {
       status: 'running', assignedAgentId: agentId, assignedRole: (role as any) || task.assignedRole || 'builder',
     });

@@ -3,11 +3,25 @@ import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 
 export interface Identity { id: string; username: string }
+
+class RelayAuthError extends Error {
+  constructor(message: string, readonly fatal: boolean) {
+    super(message);
+    this.name = 'RelayAuthError';
+  }
+}
+
 export async function authorizeHub(token: string): Promise<Identity> {
-  const response = await fetch('https://atrishub.com/api/auth/me', { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
-  if (!response.ok) throw new Error('Unauthorized');
+  let response: Response;
+  try {
+    response = await fetch('https://atrishub.com/api/auth/me', { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+  } catch (error) {
+    throw new RelayAuthError(error instanceof Error ? error.message : 'Hub unreachable', false);
+  }
+  if (response.status === 401 || response.status === 403) throw new RelayAuthError('Unauthorized', true);
+  if (!response.ok) throw new RelayAuthError(`Hub auth error (${response.status})`, false);
   const data = await response.json() as { user?: Identity };
-  if (!data.user?.id || typeof data.user.username !== 'string') throw new Error('Unauthorized');
+  if (!data.user?.id || typeof data.user.username !== 'string') throw new RelayAuthError('Unauthorized', true);
   return { id: data.user.id, username: data.user.username };
 }
 
@@ -27,10 +41,15 @@ export function createMobileRelay(options: { authorize?: (token: string) => Prom
   const sessions = new Map<string, Peer>();
   const alive = new WeakMap<WebSocket, boolean>();
   server.on('upgrade', (req, socket, head) => {
+    const onSocketError = () => { if (!socket.destroyed) socket.destroy(); };
+    socket.on('error', onSocketError);
     if (req.url !== '/remote/v1/ws' || wss.clients.size >= 200) { socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n'); return; }
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
+    wss.handleUpgrade(req, socket, head, ws => {
+      socket.off('error', onSocketError);
+      wss.emit('connection', ws);
+    });
   });
-  const send = (ws: WebSocket, message: unknown) => { if (ws.readyState === WebSocket.OPEN) { if (ws.bufferedAmount > 2_000_000) ws.close(1008, 'Slow receiver'); else ws.send(JSON.stringify(message)); } };
+  const send = (ws: WebSocket, message: unknown) => { if (ws.readyState === WebSocket.OPEN) { if (ws.bufferedAmount > 2_000_000) ws.terminate(); else ws.send(JSON.stringify(message)); } };
   wss.on('connection', socket => {
     alive.set(socket, true);
     socket.on('pong', () => alive.set(socket, true));
@@ -118,7 +137,13 @@ export function createMobileRelay(options: { authorize?: (token: string) => Prom
     for (const peer of peers.values()) {
       if (peer.validating) continue;
       peer.validating = true;
-      void authorize(peer.token).then(identity => { if (identity.id !== peer.identity.id) peer.socket.close(1008, 'Session expired'); }).catch(() => peer.socket.close(1008, 'Session expired')).finally(() => { peer.validating = false; });
+      void authorize(peer.token)
+        .then(identity => { if (identity.id !== peer.identity.id) peer.socket.close(1008, 'Session expired'); })
+        .catch((error) => {
+          if (error instanceof RelayAuthError && !error.fatal) return;
+          peer.socket.close(1008, 'Session expired');
+        })
+        .finally(() => { peer.validating = false; });
     }
   }, options.revalidateMs || 60_000);
   interval.unref();

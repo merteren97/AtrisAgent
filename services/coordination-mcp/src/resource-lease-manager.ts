@@ -1,5 +1,5 @@
 import { resourceLeases, type AtrisDatabase, type ResourceLeaseSelect } from '@atris-agent-code/database';
-import { and, eq, gt, lt } from 'drizzle-orm';
+import { and, eq, gt, lte } from 'drizzle-orm';
 
 export interface LeaseInfo {
   id: string;
@@ -187,19 +187,19 @@ export class ResourceLeaseManager {
     if (db) {
       const expiredRows = await db.select().from(resourceLeases).where(and(
         eq(resourceLeases.status, 'active'),
-        lt(resourceLeases.expiresAt, nowIso),
+        lte(resourceLeases.expiresAt, nowIso),
       ));
       if (expiredRows.length === 0) return 0;
       await db.update(resourceLeases)
         .set({ status: 'expired' })
-        .where(and(eq(resourceLeases.status, 'active'), lt(resourceLeases.expiresAt, nowIso)));
+        .where(and(eq(resourceLeases.status, 'active'), lte(resourceLeases.expiresAt, nowIso)));
       for (const row of expiredRows) this.inMemoryLeases.delete(row.id);
       return expiredRows.length;
     }
 
     let cleaned = 0;
     for (const [id, lease] of this.inMemoryLeases.entries()) {
-      if (lease.expiresAt < nowIso) {
+      if (lease.expiresAt <= nowIso) {
         lease.status = 'expired';
         this.inMemoryLeases.delete(id);
         cleaned++;

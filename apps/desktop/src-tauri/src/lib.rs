@@ -179,98 +179,110 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-fn store_local_secret(app: AppHandle, secret_ref: String, value: String) -> Result<(), String> {
+async fn store_local_secret(app: AppHandle, secret_ref: String, value: String) -> Result<(), String> {
     validate_secret_ref(&secret_ref)?;
-    if secret_ref == SESSION_TOKEN_KEY {
-        #[cfg(windows)]
-        {
-            session_store::save(&app, &value)?;
-            // Once DPAPI has been written, remove any pre-DPAPI keyring copy.
-            if let Ok(entry) = keyring_entry() {
-                let _ = entry.delete_credential();
-            }
-            return Ok(());
-        }
-        #[cfg(not(windows))]
-        {
-            return keyring_entry()?
-                .set_password(&value)
-                .map_err(|error| error.to_string());
-        }
-    }
-    keyring_entry()?
-        .set_password(&value)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn read_local_secret(app: AppHandle, secret_ref: String) -> Result<Option<String>, String> {
-    validate_secret_ref(&secret_ref)?;
-    if secret_ref == SESSION_TOKEN_KEY {
-        #[cfg(windows)]
-        {
-            if let Some(token) = session_store::load(&app)? {
+    tauri::async_runtime::spawn_blocking(move || {
+        if secret_ref == SESSION_TOKEN_KEY {
+            #[cfg(windows)]
+            {
+                session_store::save(&app, &value)?;
+                // Once DPAPI has been written, remove any pre-DPAPI keyring copy.
                 if let Ok(entry) = keyring_entry() {
                     let _ = entry.delete_credential();
                 }
-                return Ok(Some(token));
+                return Ok(());
             }
-            return match keyring_entry()?.get_password() {
-                Ok(token) => {
-                    // Migrate the legacy keyring token into the DPAPI file once.
-                    if session_store::save(&app, &token).is_ok() {
-                        if let Ok(entry) = keyring_entry() {
-                            let _ = entry.delete_credential();
-                        }
-                    }
-                    Ok(Some(token))
-                }
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(error.to_string()),
-            };
+            #[cfg(not(windows))]
+            {
+                return keyring_entry()?
+                    .set_password(&value)
+                    .map_err(|error| error.to_string());
+            }
         }
-        #[cfg(not(windows))]
-        {
-            return match keyring_entry()?.get_password() {
-                Ok(value) => Ok(Some(value)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(error.to_string()),
-            };
-        }
-    }
-    match keyring_entry()?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+        keyring_entry()?
+            .set_password(&value)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Secret storage worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn delete_local_secret(app: AppHandle, secret_ref: String) -> Result<(), String> {
+async fn read_local_secret(app: AppHandle, secret_ref: String) -> Result<Option<String>, String> {
     validate_secret_ref(&secret_ref)?;
-    if secret_ref == SESSION_TOKEN_KEY {
-        #[cfg(windows)]
-        {
-            // Delete the legacy copy first; if this fails, leave DPAPI intact so
-            // a retry cannot resurrect a session from an inconsistent state.
-            match keyring_entry()?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(error) => return Err(error.to_string()),
+    tauri::async_runtime::spawn_blocking(move || {
+        if secret_ref == SESSION_TOKEN_KEY {
+            #[cfg(windows)]
+            {
+                if let Some(token) = session_store::load(&app)? {
+                    if let Ok(entry) = keyring_entry() {
+                        let _ = entry.delete_credential();
+                    }
+                    return Ok(Some(token));
+                }
+                return match keyring_entry()?.get_password() {
+                    Ok(token) => {
+                        // Migrate the legacy keyring token into the DPAPI file once.
+                        if session_store::save(&app, &token).is_ok() {
+                            if let Ok(entry) = keyring_entry() {
+                                let _ = entry.delete_credential();
+                            }
+                        }
+                        Ok(Some(token))
+                    }
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                };
             }
-            return session_store::clear(&app);
+            #[cfg(not(windows))]
+            {
+                return match keyring_entry()?.get_password() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                };
+            }
         }
-        #[cfg(not(windows))]
-        {
-            return match keyring_entry()?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(error) => Err(error.to_string()),
-            };
+        match keyring_entry()?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
         }
-    }
-    match keyring_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
+    })
+    .await
+    .map_err(|error| format!("Secret read worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn delete_local_secret(app: AppHandle, secret_ref: String) -> Result<(), String> {
+    validate_secret_ref(&secret_ref)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if secret_ref == SESSION_TOKEN_KEY {
+            #[cfg(windows)]
+            {
+                // Delete the legacy copy first; if this fails, leave DPAPI intact so
+                // a retry cannot resurrect a session from an inconsistent state.
+                match keyring_entry()?.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                return session_store::clear(&app);
+            }
+            #[cfg(not(windows))]
+            {
+                return match keyring_entry()?.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+            }
+        }
+        match keyring_entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| format!("Secret deletion worker failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -321,11 +333,13 @@ fn window_close(
 }
 
 #[tauri::command]
-fn get_runtime_config(
-    app: AppHandle,
-    state: State<'_, runtime::RuntimeState>,
-) -> Result<runtime::RuntimeConfig, String> {
-    state.ensure_config(&app)
+async fn get_runtime_config(app: AppHandle) -> Result<runtime::RuntimeConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<runtime::RuntimeState>();
+        state.ensure_config(&app)
+    })
+    .await
+    .map_err(|error| format!("Runtime config worker failed: {error}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

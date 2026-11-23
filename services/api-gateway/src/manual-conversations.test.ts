@@ -572,10 +572,12 @@ try {
   const outsideDir = path.join(previewRoot, 'outside');
   const monorepoDir = path.join(previewRoot, 'monorepo');
   const subprojectDir = path.join(monorepoDir, 'subproject');
+  const siblingRepoDir = path.join(monorepoDir, 'unrelated-sibling');
   fs.mkdirSync(path.join(wsDir, 'assets'), { recursive: true });
   fs.mkdirSync(outsideDir, { recursive: true });
   fs.mkdirSync(path.join(monorepoDir, '.git'), { recursive: true });
   fs.mkdirSync(subprojectDir, { recursive: true });
+  fs.mkdirSync(siblingRepoDir, { recursive: true });
   fs.writeFileSync(path.join(wsDir, 'assets', 'screen.png'), pngBytes);
   fs.writeFileSync(path.join(wsDir, 'My Screen.jpg'), jpegBytes);
   fs.writeFileSync(path.join(wsDir, 'not-image.png'), 'plain text');
@@ -583,6 +585,7 @@ try {
   fs.writeFileSync(path.join(outsideDir, 'secret.png'), pngBytes);
   fs.writeFileSync(path.join(previewRoot, 'parent-secret.png'), pngBytes);
   fs.writeFileSync(path.join(monorepoDir, 'architecture.webp'), webpBytes);
+  fs.writeFileSync(path.join(siblingRepoDir, 'secret.png'), pngBytes);
   sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('ws-image-standalone', wsDir);
   sqlite.prepare('INSERT INTO workspaces VALUES (?, ?)').run('ws-image-subproject', subprojectDir);
 
@@ -600,6 +603,9 @@ try {
   const parentRepoPreview = await post('/image-preview', { cwd: '', path: path.join(monorepoDir, 'architecture.webp') });
   assert.equal(parentRepoPreview.status, 200);
   assert.equal((await parentRepoPreview.json()).mimeType, 'image/webp');
+
+  const siblingRepoPreview = await post('/image-preview', { cwd: subprojectDir, path: path.join(siblingRepoDir, 'secret.png') });
+  assert.equal(siblingRepoPreview.status, 403);
 
   const outsideRes = await post('/image-preview', { cwd: wsDir, path: path.join(outsideDir, 'secret.png') });
   assert.equal(outsideRes.status, 403);

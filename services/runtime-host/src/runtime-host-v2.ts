@@ -55,6 +55,7 @@ interface SupervisorSession {
   agentProfileId?: string;
   cwd: string;
   busy: boolean;
+  discarded?: boolean;
   lastUsedAt: number;
   evictionTimer?: ReturnType<typeof setTimeout>;
 }
@@ -132,6 +133,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     const sessions = [...this.supervisorSessions.entries()];
     await Promise.all(sessions.map(async ([missionId, session]) => {
       let sessionFailed = false;
+      session.discarded = true;
       if (session.evictionTimer) clearTimeout(session.evictionTimer);
       try { await session.adapter.releaseProviderSession(session.providerSessionId); } catch (error) { sessionFailed = true; recordFailure(error); }
       try { await session.adapter.shutdown(); } catch (error) { sessionFailed = true; recordFailure(error); }
@@ -231,6 +233,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   private async discardSupervisorSession(missionId: string, requireStopped = false): Promise<void> {
     const session = this.supervisorSessions.get(missionId);
     if (!session) return;
+    session.discarded = true;
     if (session.evictionTimer) clearTimeout(session.evictionTimer);
     await session.adapter.releaseProviderSession(session.providerSessionId).catch(() => undefined);
     if (requireStopped) await session.adapter.shutdown();
@@ -239,9 +242,10 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   }
 
   private scheduleSupervisorEviction(missionId: string, session: SupervisorSession): void {
+    if (session.discarded || this.supervisorSessions.get(missionId) !== session) return;
     if (session.evictionTimer) clearTimeout(session.evictionTimer);
     const checkEviction = () => {
-      if (session.busy) return;
+      if (session.busy || session.discarded || this.supervisorSessions.get(missionId) !== session) return;
       const elapsed = Date.now() - session.lastUsedAt;
       const remaining = this.supervisorIdleTtlMs - elapsed;
       if (remaining <= 0) {
@@ -696,7 +700,9 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
       if (continuity) {
         continuity.busy = false;
         continuity.lastUsedAt = Date.now();
-        this.scheduleSupervisorEviction(request.missionId, continuity);
+        if (!continuity.discarded) {
+          this.scheduleSupervisorEviction(request.missionId, continuity);
+        }
       } else {
         await adapter.shutdown().catch(() => undefined);
       }

@@ -47,6 +47,7 @@ function spawnNpm(args) {
     env: process.env,
     stdio: 'inherit',
     windowsHide: false,
+    ...(process.platform !== 'win32' ? { detached: true } : {}),
   };
 
   if (npmExecPath && /\.(?:c|m)?js$/i.test(npmExecPath)) {
@@ -82,7 +83,11 @@ function terminateChild(child) {
     return;
   }
 
-  child.kill('SIGTERM');
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    child.kill('SIGTERM');
+  }
 }
 
 function stop(code = 0) {
@@ -92,7 +97,7 @@ function stop(code = 0) {
   for (const child of children) terminateChild(child);
 
   // Let inherited stdout/stderr flush before ending the beforeDevCommand.
-  setTimeout(() => process.exit(code), 250).unref();
+  setTimeout(() => process.exit(code), 250);
 }
 
 function startProcess(label, args) {

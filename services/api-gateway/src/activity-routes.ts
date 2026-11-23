@@ -79,6 +79,15 @@ function isUnreadCompletion(
   return updMs !== null && nowMs - updMs <= UNREAD_COMPLETION_WINDOW_MS;
 }
 
+function getExistingTables(sqlite: Database.Database, names: string[]): Set<string> {
+  if (names.length === 0) return new Set();
+  const placeholders = names.map(() => '?').join(', ');
+  const rows = sqlite
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+    .all(...names) as Array<{ name: string }>;
+  return new Set(rows.map((r) => r.name));
+}
+
 function hasTable(sqlite: Database.Database, name: string): boolean {
   const row = sqlite
     .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
@@ -105,7 +114,10 @@ function capitalizeStatus(status: string): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
+const ensuredActivityDbs = new WeakSet<Database.Database>();
+
 export function ensureActivityTables(sqlite: Database.Database): void {
+  if (ensuredActivityDbs.has(sqlite)) return;
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS activity_item_meta (
       item_key TEXT PRIMARY KEY,
@@ -139,6 +151,7 @@ export function ensureActivityTables(sqlite: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_usage_ledger_recorded ON usage_ledger(recorded_at);
     CREATE INDEX IF NOT EXISTS idx_usage_ledger_workspace ON usage_ledger(workspace_id, recorded_at);
   `);
+  ensuredActivityDbs.add(sqlite);
 }
 
 function getMetaRow(sqlite: Database.Database, itemKey: string): ActivityItemMetaRow | undefined {
@@ -158,9 +171,10 @@ function upsertManualTiming(
     lastCompletedAt?: string | null;
     durationMs?: number | null;
     nowIso: string;
+    existing?: ActivityItemMetaRow;
   },
 ): ActivityItemMetaRow {
-  const existing = getMetaRow(sqlite, itemKey);
+  const existing = patch.existing ?? getMetaRow(sqlite, itemKey);
   const next: ActivityItemMetaRow = {
     item_key: itemKey,
     pinned_at: existing?.pinned_at ?? null,
@@ -233,7 +247,15 @@ export async function buildActivitySummary(
   const items: ActivitySummaryItem[] = [];
 
   // 1. Orchestrator missions
-  if (hasTable(sqlite, 'missions')) {
+  const existingTables = getExistingTables(sqlite, [
+    'missions',
+    'mission_runs',
+    'conversation_turns',
+    'agent_instances',
+    'approvals',
+    'orchestrator_questions',
+  ]);
+  if (existingTables.has('missions')) {
     const missionRows = (workspaceId
       ? sqlite
           .prepare(
@@ -275,17 +297,6 @@ export async function buildActivitySummary(
       completed_at: string | null;
       error: string | null;
     };
-    const runsByMission: Map<string, MissionRunRow[]> = hasTable(sqlite, 'mission_runs')
-      ? groupByMissionId(
-          sqlite
-            .prepare(
-              `SELECT id, mission_id, turn_id, status, started_at, completed_at, error
-               FROM mission_runs ORDER BY started_at DESC`,
-            )
-            .all() as MissionRunRow[],
-        )
-      : new Map();
-
     type ConversationTurnRow = {
       id: string;
       mission_id: string;
@@ -294,17 +305,6 @@ export async function buildActivitySummary(
       started_at: string | null;
       completed_at: string | null;
     };
-    const turnsByMission: Map<string, ConversationTurnRow[]> = hasTable(sqlite, 'conversation_turns')
-      ? groupByMissionId(
-          sqlite
-            .prepare(
-              `SELECT id, mission_id, status, created_at, started_at, completed_at
-               FROM conversation_turns ORDER BY created_at DESC`,
-            )
-            .all() as ConversationTurnRow[],
-        )
-      : new Map();
-
     type AgentInstanceRow = {
       id: string;
       mission_id: string;
@@ -315,17 +315,6 @@ export async function buildActivitySummary(
       status: string;
       created_at: string;
     };
-    const agentsByMission: Map<string, AgentInstanceRow[]> = hasTable(sqlite, 'agent_instances')
-      ? groupByMissionId(
-          sqlite
-            .prepare(
-              `SELECT id, mission_id, role, model_profile_id, account_profile_id, runtime_adapter_id, status, created_at
-               FROM agent_instances ORDER BY created_at DESC`,
-            )
-            .all() as AgentInstanceRow[],
-        )
-      : new Map();
-
     type PendingApprovalRow = {
       id: string;
       mission_id: string;
@@ -335,14 +324,78 @@ export async function buildActivitySummary(
       status: string;
       created_at: string;
     };
-    const approvalsByMission: Map<string, PendingApprovalRow[]> = hasTable(sqlite, 'approvals')
+
+    const hasMissions = missionRows.length > 0;
+    const missionFilterClause = workspaceId ? 'mission_id IN (SELECT id FROM missions WHERE workspace_id = ?)' : '';
+    const runsByMission: Map<string, MissionRunRow[]> = hasMissions && existingTables.has('mission_runs')
       ? groupByMissionId(
-          sqlite
-            .prepare(
-              `SELECT id, mission_id, task_id, type, description, status, created_at
-               FROM approvals WHERE status = 'pending' ORDER BY created_at DESC`,
-            )
-            .all() as PendingApprovalRow[],
+          (workspaceId
+            ? sqlite
+                .prepare(
+                  `SELECT id, mission_id, turn_id, status, started_at, completed_at, error
+                   FROM mission_runs WHERE ${missionFilterClause} ORDER BY started_at DESC`,
+                )
+                .all(workspaceId)
+            : sqlite
+                .prepare(
+                  `SELECT id, mission_id, turn_id, status, started_at, completed_at, error
+                   FROM mission_runs ORDER BY started_at DESC`,
+                )
+                .all()) as MissionRunRow[],
+        )
+      : new Map();
+
+    const turnsByMission: Map<string, ConversationTurnRow[]> = hasMissions && existingTables.has('conversation_turns')
+      ? groupByMissionId(
+          (workspaceId
+            ? sqlite
+                .prepare(
+                  `SELECT id, mission_id, status, created_at, started_at, completed_at
+                   FROM conversation_turns WHERE ${missionFilterClause} ORDER BY created_at DESC`,
+                )
+                .all(workspaceId)
+            : sqlite
+                .prepare(
+                  `SELECT id, mission_id, status, created_at, started_at, completed_at
+                   FROM conversation_turns ORDER BY created_at DESC`,
+                )
+                .all()) as ConversationTurnRow[],
+        )
+      : new Map();
+
+    const agentsByMission: Map<string, AgentInstanceRow[]> = hasMissions && existingTables.has('agent_instances')
+      ? groupByMissionId(
+          (workspaceId
+            ? sqlite
+                .prepare(
+                  `SELECT id, mission_id, role, model_profile_id, account_profile_id, runtime_adapter_id, status, created_at
+                   FROM agent_instances WHERE ${missionFilterClause} ORDER BY created_at DESC`,
+                )
+                .all(workspaceId)
+            : sqlite
+                .prepare(
+                  `SELECT id, mission_id, role, model_profile_id, account_profile_id, runtime_adapter_id, status, created_at
+                   FROM agent_instances ORDER BY created_at DESC`,
+                )
+                .all()) as AgentInstanceRow[],
+        )
+      : new Map();
+
+    const approvalsByMission: Map<string, PendingApprovalRow[]> = hasMissions && existingTables.has('approvals')
+      ? groupByMissionId(
+          (workspaceId
+            ? sqlite
+                .prepare(
+                  `SELECT id, mission_id, task_id, type, description, status, created_at
+                   FROM approvals WHERE status = 'pending' AND ${missionFilterClause} ORDER BY created_at DESC`,
+                )
+                .all(workspaceId)
+            : sqlite
+                .prepare(
+                  `SELECT id, mission_id, task_id, type, description, status, created_at
+                   FROM approvals WHERE status = 'pending' ORDER BY created_at DESC`,
+                )
+                .all()) as PendingApprovalRow[],
         )
       : new Map();
 
@@ -356,10 +409,14 @@ export async function buildActivitySummary(
         questions?: Array<{ question?: string }>;
       }>
     >();
-    if (hasTable(sqlite, 'orchestrator_questions')) {
-      const qRows = sqlite
-        .prepare('SELECT mission_id, payload FROM orchestrator_questions')
-        .all() as Array<{ mission_id: string; payload: string }>;
+    if (hasMissions && existingTables.has('orchestrator_questions')) {
+      const qRows = (workspaceId
+        ? sqlite
+            .prepare(`SELECT mission_id, payload FROM orchestrator_questions WHERE ${missionFilterClause}`)
+            .all(workspaceId)
+        : sqlite
+            .prepare('SELECT mission_id, payload FROM orchestrator_questions')
+            .all()) as Array<{ mission_id: string; payload: string }>;
       for (const row of qRows) {
         try {
           const parsed = JSON.parse(row.payload);
@@ -620,6 +677,7 @@ export async function buildActivitySummary(
         meta = upsertManualTiming(sqlite, itemKey, {
           activeStartedAt: earliestWorkingAt || nowIso,
           nowIso,
+          existing: meta,
         });
         metaByKey.set(itemKey, meta);
       }
@@ -658,6 +716,7 @@ export async function buildActivitySummary(
           lastCompletedAt: endIso,
           durationMs: computedDuration,
           nowIso,
+          existing: meta,
         });
         metaByKey.set(itemKey, meta);
       } else {
@@ -867,10 +926,18 @@ export async function buildActivitySummary(
     return b.updatedAt.localeCompare(a.updatedAt);
   });
 
+  let attentionCount = 0;
+  let runningCount = 0;
+  let unreadCompletedCount = 0;
+  for (const item of items) {
+    if (item.state === 'attention') attentionCount += 1;
+    else if (item.state === 'running') runningCount += 1;
+    if (item.unreadCompletion) unreadCompletedCount += 1;
+  }
   const counts = {
-    attention: items.filter((item) => item.state === 'attention').length,
-    running: items.filter((item) => item.state === 'running').length,
-    unreadCompleted: items.filter((item) => item.unreadCompletion).length,
+    attention: attentionCount,
+    running: runningCount,
+    unreadCompleted: unreadCompletedCount,
     total: items.length,
   };
 

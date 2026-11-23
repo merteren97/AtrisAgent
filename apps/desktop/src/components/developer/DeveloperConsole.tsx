@@ -1,8 +1,9 @@
-import { useState, useRef } from 'react';
+import { useMemo, useState, useRef } from 'react';
 import { useSettingsStore } from '@/stores/settings-store';
 import { useMissionStore } from '@/stores/mission-store';
 import { useAccountStore } from '@/stores/account-store';
 import { getApiOrigin } from '@/lib/api-client';
+import { tailWindow } from '@/lib/timeline-window';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -19,6 +20,8 @@ const RUNTIME_EVENT_TYPES = new Set([
   'runtime_telemetry',
 ]);
 
+const DEV_CONSOLE_MAX_ROWS = 250;
+
 export function DeveloperConsole() {
   const { devMode, toggleDevMode } = useSettingsStore();
   const { timeline } = useMissionStore();
@@ -27,16 +30,26 @@ export function DeveloperConsole() {
   const [activeTab, setActiveTab] = useState('events');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  if (!devMode) return null;
+  const normalizedFilter = filter.trim().toLowerCase();
+  const filteredEvents = useMemo(() => (
+    !devMode ? [] : timeline.filter((e) =>
+      !normalizedFilter || e.content.toLowerCase().includes(normalizedFilter)
+      || (e.eventType || '').toLowerCase().includes(normalizedFilter),
+    )
+  ), [devMode, normalizedFilter, timeline]);
+  const runtimeEvents = useMemo(() => (
+    !devMode ? [] : timeline.filter((event) => RUNTIME_EVENT_TYPES.has(event.eventType || ''))
+  ), [devMode, timeline]);
+  const mcpEvents = useMemo(() => (
+    !devMode ? [] : timeline.filter((e) =>
+      e.eventType?.includes('tool') || e.eventType?.includes('mcp') || (e.metadata && 'toolName' in e.metadata),
+    )
+  ), [devMode, timeline]);
 
-  const filteredEvents = timeline.filter(e =>
-    !filter || e.content.toLowerCase().includes(filter.toLowerCase()) ||
-    (e.eventType || '').toLowerCase().includes(filter.toLowerCase())
-  );
-  const runtimeEvents = timeline.filter((event) => RUNTIME_EVENT_TYPES.has(event.eventType || ''));
-  const mcpEvents = timeline.filter(e =>
-    e.eventType?.includes('tool') || e.eventType?.includes('mcp') || (e.metadata && 'toolName' in e.metadata)
-  );
+  const visibleFilteredEvents = useMemo(() => tailWindow(filteredEvents, DEV_CONSOLE_MAX_ROWS).items, [filteredEvents]);
+  const visibleRuntimeEvents = useMemo(() => tailWindow(runtimeEvents, DEV_CONSOLE_MAX_ROWS).items, [runtimeEvents]);
+
+  if (!devMode) return null;
 
   return (
     <div className="h-[300px] border-t border-border bg-card flex flex-col shrink-0 shadow-2xl z-40 select-none">
@@ -66,7 +79,7 @@ export function DeveloperConsole() {
           </div>
           <ScrollArea className="flex-1" ref={scrollRef}>
             <div className="p-2 space-y-0.5 font-mono text-[11px]">
-              {filteredEvents.map(event => (
+              {visibleFilteredEvents.map(event => (
                 <div key={event.id} className="flex items-start gap-2 py-0.5 hover:bg-muted/50 px-1.5 rounded border border-transparent hover:border-border/30 transition-colors">
                   <span className="text-muted-foreground shrink-0 w-16">{event.timestamp}</span>
                   <Badge variant="outline" className={cn('text-[9px] px-1 py-0 shrink-0 font-mono uppercase',
@@ -92,7 +105,7 @@ export function DeveloperConsole() {
               </div>
               <div className="bg-zinc-950 p-3 rounded-lg border border-white/10 text-zinc-300 space-y-1.5 leading-relaxed">
                 <div className={serviceOnline ? 'text-emerald-400' : 'text-rose-400'}>[SYSTEM] Local API {serviceOnline ? `reachable at ${getApiOrigin()}` : `unreachable at ${getApiOrigin()} · recovery supervisor active`}</div>
-                {runtimeEvents.map((event) => {
+                {visibleRuntimeEvents.map((event) => {
                   const metadata = event.metadata as Record<string, unknown> | undefined;
                   const agentId = typeof metadata?.agentInstanceId === 'string' ? metadata.agentInstanceId.slice(0, 8) : '--------';
                   return (

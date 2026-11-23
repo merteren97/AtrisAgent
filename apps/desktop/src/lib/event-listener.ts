@@ -9,11 +9,11 @@ import { boundStreamContent, compactTimelineMetadata } from '@/lib/timeline-meta
 let reconnectTimer: number | null = null;
 let streamAbortController: AbortController | null = null;
 let transportActive = false;
-let needsReconcile = false;
+const reconcileMissions = new Set<string>();
 let unsubscribeMission: (() => void) | null = null;
 const highestSequenceByMission = new Map<string, number>();
 const refreshedPlanByMission = new Map<string, string>();
-const TEXT_DELTA_BATCH_MS = 16;
+const TEXT_DELTA_BATCH_MS = 50;
 
 type PendingTextDelta = {
   key: string;
@@ -165,7 +165,7 @@ export function handleIncomingEvent(eventData: any): void {
     const previous = highestSequenceByMission.get(eventData.missionId) || 0;
     if (eventData.sequence <= previous) return;
     if (previous > 0 && eventData.sequence > previous + 1) {
-      markTransportGap();
+      markTransportGap(eventData.missionId);
       streamAbortController?.abort();
       scheduleReconnect();
       return;
@@ -584,15 +584,16 @@ export function handleIncomingEvent(eventData: any): void {
   recordSequence(eventData);
 }
 
-function markTransportGap(): void {
-  needsReconcile = true;
+function markTransportGap(missionId?: string | null): void {
+  const target = missionId || useMissionStore.getState().activeMissionId;
+  if (target) reconcileMissions.add(target);
 }
 
-function reconcileAfterGap(): void {
-  if (!needsReconcile) return;
-  needsReconcile = false;
-  const missionId = useMissionStore.getState().activeMissionId;
-  if (missionId) void useMissionStore.getState().fetchMissionState(missionId);
+function reconcileAfterGap(missionId: string): void {
+  if (!reconcileMissions.delete(missionId)) return;
+  if (useMissionStore.getState().activeMissionId === missionId) {
+    void useMissionStore.getState().fetchMissionState(missionId);
+  }
 }
 
 function scheduleReconnect(): void {
@@ -640,7 +641,7 @@ async function connectSse(): Promise<void> {
     useMissionStore.getState().setTransportStatus('idle');
     return;
   }
-  useMissionStore.getState().setTransportStatus(needsReconcile ? 'reconnecting' : 'connecting');
+  useMissionStore.getState().setTransportStatus(reconcileMissions.has(missionId) ? 'reconnecting' : 'connecting');
   try {
     const headers = runtimeHeaders({
       Accept: 'text/event-stream',
@@ -670,7 +671,7 @@ async function connectSse(): Promise<void> {
     if (!response.ok || !response.body) throw new Error(`SSE connection failed with ${response.status}`);
     useAccountStore.getState().setServiceOnline(true);
     useMissionStore.getState().setTransportStatus('connected');
-    reconcileAfterGap();
+    reconcileAfterGap(missionId);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -687,14 +688,14 @@ async function connectSse(): Promise<void> {
     if (buffer.trim()) handleSseFrame(buffer.replace(/\r/g, ''));
     if (transportActive && !controller.signal.aborted) {
       useMissionStore.getState().setTransportStatus('reconnecting', 'Live updates disconnected. Reconnecting...');
-      markTransportGap();
+      markTransportGap(missionId);
       scheduleReconnect();
     }
   } catch (error) {
     if (!transportActive || controller.signal.aborted) return;
     console.warn('[EventListener] Authenticated SSE connection failed:', error);
     useMissionStore.getState().setTransportStatus('error', error instanceof Error ? error.message : 'Live updates unavailable.');
-    markTransportGap();
+    markTransportGap(missionId);
     scheduleReconnect();
   } finally {
     if (streamAbortController === controller) streamAbortController = null;
@@ -720,7 +721,18 @@ export function initEventListener(): () => void {
   reconnectTimer = null;
   unsubscribeMission?.();
   unsubscribeMission = useMissionStore.subscribe((state, previous) => {
+    if (state.missions !== previous.missions) {
+      const liveIds = new Set(state.missions.map((mission) => mission.id));
+      for (const id of highestSequenceByMission.keys()) {
+        if (!liveIds.has(id) && id !== state.activeMissionId) {
+          highestSequenceByMission.delete(id);
+          refreshedPlanByMission.delete(id);
+          reconcileMissions.delete(id);
+        }
+      }
+    }
     if (state.activeMissionId === previous.activeMissionId) return;
+    flushPendingTextDeltas(previous.activeMissionId || undefined);
     streamAbortController?.abort();
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -734,7 +746,7 @@ export function initEventListener(): () => void {
     streamAbortController = null;
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
-    needsReconcile = false;
+    reconcileMissions.clear();
     unsubscribeMission?.();
     unsubscribeMission = null;
     useMissionStore.getState().setTransportStatus('idle');

@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'child_process';
+import { StringDecoder } from 'node:string_decoder';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import type {
@@ -27,7 +28,10 @@ import {
   prepareControlPlaneSession,
   revokeControlPlaneAgent,
 } from '../control-plane';
-import { findExecutable, getHelpText, redactSecrets, runCommand, runtimeProfileEnv, spawnHidden } from '../runtime-utils';
+import { findExecutable, getHelpText, redactSecrets, runCommand, runtimeProfileEnv, spawnHidden, terminateProcessTree } from '../runtime-utils';
+
+const MAX_AUTH_OUTPUT_CHARS = 32_768;
+const MAX_STREAM_BUFFER_CHARS = 2 * 1024 * 1024;
 
 interface PendingAuth {
   process?: ChildProcess;
@@ -44,6 +48,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
   private authFlows = new Map<string, PendingAuth>();
   private sessionContext = new Map<string, { missionId: string; taskId: string }>();
   private toolNamesBySession = new Map<string, Map<string, string>>();
+  private terminalSessions = new Set<string>();
 
   constructor(eventBus?: LocalEventBus) {
     super(eventBus);
@@ -138,8 +143,14 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     });
     const flow: PendingAuth = { process: child, profileId, output: '' };
     this.authFlows.set(authId, flow);
-    child.stdout?.on('data', (chunk) => { flow.output += redactSecrets(chunk.toString()); });
-    child.stderr?.on('data', (chunk) => { flow.output += redactSecrets(chunk.toString()); });
+    const appendAuthOutput = (chunk: Buffer | string) => {
+      flow.output += redactSecrets(chunk.toString());
+      if (flow.output.length > MAX_AUTH_OUTPUT_CHARS) {
+        flow.output = flow.output.slice(-MAX_AUTH_OUTPUT_CHARS);
+      }
+    };
+    child.stdout?.on('data', appendAuthOutput);
+    child.stderr?.on('data', appendAuthOutput);
     child.on('error', (error) => { flow.error = error.message; });
     child.on('close', (code) => {
       if (code !== 0 && !flow.error) flow.error = `Claude authentication exited with code ${code}`;
@@ -160,7 +171,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     if (!flow) return { authId, status: 'error', message: 'Authentication flow not found.' };
     const status = await this.verifyAuthentication(flow.profileId);
     if (status === 'connected') {
-      flow.process?.kill('SIGTERM');
+      if (flow.process) await terminateProcessTree(flow.process).catch(() => undefined);
       this.authFlows.delete(authId);
       return { authId, status, message: 'Claude Code authentication is connected.' };
     }
@@ -169,6 +180,13 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       status: flow.error ? 'error' : 'awaiting_browser',
       message: flow.error || flow.output.trim().slice(-1_500) || 'Waiting for Claude Code authentication.',
     };
+  }
+
+  override async shutdown(): Promise<void> {
+    const flows = [...this.authFlows.values()];
+    this.authFlows.clear();
+    await Promise.all(flows.map((flow) => (flow.process ? terminateProcessTree(flow.process).catch(() => undefined) : Promise.resolve())));
+    await super.shutdown();
   }
 
   async verifyAuthentication(profileId?: string): Promise<AccountProfileStatus> {
@@ -295,44 +313,89 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       id: sessionId, agentInstanceId: sessionId, runtimeSessionId: '',
       startedAt: new Date().toISOString(), endedAt: null,
     };
+
+    let child: ChildProcess;
+    try {
+      child = spawnHidden('claude', args, {
+        cwd,
+        env: {
+          ...process.env,
+          ...this.env(options.profileId),
+          ...options.env,
+          ...controlPlaneEnv(controlPlane),
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      mcpConfig.cleanup();
+      revokeControlPlaneAgent(sessionId);
+      throw error;
+    }
+
     this.activeSessions.set(sessionId, session);
     this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
     this.toolNamesBySession.set(sessionId, new Map());
+    this.terminalSessions.delete(sessionId);
+    this.registerProcess(sessionId, child);
     this.emitEvent({ id: crypto.randomUUID(), type: 'agent_started', missionId: options.missionId, agentInstanceId: sessionId, role: String(options.role || 'builder'), model: options.model || 'Claude default', timestamp: new Date().toISOString() });
 
-    const child = spawnHidden('claude', args, {
-      cwd,
-      env: {
-        ...process.env,
-        ...this.env(options.profileId),
-        ...options.env,
-        ...controlPlaneEnv(controlPlane),
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    this.registerProcess(sessionId, child);
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
     let buffer = '';
-    child.stdout?.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || '';
-      for (const line of lines) this.handleStreamLine(sessionId, line);
-    });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const error = redactSecrets(chunk.toString('utf8'));
-      if (error.trim()) this.emitAgentError(sessionId, error);
-    });
-    child.on('error', (error) => this.emitAgentError(sessionId, error.message));
-    child.on('close', (code) => {
+    let finalized = false;
+    const finalizeSession = (exitCode: number | null, spawnError?: string) => {
+      if (finalized) return;
+      finalized = true;
+      const tail = stdoutDecoder.end();
+      if (tail) buffer += tail;
       if (buffer.trim()) this.handleStreamLine(sessionId, buffer);
+      const stderrTail = stderrDecoder.end();
+      if (stderrTail.trim() && !this.isSessionCancelled(sessionId)) {
+        this.emitAgentError(sessionId, redactSecrets(stderrTail));
+      }
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
       mcpConfig.cleanup();
       revokeControlPlaneAgent(sessionId);
       this.toolNamesBySession.delete(sessionId);
-      if (code !== 0) this.emitFailure(sessionId, `Claude Code exited with code ${code}`, code);
+      if (!this.terminalSessions.has(sessionId) && !this.isSessionCancelled(sessionId)) {
+        if (spawnError) {
+          this.terminalSessions.add(sessionId);
+          this.emitFailure(sessionId, spawnError, exitCode);
+        } else if (exitCode !== 0) {
+          this.terminalSessions.add(sessionId);
+          this.emitFailure(sessionId, `Claude Code exited with code ${exitCode}`, exitCode);
+        }
+      }
+      this.terminalSessions.delete(sessionId);
+      this.clearSessionCancellation(sessionId);
       this.sessionContext.delete(sessionId);
+    };
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (this.isSessionCancelled(sessionId)) return;
+      buffer += stdoutDecoder.write(chunk);
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      if (buffer.length > MAX_STREAM_BUFFER_CHARS) {
+        buffer = buffer.slice(-MAX_STREAM_BUFFER_CHARS);
+      }
+      for (const line of lines) this.handleStreamLine(sessionId, line);
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (this.isSessionCancelled(sessionId)) return;
+      const error = redactSecrets(stderrDecoder.write(chunk));
+      if (error.trim()) this.emitAgentError(sessionId, error);
+    });
+    child.on('error', (error) => {
+      if (!this.isSessionCancelled(sessionId)) {
+        this.emitAgentError(sessionId, error.message);
+      }
+      finalizeSession(null, error.message);
+    });
+    child.on('close', (code) => {
+      finalizeSession(code);
     });
     return session;
   }
@@ -395,6 +458,8 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
         }
       }
     } else if (message.type === 'result') {
+      if (this.terminalSessions.has(sessionId) || this.isSessionCancelled(sessionId)) return;
+      this.terminalSessions.add(sessionId);
       this.recordProviderUsage(sessionId, message);
       if (message.is_error || message.subtype === 'error') this.emitFailure(sessionId, message.result || message.error || 'Claude run failed');
       else this.emitEvent({ id: crypto.randomUUID(), type: 'task_completed', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, result: message.result || 'Claude task completed', timestamp });

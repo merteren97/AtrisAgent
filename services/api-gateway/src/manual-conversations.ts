@@ -471,6 +471,7 @@ export class ManualConversationStore {
     }
 
     const allowedRoots = new Set<string>();
+    const gitParentRoots = new Set<string>();
     if (realCwd) allowedRoots.add(realCwd);
 
     try {
@@ -482,7 +483,8 @@ export class ManualConversationStore {
         const parent = path.dirname(wsReal);
         if (parent !== wsReal && fs.existsSync(path.join(parent, '.git'))) {
           const parentReal = resolveExistingDirectory(parent);
-          if (parentReal) allowedRoots.add(parentReal);
+          // Only allow files directly at the parent git root so a shared parent .git does not expose sibling directories.
+          if (parentReal) gitParentRoots.add(parentReal);
         }
       }
     } catch {
@@ -500,7 +502,12 @@ export class ManualConversationStore {
       if (realBrainDir) allowedRoots.add(realBrainDir);
     }
 
-    const allowed = Array.from(allowedRoots).some(root => isInsideAllowedRoot(root, candidate));
+    const candidateDir = path.dirname(candidate);
+    const matchesDir = (a: string, b: string) => process.platform === 'win32'
+      ? a.toLowerCase() === b.toLowerCase()
+      : a === b;
+    const allowed = Array.from(allowedRoots).some(root => isInsideAllowedRoot(root, candidate))
+      || Array.from(gitParentRoots).some(root => matchesDir(candidateDir, root));
     if (!allowed) return fail('Image is outside allowed project directories.', 403);
 
     const extension = path.extname(candidate).toLowerCase();

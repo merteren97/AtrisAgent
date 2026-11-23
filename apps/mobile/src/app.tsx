@@ -104,6 +104,12 @@ export function App() {
     void load(); const timer = window.setInterval(() => { if (!document.hidden) void load(); }, 2000);
     return () => { active = false; window.clearInterval(timer); };
   }, [agentId, screen, session.connected]);
+  useEffect(() => {
+    if (screen === 'workspace' && session.connected && !workspace) {
+      setWorkspaceId('');
+      setScreen('home');
+    }
+  }, [screen, session.connected, workspace]);
   useEffect(() => { if (follow.current) endRef.current?.scrollIntoView({ block: 'end' }); }, [messages]);
 
   const openAgent = (item: Agent, project = workspaceId) => { setWorkspaceId(project); setAgentId(item.id); setMessages([]); follow.current = true; setScreen('chat'); };

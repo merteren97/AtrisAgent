@@ -61,23 +61,39 @@ export class ModelCatalogService {
   }
 
   private saveCachedCatalog(): void {
+    const temporaryPath = `${this.cacheFilePath}.${process.pid}.${globalThis.crypto.randomUUID()}.tmp`;
     try {
-      fs.writeFileSync(this.cacheFilePath, JSON.stringify([...this.cachedCatalog.values()], null, 2), 'utf8');
+      fs.writeFileSync(temporaryPath, JSON.stringify([...this.cachedCatalog.values()], null, 2), 'utf8');
+      fs.renameSync(temporaryPath, this.cacheFilePath);
     } catch (error) {
+      try { fs.rmSync(temporaryPath, { force: true }); } catch { /* ignore cleanup failure */ }
       console.warn('[ModelCatalogService] Could not save model catalog cache:', error);
     }
   }
 
   async discoverLiveModels(accountProfiles: AccountProfile[]): Promise<ModelDescriptor[]> {
+    const eligible = accountProfiles.flatMap((profile) => {
+      if (profile.authStatus !== 'connected') return [];
+      const adapter = this.adapters.get(profile.runtimeType);
+      if (!adapter) return [];
+      adapter.configureProfile(profile);
+      return [{ profile, adapter }];
+    });
+
+    const settled = await Promise.allSettled(
+      eligible.map(async ({ profile, adapter }) => ({
+        profile,
+        adapter,
+        models: await adapter.discoverModels(profile.id),
+      })),
+    );
+
     let successfulProfiles = 0;
     let catalogChanged = false;
-    for (const profile of accountProfiles) {
-      if (profile.authStatus !== 'connected') continue;
-      const adapter = this.adapters.get(profile.runtimeType);
-      if (!adapter) continue;
-      adapter.configureProfile(profile);
-      try {
-        const models = await adapter.discoverModels(profile.id);
+    settled.forEach((outcome, index) => {
+      const { profile, adapter } = eligible[index];
+      if (outcome.status === 'fulfilled') {
+        const { models } = outcome.value;
         successfulProfiles += 1;
         catalogChanged = catalogChanged || this.getModelsForProfile(profile.id).length > 0 || models.length > 0;
         this.removeProfile(profile.id, false);
@@ -92,13 +108,13 @@ export class ModelCatalogService {
           };
           this.cachedCatalog.set(descriptor.catalogId, descriptor);
         }
-      } catch (error) {
+      } else {
         // A failed refresh is not authoritative, but the previous in-memory
         // live descriptors must not continue to claim that they are live.
         catalogChanged = this.markProfileStale(profile.id) || catalogChanged;
-        console.warn(`[ModelCatalogService] Discovery failed for ${profile.profileName}: ${discoveryDiagnostic(error)}`);
+        console.warn(`[ModelCatalogService] Discovery failed for ${profile.profileName}: ${discoveryDiagnostic(outcome.reason)}`);
       }
-    }
+    });
 
     // A successful discovery is authoritative even when the runtime returns an
     // empty list. Persist removals so stale models cannot reappear after restart.

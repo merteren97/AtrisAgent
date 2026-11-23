@@ -1,6 +1,9 @@
-import { Readable } from "node:stream";
+import { Readable, pipeline } from "node:stream";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { Router, type Request, type Response as ExpressResponse } from "express";
+
+const GITHUB_API_TIMEOUT_MS = 15_000;
+const GITHUB_DOWNLOAD_TIMEOUT_MS = 60_000;
 
 type FetchLike = typeof fetch;
 
@@ -226,7 +229,7 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
 
     const response = await fetchImpl(
       `https://api.github.com/repos/${repoOwner()}/${repoName()}/releases/latest`,
-      { headers: githubHeaders("application/vnd.github+json") },
+      { headers: githubHeaders("application/vnd.github+json"), signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS) },
     );
 
     if (!response.ok) return { ok: false as const, status: response.status };
@@ -239,7 +242,10 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
 
   async function getMobileRelease() {
     if (cachedMobileRelease && cachedMobileRelease.expiresAt > Date.now()) return { ok: true as const, data: cachedMobileRelease.data };
-    const response = await fetchImpl(`https://api.github.com/repos/${repoOwner()}/${repoName()}/releases?per_page=100`, { headers: githubHeaders("application/vnd.github+json") });
+    const response = await fetchImpl(`https://api.github.com/repos/${repoOwner()}/${repoName()}/releases?per_page=100`, {
+      headers: githubHeaders("application/vnd.github+json"),
+      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
+    });
     if (!response.ok) return { ok: false as const, status: response.status };
     const releases = await response.json() as GitHubRelease[];
     if (!Array.isArray(releases)) return { ok: false as const, status: 502 };
@@ -307,7 +313,7 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
 
       const githubResponse = await fetchImpl(
         `https://api.github.com/repos/${repoOwner()}/${repoName()}/releases/assets/${assetId}`,
-        { headers: githubHeaders("application/octet-stream"), redirect: "manual" },
+        { headers: githubHeaders("application/octet-stream"), redirect: "manual", signal: AbortSignal.timeout(GITHUB_DOWNLOAD_TIMEOUT_MS) },
       );
 
       if (githubResponse.status >= 300 && githubResponse.status < 400) {
@@ -333,10 +339,19 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
       const contentLength = githubResponse.headers.get("content-length");
       if (contentLength) response.setHeader("Content-Length", contentLength);
 
-      Readable.fromWeb(githubResponse.body as unknown as NodeReadableStream).pipe(response);
+      const upstream = Readable.fromWeb(githubResponse.body as unknown as NodeReadableStream);
+      pipeline(upstream, response, (error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_STREAM_PREMATURE_CLOSE") {
+          console.error("AtrisAgentCode release download stream failed.", error);
+        }
+      });
       return;
     } catch (error) {
       console.error("AtrisAgentCode release download proxy failed.", error);
+      if (response.headersSent) {
+        if (!response.writableEnded) response.end();
+        return;
+      }
       return response.status(502).send("GitHub release service is temporarily unavailable");
     }
   });
@@ -375,7 +390,7 @@ export function createAgentReleaseRouter(options: ReleaseRouterOptions = {}) {
 
       const signatureResponse = await fetchImpl(
         `https://api.github.com/repos/${repoOwner()}/${repoName()}/releases/assets/${signatureAsset.id}`,
-        { headers: githubHeaders("application/octet-stream") },
+        { headers: githubHeaders("application/octet-stream"), signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS) },
       );
       if (!signatureResponse.ok) return noUpdate(response, `signature_fetch_failed_${signatureResponse.status}`, debug);
 

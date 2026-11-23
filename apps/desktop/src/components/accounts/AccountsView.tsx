@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { AccountProfile, RuntimeType } from '@atris-agent-code/domain';
 import {
   Activity,
@@ -61,6 +61,19 @@ export function AccountsView() {
   const [providerId, setProviderId] = useState('');
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  const notifyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (notifyTimerRef.current !== null) {
+        window.clearTimeout(notifyTimerRef.current);
+        notifyTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
 
@@ -78,8 +91,13 @@ export function AccountsView() {
   }, [authMethod, selectedMethods]);
 
   const notify = (message: string) => {
+    if (!mountedRef.current) return;
     setFeedback(message);
-    window.setTimeout(() => setFeedback(null), 4_000);
+    if (notifyTimerRef.current !== null) window.clearTimeout(notifyTimerRef.current);
+    notifyTimerRef.current = window.setTimeout(() => {
+      notifyTimerRef.current = null;
+      if (mountedRef.current) setFeedback(null);
+    }, 4_000);
   };
 
   const openWizard = (type: RuntimeType) => {
@@ -103,25 +121,32 @@ export function AccountsView() {
       if (!runtime?.installation.installed) throw new Error(`${runtime?.name || runtimeType} is not installed or could not be discovered.`);
       const profileMode = runtimeType === 'antigravity' || (runtimeType === 'opencode' && ['existing_cli', 'existing_store'].includes(authMethod)) ? 'shared_cli' : 'isolated';
       const profile = await addProfile('', runtimeType, profileName.trim(), undefined, authMethod, roles, schedulerAuto, profileMode);
+      if (!mountedRef.current) return;
       setCreatedProfileId(profile.id);
       if (!authMethod) return;
       const options: Record<string, unknown> = {};
       if (runtimeType === 'opencode' && !['existing_cli', 'existing_store'].includes(authMethod)) options.providerId = providerId.trim();
       if (authMethod.includes('api_key') || authMethod.includes('token') || authMethod.includes('secret')) options.secret = secret;
       const flow = await beginAuthentication(profile.id, authMethod, options);
+      if (!mountedRef.current) return;
       setAuthFlow(flow);
       notify(flow.status === 'failed' ? (flow.instructions || 'Connection could not be started.') : flow.status === 'completed' ? 'Account connected.' : 'Official authentication flow started.');
       if (flow.status === 'completed') await refreshModels(profile.id);
+      if (!mountedRef.current) return;
       if (runtimeType === 'antigravity' && flow.status === 'pending') {
         notify('Checking your existing Antigravity session in the background…');
         const result = await pollAuthentication(profile.id, flow.authId);
+        if (!mountedRef.current) return;
         notify(result.message || `Connection: ${result.status}`);
-        if (result.status === 'connected') { await refreshModels(profile.id); setDialogOpen(false); }
+        if (result.status === 'connected') {
+          await refreshModels(profile.id);
+          if (mountedRef.current) setDialogOpen(false);
+        }
       }
     } catch (cause: any) {
       notify(cause?.message || 'Profile creation failed.');
     } finally {
-      setBusyAction(null);
+      if (mountedRef.current) setBusyAction(null);
     }
   };
 
@@ -130,8 +155,10 @@ export function AccountsView() {
     setBusyAction('poll');
     try {
       const result = await pollAuthentication(createdProfileId, authFlow.authId);
+      if (!mountedRef.current) return;
       if (result.status === 'connected') {
         await refreshModels(createdProfileId);
+        if (!mountedRef.current) return;
         notify(result.message || 'Authentication verified and live model catalog refreshed.');
         setDialogOpen(false);
       } else {
@@ -139,7 +166,7 @@ export function AccountsView() {
       }
     } catch (cause: any) {
       notify(cause?.message || 'Authentication check failed.');
-    } finally { setBusyAction(null); }
+    } finally { if (mountedRef.current) setBusyAction(null); }
   };
 
   const restartAuthentication = async () => {
@@ -147,17 +174,22 @@ export function AccountsView() {
     setBusyAction('restart-auth');
     try {
       const flow = await beginAuthentication(createdProfileId, authMethod, {});
+      if (!mountedRef.current) return;
       setAuthFlow(flow);
       notify(flow.instructions || 'Connection check prepared.');
       if (runtimeType === 'antigravity' && flow.status === 'pending') {
         const result = await pollAuthentication(createdProfileId, flow.authId);
+        if (!mountedRef.current) return;
         notify(result.message || `Connection: ${result.status}`);
-        if (result.status === 'connected') { await refreshModels(createdProfileId); setDialogOpen(false); }
+        if (result.status === 'connected') {
+          await refreshModels(createdProfileId);
+          if (mountedRef.current) setDialogOpen(false);
+        }
       }
     } catch (cause: any) {
       notify(cause?.message || 'Authentication could not be restarted.');
     } finally {
-      setBusyAction(null);
+      if (mountedRef.current) setBusyAction(null);
     }
   };
 
@@ -165,7 +197,7 @@ export function AccountsView() {
     setBusyAction(key);
     try { await action(); notify(success); }
     catch (cause: any) { notify(cause?.message || 'Operation failed.'); }
-    finally { setBusyAction(null); }
+    finally { if (mountedRef.current) setBusyAction(null); }
   };
 
   const continueAuthentication = async (profile: AccountProfile) => {
@@ -178,6 +210,7 @@ export function AccountsView() {
     setBusyAction(`connect-${profile.id}`);
     try {
       const flow = await beginAuthentication(profile.id, method, {});
+      if (!mountedRef.current) return;
       setRuntimeType(profile.runtimeType);
       setProfileName(profile.profileName);
       setAuthMethod(method);
@@ -188,13 +221,17 @@ export function AccountsView() {
       if (profile.runtimeType === 'antigravity' && flow.status === 'pending') {
         notify('Checking your existing Antigravity session in the background…');
         const result = await pollAuthentication(profile.id, flow.authId);
+        if (!mountedRef.current) return;
         notify(result.message || `Connection: ${result.status}`);
-        if (result.status === 'connected') { await refreshModels(profile.id); setDialogOpen(false); }
+        if (result.status === 'connected') {
+          await refreshModels(profile.id);
+          if (mountedRef.current) setDialogOpen(false);
+        }
       }
     } catch (cause: any) {
       notify(cause?.message || 'Authentication could not be started.');
     } finally {
-      setBusyAction(null);
+      if (mountedRef.current) setBusyAction(null);
     }
   };
 
@@ -202,9 +239,11 @@ export function AccountsView() {
     setBusyAction(`switch-${profile.id}`);
     try {
       await logoutProfile(profile.id);
+      if (!mountedRef.current) return;
       const runtime = runtimes.find((item) => item.runtimeType === profile.runtimeType);
       const method = profile.authMethod || runtime?.authMethods[0]?.id || 'native_keyring';
       const flow = await beginAuthentication(profile.id, method, {});
+      if (!mountedRef.current) return;
       setRuntimeType(profile.runtimeType);
       setProfileName(profile.profileName);
       setAuthMethod(method);
@@ -215,7 +254,7 @@ export function AccountsView() {
     } catch (cause: any) {
       notify(cause?.message || 'Antigravity account switching could not be started.');
     } finally {
-      setBusyAction(null);
+      if (mountedRef.current) setBusyAction(null);
     }
   };
 

@@ -33,14 +33,43 @@ export function CodexPermissions({agent, live, disabled, onApply}: {
   useEffect(() => {
     if (!open || !live) { setCurrent(undefined); return; }
     let disposed = false, first = true;
-    const refresh = async () => {
-      try {
-        const value = await apiRequest<CodexLivePermissions>(`/manual/agents/${agent.id}/permissions/live`);
-        if (!disposed) { setCurrent(value); if (first && value.mode && !selectionTouched.current) setSelected(value.mode); first = false; }
-      } catch (e) { if (!disposed) setCurrent({available:false, reason:e instanceof Error ? e.message : String(e)}); }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | null = null;
+    const schedule = () => {
+      if (disposed || document.hidden) return;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => { timer = undefined; void refresh(); }, 1500);
     };
-    void refresh(); const timer = setInterval(() => void refresh(), 1500);
-    return () => { disposed = true; clearInterval(timer); };
+    const refresh = async () => {
+      if (disposed || document.hidden) return;
+      controller?.abort();
+      const myController = new AbortController();
+      controller = myController;
+      try {
+        const value = await apiRequest<CodexLivePermissions>(`/manual/agents/${agent.id}/permissions/live`, { signal: myController.signal });
+        if (!disposed && controller === myController) { setCurrent(value); if (first && value.mode && !selectionTouched.current) setSelected(value.mode); first = false; }
+      } catch (e) {
+        if (!disposed && controller === myController && !myController.signal.aborted) setCurrent({available:false, reason:e instanceof Error ? e.message : String(e)});
+      } finally {
+        if (controller === myController) schedule();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+      } else if (!disposed) {
+        if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
+        void refresh();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    if (!document.hidden) void refresh();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) clearTimeout(timer);
+      controller?.abort();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [open, live, agent.id]);
   const apply = async (now: boolean) => {
     if (!selected || saving) return;

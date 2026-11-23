@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 21;
+export const DATABASE_SCHEMA_VERSION = 22;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -541,5 +541,45 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
       if (!hasColumn(sqlite, 'tasks', 'route_preference')) sqlite.exec('ALTER TABLE tasks ADD COLUMN route_preference TEXT');
     }
     sqlite.exec('PRAGMA user_version = 21');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 22) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'tasks')) {
+      if (hasColumn(sqlite, 'tasks', 'mission_id') && hasColumn(sqlite, 'tasks', 'status')) {
+        sqlite.exec('CREATE INDEX IF NOT EXISTS idx_tasks_mission_status ON tasks(mission_id, status)');
+      }
+      if (hasColumn(sqlite, 'tasks', 'plan_id')) {
+        sqlite.exec('CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id)');
+      }
+    }
+    if (hasTable(sqlite, 'task_dependencies')) {
+      if (hasColumn(sqlite, 'task_dependencies', 'task_id')) {
+        sqlite.exec('CREATE INDEX IF NOT EXISTS idx_task_dependencies_task ON task_dependencies(task_id)');
+      }
+      if (hasColumn(sqlite, 'task_dependencies', 'depends_on_task_id')) {
+        sqlite.exec('CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on_task_id)');
+      }
+    }
+    if (hasTable(sqlite, 'agent_instances') && hasColumn(sqlite, 'agent_instances', 'mission_id') && hasColumn(sqlite, 'agent_instances', 'status')) {
+      sqlite.exec('CREATE INDEX IF NOT EXISTS idx_agent_instances_mission_status ON agent_instances(mission_id, status)');
+    }
+    if (hasTable(sqlite, 'approvals') && hasColumn(sqlite, 'approvals', 'mission_id') && hasColumn(sqlite, 'approvals', 'status')) {
+      sqlite.exec('CREATE INDEX IF NOT EXISTS idx_approvals_mission_status ON approvals(mission_id, status)');
+    }
+    if (hasTable(sqlite, 'worktrees')) {
+      if (hasColumn(sqlite, 'worktrees', 'mission_id')) {
+        sqlite.exec('CREATE INDEX IF NOT EXISTS idx_worktrees_mission ON worktrees(mission_id)');
+      }
+      if (hasColumn(sqlite, 'worktrees', 'task_id')) {
+        sqlite.exec('CREATE INDEX IF NOT EXISTS idx_worktrees_task ON worktrees(task_id)');
+      }
+    }
+    if (hasTable(sqlite, 'checkpoints') && hasColumn(sqlite, 'checkpoints', 'workspace_id') && hasColumn(sqlite, 'checkpoints', 'mission_id')) {
+      sqlite.exec('CREATE INDEX IF NOT EXISTS idx_checkpoints_workspace_mission ON checkpoints(workspace_id, mission_id)');
+    }
+    if (hasTable(sqlite, 'artifacts') && hasColumn(sqlite, 'artifacts', 'mission_id') && hasColumn(sqlite, 'artifacts', 'type')) {
+      sqlite.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_mission_type ON artifacts(mission_id, type)');
+    }
+    sqlite.exec('PRAGMA user_version = 22');
   })();
 }

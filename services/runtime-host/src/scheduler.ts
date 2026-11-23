@@ -57,7 +57,7 @@ export class Scheduler {
       const accountMatches = !request.preferredAccountProfileId || request.preferredAccountProfileId === profile.id;
 
       for (const model of models.filter((item) => item.accountProfileId === profile.id)) {
-        if (!model.supportedRoles.includes(request.role)) continue;
+        if (!model.supportedRoles.some((role) => role.toLowerCase() === roleName)) continue;
         if (model.availability === 'unavailable' || model.availability === 'deprecated' || model.availability === 'rate_limited') continue;
 
         const preferredModel = Boolean(useConfiguredPreferences && request.preferredCatalogId && request.preferredCatalogId === model.catalogId);
@@ -135,7 +135,12 @@ export class Scheduler {
       }
     }
 
-    routes.sort((a, b) => b.score - a.score || String(a.model?.displayName).localeCompare(String(b.model?.displayName)));
+    routes.sort((a, b) =>
+      b.score - a.score
+      || String(a.model?.displayName).localeCompare(String(b.model?.displayName))
+      || String(a.model?.accountProfileId || a.profile?.id || '').localeCompare(String(b.model?.accountProfileId || b.profile?.id || ''))
+      || String(a.model?.catalogId || '').localeCompare(String(b.model?.catalogId || '')),
+    );
     const selected = routes[0];
     if (!selected) {
       const hasFixedConstraint = selectionMode === 'fixed' && Boolean(request.preferredAccountProfileId || constrainedCatalogs.size);
