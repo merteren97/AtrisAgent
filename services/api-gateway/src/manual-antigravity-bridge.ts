@@ -124,13 +124,13 @@ export function parseAntigravityQuestions(rawQuestions: unknown, id: string): Ma
   if (!rawList || rawList.length === 0) return undefined;
 
   const validEntries = rawList.filter((entry): entry is Record<string, any> =>
-    Boolean(entry && typeof entry === 'object' && !Array.isArray(entry) && typeof (entry as any).question === 'string' && Array.isArray((entry as any).options)),
+    Boolean(entry && typeof entry === 'object' && !Array.isArray(entry) && typeof (entry as any).question === 'string' && (Array.isArray((entry as any).options) || (entry as any).custom !== false)),
   );
   if (validEntries.length === 0) return undefined;
 
   const questions: ManualQuestion['questions'] = validEntries.map((entry, idx) => {
     const options: Array<{ label: string; description?: string }> = [];
-    for (const option of entry.options as unknown[]) {
+    for (const option of (Array.isArray(entry.options) ? entry.options : []) as unknown[]) {
       if (typeof option === 'string') {
         if (option.trim()) options.push({ label: option });
       } else if (option && typeof option === 'object' && !Array.isArray(option)) {
@@ -771,6 +771,42 @@ export class ManualAntigravityBridge {
   }
   pendingQuestions(agent: ManualAgent): ManualQuestion[] {
     return this.read(agent).questions;
+  }
+  recentFileTouches(agent: ManualAgent, sinceMs: number): Array<{ path: string; kind: 'read' | 'write'; at: number }> {
+    const sessionId = this.session(agent);
+    if (!sessionId) return [];
+    const filename = this.resolveTranscriptFile(sessionId);
+    if (!filename) return [];
+    let parsed: ReturnType<typeof readParsedTranscript>['parsed'];
+    let fallbackMs: number;
+    try {
+      const result = readParsedTranscript(filename, sessionId);
+      parsed = result.parsed;
+      fallbackMs = (result.mtimeIso ? Date.parse(result.mtimeIso) : NaN) || Date.now();
+    } catch {
+      return [];
+    }
+    const writeTools = new Set(['edit_file', 'write_file', 'replace_file_content', 'multi_replace_file_content', 'write_to_file', 'delete_file']);
+    const touches: Array<{ path: string; kind: 'read' | 'write'; at: number }> = [];
+    for (const [, step] of parsed.sortedSteps) {
+      if (step.type !== 'PLANNER_RESPONSE' || !Array.isArray(step.tool_calls)) continue;
+      const tsStr = stepTimestamp(step);
+      const at = tsStr ? Date.parse(tsStr) : fallbackMs;
+      if (Number.isFinite(at) && at < sinceMs) continue;
+      for (const call of step.tool_calls) {
+        const name = String(call?.name || '');
+        const kind = writeTools.has(name) ? 'write' : name === 'read_file' ? 'read' : undefined;
+        if (!kind) continue;
+        const args = unwrapAntigravityArgsRecord(call?.args && typeof call.args === 'object' ? call.args : {});
+        for (const key of ['Path', 'path', 'TargetFile', 'file_path']) {
+          const candidate = args[key];
+          if (typeof candidate === 'string' && candidate.trim()) {
+            touches.push({ path: candidate.trim(), kind, at: Number.isFinite(at) ? at : fallbackMs });
+          }
+        }
+      }
+    }
+    return touches;
   }
   activity(agent: ManualAgent): { state: string; at?: string } {
     const sessionId = this.session(agent);

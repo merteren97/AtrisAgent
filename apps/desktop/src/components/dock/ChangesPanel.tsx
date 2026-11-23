@@ -196,7 +196,7 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
       const issue = result.error || result.conflicts?.map(item => `${item.path}: ${item.reason}`).join('\n');
       setActionStatus(issue ? { text: `${verb} ${result.completed.length}/${targets.length}.\n${issue}`, error: true } : { text: `${verb}: ${result.completed.length}` });
       select(new Map());
-      if (action !== 'approve' && opened && result.completed.includes(opened)) open(undefined);
+      if (opened && result.completed.includes(opened)) open(undefined);
     } catch (error) { setActionStatus({ text: error instanceof Error ? error.message : 'The selected changes could not be updated.', error: true }); }
     finally { setPending(false); refresh(value => value + 1); }
   };
@@ -213,7 +213,7 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
       {t(data.quality === 'failed' ? 'Verification failed' : data.quality === 'verified' ? 'Verified' : 'Awaiting verification')}
     </p>}
     {(loadError || data?.error) && <p role="alert" className="border-b bg-destructive/5 px-3 py-2 text-xs text-destructive">{loadError || data?.error}</p>}
-    {data?.mode === 'project' && <p role="status" className="shrink-0 border-b px-3 py-2 text-xs text-muted-foreground">{data.preparing ? 'Recording starting versions…' : data.notice || 'Edits are already saved in the project. Approving keeps them and preserves Undo history.'}</p>}
+    {data?.mode === 'project' && <p role="status" className="shrink-0 border-b px-3 py-2 text-xs text-muted-foreground">{data.preparing ? 'Recording starting versions…' : data.notice || 'Edits are saved directly in the project folder. Approve clears reviewed changes; Undo restores the version before this conversation.'}</p>}
     {actionStatus && <p role={actionStatus.error ? 'alert' : 'status'} className={cn('max-h-28 overflow-y-auto whitespace-pre-wrap break-words border-b px-3 py-2 text-xs', actionStatus.error ? 'text-destructive' : 'text-emerald-700 dark:text-emerald-400')}>{actionStatus.text}</p>}
     {!data ? <ReviewEmpty>{!loadError && t('Loading changes…')}</ReviewEmpty> : data.mode === 'direct' ? <ReviewEmpty><strong className="text-foreground">Direct workspace session</strong><p>This conversation edits the registered folder directly and does not record undo history.</p></ReviewEmpty> : !files.length ? <ReviewEmpty><strong className="text-foreground">{t('No changes yet')}</strong></ReviewEmpty> : <>
       <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] text-muted-foreground">{selectable.length > 0 && <label className="flex items-center gap-2"><input type="checkbox" className={checkboxStyle} checked={visibleSelection.length === selectable.length} ref={input => { if (input) input.indeterminate = visibleSelection.length > 0 && visibleSelection.length < selectable.length; }} onChange={event => select(event.target.checked ? new Map(selectable.map(file => [file.path, file.revision!])) : new Map())} />{t('Select all')}</label>}<span className="ml-auto tabular-nums">{visibleSelection.length ? `${visibleSelection.length} / ` : ''}{files.length}</span></div>
@@ -228,6 +228,9 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
        </>} />
        {data.mode === 'project' && <footer className="flex shrink-0 flex-wrap gap-1.5 border-t p-2">
          <Button size="sm" disabled={blocked || !(visibleSelection.some(file => file.state === 'pending') || !visibleSelection.length && current?.state === 'pending')} onClick={() => show('approve', visibleSelection.length ? visibleSelection.filter(file => file.state === 'pending') : [current!])}><Check />Approve</Button>
+         {!visibleSelection.length && files.filter(file => file.state === 'pending' && file.revision).length > 1 && (
+           <Button size="sm" variant="ghost" disabled={blocked} onClick={() => show('approve', files.filter(file => file.state === 'pending' && file.revision))}>Approve all</Button>
+         )}
          <Button size="sm" variant="outline" disabled={blocked || !(visibleSelection.some(file => file.restorable) || !visibleSelection.length && current?.restorable)} onClick={() => show('undo', visibleSelection.length ? visibleSelection.filter(file => file.restorable) : [current!])}><Undo2 />{visibleSelection.length ? t('Undo selected') : t('Undo file')}</Button>
        </footer>}
       {data.mode === 'live' && <footer className="flex shrink-0 flex-wrap gap-1.5 border-t p-2">
@@ -246,7 +249,7 @@ export function ChangesList({ root, title, project, builder = false }: { root: s
     {Boolean(data?.omitted) && <p className="shrink-0 border-t px-3 py-1 text-[10px] text-muted-foreground">Generated files, common secret files and links are excluded.</p>}
     <Dialog open={Boolean(confirm)} onOpenChange={value => { if (!value) setConfirm(undefined); }}>
       <DialogContent className="z-[115]" showCloseButton={false}>
-        <DialogHeader><DialogTitle>{confirm?.action === 'undo' ? t('Undo project changes?') : `${confirm?.action === 'approve' ? 'Approve' : confirm?.action === 'apply' ? 'Apply' : 'Discard'} ${confirm?.files.length} ${confirm?.files.length === 1 ? 'file' : 'files'}?`}</DialogTitle><DialogDescription>{confirm?.action === 'approve' ? 'Keep these saved versions and mark them as reviewed. Undo will still be available for versions with a saved history.' : confirm?.action === 'undo' ? 'Restore the recorded previous versions. Files edited since the selected version will be kept.' : confirm?.action === 'apply' ? `Write the reviewed changes to ${project}. Conflicting project edits will be kept.` : 'Restore the selected files in this conversation copy to their last approved state. The project will not be modified.'}</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle>{confirm?.action === 'undo' ? t('Undo project changes?') : `${confirm?.action === 'approve' ? 'Approve' : confirm?.action === 'apply' ? 'Apply' : 'Discard'} ${confirm?.files.length} ${confirm?.files.length === 1 ? 'file' : 'files'}?`}</DialogTitle><DialogDescription>{confirm?.action === 'approve' ? 'Keep these saved changes in the project folder and clear them from this conversation’s review list.' : confirm?.action === 'undo' ? 'Restore the recorded previous versions from before this conversation. Files edited since the selected version will be kept.' : confirm?.action === 'apply' ? `Write the reviewed changes to ${project}. Conflicting project edits will be kept.` : 'Restore the selected files in this conversation copy to their last approved state. The project will not be modified.'}</DialogDescription></DialogHeader>
         <DialogFooter><Button variant="outline" onClick={() => setConfirm(undefined)}>{t('Cancel')}</Button><Button variant={confirm?.action === 'apply' || confirm?.action === 'approve' ? 'default' : 'destructive'} onClick={() => void resolve()}>{confirm?.action === 'approve' ? 'Approve changes' : confirm?.action === 'undo' ? t('Undo changes') : confirm?.action === 'apply' ? 'Apply to project' : 'Discard changes'}</Button></DialogFooter>
       </DialogContent>
     </Dialog>

@@ -132,7 +132,7 @@ async function testManualTrustAndChanges(page, url) {
     const agent = { id: 'agy-fixture', conversationId: 'review', runtimeType: 'antigravity', name: 'Antigravity 1', cwd: workspace.path };
     useWorkspaceStore.setState({ workspaces: [workspace], activeWorkspaceId: workspace.id });
     useManualStore.setState({ mode: 'manual', activeByWorkspace: {sample: 'review'}, conversations: { sample: [{ id: 'review', workspaceId: 'sample', title: 'Fixture conversation', agents: [agent] }] } });
-    const recorded = window.manualReview = { writes: [], refreshes: [], actions: [], cwd: null, ready: false };
+    const recorded = window.manualReview = { writes: [], refreshes: [], actions: [], cwd: null, ready: false, questions: [] };
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('Send must not use the clipboard'); } } });
     let started = false;
     window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
@@ -140,27 +140,32 @@ async function testManualTrustAndChanges(page, url) {
       if (command === 'manual_terminal_snapshot') return { id: agent.id, status: started ? 'open' : 'disconnected', sequence: started ? 1 : 0,
         output: '', reset: !started, rows: 30, columns: 120, resizes: [], inputReady: recorded.ready };
       if (command === 'manual_terminal_write') {
-        if (!recorded.ready) throw new Error('Antigravity is not ready. Check Code.');
+        if (args.paste && !recorded.ready) throw new Error('Antigravity is not ready. Check Code.');
         recorded.writes.push(args);
       }
     } };
-    let reviewState = 'pending';
+    let pendingFiles = [
+      { path: 'a.ts', state: 'pending', revision: 'fixture-revision-a', status: 'modified', restorable: true },
+      { path: 'b.ts', state: 'pending', revision: 'fixture-revision-b', status: 'added', restorable: true },
+    ];
     const fetch = window.fetch;
     window.fetch = async (input, options) => {
       const u = new URL(input);
       if (u.origin !== origin) throw new Error('Unexpected external request');
       if (u.pathname.endsWith('/launch')) return Response.json({ id: agent.id, cwd: agent.cwd, runtimeType: agent.runtimeType });
+      if (u.pathname.endsWith('/turn-started')) return new Response(null, { status: 204 });
       if (u.pathname.endsWith('/changes/resolve')) {
         const action = JSON.parse(options.body); recorded.actions.push(action);
-        reviewState = action.action === 'approve' ? 'approved' : 'reverted';
-        return Response.json({ completed: ['a.ts'], conflicts: [] });
+        const completed = action.files.map(item => item.path);
+        pendingFiles = pendingFiles.filter(item => !completed.includes(item.path));
+        return Response.json({ completed, conflicts: [] });
       }
       if (u.pathname.endsWith('/changes/file')) return Response.json({ before: 'before\n', after: 'after\n' });
       if (u.pathname.endsWith('/changes')) {
         recorded.refreshes.push(u.searchParams.get('refresh'));
-        return Response.json({ mode: 'project', files: [{ path: 'a.ts', state: reviewState, revision: 'fixture-revision', status: 'modified', restorable: reviewState !== 'reverted' }] });
+        return Response.json({ mode: 'project', files: pendingFiles });
       }
-      if (u.pathname.endsWith('/messages')) return Response.json({ revision: 'fixture', messages: [], supported: true, bound: false });
+      if (u.pathname.endsWith('/messages')) return Response.json({ revision: `fixture-${recorded.questions.length}`, messages: [], questions: recorded.questions, supported: true, bound: true });
       if (u.pathname.startsWith('/api/')) return Response.json({});
       return fetch(input, options);
     };
@@ -186,6 +191,27 @@ async function testManualTrustAndChanges(page, url) {
   assert.deepEqual(await page.evaluate(() => ({ cwd: window.manualReview.cwd, writes: window.manualReview.writes })), {
     cwd: 'C:/fixture', writes: [{ id: 'agy-fixture', data: testPrompt, paste: true }],
   });
+  // Verify Antigravity interactive questions can be answered from Chat even while inputReady is false.
+  await page.evaluate(() => {
+    window.manualReview.ready = false;
+    window.manualReview.writes = [];
+    window.manualReview.questions = [{
+      id: 'q-agy-1',
+      questions: [
+        { header: 'Question 1/2', question: 'Pick style', options: [{ label: 'Minimal' }, { label: 'Mission Control' }] },
+        { header: 'Question 2/2', question: 'Pick language', options: [{ label: 'English' }, { label: 'Turkish' }] },
+      ],
+    }];
+  });
+  await page.getByLabel('Agent question').waitFor({ timeout: 5000 });
+  await page.getByLabel('Mission Control').click();
+  await page.getByLabel('Turkish').click();
+  await page.getByRole('button', { name: 'Submit answers', exact: true }).click();
+  await page.waitForFunction(() => window.manualReview.writes.length === 2);
+  assert.deepEqual(await page.evaluate(() => window.manualReview.writes), [
+    { id: 'agy-fixture', data: '\u001b[B\r', paste: false },
+    { id: 'agy-fixture', data: '\u001b[B\r', paste: false },
+  ]);
   const review = page.locator('#review-root');
   await review.getByRole('button', { name: 'Refresh changes' }).click();
   await page.waitForFunction(() => window.manualReview.refreshes.includes('1'));
@@ -193,12 +219,47 @@ async function testManualTrustAndChanges(page, url) {
   await review.getByLabel('Code comparison').getByText('after', { exact: true }).filter({ visible: true }).waitFor();
   await review.getByRole('button', { name: 'Approve', exact: true }).click();
   await page.getByRole('button', { name: 'Approve changes', exact: true }).click();
-  await review.getByText('Approved', { exact: true }).waitFor();
+  await review.getByText('Approved: 1', { exact: true }).waitFor();
+  await review.getByRole('button', { name: /b\.ts/ }).click();
   await review.getByRole('button', { name: 'Undo file', exact: true }).click();
   await page.getByRole('button', { name: 'Undo changes', exact: true }).click();
-  await review.getByText('Undone', { exact: true }).waitFor();
-  assert.deepEqual(await page.evaluate(() => window.manualReview.actions), ['approve', 'undo'].map(action => ({ action, files: [{ path: 'a.ts', revision: 'fixture-revision' }] })));
-  console.log('PASS: Antigravity sends from Chat, preserves input on failure, and Undo still works after approval');
+  await review.getByText('No changes yet', { exact: true }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.manualReview.actions), [
+    { action: 'approve', files: [{ path: 'a.ts', revision: 'fixture-revision-a' }] },
+    { action: 'undo', files: [{ path: 'b.ts', revision: 'fixture-revision-b' }] },
+  ]);
+  // Verify Latest messages button is horizontally centered above Changed files (when present) and above composer (when absent).
+  await page.evaluate(() => {
+    window.manualReview.questions = [];
+    const container = document.querySelector('#manual-root [class*="overflow-y-auto"]');
+    if (container && container.firstElementChild) {
+      for (let i = 0; i < 30; i++) {
+        const p = document.createElement('p');
+        p.textContent = `Filler line ${i} for scroll test`;
+        p.style.height = '40px';
+        container.firstElementChild.appendChild(p);
+      }
+      container.scrollTop = 0;
+      container.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
+  });
+  const latestBtn = page.locator('#manual-root').getByRole('button', { name: /Latest messages/i });
+  await latestBtn.waitFor({ timeout: 5000 });
+  const centeredCheck = await page.evaluate(() => {
+    const viewport = document.querySelector('#manual-root [class*="overflow-y-auto"]');
+    const btn = Array.from(document.querySelectorAll('#manual-root button')).find(b => /Latest messages/i.test(b.textContent || ''));
+    const composer = document.querySelector('#manual-root form');
+    if (!viewport || !btn || !composer) return null;
+    const vr = viewport.getBoundingClientRect();
+    const br = btn.getBoundingClientRect();
+    const cr = composer.getBoundingClientRect();
+    return {
+      centerDelta: Math.abs((br.left + br.width / 2) - (vr.left + vr.width / 2)),
+      aboveComposer: br.bottom <= cr.top + 2,
+    };
+  });
+  assert.ok(centeredCheck && centeredCheck.centerDelta < 4 && centeredCheck.aboveComposer, `Expected centered Latest messages button above composer, got ${JSON.stringify(centeredCheck)}`);
+  console.log('PASS: Antigravity Chat send + question reply work, Latest messages is centered above composer/changed-files, and conversation Approve/Undo clear reviewed files');
 }
 
 (async () => {

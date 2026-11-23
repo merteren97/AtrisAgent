@@ -17,9 +17,25 @@ const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
 const HOOK_SOURCE = `${MARKER}\n` + String.raw`
 'use strict';
 const fs = require('node:fs');
+const path = require('node:path');
 let source = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { source += chunk; if (source.length > 1048576) process.exit(1); });
+function extractPaths(value, out) {
+  if (!value || typeof value !== 'object' || out.length >= 20) return;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === 'string' && item.trim() && item.length <= 2048) out.push(item.trim());
+      else extractPaths(item, out);
+    }
+    return;
+  }
+  for (const key of ['file_path', 'path', 'target_file', 'TargetFile', 'Path', 'filePath', 'filename', 'paths']) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && candidate.trim() && candidate.length <= 2048) out.push(candidate.trim());
+    else if (Array.isArray(candidate)) extractPaths(candidate, out);
+  }
+}
 process.stdin.on('end', () => {
   try {
     const input = JSON.parse(source);
@@ -28,11 +44,23 @@ process.stdin.on('end', () => {
     if (typeof sessionId !== 'string' || !/^[a-zA-Z0-9_-]{8,128}$/.test(sessionId.replace(/-/g, '_'))) return;
     if (typeof transcriptPath !== 'string' || !transcriptPath.endsWith('.jsonl')) return;
     const event = input.hook_event_name;
-    if (!['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PostToolUse'].includes(event)) return;
+    if (!['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PreToolUse','PostToolUse'].includes(event)) return;
     const output = process.argv[2];
     if (!output) return;
-    const record = {sessionId, transcriptPath, event, at: new Date().toISOString()};
-    fs.appendFileSync(output, JSON.stringify(record)+'\n', {mode: 0o600});
+    const at = new Date().toISOString();
+    if (event !== 'PreToolUse') {
+      const record = {sessionId, transcriptPath, event, at};
+      fs.appendFileSync(output, JSON.stringify(record)+'\n', {mode: 0o600});
+    }
+    if (event === 'PreToolUse' || event === 'PostToolUse') {
+      const paths = [];
+      extractPaths(input.tool_input, paths);
+      const unique = [...new Set(paths)];
+      if (unique.length) {
+        const toolLog = path.join(path.dirname(output), 'tool-events.jsonl');
+        fs.appendFileSync(toolLog, JSON.stringify({sessionId, event, toolName: String(input.tool_name || ''), paths: unique, at})+'\n', {mode: 0o600});
+      }
+    }
   } catch { process.exitCode = 1; }
 });
 `;
@@ -50,6 +78,14 @@ export const AtrisManualSession = async ({client, directory}) => {
   const replyErrorFile = path.join(root, 'opencode-question-error.json');
   const routeFile = path.join(root, 'opencode-route.json');
   const activityFile = path.join(root, 'opencode-activity.json');
+  const fileEventsFile = path.join(root, 'opencode-file-events.jsonl');
+  const recordFileTouch = (tool, rawPaths) => {
+    try {
+      const paths = [...new Set((rawPaths || []).filter(p => typeof p === 'string' && p.trim() && p.length <= 2048).map(p => p.trim()))];
+      if (!paths.length || !sessionId) return;
+      fs.appendFileSync(fileEventsFile, JSON.stringify({ sessionID: sessionId, tool: String(tool || ''), paths, at: new Date().toISOString() }) + '\n', { mode: 0o600 });
+    } catch {}
+  };
   const pending = new Map();
   const savePending = () => {
     try { fs.writeFileSync(pendingFile+'.tmp', JSON.stringify([...pending.values()]), {mode: 0o600}); fs.renameSync(pendingFile+'.tmp', pendingFile); } catch {}
@@ -152,6 +188,10 @@ export const AtrisManualSession = async ({client, directory}) => {
       } catch {}
       return;
     }
+    if (event.type === 'file.edited' && event.properties?.file) {
+      recordFileTouch('file.edited', [event.properties.file]);
+      return;
+    }
     if (event.type !== 'message.part.updated') return;
     const part = event.properties?.part;
     if (!part || part.sessionID !== sessionId || !part.id) return;
@@ -160,6 +200,14 @@ export const AtrisManualSession = async ({client, directory}) => {
     if (part.type === 'text' && role && !part.synthetic && typeof part.text === 'string') {
       messages.set(id, {id, role, text: part.text.slice(0,65536)});
     } else if (part.type === 'tool') {
+      const inp = part.state?.input;
+      if (inp && typeof inp === 'object') {
+        const touched = [];
+        for (const k of ['filePath', 'file_path', 'path', 'target_file', 'filename']) {
+          if (typeof inp[k] === 'string') touched.push(inp[k]);
+        }
+        if (touched.length) recordFileTouch(part.tool || 'tool', touched);
+      }
       messages.set(id, {id, role:'tool', toolName:part.tool || 'Tool', text: 'Tool '+(part.state?.status || 'requested')+'. Open Code for output and approvals.', failed:part.state?.status === 'error'});
     }
     flush();
@@ -325,6 +373,56 @@ export class ManualProviderBridge {
     }
     return latest;
   }
+  recentFileTouches(agent: ManualAgent, sinceMs: number): Array<{ path: string; kind: 'read' | 'write'; at: number }> {
+    if (agent.runtimeType === 'antigravity') {
+      return new ManualAntigravityBridge(this.dataDir, this.antigravityTranscriptRoot).recentFileTouches(agent, sinceMs);
+    }
+    const touches: Array<{ path: string; kind: 'read' | 'write'; at: number }> = [];
+    const readTools = new Set(['read', 'read_file', 'view_file', 'cat', 'glob', 'grep']);
+    if (agent.runtimeType === 'opencode') {
+      const filename = path.join(this.directory(agent), 'opencode-file-events.jsonl');
+      if (!fs.existsSync(filename)) return [];
+      try {
+        if (fs.lstatSync(filename).isSymbolicLink()) return [];
+        const sessionId = this.openCodeHistory(agent).sessionId;
+        for (const line of readTail(filename, 128 * 1024).source.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (sessionId && entry.sessionID !== sessionId) continue;
+            const at = Date.parse(entry.at);
+            if (!Number.isFinite(at) || at < sinceMs) continue;
+            const kind = readTools.has(String(entry.tool || '').toLowerCase()) ? 'read' : 'write';
+            for (const p of Array.isArray(entry.paths) ? entry.paths : []) {
+              if (typeof p === 'string' && p.trim()) touches.push({ path: p.trim(), kind, at });
+            }
+          } catch {}
+        }
+      } catch {}
+      return touches;
+    }
+    if (agent.runtimeType === 'claude_code' || agent.runtimeType === 'codex') {
+      const filename = path.join(this.directory(agent), 'tool-events.jsonl');
+      if (!fs.existsSync(filename)) return [];
+      try {
+        if (fs.lstatSync(filename).isSymbolicLink()) return [];
+        for (const line of readTail(filename, 128 * 1024).source.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            const at = Date.parse(entry.at);
+            if (!Number.isFinite(at) || at < sinceMs) continue;
+            const kind = readTools.has(String(entry.toolName || '').toLowerCase()) ? 'read' : 'write';
+            for (const p of Array.isArray(entry.paths) ? entry.paths : []) {
+              if (typeof p === 'string' && p.trim()) touches.push({ path: p.trim(), kind, at });
+            }
+          } catch {}
+        }
+      } catch {}
+      return touches;
+    }
+    return [];
+  }
   private directory(agent: ManualAgent): string { return path.join(this.dataDir, 'manual-sessions', agent.id); }
   private codexRoot(agent: ManualAgent): string { return agent.sharedProfile ? process.env.CODEX_HOME || path.join(os.homedir(), '.codex') : agent.configDir; }
   private hookCommand(agent: ManualAgent): {command: string; commandWindows: string} {
@@ -356,7 +454,7 @@ export class ManualProviderBridge {
   }
   prepareClaude(agent: ManualAgent, hasInitialTranscript: boolean): string[] {
     const command = this.hookCommand(agent);
-    const hooks = Object.fromEntries(['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PostToolUse'].map(event => [event, [{hooks:[{type:'command', command:process.platform === 'win32' ? command.commandWindows : command.command, timeout:5}]}]]));
+    const hooks = Object.fromEntries(['SessionStart','UserPromptSubmit','Stop','PermissionRequest','PreToolUse','PostToolUse'].map(event => [event, [{hooks:[{type:'command', command:process.platform === 'win32' ? command.commandWindows : command.command, timeout:5}]}]]));
     const bound = this.claudeBindings(agent).at(-1);
     // A file avoids Windows .cmd/PowerShell stripping embedded JSON quotation marks.
     // Content-addressed files are immutable; an existing unmanaged file is never overwritten.

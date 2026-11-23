@@ -93,3 +93,80 @@ test('undoing a later edit reveals the preceding approved version', () => fixtur
   assert.deepEqual((await review.resolve('project', 'undo', [visible])).completed, ['main.ts']);
   assert.equal(fs.readFileSync(filename, 'utf8'), 'starting version');
 }));
+
+test('conversation-scoped review ignores pre-existing Git diff, aggregates multi-tab edits, clears on approve/delete, and safely undoes', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-direct-conv-test-'));
+  const project = path.join(root, 'project'), data = path.join(root, 'data');
+  fs.mkdirSync(project); fs.mkdirSync(data);
+  const db = new Database(path.join(data, 'test.db'));
+  db.exec('PRAGMA foreign_keys=ON; CREATE TABLE workspaces (id TEXT PRIMARY KEY, path TEXT NOT NULL)');
+  db.prepare('INSERT INTO workspaces VALUES (?,?)').run('project', project);
+  const runGit = (...args: string[]) => execFileSync('git', args, { cwd: project, windowsHide: true });
+  runGit('init', '-q');
+  fs.writeFileSync(path.join(project, 'dirty.ts'), 'pre-existing dirty\n');
+  runGit('add', 'dirty.ts');
+  fs.writeFileSync(path.join(project, 'dirty.ts'), 'dirty working tree\n');
+  fs.writeFileSync(path.join(project, 'untracked.ts'), 'untracked before chat\n');
+
+  let activeAttribution: { conversationId: string; agentId?: string } | undefined;
+  const review = new DirectProjectReview(db, data, id => id === 'project' ? project : undefined, () => activeAttribution);
+  try {
+    await review.ready('project');
+    // Brand-new conversation must show 0 files even with pre-existing dirty/untracked Git files.
+    assert.deepEqual((await review.listForConversation('project', 'conv-a', true)).files, []);
+    assert.deepEqual((await review.listForConversation('project', 'conv-b', true)).files, []);
+
+    // External/human edit while no conversation is active must not pollute any chat.
+    fs.writeFileSync(path.join(project, 'human.ts'), 'human edit\n');
+    assert.deepEqual((await review.listForConversation('project', 'conv-a', true)).files, []);
+
+    // Tab 1 and Tab 2 inside conv-a both edit dirty.ts (and Tab 2 adds tab2.ts).
+    activeAttribution = { conversationId: 'conv-a', agentId: 'tab-1' };
+    fs.writeFileSync(path.join(project, 'dirty.ts'), 'tab 1 edit\n');
+    await review.listForConversation('project', 'conv-a', true);
+    activeAttribution = { conversationId: 'conv-a', agentId: 'tab-2' };
+    fs.writeFileSync(path.join(project, 'dirty.ts'), 'tab 2 edit\n');
+    fs.writeFileSync(path.join(project, 'tab2.ts'), 'created by tab 2\n');
+
+    const convAList = await review.listForConversation('project', 'conv-a', true);
+    assert.deepEqual(convAList.files.map(f => f.path), ['dirty.ts', 'tab2.ts']);
+    // Sibling conversation conv-b still sees 0 changes.
+    assert.deepEqual((await review.listForConversation('project', 'conv-b', true)).files, []);
+
+    // Preview for dirty.ts shows original pre-conversation dirty bytes -> latest tab 2 bytes.
+    const dirtyEntry = convAList.files.find(f => f.path === 'dirty.ts')!;
+    assert.deepEqual(
+      await review.previewForConversation('project', 'conv-a', 'dirty.ts', dirtyEntry.revision),
+      { before: 'dirty working tree\n', after: 'tab 2 edit\n' },
+    );
+
+    // Undo dirty.ts restores pre-conversation dirty bytes (NOT git HEAD) and clears it from conv-a.
+    assert.deepEqual(
+      await review.resolveForConversation('project', 'conv-a', 'undo', [dirtyEntry]),
+      { completed: ['dirty.ts'], conflicts: [] },
+    );
+    assert.equal(fs.readFileSync(path.join(project, 'dirty.ts'), 'utf8'), 'dirty working tree\n');
+    assert.deepEqual((await review.listForConversation('project', 'conv-a', true)).files.map(f => f.path), ['tab2.ts']);
+
+    // Approve tab2.ts keeps file on disk and clears it from conv-a.
+    const tab2Entry = (await review.listForConversation('project', 'conv-a', false)).files[0];
+    assert.deepEqual(
+      await review.resolveForConversation('project', 'conv-a', 'approve', [tab2Entry]),
+      { completed: ['tab2.ts'], conflicts: [] },
+    );
+    assert.equal(fs.readFileSync(path.join(project, 'tab2.ts'), 'utf8'), 'created by tab 2\n');
+    assert.deepEqual((await review.listForConversation('project', 'conv-a', false)).files, []);
+
+    // Delete conversation clears pending tracked changes like Approve while keeping files on disk.
+    activeAttribution = { conversationId: 'conv-b', agentId: 'b-tab-1' };
+    fs.writeFileSync(path.join(project, 'from-b.ts'), 'keep after delete\n');
+    assert.deepEqual((await review.listForConversation('project', 'conv-b', true)).files.map(f => f.path), ['from-b.ts']);
+    review.clearConversation('conv-b');
+    assert.deepEqual((await review.listForConversation('project', 'conv-b', false)).files, []);
+    assert.equal(fs.readFileSync(path.join(project, 'from-b.ts'), 'utf8'), 'keep after delete\n');
+  } finally {
+    await review.close();
+    db.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

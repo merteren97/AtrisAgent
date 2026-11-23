@@ -466,23 +466,47 @@ try {
     const directId = randomUUID();
     assert.equal((await post('/conversations', { workspaceId: 'review-project', id: directId, isolated: false, liveChanges: false })).status, 200);
     const directAgent = await (await post(`/conversations/${directId}/agents`, { ...input, id: randomUUID() })).json();
+    const directTab2 = await (await post(`/conversations/${directId}/agents`, { ...input, id: randomUUID() })).json();
     assert.equal(directAgent.cwd, fs.realpathSync(reviewProject));
     assert.equal((await (await fetch(`${base}/conversations/${directId}/changes`)).json()).mode, 'project');
+    assert.deepEqual((await (await fetch(`${base}/conversations/${directId}/changes`)).json()).files, [], 'Brand-new direct conversation starts with 0 changed files');
     const secondDirect = randomUUID();
     assert.equal((await post('/conversations', { workspaceId: 'review-project', id: secondDirect })).status, 200);
     const secondAgent = await (await post(`/conversations/${secondDirect}/agents`, { ...input, id: randomUUID() })).json();
     assert.equal(secondAgent.cwd, directAgent.cwd, 'New Manual conversations never generate a new CLI directory');
     await installedStore.projectReview.ready('review-project');
-    fs.writeFileSync(path.join(reviewProject, 'review.ts'), 'changed directly');
-    const latest = await (await fetch(`${base}/conversations/${secondDirect}/changes?refresh=1`)).json();
+    // Idle edit with no active turn does not pollute either conversation.
+    fs.writeFileSync(path.join(reviewProject, 'idle.ts'), 'external edit');
+    assert.deepEqual((await (await fetch(`${base}/conversations/${directId}/changes?refresh=1`)).json()).files, []);
+    assert.deepEqual((await (await fetch(`${base}/conversations/${secondDirect}/changes?refresh=1`)).json()).files, []);
+    // Active turn in directId attributes edits across its tabs only to directId.
+    assert.equal((await post(`/agents/${directAgent.id}/turn-started`, {})).status, 204);
+    fs.writeFileSync(path.join(reviewProject, 'review.ts'), 'changed by tab 1');
+    await fetch(`${base}/conversations/${directId}/changes?refresh=1`);
+    assert.equal((await post(`/agents/${directTab2.id}/turn-started`, {})).status, 204);
+    fs.writeFileSync(path.join(reviewProject, 'review.ts'), 'changed by tab 2');
+    fs.writeFileSync(path.join(reviewProject, 'approved.ts'), 'keep after approve');
+    const latest = await (await fetch(`${base}/conversations/${directId}/changes?refresh=1`)).json();
+    assert.deepEqual(latest.files.map((file: any) => file.path), ['approved.ts', 'review.ts']);
+    assert.deepEqual((await (await fetch(`${base}/conversations/${secondDirect}/changes?refresh=1`)).json()).files, [], 'Sibling conversation does not see directId changes');
+    const approvedFile = latest.files.find((file: any) => file.path === 'approved.ts');
     const reviewFile = latest.files.find((file: any) => file.path === 'review.ts');
     assert.equal(reviewFile.state, 'pending');
-    const approve = await (await post(`/conversations/${directId}/changes/resolve`, { action: 'approve', files: [reviewFile] })).json();
-    assert.deepEqual(approve.completed, ['review.ts']);
-    assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'changed directly');
-    const reverted = await (await post(`/conversations/${secondDirect}/changes/resolve`, { action: 'undo', files: [reviewFile] })).json();
+    const approve = await (await post(`/conversations/${directId}/changes/resolve`, { action: 'approve', files: [approvedFile] })).json();
+    assert.deepEqual(approve.completed, ['approved.ts']);
+    assert.equal(fs.readFileSync(path.join(reviewProject, 'approved.ts'), 'utf8'), 'keep after approve');
+    assert.deepEqual((await (await fetch(`${base}/conversations/${directId}/changes`)).json()).files.map((file: any) => file.path), ['review.ts'], 'Approved file clears from conversation changes');
+    const reverted = await (await post(`/conversations/${directId}/changes/resolve`, { action: 'undo', files: [reviewFile] })).json();
     assert.deepEqual(reverted.completed, ['review.ts']);
     assert.equal(fs.readFileSync(path.join(reviewProject, 'review.ts'), 'utf8'), 'export {};\n');
+    assert.deepEqual((await (await fetch(`${base}/conversations/${directId}/changes`)).json()).files, [], 'Undone file clears from conversation changes');
+    // Deleting a conversation with pending changes clears them like Approve without reverting disk files.
+    assert.equal((await post(`/agents/${secondAgent.id}/turn-started`, {})).status, 204);
+    fs.writeFileSync(path.join(reviewProject, 'delete-keep.ts'), 'kept on conversation delete');
+    assert.deepEqual((await (await fetch(`${base}/conversations/${secondDirect}/changes?refresh=1`)).json()).files.map((file: any) => file.path), ['delete-keep.ts']);
+    assert.equal((await fetch(`${base}/conversations/${secondDirect}`, { method: 'DELETE' })).status, 204);
+    assert.equal(fs.readFileSync(path.join(reviewProject, 'delete-keep.ts'), 'utf8'), 'kept on conversation delete');
+    assert.deepEqual((await (await fetch(`${base}/conversations/${directId}/changes`)).json()).files, []);
 
     const liveId = randomUUID();
     const isWatching = () => (sqlite.prepare('SELECT active FROM live_project_scopes WHERE id = ?').get(`manual:${liveId}`) as { active: number }).active;

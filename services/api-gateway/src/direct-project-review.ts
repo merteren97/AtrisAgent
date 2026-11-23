@@ -16,12 +16,14 @@ const missing = '-';
 const fail = (message: string, status = 409) => Object.assign(new Error(message), { status });
 type State = 'pending' | 'approved' | 'reverted';
 type Entry = { path: string; revision: string; state: State; before_key: string; after_key: string; before_mode: number; previous: string | null; undoing: number };
+type ConversationEntry = { conversation_id: string; project: string; path: string; before_key: string; before_mode: number; after_key: string; revision: string; last_agent_id: string | null; state: State; updated_at: string };
 type Head = { digest: string; stamp: string; mode: number; revision: string | null };
 type Snapshot = { digest: string; stamp: string; mode: number; bytes?: Buffer };
 type Project = { id: string; root: string; gitRootPath?: string; ready: Promise<void>; settled: boolean; seeded: boolean; bytes: number; tracked: number;
   queue: Promise<unknown>; pending: Set<string>; full: boolean; watcher?: fs.FSWatcher; timer?: NodeJS.Timeout;
   interval?: NodeJS.Timeout; closed: boolean; issue?: string; gitAt: number; gitFiles: Map<string, string>; gitRead?: Promise<void> };
 type Selection = Array<{ path: string; revision: string }>;
+export type ChangeAttribution = { conversationId: string; agentId?: string };
 
 function stamp(stat: fs.BigIntStats) { return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mode}:${stat.mtimeNs}:${stat.ctimeNs}`; }
 function relativePath(value: string) {
@@ -34,7 +36,12 @@ const present = ({ before_key, after_key }: Pick<Entry, 'before_key' | 'after_ke
 export class DirectProjectReview {
   private projects = new Map<string, Project>();
   private closed = false;
-  constructor(private db: Database.Database, private dataDir: string, private registeredPath: (id: string) => string | undefined) {
+  constructor(
+    private db: Database.Database,
+    private dataDir: string,
+    private registeredPath: (id: string) => string | undefined,
+    private attributeChange?: (workspaceId: string, relativePath: string) => ChangeAttribution | undefined,
+  ) {
     db.exec(`CREATE TABLE IF NOT EXISTS direct_review_project (
       id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE, root TEXT NOT NULL, seeded INTEGER NOT NULL DEFAULT 0
     ); CREATE TABLE IF NOT EXISTS direct_review_blob (
@@ -47,7 +54,19 @@ export class DirectProjectReview {
       project TEXT NOT NULL REFERENCES direct_review_project(id) ON DELETE CASCADE, revision TEXT NOT NULL, path TEXT NOT NULL,
       before_key TEXT NOT NULL, after_key TEXT NOT NULL, before_mode INTEGER NOT NULL, previous TEXT,
       state TEXT NOT NULL DEFAULT 'pending', undoing INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, revision)
-    )`);
+    ); CREATE TABLE IF NOT EXISTS direct_review_conversation_entry (
+      conversation_id TEXT NOT NULL,
+      project TEXT NOT NULL REFERENCES direct_review_project(id) ON DELETE CASCADE,
+      path TEXT NOT NULL,
+      before_key TEXT NOT NULL,
+      before_mode INTEGER NOT NULL,
+      after_key TEXT NOT NULL,
+      revision TEXT NOT NULL,
+      last_agent_id TEXT,
+      state TEXT NOT NULL DEFAULT 'pending',
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(conversation_id, path)
+    ); CREATE INDEX IF NOT EXISTS direct_review_conv_project_state ON direct_review_conversation_entry(project, conversation_id, state)`);
   }
 
   private guard(project: Project) {
@@ -227,7 +246,8 @@ export class DirectProjectReview {
     };
     const dirs = [''], seen = new Set<string>();
     let entries = 0;
-    while (dirs.length && !project.closed) {
+    let hitLimit = false;
+    while (dirs.length && !project.closed && !hitLimit) {
       const dir = dirs.pop()!;
       const folder = path.join(project.root, dir);
       if (path.relative(folder, await fs.promises.realpath(folder)) !== '') continue;
@@ -236,7 +256,7 @@ export class DirectProjectReview {
         if (excludedName(item.name)) continue;
         const relative = relativePath(dir ? `${dir}/${item.name}` : item.name);
         if (!relative || this.isAppData(project, relative)) continue;
-        if (++entries > entryLimit) throw fail('This project exceeds the file history limit. Only captured versions can be undone.');
+        if (++entries > entryLimit) { hitLimit = true; break; }
         if (entries % 100 === 0) {
           flushWrites();
           await new Promise<void>(resolve => setImmediate(resolve));
@@ -255,8 +275,8 @@ export class DirectProjectReview {
             if (project.closed) break;
             if (!old && next.digest === missing) continue;
             if (!old && project.tracked + pendingWrites.length >= entryLimit) {
-              project.issue = 'The project history limit was reached. Only captured versions can be undone.';
-              continue;
+              hitLimit = true;
+              break;
             }
             if (old?.digest === next.digest && old.stamp === next.stamp) continue;
             pendingWrites.push({ relative, old, next, seed });
@@ -270,7 +290,7 @@ export class DirectProjectReview {
     }
     flushWrites();
     if (project.closed) return;
-    if (!seed) {
+    if (!seed && !hitLimit) {
       for (const [relative, old] of headCache) {
         if (project.closed) break;
         if (old.digest !== missing && !seen.has(relative)) {
@@ -279,11 +299,33 @@ export class DirectProjectReview {
         }
       }
     }
-    if (seed && !project.issue) {
+    if (seed && !project.issue && !hitLimit) {
       this.db.prepare('UPDATE direct_review_project SET seeded=1 WHERE id=?').run(project.id);
       project.seeded = true;
     }
     this.trim(project);
+  }
+
+  async ensureBaseline(id: string, relativePaths: string[]) {
+    if (!relativePaths.length) return;
+    const project = this.projects.get(id) ?? await this.project(id).catch(() => undefined);
+    if (!project || project.closed) return;
+    const unique = [...new Set(relativePaths.map(item => relativePath(item)).filter((item): item is string => Boolean(item) && !this.isAppData(project, item!)))].slice(0, 64);
+    if (!unique.length) return;
+    await this.enqueue(project, async () => {
+      for (const relative of unique) {
+        if (project.closed) break;
+        if (this.head(project, relative)) continue;
+        try {
+          const snapshot = await this.readFile(project, relative);
+          if (project.closed) break;
+          this.db.transaction(() => {
+            this.storeBlob(project, snapshot);
+            this.writeHead(project, relative, snapshot, null);
+          })();
+        } catch { /* Ignore unreadable/transient files during lazy baseline capture. */ }
+      }
+    }).catch(() => {});
   }
 
   private commitObserved(project: Project, relative: string, old: Head | undefined, next: Snapshot, seed: boolean) {
@@ -303,6 +345,34 @@ export class DirectProjectReview {
     this.db.prepare('INSERT INTO direct_review_entry (project,revision,path,before_key,after_key,before_mode,previous) VALUES (?,?,?,?,?,?,?)')
       .run(project.id, revision, relative, before, next.digest, old?.mode ?? 0, old?.revision ?? null);
     this.writeHead(project, relative, next, revision);
+    if (!seed) {
+      const attribution = this.attributeChange?.(project.id, relative);
+      if (attribution?.conversationId) {
+        const now = new Date().toISOString();
+        const existing = this.db.prepare(
+          "SELECT * FROM direct_review_conversation_entry WHERE conversation_id = ? AND project = ? AND path = ? AND state = 'pending'"
+        ).get(attribution.conversationId, project.id, relative) as ConversationEntry | undefined;
+        if (existing) {
+          if (existing.before_key === next.digest) {
+            this.db.prepare('DELETE FROM direct_review_conversation_entry WHERE conversation_id = ? AND path = ?')
+              .run(attribution.conversationId, relative);
+          } else {
+            this.db.prepare(
+              'UPDATE direct_review_conversation_entry SET after_key = ?, revision = ?, last_agent_id = ?, updated_at = ? WHERE conversation_id = ? AND path = ?'
+            ).run(next.digest, revision, attribution.agentId ?? existing.last_agent_id, now, attribution.conversationId, relative);
+          }
+        } else {
+          this.db.prepare(`INSERT INTO direct_review_conversation_entry
+            (conversation_id, project, path, before_key, before_mode, after_key, revision, last_agent_id, state, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ON CONFLICT(conversation_id, path) DO UPDATE SET
+              project=excluded.project, before_key=excluded.before_key, before_mode=excluded.before_mode,
+              after_key=excluded.after_key, revision=excluded.revision, last_agent_id=excluded.last_agent_id,
+              state='pending', updated_at=excluded.updated_at`)
+            .run(attribution.conversationId, project.id, relative, before, old?.mode ?? 0, next.digest, revision, attribution.agentId ?? null, now);
+        }
+      }
+    }
   }
 
   private async observe(project: Project, relative: string, seed: boolean, skipUnchanged = false) {
@@ -324,11 +394,14 @@ export class DirectProjectReview {
   private trim(project: Project) {
     this.db.transaction(() => {
       this.db.prepare(`DELETE FROM direct_review_entry WHERE project=? AND undoing=0 AND revision NOT IN
-        (SELECT revision FROM direct_review_head WHERE project=? AND revision IS NOT NULL) AND rowid NOT IN
-        (SELECT rowid FROM direct_review_entry WHERE project=? ORDER BY rowid DESC LIMIT 1000)`).run(project.id, project.id, project.id);
+        (SELECT revision FROM direct_review_head WHERE project=? AND revision IS NOT NULL) AND revision NOT IN
+        (SELECT revision FROM direct_review_conversation_entry WHERE project=? AND state='pending') AND rowid NOT IN
+        (SELECT rowid FROM direct_review_entry WHERE project=? ORDER BY rowid DESC LIMIT 1000)`).run(project.id, project.id, project.id, project.id);
       this.db.prepare(`DELETE FROM direct_review_blob WHERE project=? AND digest NOT IN (SELECT digest FROM direct_review_head WHERE project=?)
-        AND digest NOT IN (SELECT before_key FROM direct_review_entry WHERE project=?) AND digest NOT IN (SELECT after_key FROM direct_review_entry WHERE project=?)`)
-        .run(project.id, project.id, project.id, project.id);
+        AND digest NOT IN (SELECT before_key FROM direct_review_entry WHERE project=?) AND digest NOT IN (SELECT after_key FROM direct_review_entry WHERE project=?)
+        AND digest NOT IN (SELECT before_key FROM direct_review_conversation_entry WHERE project=? AND state='pending')
+        AND digest NOT IN (SELECT after_key FROM direct_review_conversation_entry WHERE project=? AND state='pending')`)
+        .run(project.id, project.id, project.id, project.id, project.id, project.id);
       project.bytes = (this.db.prepare('SELECT COALESCE(SUM(length(bytes)),0) AS bytes FROM direct_review_blob WHERE project=?').get(project.id) as {bytes: number}).bytes;
     })();
   }
@@ -440,6 +513,94 @@ export class DirectProjectReview {
             this.db.transaction(() => {
               this.db.prepare("UPDATE direct_review_entry SET state='reverted',undoing=0 WHERE project=? AND revision=?").run(id, revision);
               this.writeHead(project, relative, { digest: entry.before_key, stamp: '', mode: entry.before_mode }, this.undoHead(project, entry));
+            })();
+          }
+          completed.push(relative);
+        } catch (error) { conflicts.push({ path: relative, reason: error instanceof Error ? error.message : 'Could not update this review.' }); }
+      }
+      project.gitAt = 0;
+      return { completed, conflicts };
+    });
+  }
+
+  clearConversation(conversationId: string) {
+    this.db.prepare('DELETE FROM direct_review_conversation_entry WHERE conversation_id = ?').run(conversationId);
+  }
+
+  async listForConversation(id: string, conversationId: string, refresh = false) {
+    const project = await this.project(id);
+    if (refresh) await this.enqueue(project, async () => {
+      try { await this.reconcile(project, false); }
+      catch { project.issue = 'Some files could not be refreshed. Only captured versions can be undone.'; }
+    });
+    this.guard(project);
+    const entries = this.db.prepare(`SELECT ce.*,
+      (ce.before_key='-' OR b.digest IS NOT NULL) AND (ce.after_key='-' OR a.digest IS NOT NULL) AS restorable
+      FROM direct_review_conversation_entry ce
+      LEFT JOIN direct_review_blob b ON b.project=ce.project AND b.digest=ce.before_key
+      LEFT JOIN direct_review_blob a ON a.project=ce.project AND a.digest=ce.after_key
+      WHERE ce.project=? AND ce.conversation_id=? AND ce.state='pending' ORDER BY ce.path`)
+      .all(id, conversationId) as Array<ConversationEntry & { restorable: number }>;
+    const files: Array<{ path: string; revision: string; status: string; state: State | 'project'; restorable: boolean; issue?: string; agentId?: string }> = entries.map(entry => ({
+      path: entry.path,
+      revision: entry.revision,
+      status: present(entry),
+      state: entry.state,
+      restorable: Boolean(entry.restorable) && entry.state !== 'reverted',
+      ...(entry.last_agent_id ? { agentId: entry.last_agent_id } : {}),
+      ...(entry.restorable ? {} : { issue: 'This version has no complete undo record.' }),
+    }));
+    return { mode: 'project' as const, files, preparing: false, notice: project.issue };
+  }
+
+  async previewForConversation(id: string, conversationId: string, relative: string, revision: string) {
+    const project = await this.project(id);
+    if (!relativePath(relative) || this.isAppData(project, relative)) throw fail('Invalid review file.', 400);
+    const ce = this.db.prepare(
+      'SELECT * FROM direct_review_conversation_entry WHERE conversation_id=? AND project=? AND path=? AND revision=?'
+    ).get(conversationId, project.id, relative, revision) as ConversationEntry | undefined;
+    if (ce) return this.textPreview(this.blob(project, ce.before_key), this.blob(project, ce.after_key));
+    const entry = this.entry(project, relative, revision);
+    if (!entry) throw fail('This file revision is unavailable.');
+    return this.textPreview(this.blob(project, entry.before_key), this.blob(project, entry.after_key));
+  }
+
+  async resolveForConversation(id: string, conversationId: string, action: 'approve' | 'undo', selection: Selection) {
+    if (!selection.length || selection.length > 200 || new Set(selection.map(file => file.path)).size !== selection.length) throw fail('Choose up to 200 different files.', 400);
+    const project = await this.project(id);
+    return this.enqueue(project, async () => {
+      const completed: string[] = [], conflicts: Array<{path: string; reason: string}> = [];
+      for (const { path: relative, revision } of selection) {
+        try {
+          this.guard(project);
+          if (!relativePath(relative) || this.isAppData(project, relative)) throw fail('Invalid review file.');
+          const ce = this.db.prepare(
+            "SELECT * FROM direct_review_conversation_entry WHERE conversation_id=? AND project=? AND path=? AND state='pending'"
+          ).get(conversationId, id, relative) as ConversationEntry | undefined;
+          if (!ce || ce.revision !== revision) throw fail('This revision is no longer current. Refresh and review the latest difference.');
+          if (action === 'approve') {
+            this.db.transaction(() => {
+              this.db.prepare('DELETE FROM direct_review_conversation_entry WHERE conversation_id=? AND project=? AND path=?')
+                .run(conversationId, id, relative);
+              this.db.prepare("UPDATE direct_review_entry SET state='approved', undoing=0 WHERE project=? AND revision=? AND state='pending'")
+                .run(id, revision);
+            })();
+          } else {
+            const disk = await this.readFile(project, relative);
+            this.guard(project);
+            if (disk.digest !== ce.after_key) throw fail('The file was edited after this revision. Your edits were kept.');
+            const before = this.blob(project, ce.before_key);
+            if (before === undefined || this.blob(project, ce.after_key) === undefined) throw fail('There is no complete undo record for this version.');
+            const value: FileBytes | null = before === null ? null : { bytes: before, mode: ce.before_mode };
+            this.db.prepare('UPDATE direct_review_entry SET undoing=1 WHERE project=? AND revision=?').run(id, revision);
+            replaceReviewedFile(project.root, relative, value, ce.after_key);
+            const currentEntry = this.entry(project, relative, revision);
+            this.db.transaction(() => {
+              this.db.prepare('DELETE FROM direct_review_conversation_entry WHERE conversation_id=? AND project=? AND path=?')
+                .run(conversationId, id, relative);
+              this.db.prepare("UPDATE direct_review_entry SET state='reverted', undoing=0 WHERE project=? AND revision=?").run(id, revision);
+              const nextRevision = currentEntry ? this.undoHead(project, currentEntry) : null;
+              this.writeHead(project, relative, { digest: ce.before_key, stamp: '', mode: ce.before_mode }, nextRevision === revision ? null : nextRevision);
             })();
           }
           completed.push(relative);
