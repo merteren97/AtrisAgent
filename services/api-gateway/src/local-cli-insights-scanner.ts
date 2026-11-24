@@ -63,15 +63,29 @@ function parseTsMs(value: unknown): number | null {
 }
 
 function readTextBounded(filePath: string, maxBytes = 8 * 1024 * 1024): string {
-  const stat = fs.statSync(filePath);
-  if (stat.size <= maxBytes) {
-    return fs.readFileSync(filePath, 'utf8');
-  }
   const fd = fs.openSync(filePath, 'r');
   try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0) return '';
+    if (stat.size <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(stat.size);
+      let offset = 0;
+      while (offset < stat.size) {
+        const read = fs.readSync(fd, buffer, offset, stat.size - offset, offset);
+        if (read <= 0) break;
+        offset += read;
+      }
+      return buffer.subarray(0, offset).toString('utf8');
+    }
     const buffer = Buffer.allocUnsafe(maxBytes);
-    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, stat.size - maxBytes);
-    const text = buffer.subarray(0, bytesRead).toString('utf8');
+    const startOffset = stat.size - maxBytes;
+    let offset = 0;
+    while (offset < maxBytes) {
+      const read = fs.readSync(fd, buffer, offset, maxBytes - offset, startOffset + offset);
+      if (read <= 0) break;
+      offset += read;
+    }
+    const text = buffer.subarray(0, offset).toString('utf8');
     const nl = text.indexOf('\n');
     return nl >= 0 ? text.slice(nl + 1) : text;
   } finally {
