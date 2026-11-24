@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           echo "Checking CI readiness for exact SHA $EXPECTED_SHA..."
           for i in $(seq 1 75); do
-            count="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&status=success&per_page=100" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length' | awk '{ total += $1 } END { print total + 0 }')"
+            count="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_SHA&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == env.EXPECTED_SHA and .status == "completed" and .conclusion == "success")] | length' | awk '{ total += $1 } END { print total + 0 }')"
             if [ "$count" -ge 1 ]; then
               echo "Exact SHA $EXPECTED_SHA has verified successful CI ($count runs)."
               exit 0
