@@ -106,7 +106,8 @@ test("release publishing stays owner-controlled and requires both desktop platfo
   assert.match(release, /echo "RELEASE_TAG=\$normalized_tag" >> "\$GITHUB_ENV"/, "canonical release tags must flow to later build and publish steps");
   assert.match(release, /group:\s*atris-agent-release\s*$/m, "only one release workflow may execute at a time regardless of input casing");
   assert.match(release, /environment:\s*production-release/, "publication must use the protected production environment");
-  assert.match(release, /actions\/workflows\/ci\.yml\/runs\?head_sha=\$EXPECTED_SHA&status=success/, "release readiness must require successful CI for the exact SHA");
+  assert.match(release, /actions\/workflows\/ci\.yml\/runs\?head_sha=\$EXPECTED_SHA/, "release readiness must query CI runs for the exact SHA");
+  assert.match(release, /select\(\.head_sha == env\.EXPECTED_SHA and \.status == "completed" and \.conclusion == "success"\)/, "release readiness must require completed successful CI for the exact SHA");
   assert.match(release, /ref:\s*\$\{\{ github\.sha \}\}/, "all jobs must checkout the automatic workflow SHA");
   assert.match(release, /EXPECTED_SHA:\s*\$\{\{ github\.sha \}\}/, "CI readiness must derive the SHA from the workflow revision");
   assert.match(release, /RELEASE_SHA:\s*\$\{\{ github\.sha \}\}/, "release tagging must derive its target from the workflow revision");
