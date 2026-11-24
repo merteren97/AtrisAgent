@@ -15,6 +15,7 @@ import type {
   CliProviderId,
   InsightsModeBreakdown,
   InsightsProviderBreakdown,
+  InsightsSourceScope,
   InsightsTimeRange,
   InsightsTopSession,
   InsightsUsageResponse,
@@ -28,6 +29,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { UsageLimitsSection } from './UsageLimitsSection';
 
 export const PROVIDER_ORDER: readonly CliProviderId[] = [
   'claude_code',
@@ -43,6 +45,11 @@ export const TIME_RANGE_OPTIONS: ReadonlyArray<{ value: InsightsTimeRange; label
   { value: '7d', label: '7d' },
   { value: '30d', label: '30d' },
   { value: 'all', label: 'All' },
+];
+
+export const SOURCE_SCOPE_OPTIONS: ReadonlyArray<{ value: InsightsSourceScope; label: string }> = [
+  { value: 'all', label: 'All local CLI' },
+  { value: 'atris', label: 'AtrisAgent' },
 ];
 
 export const PROVIDER_META: Record<
@@ -93,8 +100,27 @@ const SHORT_DATE_WITH_YEAR_FORMATTER = new Intl.DateTimeFormat('en-US', {
   year: 'numeric',
 });
 
-export function buildInsightsUsageUrl(range: InsightsTimeRange, workspaceId: string | null): string {
-  return `/insights/usage?range=${range}${workspaceId ? `&workspaceId=${encodeURIComponent(workspaceId)}` : ''}`;
+export interface BuildInsightsUsageUrlOptions {
+  sourceScope?: InsightsSourceScope;
+  provider?: CliProviderId | 'all';
+}
+
+export function buildInsightsUsageUrl(
+  range: InsightsTimeRange,
+  workspaceId: string | null,
+  options?: BuildInsightsUsageUrlOptions,
+): string {
+  const params = new URLSearchParams({ range });
+  if (workspaceId) {
+    params.set('workspaceId', workspaceId);
+  }
+  if (options?.sourceScope) {
+    params.set('sourceScope', options.sourceScope);
+  }
+  if (options?.provider && options.provider !== 'all') {
+    params.set('provider', options.provider);
+  }
+  return `/insights/usage?${params.toString()}`;
 }
 
 export function formatTokenCount(value: number | null | undefined): string {
@@ -324,6 +350,7 @@ function LoadingSkeleton() {
 export function AnalyticsDashboard() {
   const workspaces = useWorkspaceStore((state) => state.workspaces);
   const [range, setRange] = useState<InsightsTimeRange>('7d');
+  const [sourceScope, setSourceScope] = useState<InsightsSourceScope>('all');
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<CliProviderId | 'all'>('all');
   const [data, setData] = useState<InsightsUsageResponse | null>(null);
@@ -345,7 +372,10 @@ export function AnalyticsDashboard() {
       setError(null);
       try {
         const response = await apiRequest<InsightsUsageResponse>(
-          buildInsightsUsageUrl(range, workspaceId),
+          buildInsightsUsageUrl(range, workspaceId, {
+            sourceScope,
+            provider: selectedProvider,
+          }),
           { signal },
         );
         if (requestSeqRef.current !== requestId) return;
@@ -364,7 +394,7 @@ export function AnalyticsDashboard() {
         }
       }
     },
-    [range, workspaceId],
+    [range, workspaceId, sourceScope, selectedProvider],
   );
 
   useEffect(() => {
@@ -452,6 +482,32 @@ export function AnalyticsDashboard() {
 
             <div
               role="group"
+              aria-label="Source scope"
+              className="inline-flex h-8 items-center rounded-md border border-border/80 bg-muted/60 p-0.5"
+            >
+              {SOURCE_SCOPE_OPTIONS.map((option) => {
+                const active = sourceScope === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setSourceScope(option.value)}
+                    className={cn(
+                      'rounded-[5px] px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+                      active
+                        ? 'bg-background text-foreground shadow-xs'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div
+              role="group"
               aria-label="Time range"
               className="inline-flex h-8 items-center rounded-md border border-border/80 bg-muted/60 p-0.5"
             >
@@ -492,6 +548,9 @@ export function AnalyticsDashboard() {
             </Button>
           </div>
         </header>
+
+        {/* Plan Usage Limits */}
+        <UsageLimitsSection />
 
         {/* Inline Error Banner when stale data exists */}
         {error && data && (
@@ -1050,16 +1109,26 @@ export function AnalyticsDashboard() {
                         const providerMeta = session.provider === 'mixed' ? null : PROVIDER_META[session.provider];
                         const providerColor = providerMeta?.color;
                         const providerLabel = providerMeta?.label ?? 'Mixed CLIs';
+                        const isExternal = Boolean(session.external);
 
                         return (
                           <tr
                             key={session.itemKey}
-                            tabIndex={0}
-                            role="button"
-                            aria-label={`Open ${session.title || 'Untitled session'} in ${session.workspaceName}`}
-                            onClick={() => void navigateToActivityTarget(session.target)}
-                            onKeyDown={(event) => handleSessionKeyDown(event, session)}
-                            className="cursor-pointer transition-colors hover:bg-muted/40 focus-visible:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                            tabIndex={isExternal ? undefined : 0}
+                            role={isExternal ? undefined : 'button'}
+                            aria-label={
+                              isExternal
+                                ? undefined
+                                : `Open ${session.title || 'Untitled session'} in ${session.workspaceName}`
+                            }
+                            onClick={isExternal ? undefined : () => void navigateToActivityTarget(session.target)}
+                            onKeyDown={isExternal ? undefined : (event) => handleSessionKeyDown(event, session)}
+                            className={cn(
+                              'transition-colors',
+                              isExternal
+                                ? 'hover:bg-muted/20'
+                                : 'cursor-pointer hover:bg-muted/40 focus-visible:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+                            )}
                           >
                             <td className="max-w-[320px] px-4 py-2.5">
                               <div className="flex items-center gap-2.5">
@@ -1092,9 +1161,16 @@ export function AnalyticsDashboard() {
                               </div>
                             </td>
                             <td className="px-3 py-2.5 whitespace-nowrap">
-                              <Badge variant="outline" className="text-[10px] font-medium">
-                                {modeMeta.label}
-                              </Badge>
+                              <div className="flex items-center gap-1.5">
+                                <Badge variant="outline" className="text-[10px] font-medium">
+                                  {modeMeta.label}
+                                </Badge>
+                                {isExternal && (
+                                  <Badge variant="secondary" className="text-[10px] font-medium">
+                                    Local CLI
+                                  </Badge>
+                                )}
+                              </div>
                             </td>
                             <td className="px-3 py-2.5 text-right tabular-nums text-muted-foreground">
                               {session.usageAvailable ? formatTokenCount(session.inputTokens) : '—'}

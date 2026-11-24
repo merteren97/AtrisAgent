@@ -47,6 +47,7 @@ export function isLocalDataRequest(req: Request, runtimeToken?: string): boolean
     ['PATCH', /^\/api\/activity\/rename$/],
     ['POST', /^\/api\/activity\/clear-completed$/],
     ['GET', /^\/api\/insights\/usage$/],
+    ['GET', /^\/api\/insights\/usage-limits$/],
   ];
   return routes.some(([methods, pattern]) => methods.split('|').includes(method) && pattern.test(pathname));
 }

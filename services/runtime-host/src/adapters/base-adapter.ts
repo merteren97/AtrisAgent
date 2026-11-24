@@ -77,6 +77,7 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
   protected stderrBuffers: Map<string, string> = new Map();
   private cancelledSessions = new Set<string>();
   private reportedUsage = new Map<string, UsageSnapshot>();
+  private reportedUsageByMessage = new Map<string, Map<string, UsageSnapshot>>();
 
   constructor(eventBus?: LocalEventBus) {
     this.eventBus = eventBus;
@@ -181,14 +182,32 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
     const reported = this.reportedUsage.get(sessionId);
     if (reported) {
       this.reportedUsage.delete(sessionId);
+      this.reportedUsageByMessage.delete(sessionId);
       return reported;
     }
+    this.reportedUsageByMessage.delete(sessionId);
     return this.discoverUsage(sessionId);
   }
 
-  protected recordProviderUsage(sessionId: string, payload: unknown): void {
+  protected recordProviderUsage(
+    sessionId: string,
+    payload: unknown,
+    options?: { accumulate?: boolean; messageId?: string },
+  ): void {
     const usage = providerUsageFromPayload(payload);
-    if (usage) this.reportedUsage.set(sessionId, usage);
+    if (!usage) return;
+    if (!options?.accumulate) {
+      this.reportedUsage.set(sessionId, usage);
+      return;
+    }
+    let byMessage = this.reportedUsageByMessage.get(sessionId);
+    if (!byMessage) {
+      byMessage = new Map<string, UsageSnapshot>();
+      this.reportedUsageByMessage.set(sessionId, byMessage);
+    }
+    const key = options.messageId ? `msg:${options.messageId}` : `anon:${byMessage.size + 1}`;
+    byMessage.set(key, usage);
+    this.reportedUsage.set(sessionId, sumUsageSnapshots(byMessage.values()));
   }
 
   // 6. Session Lifecycle
@@ -226,6 +245,8 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
       this.activeProcesses.delete(sessionId);
     }
     this.activeSessions.delete(sessionId);
+    this.reportedUsage.delete(sessionId);
+    this.reportedUsageByMessage.delete(sessionId);
   }
 
   async cancelRun(runId: string): Promise<void> {
@@ -239,6 +260,8 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
     }
     this.activeProcesses.clear();
     this.activeSessions.clear();
+    this.reportedUsage.clear();
+    this.reportedUsageByMessage.clear();
   }
 
   async openDeveloperConsole(_sessionId: string): Promise<void> {
@@ -247,6 +270,48 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
 
   // CLI Process Helper for child-process-based adapters
   abstract spawnAgent(options: SpawnAgentOptions): Promise<AgentSession>;
+}
+
+function sumUsageSnapshots(snapshots: Iterable<UsageSnapshot>): UsageSnapshot {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedTokens = 0;
+  let hasCached = false;
+  let reasoningTokens = 0;
+  let hasReasoning = false;
+  let totalCost = 0;
+  let hasCost = false;
+  let currency = '';
+  let timestamp = new Date().toISOString();
+
+  for (const snap of snapshots) {
+    inputTokens += snap.inputTokens;
+    outputTokens += snap.outputTokens;
+    if (snap.cachedTokens !== undefined) {
+      cachedTokens += snap.cachedTokens;
+      hasCached = true;
+    }
+    if (snap.reasoningTokens !== undefined) {
+      reasoningTokens += snap.reasoningTokens;
+      hasReasoning = true;
+    }
+    if (snap.totalCost !== null) {
+      totalCost += snap.totalCost;
+      hasCost = true;
+    }
+    if (snap.currency) currency = snap.currency;
+    if (snap.timestamp) timestamp = snap.timestamp;
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    ...(hasCached ? { cachedTokens } : {}),
+    ...(hasReasoning ? { reasoningTokens } : {}),
+    totalCost: hasCost ? totalCost : null,
+    currency,
+    timestamp,
+  };
 }
 
 function providerUsageFromPayload(payload: unknown): UsageSnapshot | null {
@@ -258,11 +323,24 @@ function providerUsageFromPayload(payload: unknown): UsageSnapshot | null {
     const input = finiteNumber(usage.input_tokens, usage.inputTokens, usage.prompt_tokens, usage.promptTokens, usage.input);
     const output = finiteNumber(usage.output_tokens, usage.outputTokens, usage.completion_tokens, usage.completionTokens, usage.output);
     if (input === undefined && output === undefined) continue;
+
+    const cacheRead = finiteNumber(usage.cache_read_input_tokens, usage.cacheReadInputTokens, usage.cache?.read);
+    const cacheWrite = finiteNumber(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens, usage.cache?.write);
+    const directCached = finiteNumber(usage.cached_input_tokens, usage.cachedTokens);
+    const cached = (cacheRead !== undefined || cacheWrite !== undefined)
+      ? Math.max(0, (cacheRead || 0) + (cacheWrite || 0))
+      : directCached !== undefined
+        ? Math.max(0, directCached)
+        : undefined;
+
+    const reasoning = finiteNumber(usage.reasoning_output_tokens, usage.reasoningTokens, usage.reasoning_tokens, usage.reasoning);
     const cost = finiteNumber(root.total_cost_usd, root.totalCostUsd, usage.total_cost, usage.totalCost, usage.cost, root.cost);
     const currency = stringValue(usage.currency, root.currency) || (root.total_cost_usd != null || root.totalCostUsd != null ? 'USD' : '');
     return {
       inputTokens: Math.max(0, input || 0),
       outputTokens: Math.max(0, output || 0),
+      ...(cached !== undefined ? { cachedTokens: cached } : {}),
+      ...(reasoning !== undefined ? { reasoningTokens: Math.max(0, reasoning) } : {}),
       totalCost: cost === undefined ? null : Math.max(0, cost),
       currency,
       timestamp: new Date().toISOString(),

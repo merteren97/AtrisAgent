@@ -108,7 +108,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       // Codex exec approvals must be configured before launch; this adapter
       // cannot answer an in-flight approval request.
       interactiveApproval: false,
-      usageInfo: false,
+      usageInfo: /--json\b/.test(execHelp),
       cancellation: true,
       worktreeAwareness: true,
       headlessAuth: /device-auth|with-api-key|with-access-token/.test(help),
@@ -528,10 +528,10 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       return;
     }
     if (event.type === 'turn.completed') {
-      this.recordProviderUsage(sessionId, event);
+      this.recordProviderUsage(sessionId, event, { accumulate: true });
       this.emitCompleted(sessionId, this.finalMessages.get(sessionId) || 'Codex turn completed');
     } else if (event.type === 'turn.failed' || event.type === 'error') {
-      this.recordProviderUsage(sessionId, event);
+      this.recordProviderUsage(sessionId, event, { accumulate: true });
       this.emitFailure(sessionId, event.error?.message || event.message || 'Codex turn failed');
     }
   }

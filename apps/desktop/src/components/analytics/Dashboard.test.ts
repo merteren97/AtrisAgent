@@ -22,6 +22,18 @@ assert.equal(
   '/insights/usage?range=30d&workspaceId=ws-alpha%2F1',
 );
 assert.equal(buildInsightsUsageUrl('all', 'ws-2'), '/insights/usage?range=all&workspaceId=ws-2');
+assert.equal(
+  buildInsightsUsageUrl('7d', null, { sourceScope: 'all', provider: 'all' }),
+  '/insights/usage?range=7d&sourceScope=all',
+);
+assert.equal(
+  buildInsightsUsageUrl('30d', 'ws-1', { sourceScope: 'atris', provider: 'opencode' }),
+  '/insights/usage?range=30d&workspaceId=ws-1&sourceScope=atris&provider=opencode',
+);
+assert.equal(
+  buildInsightsUsageUrl('today', null, { provider: 'codex' }),
+  '/insights/usage?range=today&provider=codex',
+);
 
 // formatTokenCount
 assert.equal(formatTokenCount(0), '0');

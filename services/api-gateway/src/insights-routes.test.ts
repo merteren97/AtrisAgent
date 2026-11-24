@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
@@ -11,6 +12,7 @@ import type { RuntimeTelemetry } from '@atris-agent-code/event-schema';
 import { RuntimeHostV2, type RuntimeHost, type SpawnAgentOptions } from '@atris-agent-code/runtime-host';
 import type { InsightsUsageResponse } from './activity-types';
 import { installInsightsRoutes, recordPlanningTurnTelemetry } from './insights-routes';
+import { LocalCliInsightsScanner } from './local-cli-insights-scanner';
 import { ManualAntigravityBridge } from './manual-antigravity-bridge';
 import { ManualConversationStore, type ManualAgent } from './manual-conversations';
 import { ManualProviderBridge } from './manual-provider-bridge';
@@ -556,6 +558,314 @@ async function runTests(): Promise<void> {
     assert.equal(ws2Data.workspaceId, 'ws-2');
     assert.equal(ws2Data.totals.totalRuns, 2);
     assert.equal(ws2Data.totals.totalTokens, 130 + 1200);
+
+    // 5. Additional tests: OpenCode SQLite (message JSON + session fallback), Codex state_5.sqlite fallback,
+    //    Antigravity full token extraction, ?provider= filtering past top-25 truncation, and LocalCliInsightsScanner.
+
+    // 5a. OpenCode SQLite (opencode.db) with message JSON rows
+    const ocDbCfg = path.join(tempDir, 'oc-db-cfg');
+    const ocDbDir = path.join(ocDbCfg, 'data', 'opencode');
+    fs.mkdirSync(ocDbDir, { recursive: true });
+    const ocDbPath = path.join(ocDbDir, 'opencode.db');
+    const ocDb = new Database(ocDbPath);
+    ocDb.exec(`
+      CREATE TABLE session (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        directory TEXT,
+        time_created INTEGER,
+        time_updated INTEGER,
+        tokens_input INTEGER DEFAULT 0,
+        tokens_output INTEGER DEFAULT 0,
+        tokens_reasoning INTEGER DEFAULT 0,
+        tokens_cache_read INTEGER DEFAULT 0,
+        tokens_cache_write INTEGER DEFAULT 0,
+        cost REAL
+      );
+      CREATE TABLE message (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        time_created INTEGER,
+        time_updated INTEGER,
+        data TEXT NOT NULL
+      );
+    `);
+    const ocDbSessId = 'ses_sqlite_msg';
+    const ocDbFallbackSessId = 'ses_sqlite_fallback';
+    const t0 = todayMid.getTime();
+    ocDb.prepare('INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(
+      ocDbSessId, 'SQLite Msg Session', wsOneDir, t0, t0 + 10_000,
+    );
+    ocDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+      'm_1', ocDbSessId, t0, t0 + 5_000,
+      JSON.stringify({
+        role: 'assistant',
+        cost: 0.04,
+        time: { created: t0, completed: t0 + 5_000 },
+        tokens: { input: 110, output: 45, reasoning: 15, cache: { read: 20, write: 5 } },
+      }),
+    );
+    ocDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+      'm_2', ocDbSessId, t0 + 6_000, t0 + 10_000,
+      JSON.stringify({
+        role: 'assistant',
+        cost: 0.02,
+        time: { created: t0 + 6_000, completed: t0 + 10_000 },
+        tokens: { input: 90, output: 30, reasoning: 5, cache: { read: 10, write: 0 } },
+      }),
+    );
+    // Session-level fallback row (no message rows)
+    ocDb.prepare(
+      'INSERT INTO session (id, title, directory, time_created, time_updated, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(ocDbFallbackSessId, 'SQLite Fallback Session', wsTwoDir, t0, t0 + 7_000, 300, 75, 12, 30, 8, 0.09);
+    ocDb.close();
+
+    const ocDbAgent: ManualAgent = {
+      ...ocAgent,
+      id: randomUUID(),
+      providerSessionId: ocDbSessId,
+      configDir: ocDbCfg,
+      sharedProfile: false,
+    };
+    const ocDbUsage = bridge.agentUsageSummary(ocDbAgent);
+    assert.equal(ocDbUsage.inputTokens, 200);
+    assert.equal(ocDbUsage.outputTokens, 75);
+    assert.equal(ocDbUsage.reasoningTokens, 20);
+    assert.equal(ocDbUsage.cachedTokens, 35);
+    assert.equal(ocDbUsage.turnCount, 2);
+    assert.equal(ocDbUsage.durationMs, 10_000);
+    assert.equal(ocDbUsage.usageAvailable, true);
+
+    const ocDbFallbackAgent: ManualAgent = {
+      ...ocAgent,
+      id: randomUUID(),
+      providerSessionId: ocDbFallbackSessId,
+      configDir: ocDbCfg,
+      sharedProfile: false,
+    };
+    const ocDbFallbackUsage = bridge.agentUsageSummary(ocDbFallbackAgent);
+    assert.equal(ocDbFallbackUsage.inputTokens, 300);
+    assert.equal(ocDbFallbackUsage.outputTokens, 75);
+    assert.equal(ocDbFallbackUsage.reasoningTokens, 12);
+    assert.equal(ocDbFallbackUsage.cachedTokens, 38);
+    assert.equal(ocDbFallbackUsage.durationMs, 7_000);
+    assert.equal(ocDbFallbackUsage.usageAvailable, true);
+
+    // 5b. Codex fallback via state_5.sqlite when bindings.jsonl is absent
+    const codexSqliteCfg = path.join(tempDir, 'codex-sqlite-cfg');
+    fs.mkdirSync(codexSqliteCfg, { recursive: true });
+    const codexFallbackSessId = randomUUID();
+    const codexFallbackRollout = path.join(codexSqliteCfg, 'rollout-fallback.jsonl');
+    fs.writeFileSync(
+      codexFallbackRollout,
+      [
+        { timestamp: twoDaysAgo.toISOString(), type: 'session_meta', payload: { id: codexFallbackSessId, cwd: wsOneDir } },
+        { timestamp: new Date(twoDaysAgo.getTime() + 4000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 140, cached_input_tokens: 25, output_tokens: 55, reasoning_output_tokens: 10 } } } },
+        { timestamp: new Date(twoDaysAgo.getTime() + 6000).toISOString(), type: 'event_msg', payload: { type: 'task_complete' } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+    const codexStateDb = new Database(path.join(codexSqliteCfg, 'state_5.sqlite'));
+    codexStateDb.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        cwd TEXT,
+        rollout_path TEXT,
+        tokens_used INTEGER,
+        created_at INTEGER,
+        updated_at INTEGER
+      );
+    `);
+    codexStateDb.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      codexFallbackSessId, 'Codex SQLite Fallback', wsOneDir, codexFallbackRollout, 230, twoDaysAgo.getTime(), twoDaysAgo.getTime() + 6000,
+    );
+    codexStateDb.close();
+
+    const codexFallbackAgent: ManualAgent = {
+      ...codexAgent,
+      id: randomUUID(),
+      providerSessionId: codexFallbackSessId,
+      configDir: codexSqliteCfg,
+      sharedProfile: false,
+    };
+    const codexFallbackUsage = bridge.agentUsageSummary(codexFallbackAgent);
+    assert.equal(codexFallbackUsage.inputTokens, 140);
+    assert.equal(codexFallbackUsage.cachedTokens, 25);
+    assert.equal(codexFallbackUsage.outputTokens, 55);
+    assert.equal(codexFallbackUsage.reasoningTokens, 10);
+    assert.equal(codexFallbackUsage.durationMs, 6000);
+    assert.equal(codexFallbackUsage.usageAvailable, true);
+
+    // 5c. Antigravity full token extraction (input_tokens, output_tokens, cache_read_tokens, thinking_tokens, durationMs)
+    const agFullAgentId = randomUUID();
+    const agFullSessionId = randomUUID();
+    const agFullAgent: ManualAgent = {
+      ...agAgent,
+      id: agFullAgentId,
+      providerSessionId: agFullSessionId,
+    };
+    const agFullArgs = agBridge.prepare(agFullAgent);
+    fs.appendFileSync(agFullArgs[1], `INFO Created conversation ${agFullSessionId}\n`);
+    const agFullTranscript = path.join(agRoot, 'brain', agFullSessionId, '.system_generated', 'logs', 'transcript_full.jsonl');
+    fs.mkdirSync(path.dirname(agFullTranscript), { recursive: true });
+    fs.writeFileSync(
+      agFullTranscript,
+      [
+        { step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Full tokens test', created_at: new Date(t0).toISOString() },
+        { step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', input_tokens: 500, output_tokens: 120, cache_read_tokens: 80, thinking_tokens: 35, content: 'Response', created_at: new Date(t0 + 8500).toISOString() },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+    const agFullUsage = bridge.agentUsageSummary(agFullAgent);
+    assert.equal(agFullUsage.inputTokens, 500);
+    assert.equal(agFullUsage.outputTokens, 120);
+    assert.equal(agFullUsage.cachedTokens, 80);
+    assert.equal(agFullUsage.reasoningTokens, 35);
+    assert.equal(agFullUsage.durationMs, 8500);
+    assert.equal(agFullUsage.usageAvailable, true);
+
+    // 5d. ?provider= filtering past top-25 truncation + sourceScope=all vs sourceScope=atris
+    const scanRootsDir = path.join(tempDir, 'scan-roots');
+    const scanXdg = path.join(scanRootsDir, 'xdg');
+    const scanCodex = path.join(scanRootsDir, 'codex');
+    const scanAg = path.join(scanRootsDir, 'ag');
+    const scanClaude = path.join(scanRootsDir, 'claude');
+    fs.mkdirSync(path.join(scanXdg, 'opencode'), { recursive: true });
+    fs.mkdirSync(path.join(scanCodex, 'sessions'), { recursive: true });
+    fs.mkdirSync(scanAg, { recursive: true });
+    fs.mkdirSync(path.join(scanClaude, 'projects', 'p1'), { recursive: true });
+
+    // Create 30 high-token external OpenCode sessions + 1 low-token external Codex session
+    const scanOcDb = new Database(path.join(scanXdg, 'opencode', 'opencode.db'));
+    scanOcDb.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL);
+    `);
+    for (let i = 0; i < 30; i++) {
+      const sid = `ext-oc-${i}`;
+      scanOcDb.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?)').run(sid, `Ext OC ${i}`, wsOneDir, t0, t0 + 1000);
+      scanOcDb.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)').run(
+        `ext-msg-${i}`, sid, t0, t0 + 1000,
+        JSON.stringify({ role: 'assistant', tokens: { input: 5000 + i, output: 500, reasoning: 0, cache: { read: 0, write: 0 } } }),
+      );
+    }
+    scanOcDb.close();
+
+    // External Codex session in ws-2 + duplicate of codexSessId (which MUST be deduplicated)
+    const extCodexId = randomUUID();
+    fs.writeFileSync(
+      path.join(scanCodex, 'sessions', 'ext-codex.jsonl'),
+      [
+        { timestamp: todayMid.toISOString(), type: 'session_meta', payload: { id: extCodexId, cwd: wsTwoDir } },
+        { timestamp: new Date(t0 + 2000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 40, cached_input_tokens: 0, output_tokens: 10, reasoning_output_tokens: 0 } } } },
+        { timestamp: new Date(t0 + 3000).toISOString(), type: 'event_msg', payload: { type: 'task_complete' } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+    fs.writeFileSync(
+      path.join(scanCodex, 'sessions', 'dup-codex.jsonl'),
+      [
+        { timestamp: todayMid.toISOString(), type: 'session_meta', payload: { id: codexSessId, cwd: wsOneDir } },
+        { timestamp: new Date(t0 + 2000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 999999, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } } } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+
+    // Bound Codex session ID differing from codexAgent.providerSessionId must also be deduplicated via boundSessionIds
+    const boundSecondCodexId = randomUUID();
+    const boundSecondRollout = path.join(codexCfg, 'rollout-bound-second.jsonl');
+    fs.writeFileSync(
+      boundSecondRollout,
+      [
+        { timestamp: twoDaysAgo.toISOString(), type: 'session_meta', payload: { id: boundSecondCodexId, cwd: wsOneDir } },
+        { timestamp: new Date(twoDaysAgo.getTime() + 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } } } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+    bridge.bindCodexRuntime(codexAgent, boundSecondCodexId, boundSecondRollout);
+    fs.writeFileSync(
+      path.join(scanCodex, 'sessions', 'dup-bound-second.jsonl'),
+      [
+        { timestamp: todayMid.toISOString(), type: 'session_meta', payload: { id: boundSecondCodexId, cwd: wsOneDir } },
+        { timestamp: new Date(t0 + 2000).toISOString(), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 888888, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 } } } },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+
+    // Antigravity external session with percent-encoded file:/// drive URI in workspace_uris
+    const extAgId = randomUUID();
+    const extAgTranscript = path.join(scanAg, 'brain', extAgId, '.system_generated', 'logs', 'transcript.jsonl');
+    fs.mkdirSync(path.dirname(extAgTranscript), { recursive: true });
+    fs.writeFileSync(
+      extAgTranscript,
+      [
+        { step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'URI test', created_at: new Date(t0).toISOString() },
+        { step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', input_tokens: 60, output_tokens: 20, content: 'Ok', created_at: new Date(t0 + 1000).toISOString() },
+      ].map((r) => JSON.stringify(r)).join('\n') + '\n',
+    );
+    const encodedWsTwoUri = pathToFileURL(wsTwoDir).href.replace(/^file:\/\/\/([A-Za-z]):/, (_, drive) => `file:///${drive.toLowerCase()}%3A`);
+    const scanAgDb = new Database(path.join(scanAg, 'conversation_summaries.db'));
+    scanAgDb.exec('CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, last_modified_time INTEGER)');
+    scanAgDb.prepare('INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)').run(
+      extAgId, 'Encoded URI AG', JSON.stringify([encodedWsTwoUri]), t0 + 1000,
+    );
+    scanAgDb.close();
+
+    const scanner = new LocalCliInsightsScanner({
+      xdgDataHome: scanXdg,
+      codexHome: scanCodex,
+      antigravityRoot: scanAg,
+      claudeConfigDir: scanClaude,
+    });
+    const scanApp = express();
+    scanApp.use(express.json());
+    installInsightsRoutes(scanApp, {
+      sqlite,
+      manualConversationStore: manualStore,
+      localCliScanner: scanner,
+    });
+    const scanServer = scanApp.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => scanServer.once('listening', resolve));
+    const scanUrl = `http://127.0.0.1:${(scanServer.address() as AddressInfo).port}`;
+
+    try {
+      // sourceScope=atris excludes external sessions
+      const atrisOnlyRes = await fetch(`${scanUrl}/api/insights/usage?range=all&sourceScope=atris`);
+      assert.equal(atrisOnlyRes.status, 200);
+      const atrisOnly = (await atrisOnlyRes.json()) as InsightsUsageResponse;
+      assert.equal(atrisOnly.sourceScope, 'atris');
+      assert.equal(atrisOnly.totals.totalTokens, allData.totals.totalTokens + 15);
+
+      // Default with scanner (sourceScope=all) includes external sessions, deduplicates codexSessId,
+      // and ?provider=codex returns external + manual Codex sessions even though 30 OpenCode sessions have higher tokens!
+      const codexFilteredRes = await fetch(`${scanUrl}/api/insights/usage?range=all&provider=codex`);
+      assert.equal(codexFilteredRes.status, 200);
+      const codexFiltered = (await codexFilteredRes.json()) as InsightsUsageResponse;
+      assert.equal(codexFiltered.sourceScope, 'all');
+      assert.ok(codexFiltered.topSessions.every((s) => s.provider === 'codex'));
+      const extCodexRow = codexFiltered.topSessions.find((s) => s.itemKey === `external:codex:${extCodexId}`);
+      assert.ok(extCodexRow, 'Low-token Codex session must be returned when ?provider=codex is set');
+      assert.equal(extCodexRow.external, true);
+      assert.equal(extCodexRow.workspaceId, 'ws-2');
+      assert.equal(
+        codexFiltered.topSessions.some((s) => s.itemKey === `external:codex:${codexSessId}`),
+        false,
+        'AtrisAgent manual session must be deduplicated from external scan',
+      );
+      assert.equal(
+        codexFiltered.topSessions.some((s) => s.itemKey === `external:codex:${boundSecondCodexId}`),
+        false,
+        'Bound CLI session ID differing from providerSessionId must be deduplicated via boundSessionIds',
+      );
+
+      // Workspace filter on sourceScope=all only includes external sessions matching that workspace
+      const ws2ExtRes = await fetch(`${scanUrl}/api/insights/usage?range=all&workspaceId=ws-2&sourceScope=all`);
+      const ws2Ext = (await ws2ExtRes.json()) as InsightsUsageResponse;
+      assert.equal(ws2Ext.topSessions.some((s) => s.itemKey.startsWith('external:opencode:')), false);
+      assert.equal(ws2Ext.topSessions.some((s) => s.itemKey === `external:codex:${extCodexId}`), true);
+      assert.equal(
+        ws2Ext.topSessions.some((s) => s.itemKey === `external:antigravity:${extAgId}`),
+        true,
+        'Percent-encoded file:/// URI in workspace_uris must match workspace path',
+      );
+    } finally {
+      await new Promise<void>((resolve, reject) => scanServer.close((err) => (err ? reject(err) : resolve())));
+    }
 
     console.log('Insights routes tests passed.');
   } finally {

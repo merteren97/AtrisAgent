@@ -41,6 +41,8 @@ export type ApprovalDecision = 'approved' | 'rejected' | 'modified';
 export interface UsageSnapshot {
   inputTokens: number;
   outputTokens: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
   totalCost: number | null;
   currency: string;
   timestamp: string;

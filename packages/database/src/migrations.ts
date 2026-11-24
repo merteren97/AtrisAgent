@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 22;
+export const DATABASE_SCHEMA_VERSION = 23;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -581,5 +581,17 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
       sqlite.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_mission_type ON artifacts(mission_id, type)');
     }
     sqlite.exec('PRAGMA user_version = 22');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 23) sqlite.transaction(() => {
+    if (hasTable(sqlite, 'runtime_telemetry')) {
+      if (!hasColumn(sqlite, 'runtime_telemetry', 'cached_tokens')) {
+        sqlite.exec('ALTER TABLE runtime_telemetry ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0');
+      }
+      if (!hasColumn(sqlite, 'runtime_telemetry', 'reasoning_tokens')) {
+        sqlite.exec('ALTER TABLE runtime_telemetry ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0');
+      }
+    }
+    sqlite.exec('PRAGMA user_version = 23');
   })();
 }

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type Database from 'better-sqlite3';
 import type { Application, Request, Response } from 'express';
 import type {
@@ -7,12 +8,14 @@ import type {
   InsightsDailyPoint,
   InsightsModeBreakdown,
   InsightsProviderBreakdown,
+  InsightsSourceScope,
   InsightsTimeRange,
   InsightsTopSession,
   InsightsUsageResponse,
 } from './activity-types';
 import { ensureActivityTables } from './activity-routes';
-import type { ManualConversationStore } from './manual-conversations';
+import type { LocalCliInsightsScanner } from './local-cli-insights-scanner';
+import type { ManualAgent, ManualConversationStore } from './manual-conversations';
 import type { PlanningTurnTelemetry } from './planning-chat';
 
 export interface InsightsRoutesDependencies {
@@ -20,7 +23,10 @@ export interface InsightsRoutesDependencies {
   manualConversationStore: Pick<
     ManualConversationStore,
     'listAllConversations' | 'agentUsageSummary'
-  >;
+  > & {
+    boundSessionIds?: (agent: ManualAgent) => string[];
+  };
+  localCliScanner?: LocalCliInsightsScanner;
 }
 
 const PROVIDERS: ReadonlyArray<{ id: CliProviderId; label: string }> = [
@@ -37,6 +43,34 @@ function hasTable(sqlite: Database.Database, name: string): boolean {
     .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(name);
   return Boolean(row);
+}
+
+function tableColumns(sqlite: Database.Database, table: string): Set<string> {
+  const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+  return new Set(rows.map((r) => r.name).filter((n): n is string => Boolean(n)));
+}
+
+function normalizeFsPath(rawPath: string): string {
+  const resolved = path.resolve(rawPath).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function matchWorkspaceForDirectory(
+  directory: string | null | undefined,
+  workspaces: Array<{ id: string; name: string; normPath: string }>,
+): { id: string; name: string } | null {
+  if (!directory || !directory.trim()) return null;
+  const normDir = normalizeFsPath(directory.trim());
+  let best: { id: string; name: string; normPath: string } | null = null;
+  for (const ws of workspaces) {
+    if (!ws.normPath) continue;
+    if (normDir === ws.normPath || normDir.startsWith(`${ws.normPath}${path.sep}`)) {
+      if (!best || ws.normPath.length > best.normPath.length) {
+        best = ws;
+      }
+    }
+  }
+  return best ? { id: best.id, name: best.name } : null;
 }
 
 export function normalizeCliProvider(raw: unknown): CliProviderId | null {
@@ -76,7 +110,7 @@ export function recordPlanningTurnTelemetry(
         (id, workspace_id, mode, item_key, title, provider, model, outcome,
          usage_available, input_tokens, output_tokens, cached_tokens, reasoning_tokens,
          cost_usd, duration_ms, recorded_at)
-       VALUES (?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+       VALUES (?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       `planning:${entry.turnId}`,
@@ -89,6 +123,7 @@ export function recordPlanningTurnTelemetry(
       entry.usageAvailable ? 1 : 0,
       Math.max(0, Math.round(entry.inputTokens)),
       Math.max(0, Math.round(entry.outputTokens)),
+      Math.max(0, Math.round(entry.cachedTokens || 0)),
       Math.max(0, Math.round(entry.reasoningTokens)),
       entry.totalCost == null ? null : Math.max(0, Number(entry.totalCost) || 0),
       Math.max(0, Math.round(entry.durationMs)),
@@ -114,18 +149,26 @@ interface SessionAccumulator {
   usageAvailable: boolean;
   recordedAt: string;
   target: ActivityTarget;
+  external?: boolean;
 }
 
 export function buildInsightsUsage(
   deps: InsightsRoutesDependencies,
-  options: { range: InsightsTimeRange; workspaceId: string | null; nowMs?: number },
+  options: {
+    range: InsightsTimeRange;
+    workspaceId: string | null;
+    provider?: CliProviderId | null;
+    sourceScope?: InsightsSourceScope;
+    nowMs?: number;
+  },
 ): InsightsUsageResponse {
-  const { sqlite, manualConversationStore } = deps;
+  const { sqlite, manualConversationStore, localCliScanner } = deps;
   ensureActivityTables(sqlite);
 
   const nowMs = options.nowMs ?? Date.now();
   const cutoff = rangeCutoffIso(options.range, nowMs);
   const workspaceId = options.workspaceId;
+  const sourceScope: InsightsSourceScope = options.sourceScope ?? (localCliScanner ? 'all' : 'atris');
 
   const providerMap = new Map<CliProviderId, InsightsProviderBreakdown>(
     PROVIDERS.map(({ id, label }) => [
@@ -199,6 +242,7 @@ export function buildInsightsUsage(
     usageAvailable: boolean;
     recordedAt: string;
     target: ActivityTarget;
+    external?: boolean;
   }): void => {
     const input = Math.max(0, Math.round(entry.inputTokens));
     const output = Math.max(0, Math.round(entry.outputTokens));
@@ -275,6 +319,7 @@ export function buildInsightsUsage(
         usageAvailable: entry.usageAvailable,
         recordedAt: entry.recordedAt,
         target: entry.target,
+        ...(entry.external ? { external: true } : {}),
       };
       sessions.set(entry.itemKey, acc);
     } else {
@@ -289,6 +334,7 @@ export function buildInsightsUsage(
       acc.turnCount += entry.turnCount;
       acc.usageAvailable = acc.usageAvailable || entry.usageAvailable;
       if (entry.recordedAt > acc.recordedAt) acc.recordedAt = entry.recordedAt;
+      if (entry.external) acc.external = true;
     }
   };
 
@@ -306,11 +352,15 @@ export function buildInsightsUsage(
     }
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const hasAgentInstances = hasTable(sqlite, 'agent_instances');
+    const rtCols = tableColumns(sqlite, 'runtime_telemetry');
+    const cachedSelect = rtCols.has('cached_tokens') ? 'rt.cached_tokens AS cachedTokens' : '0 AS cachedTokens';
+    const reasoningSelect = rtCols.has('reasoning_tokens') ? 'rt.reasoning_tokens AS reasoningTokens' : '0 AS reasoningTokens';
     const sql = hasAgentInstances
       ? `SELECT rt.mission_id AS missionId, m.workspace_id AS workspaceId, w.name AS workspaceName,
                 m.title AS title, rt.adapter_id AS adapterId, ai.model_profile_id AS model,
                 rt.usage_available AS usageAvailable, rt.input_tokens AS inputTokens,
-                rt.output_tokens AS outputTokens, rt.cost AS cost, rt.currency AS currency,
+                rt.output_tokens AS outputTokens, ${cachedSelect}, ${reasoningSelect},
+                rt.cost AS cost, rt.currency AS currency,
                 rt.duration_ms AS durationMs, rt.recorded_at AS recordedAt
          FROM runtime_telemetry rt
          JOIN missions m ON m.id = rt.mission_id
@@ -320,7 +370,8 @@ export function buildInsightsUsage(
       : `SELECT rt.mission_id AS missionId, m.workspace_id AS workspaceId, w.name AS workspaceName,
                 m.title AS title, rt.adapter_id AS adapterId, NULL AS model,
                 rt.usage_available AS usageAvailable, rt.input_tokens AS inputTokens,
-                rt.output_tokens AS outputTokens, rt.cost AS cost, rt.currency AS currency,
+                rt.output_tokens AS outputTokens, ${cachedSelect}, ${reasoningSelect},
+                rt.cost AS cost, rt.currency AS currency,
                 rt.duration_ms AS durationMs, rt.recorded_at AS recordedAt
          FROM runtime_telemetry rt
          JOIN missions m ON m.id = rt.mission_id
@@ -337,6 +388,8 @@ export function buildInsightsUsage(
       usageAvailable: number;
       inputTokens: number;
       outputTokens: number;
+      cachedTokens: number;
+      reasoningTokens: number;
       cost: number | null;
       currency: string | null;
       durationMs: number;
@@ -358,8 +411,8 @@ export function buildInsightsUsage(
         model: row.model || undefined,
         inputTokens: Number(row.inputTokens || 0),
         outputTokens: Number(row.outputTokens || 0),
-        cachedTokens: 0,
-        reasoningTokens: 0,
+        cachedTokens: Number(row.cachedTokens || 0),
+        reasoningTokens: Number(row.reasoningTokens || 0),
         costUsd: costUsd !== null && Number.isFinite(costUsd) ? costUsd : null,
         durationMs: Number(row.durationMs || 0),
         runCount: 1,
@@ -488,6 +541,73 @@ export function buildInsightsUsage(
     }
   }
 
+  // 4. Optional standalone local CLI history (when sourceScope === 'all')
+  if (sourceScope === 'all' && localCliScanner) {
+    const excludeSessionIds: Partial<Record<CliProviderId, Set<string>>> = {};
+    const allManual = workspaceId
+      ? manualConversationStore.listAllConversations(undefined)
+      : manualConversations;
+    for (const conv of allManual) {
+      for (const agent of conv.agents) {
+        const provider = normalizeCliProvider(agent.runtimeType);
+        if (!provider) continue;
+        const boundIds = [
+          ...(agent.providerSessionId ? [agent.providerSessionId] : []),
+          ...(manualConversationStore.boundSessionIds?.(agent) || []),
+        ];
+        if (!boundIds.length) continue;
+        let set = excludeSessionIds[provider];
+        if (!set) {
+          set = new Set<string>();
+          excludeSessionIds[provider] = set;
+        }
+        for (const id of boundIds) {
+          if (id) set.add(id);
+        }
+      }
+    }
+
+    const workspacesList: Array<{ id: string; name: string; normPath: string }> = hasTable(sqlite, 'workspaces')
+      ? (sqlite.prepare('SELECT id, name, path FROM workspaces').all() as Array<{ id: string; name: string; path: string }>)
+          .filter((w) => typeof w.path === 'string' && w.path.trim().length > 0)
+          .map((w) => ({ id: w.id, name: w.name, normPath: normalizeFsPath(w.path) }))
+      : [];
+
+    const externalSessions = localCliScanner.scan({ cutoffIso: cutoff, excludeSessionIds });
+    for (const ext of externalSessions) {
+      const matched = matchWorkspaceForDirectory(ext.directory, workspacesList);
+      if (workspaceId) {
+        if (!matched || matched.id !== workspaceId) continue;
+      }
+      const wsId = matched?.id ?? 'external';
+      const wsName = matched?.name ?? 'Local CLI';
+      addContribution({
+        itemKey: `external:${ext.provider}:${ext.sessionId}`,
+        title: ext.title,
+        workspaceId: wsId,
+        workspaceName: wsName,
+        mode: 'manual',
+        provider: ext.provider,
+        ...(ext.model ? { model: ext.model } : {}),
+        inputTokens: ext.inputTokens,
+        outputTokens: ext.outputTokens,
+        cachedTokens: ext.cachedTokens,
+        reasoningTokens: ext.reasoningTokens,
+        costUsd: ext.costUsd,
+        durationMs: ext.durationMs,
+        runCount: 1,
+        turnCount: ext.turnCount,
+        usageAvailable: ext.usageAvailable,
+        recordedAt: ext.recordedAt,
+        target: {
+          mode: 'manual',
+          workspaceId: wsId,
+        },
+        external: true,
+      });
+    }
+  }
+
   for (const { id } of PROVIDERS) {
     const prov = providerMap.get(id)!;
     prov.sessionCount = providerSessions.get(id)!.size;
@@ -513,7 +633,9 @@ export function buildInsightsUsage(
       usageAvailable: acc.usageAvailable,
       recordedAt: acc.recordedAt,
       target: acc.target,
+      ...(acc.external ? { external: true } : {}),
     }))
+    .filter((session) => !options.provider || session.provider === options.provider)
     .sort((a, b) => {
       if (b.totalTokens !== a.totalTokens) return b.totalTokens - a.totalTokens;
       if (b.durationMs !== a.durationMs) return b.durationMs - a.durationMs;
@@ -524,6 +646,7 @@ export function buildInsightsUsage(
   return {
     range: options.range,
     workspaceId,
+    sourceScope,
     totals: {
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
@@ -558,9 +681,26 @@ export function installInsightsRoutes(app: Application, deps: InsightsRoutesDepe
         typeof req.query.workspaceId === 'string' && req.query.workspaceId.trim()
           ? req.query.workspaceId.trim()
           : null;
+      let provider: CliProviderId | null = null;
+      if (typeof req.query.provider === 'string' && req.query.provider.trim() && req.query.provider.trim().toLowerCase() !== 'all') {
+        provider = normalizeCliProvider(req.query.provider);
+        if (!provider) {
+          return void res.status(400).json({ error: 'Invalid provider.' });
+        }
+      }
+      let sourceScope: InsightsSourceScope | undefined;
+      if (typeof req.query.sourceScope === 'string' && req.query.sourceScope.trim()) {
+        const rawScope = req.query.sourceScope.trim().toLowerCase();
+        if (rawScope !== 'all' && rawScope !== 'atris') {
+          return void res.status(400).json({ error: 'Invalid sourceScope. Expected all or atris.' });
+        }
+        sourceScope = rawScope;
+      }
       const result = buildInsightsUsage(deps, {
         range: rawRange as InsightsTimeRange,
         workspaceId,
+        provider,
+        sourceScope,
       });
       res.json(result);
     } catch (error: any) {

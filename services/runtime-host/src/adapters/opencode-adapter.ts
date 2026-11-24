@@ -196,7 +196,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       toolCallEvents: true,
       interactiveApproval: true,
       interactiveQuestions: true,
-      usageInfo: false,
+      usageInfo: true,
       cancellation: true,
       worktreeAwareness: true,
       headlessAuth: true,
@@ -432,8 +432,79 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     return [];
   }
 
-  async discoverUsage(): Promise<UsageSnapshot | null> {
-    return null;
+  async discoverUsage(sessionId?: string): Promise<UsageSnapshot | null> {
+    if (!sessionId) return null;
+    const context = this.sessionContext.get(sessionId);
+    const server = context ? this.servers.get(context.serverKey) : undefined;
+    if (!context || !server) return null;
+    try {
+      const response = await this.fetchServer(
+        server,
+        `/session/${encodeURIComponent(context.runtimeSessionId)}/message`,
+        {},
+        3_000,
+      );
+      if (!response.ok) return null;
+      const data = (await response.json()) as unknown;
+      const list = Array.isArray(data)
+        ? data
+        : data && typeof data === 'object' && Array.isArray((data as any).messages)
+          ? (data as any).messages
+          : [];
+      if (!list.length) return null;
+
+      const seen = new Set<string>();
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let cachedTokens = 0;
+      let reasoningTokens = 0;
+      let totalCost = 0;
+      let hasCost = false;
+      let hasTokens = false;
+
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const info = (item as any).info && typeof (item as any).info === 'object' ? (item as any).info : item;
+        const id = typeof info.id === 'string' ? info.id : undefined;
+        if (id) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+        }
+        const tokens = info.tokens || info.usage;
+        if (tokens && typeof tokens === 'object') {
+          const input = Number(tokens.input ?? tokens.input_tokens ?? 0);
+          const output = Number(tokens.output ?? tokens.output_tokens ?? 0);
+          const reasoning = Number(tokens.reasoning ?? tokens.reasoning_output_tokens ?? 0);
+          const cacheRead = Number(tokens.cache?.read ?? tokens.cache_read_input_tokens ?? 0);
+          const cacheWrite = Number(tokens.cache?.write ?? tokens.cache_creation_input_tokens ?? 0);
+          if ([input, output, reasoning, cacheRead, cacheWrite].some((n) => Number.isFinite(n) && n > 0)) {
+            hasTokens = true;
+          }
+          if (Number.isFinite(input) && input > 0) inputTokens += input;
+          if (Number.isFinite(output) && output > 0) outputTokens += output;
+          if (Number.isFinite(reasoning) && reasoning > 0) reasoningTokens += reasoning;
+          if (Number.isFinite(cacheRead) && cacheRead > 0) cachedTokens += cacheRead;
+          if (Number.isFinite(cacheWrite) && cacheWrite > 0) cachedTokens += cacheWrite;
+        }
+        if (typeof info.cost === 'number' && Number.isFinite(info.cost) && info.cost >= 0) {
+          totalCost += info.cost;
+          hasCost = true;
+        }
+      }
+
+      if (!hasTokens && !hasCost) return null;
+      return {
+        inputTokens: Math.max(0, Math.round(inputTokens)),
+        outputTokens: Math.max(0, Math.round(outputTokens)),
+        cachedTokens: Math.max(0, Math.round(cachedTokens)),
+        reasoningTokens: Math.max(0, Math.round(reasoningTokens)),
+        totalCost: hasCost ? totalCost : null,
+        currency: hasCost ? 'USD' : '',
+        timestamp: new Date().toISOString(),
+      };
+    } catch {
+      return null;
+    }
   }
 
   async startSession(request: StartSessionRequest): Promise<AgentSession> {
@@ -852,7 +923,9 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       }
     } else if (type === 'message.updated') {
       if (relatedSessionId !== context.runtimeSessionId) return;
-      this.recordProviderUsage(sessionId, properties.info || properties.message || properties);
+      const info = properties.info || properties.message || properties;
+      const messageId = typeof info?.id === 'string' && info.id.trim() ? info.id.trim() : undefined;
+      this.recordProviderUsage(sessionId, info, { accumulate: true, messageId });
     } else if (type === 'permission.updated' || type === 'permission.asked') {
       if (relatedSessionId !== context.runtimeSessionId) return;
       const permission = properties.permission || properties;
