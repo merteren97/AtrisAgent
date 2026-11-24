@@ -70,6 +70,8 @@ import { installAutoSetupRoutes } from './integration-auto-setup';
 import { manualCoordination } from './manual-coordination';
 import { installActivityRoutes } from './activity-routes';
 import { installInsightsRoutes, recordPlanningTurnTelemetry } from './insights-routes';
+import { LocalCliInsightsScanner } from './local-cli-insights-scanner';
+import { installUsageLimitsRoutes } from './usage-limits-routes';
 
 import path from 'path';
 import fs from 'fs';
@@ -677,7 +679,9 @@ installActivityRoutes(app, {
 installInsightsRoutes(app, {
   sqlite,
   manualConversationStore,
+  localCliScanner: new LocalCliInsightsScanner(),
 });
+installUsageLimitsRoutes(app);
 installPlanningHandoffRoutes(app, {
   store: planningStore, manualStore: manualConversationStore, runtimeHost, sqlite, fenced: planningFence,
   startOrchestrator: async ({ workspaceId, request, options, idempotencyKey }) => {

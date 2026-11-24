@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3';
 import { redactSensitiveValue } from '@atris-agent-code/event-bus';
 import type { ManualAgent, ManualMessage, ManualQuestion } from './manual-conversations';
 import { ManualAntigravityBridge } from './manual-antigravity-bridge';
@@ -10,6 +11,7 @@ import { MANUAL_OPENCODE_TUI } from './manual-opencode-tui';
 import { readCodexManualHistory } from './manual-codex-history';
 import { codexPermissionArgs } from './manual-codex-permissions';
 import { codexManualProfile } from './manual-codex-startup';
+import { readOpenCodeSessionUsage } from './opencode-usage-reader';
 export { parseCodexManualTranscript } from './manual-codex-history';
 
 const MARKER = '// AtrisAgent managed manual session bridge v1';
@@ -745,6 +747,31 @@ export class ManualProviderBridge {
     };
   }
 
+  boundSessionIds(agent: ManualAgent): string[] {
+    const ids = new Set<string>();
+    if (agent.providerSessionId) ids.add(agent.providerSessionId);
+    try {
+      if (agent.runtimeType === 'codex') {
+        for (const b of this.codexBindings(agent)) {
+          if (b.sessionId) ids.add(b.sessionId);
+        }
+      } else if (agent.runtimeType === 'claude_code') {
+        for (const b of this.claudeBindings(agent)) {
+          if (b.sessionId) ids.add(b.sessionId);
+        }
+      } else if (agent.runtimeType === 'opencode') {
+        const sid = this.openCodeHistory(agent).sessionId;
+        if (sid) ids.add(sid);
+      } else if (agent.runtimeType === 'antigravity') {
+        const sid = new ManualAntigravityBridge(this.dataDir, this.antigravityTranscriptRoot).boundSessionId(agent);
+        if (sid) ids.add(sid);
+      }
+    } catch {
+      // Best-effort bound session ID discovery.
+    }
+    return [...ids];
+  }
+
   agentUsageSummary(agent: ManualAgent): ManualAgentUsageSummary {
     const empty: ManualAgentUsageSummary = {
       inputTokens: 0,
@@ -860,7 +887,6 @@ export class ManualProviderBridge {
 
       if (agent.runtimeType === 'codex') {
         const bindings = this.codexBindings(agent);
-        if (!bindings.length) return empty;
         const uniqueFiles = new Map<string, fs.Stats>();
         const signatures: string[] = [];
         for (const binding of bindings) {
@@ -874,7 +900,105 @@ export class ManualProviderBridge {
             // Skip missing rollout.
           }
         }
-        if (!uniqueFiles.size) return empty;
+
+        let sqliteThreadFallback: { tokensUsed: number; createdAt: number | null; updatedAt: number | null } | null = null;
+        if (!uniqueFiles.size && agent.providerSessionId) {
+          const codexRoots = [this.codexRoot(agent)];
+          if (agent.sharedProfile) {
+            const defaultCodex = path.join(os.homedir(), '.codex');
+            if (!codexRoots.includes(defaultCodex)) codexRoots.push(defaultCodex);
+          }
+          for (const root of codexRoots) {
+            const stateDbPath = path.join(root, 'state_5.sqlite');
+            try {
+              const dbStat = fs.lstatSync(stateDbPath);
+              if (dbStat.isFile() && !dbStat.isSymbolicLink()) {
+                let db: Database.Database | undefined;
+                try {
+                  db = new Database(stateDbPath, { readonly: true, fileMustExist: true });
+                  const cols = new Set(
+                    (db.prepare('PRAGMA table_info(threads)').all() as Array<{ name?: string }>)
+                      .map((c) => c.name)
+                      .filter((n): n is string => Boolean(n)),
+                  );
+                  if (cols.has('id')) {
+                    const selectCols = ['rollout_path', 'tokens_used', 'created_at', 'updated_at'].filter((c) => cols.has(c));
+                    const row = db
+                      .prepare(`SELECT ${selectCols.join(', ')} FROM threads WHERE id = ? LIMIT 1`)
+                      .get(agent.providerSessionId) as Record<string, any> | undefined;
+                    if (row) {
+                      const rolloutPath = typeof row.rollout_path === 'string' && row.rollout_path.trim()
+                        ? row.rollout_path.trim()
+                        : undefined;
+                      if (rolloutPath) {
+                        try {
+                          const rStat = fs.lstatSync(rolloutPath);
+                          if (rStat.isFile() && !rStat.isSymbolicLink()) {
+                            uniqueFiles.set(rolloutPath, rStat);
+                            signatures.push(`${rolloutPath}:${rStat.mtimeMs}:${rStat.size}`);
+                          }
+                        } catch {
+                          // Rollout path missing on disk; keep SQLite fallback.
+                        }
+                      }
+                      if (!uniqueFiles.size) {
+                        sqliteThreadFallback = {
+                          tokensUsed: nonNegInt(row.tokens_used),
+                          createdAt: parseTimestampMs(row.created_at),
+                          updatedAt: parseTimestampMs(row.updated_at),
+                        };
+                      }
+                      break;
+                    }
+                  }
+                } catch {
+                  // Ignore unreadable state_5.sqlite.
+                } finally {
+                  try { db?.close(); } catch {}
+                }
+              }
+            } catch {
+              // state_5.sqlite does not exist.
+            }
+
+            if (!uniqueFiles.size && !sqliteThreadFallback) {
+              const sessionsDir = path.join(root, 'sessions');
+              const foundRollout = findCodexRolloutBySessionId(sessionsDir, agent.providerSessionId);
+              if (foundRollout) {
+                try {
+                  const rStat = fs.lstatSync(foundRollout);
+                  if (rStat.isFile() && !rStat.isSymbolicLink()) {
+                    uniqueFiles.set(foundRollout, rStat);
+                    signatures.push(`${foundRollout}:${rStat.mtimeMs}:${rStat.size}`);
+                  }
+                } catch {
+                  // Ignore missing file.
+                }
+              }
+            }
+            if (uniqueFiles.size || sqliteThreadFallback) break;
+          }
+        }
+
+        if (!uniqueFiles.size) {
+          if (sqliteThreadFallback && sqliteThreadFallback.tokensUsed > 0) {
+            const { tokensUsed, createdAt, updatedAt } = sqliteThreadFallback;
+            const durationMs = createdAt !== null && updatedAt !== null ? Math.max(0, updatedAt - createdAt) : 0;
+            const lastTs = updatedAt ?? createdAt;
+            return {
+              inputTokens: tokensUsed,
+              outputTokens: 0,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+              totalCostUsd: null,
+              turnCount: 1,
+              durationMs,
+              usageAvailable: true,
+              lastRecordedAt: lastTs !== null ? new Date(lastTs).toISOString() : null,
+            };
+          }
+          return empty;
+        }
 
         const cacheKey = `codex:${agent.id}`;
         const signature = signatures.sort().join('|');
@@ -956,8 +1080,26 @@ export class ManualProviderBridge {
 
       if (agent.runtimeType === 'opencode') {
         const history = this.openCodeHistory(agent);
-        const sessionId = history.sessionId;
+        const sessionId = history.sessionId || agent.providerSessionId;
         if (!sessionId) return empty;
+
+        const sqliteUsage = readOpenCodeSessionUsage(sessionId, {
+          configDir: agent.configDir,
+          sharedProfile: agent.sharedProfile,
+        });
+        if (sqliteUsage && (sqliteUsage.usageAvailable || sqliteUsage.turnCount > 0)) {
+          return {
+            inputTokens: sqliteUsage.inputTokens,
+            outputTokens: sqliteUsage.outputTokens,
+            cachedTokens: sqliteUsage.cachedTokens,
+            reasoningTokens: sqliteUsage.reasoningTokens,
+            totalCostUsd: sqliteUsage.totalCostUsd,
+            turnCount: sqliteUsage.turnCount,
+            durationMs: sqliteUsage.durationMs,
+            usageAvailable: sqliteUsage.usageAvailable,
+            lastRecordedAt: sqliteUsage.lastRecordedAt,
+          };
+        }
 
         const candidates = [
           ...(!agent.sharedProfile && agent.configDir
@@ -1077,54 +1219,11 @@ export class ManualProviderBridge {
 
       if (agent.runtimeType === 'antigravity') {
         const agBridge = new ManualAntigravityBridge(this.dataDir, this.antigravityTranscriptRoot);
-        const bindingFile = path.join(this.directory(agent), 'antigravity-binding.json');
-        let signaturePrefix = '';
-        try {
-          const bStat = fs.statSync(bindingFile);
-          const binding = JSON.parse(fs.readFileSync(bindingFile, 'utf8')) as { launchId?: string; sessionId?: string };
-          signaturePrefix = `${bStat.mtimeMs}:${bStat.size}`;
-          if (binding.sessionId) {
-            const agBase = this.antigravityTranscriptRoot || path.join(os.homedir(), '.gemini', 'antigravity-cli');
-            const agRoot = path.join(agBase, 'brain', binding.sessionId, '.system_generated', 'logs');
-            for (const name of ['transcript_full.jsonl', 'transcript.jsonl']) {
-              const candidate = path.join(agRoot, name);
-              try {
-                const tStat = fs.statSync(candidate);
-                signaturePrefix += `:${candidate}:${tStat.mtimeMs}:${tStat.size}`;
-                break;
-              } catch {
-                // Try next.
-              }
-            }
-          }
-        } catch {
-          // No binding file yet.
-        }
-        const cacheKey = `antigravity:${agent.id}`;
-        const cached = signaturePrefix ? usageSummaryCache.get(cacheKey) : undefined;
-        if (cached && cached.signature === signaturePrefix) return cached.summary;
-
-        const readResult = agBridge.read(agent);
-        if (!readResult.bound && readResult.messages.length === 0) return empty;
-        const assistantMessages = readResult.messages.filter((msg) => msg.role === 'assistant');
-        const reasoningTokens = assistantMessages.reduce(
-          (sum, msg) => sum + (typeof msg.thinkingTokens === 'number' && Number.isFinite(msg.thinkingTokens) ? Math.max(0, Math.round(msg.thinkingTokens)) : 0),
-          0,
-        );
-        const act = agBridge.activity(agent);
-        const summary: ManualAgentUsageSummary = {
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedTokens: 0,
-          reasoningTokens,
+        const agSummary = agBridge.usageSummary(agent);
+        return {
+          ...agSummary,
           totalCostUsd: null,
-          turnCount: assistantMessages.length,
-          durationMs: 0,
-          usageAvailable: reasoningTokens > 0,
-          lastRecordedAt: act.at || null,
         };
-        if (signaturePrefix) setUsageCache(cacheKey, signaturePrefix, summary);
-        return summary;
       }
 
       return empty;
@@ -1132,4 +1231,54 @@ export class ManualProviderBridge {
       return empty;
     }
   }
+}
+
+function findCodexRolloutBySessionId(sessionsDir: string, sessionId: string): string | undefined {
+  let rootStat: fs.Stats;
+  try {
+    rootStat = fs.lstatSync(sessionsDir);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return undefined;
+  } catch {
+    return undefined;
+  }
+
+  const candidates: Array<{ file: string; mtimeMs: number; nameMatch: boolean }> = [];
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 4 || candidates.length >= 200) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (candidates.length >= 200) break;
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        try {
+          const stat = fs.statSync(full);
+          candidates.push({
+            file: full,
+            mtimeMs: stat.mtimeMs,
+            nameMatch: entry.name.includes(sessionId),
+          });
+        } catch {
+          // Ignore disappearing files.
+        }
+      }
+    }
+  };
+  walk(sessionsDir, 0);
+  candidates.sort((a, b) => {
+    if (a.nameMatch !== b.nameMatch) return a.nameMatch ? -1 : 1;
+    return b.mtimeMs - a.mtimeMs;
+  });
+
+  for (const candidate of candidates) {
+    if (codexIdentity(candidate.file, sessionId)) return candidate.file;
+  }
+  return undefined;
 }

@@ -431,6 +431,8 @@ export const runtimeTelemetry = sqliteTable('runtime_telemetry', {
   usageSource: text('usage_source').$type<'provider_reported' | 'unavailable'>().notNull().default('unavailable'),
   inputTokens: integer('input_tokens').notNull().default(0),
   outputTokens: integer('output_tokens').notNull().default(0),
+  cachedTokens: integer('cached_tokens').notNull().default(0),
+  reasoningTokens: integer('reasoning_tokens').notNull().default(0),
   cost: real('cost'),
   currency: text('currency'),
   queueWaitMs: integer('queue_wait_ms').notNull().default(0),

@@ -714,6 +714,9 @@ export class ManualAntigravityBridge {
     }
     return sessionId;
   }
+  boundSessionId(agent: ManualAgent): string | undefined {
+    return this.session(agent);
+  }
   private resolveTranscriptFile(sessionId: string): string | undefined {
     let root: string;
     try {
@@ -768,6 +771,90 @@ export class ManualAntigravityBridge {
     if (!filename) return empty;
     const { parsed, truncated } = readParsedTranscript(filename, sessionId);
     return {messages:parsed.messages, questions:parsed.questions, truncated, bound:true};
+  }
+  usageSummary(agent: ManualAgent): {
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    reasoningTokens: number;
+    turnCount: number;
+    durationMs: number;
+    usageAvailable: boolean;
+    lastRecordedAt: string | null;
+  } {
+    const empty = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+      turnCount: 0,
+      durationMs: 0,
+      usageAvailable: false,
+      lastRecordedAt: null as string | null,
+    };
+    const sessionId = this.session(agent);
+    if (!sessionId) return empty;
+    const filename = this.resolveTranscriptFile(sessionId);
+    if (!filename) return empty;
+    const { parsed, mtimeIso } = readParsedTranscript(filename, sessionId);
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cachedTokens = 0;
+    let reasoningTokens = 0;
+    let turnCount = 0;
+    let minTs: number | null = null;
+    let maxTs: number | null = null;
+
+    const nonNeg = (v: unknown): number =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
+
+    for (const [, step] of parsed.sortedSteps) {
+      const tsStr = stepTimestamp(step);
+      const ts = tsStr ? Date.parse(tsStr) : NaN;
+      if (Number.isFinite(ts)) {
+        minTs = minTs === null ? ts : Math.min(minTs, ts);
+        maxTs = maxTs === null ? ts : Math.max(maxTs, ts);
+      }
+      if (step.type !== 'PLANNER_RESPONSE' || step.source !== 'MODEL') continue;
+      turnCount += 1;
+      const input = nonNeg(step.input_tokens);
+      const output = nonNeg(step.output_tokens);
+      const cached = nonNeg(step.cache_read_tokens);
+      const thinking = nonNeg(step.thinking_tokens);
+      inputTokens += input;
+      cachedTokens += cached;
+      if (step.thinking_tokens !== undefined) {
+        reasoningTokens += thinking;
+        outputTokens += output;
+      } else if (
+        step.input_tokens === undefined
+        && step.cache_read_tokens === undefined
+        && typeof step.thinking === 'string'
+        && step.thinking.trim()
+      ) {
+        // Legacy transcript format where output_tokens held thinking tokens.
+        reasoningTokens += output;
+      } else {
+        outputTokens += output;
+      }
+    }
+
+    const usageAvailable = inputTokens > 0 || outputTokens > 0 || cachedTokens > 0 || reasoningTokens > 0;
+    const durationMs = minTs !== null && maxTs !== null ? Math.max(0, maxTs - minTs) : 0;
+    const lastRecordedAt = maxTs !== null
+      ? new Date(maxTs).toISOString()
+      : this.activity(agent).at || mtimeIso || null;
+
+    return {
+      inputTokens,
+      outputTokens,
+      cachedTokens,
+      reasoningTokens,
+      turnCount,
+      durationMs,
+      usageAvailable,
+      lastRecordedAt,
+    };
   }
   pendingQuestions(agent: ManualAgent): ManualQuestion[] {
     return this.read(agent).questions;

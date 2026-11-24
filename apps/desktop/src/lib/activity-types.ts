@@ -66,6 +66,7 @@ export interface ActivitySummaryResponse {
 }
 
 export type InsightsTimeRange = 'today' | '7d' | '30d' | 'all';
+export type InsightsSourceScope = 'all' | 'atris';
 
 export interface InsightsProviderBreakdown {
   provider: CliProviderId;
@@ -117,11 +118,13 @@ export interface InsightsTopSession {
   usageAvailable: boolean;
   recordedAt: string;
   target: ActivityTarget;
+  external?: boolean;
 }
 
 export interface InsightsUsageResponse {
   range: InsightsTimeRange;
   workspaceId: string | null;
+  sourceScope?: InsightsSourceScope;
   totals: {
     inputTokens: number;
     outputTokens: number;
@@ -137,5 +140,45 @@ export interface InsightsUsageResponse {
   byMode: InsightsModeBreakdown[];
   daily: InsightsDailyPoint[];
   topSessions: InsightsTopSession[];
+  generatedAt: string;
+}
+
+export type QuotaProviderId = 'antigravity' | 'codex' | 'claude_code';
+
+export type UsageLimitStatus =
+  | 'ok'
+  | 'unauthenticated'
+  | 'unavailable'
+  | 'rate_limited'
+  | 'error';
+
+export interface QuotaWindow {
+  id: string;
+  label: string;
+  group?: string;
+  groupDescription?: string;
+  windowKind: 'five_hour' | 'weekly' | 'other';
+  usedPercent: number;
+  remainingPercent: number;
+  windowDurationMins?: number;
+  resetsAt: string | null;
+  description?: string | null;
+}
+
+export interface ProviderUsageLimit {
+  provider: QuotaProviderId;
+  label: string;
+  status: UsageLimitStatus;
+  planLabel?: string | null;
+  windows: QuotaWindow[];
+  message?: string | null;
+  fetchedAt: string;
+  stale?: boolean;
+}
+
+export interface UsageLimitsResponse {
+  providers: ProviderUsageLimit[];
+  opencodeNote: string;
+  cached: boolean;
   generatedAt: string;
 }

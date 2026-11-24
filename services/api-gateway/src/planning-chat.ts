@@ -73,6 +73,7 @@ export interface PlanningTurnTelemetry {
   durationMs: number;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens: number;
   reasoningTokens: number;
   totalCost: number | null;
   currency: string;
@@ -801,7 +802,14 @@ export class PlanningChatController {
       const runTelemetryAndCleanup = async () => {
         try {
           if (this.options.onTurnTelemetry) {
-            let usage: { inputTokens?: number; outputTokens?: number; totalCost?: number | null; currency?: string } | null = null;
+            let usage: {
+              inputTokens?: number;
+              outputTokens?: number;
+              cachedTokens?: number;
+              reasoningTokens?: number;
+              totalCost?: number | null;
+              currency?: string;
+            } | null = null;
             try {
               const adapterWithUsage = active.adapter as (PlanningChatAdapter & { getUsage?: (sessionId: string) => Promise<typeof usage> }) | undefined;
               if (typeof adapterWithUsage?.getUsage === 'function') {
@@ -823,6 +831,9 @@ export class PlanningChatController {
             }
             const inputTokens = Math.max(0, Math.round(usage?.inputTokens || 0));
             const outputTokens = Math.max(0, Math.round(usage?.outputTokens || 0));
+            const cachedTokens = Math.max(0, Math.round(usage?.cachedTokens || 0));
+            const providerReasoningTokens = Math.max(0, Math.round(usage?.reasoningTokens || 0));
+            const reasoningTokens = Math.max(providerReasoningTokens, thinkingTokens);
             const usageAvailable = usage !== null || thinkingTokens > 0;
             const outcome: PlanningTurnTelemetry['outcome'] = status === 'complete'
               ? 'completed'
@@ -842,7 +853,8 @@ export class PlanningChatController {
               durationMs: Math.max(0, Date.now() - active.startedAtMs),
               inputTokens,
               outputTokens,
-              reasoningTokens: thinkingTokens,
+              cachedTokens,
+              reasoningTokens,
               totalCost: usage?.totalCost == null ? null : Math.max(0, Number(usage.totalCost) || 0),
               currency: usage?.currency || 'USD',
               usageAvailable,

@@ -160,6 +160,9 @@ export class ManualConversationStore {
   agentUsageSummary(agent: ManualAgent): ManualAgentUsageSummary {
     return new ManualProviderBridge(this.dataDir).agentUsageSummary(agent);
   }
+  boundSessionIds(agent: ManualAgent): string[] {
+    return new ManualProviderBridge(this.dataDir).boundSessionIds(agent);
+  }
   workspace(id: string): { id: string; path: string } {
     return this.sqlite.prepare('SELECT id, path FROM workspaces WHERE id = ?').get(id) as {id: string; path: string} || fail('Project not found.', 404);
   }
