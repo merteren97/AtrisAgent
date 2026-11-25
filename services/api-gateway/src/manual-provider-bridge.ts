@@ -506,7 +506,8 @@ export class ManualProviderBridge {
       fs.appendFileSync(path.join(directory, 'bindings.jsonl'), JSON.stringify({sessionId, transcriptPath:actual, event:'SessionStart', at:new Date().toISOString()})+'\n', {mode:0o600});
     } catch { /* The rollout may not exist until the first completed turn; retry on the next event. */ }
   }
-  prepareOpenCode(agent: ManualAgent): {args: string[]; env: Record<string,string>} {
+  prepareOpenCode(agent: ManualAgent, version?: string): {args: string[]; env: Record<string,string>} {
+    const major = Number(String(version || '').match(/(\d+)/)?.[1] || 1);
     const directory = this.directory(agent); fs.mkdirSync(directory, {recursive:true, mode:0o700});
     fs.rmSync(path.join(directory, 'opencode-activity.json'), {force:true});
     // A new TUI starts in normal mode. Never display a previous process's mode as active.
@@ -518,8 +519,10 @@ export class ManualProviderBridge {
     const tuiConfig = path.join(directory, 'tui.json');
     writeManaged(tuiConfig, '// AtrisAgent managed manual session bridge v1\n'+JSON.stringify({$schema:'https://opencode.ai/tui.json',plugin:[[pathToFileURL(tuiPlugin).href,{model:agent.model}]]}));
     const history = this.openCodeHistory(agent);
+    // OpenCode v2 removed top-level `--model` on the TUI command; the TUI plugin applies `opencode-route.json`.
+    const args = [...(history.sessionId ? ['--session', history.sessionId] : []), ...(major >= 2 ? [] : ['--model', agent.model])];
     // Merge inherited configuration inside the native launcher. Never send its possibly-secret contents to the UI.
-    return {args: [...(history.sessionId ? ['--session', history.sessionId] : []), '--model', agent.model], env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href, ATRIS_MANUAL_OPENCODE_TUI_CONFIG:tuiConfig, XDG_STATE_HOME:path.join(directory,'state')}};
+    return {args, env: {ATRIS_MANUAL_OPENCODE_PLUGIN: pathToFileURL(plugin).href, ATRIS_MANUAL_OPENCODE_TUI_CONFIG:tuiConfig, XDG_STATE_HOME:path.join(directory,'state')}};
   }
   updateOpenCodeRoute(agent: ManualAgent): void {
     if (agent.runtimeType !== 'opencode' || !/^[^/]+\/.+$/.test(agent.model)) throw new Error('Invalid OpenCode model route.');

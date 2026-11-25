@@ -637,6 +637,42 @@ function readAgentMessages(agent: ManualAgent, bridge: ManualProviderBridge) {
     return { supported: true, messages: parseManualTranscript(tail.source, agent.providerSessionId), truncated: tail.truncated, bound: true };
 }
 
+function sendPaginatedChatSnapshot(
+  res: Response,
+  metadata: Record<string, unknown>,
+  messages: ManualMessage[],
+  options: { anchor?: string; older?: boolean; known?: string },
+) {
+  const visible = messages.filter(message => message.role !== 'tool');
+  const latest = visible.at(-1);
+  const recentTools = latest ? messages.slice(messages.lastIndexOf(latest) + 1) : [];
+  const pageSize = 30;
+  const tailStart = Math.max(0, visible.length - pageSize);
+  // Provider journals can append, backfill, or evict old records between polls.
+  // Anchor to an ID rather than a tail offset so new replies cannot shift the page.
+  const index = options.anchor ? visible.findIndex(message => message.id === options.anchor) : -1;
+  const start = index < 0 ? tailStart : Math.min(tailStart, Math.max(0, index - (options.older ? pageSize : 0)));
+  const memory = createHash('sha256');
+  let hasUser = false;
+  for (const message of visible) {
+    if (message.role !== 'user') continue;
+    hasUser = true;
+    memory.update(JSON.stringify([message.id, message.text]));
+  }
+  const snapshot = {
+    ...metadata,
+    messages: visible.slice(start),
+    recentTools,
+    hasOlder: start > 0,
+    memoryRevision: hasUser ? memory.digest('hex') : undefined,
+  };
+  const serialized = JSON.stringify(snapshot);
+  const revision = createHash('sha256').update(serialized).digest('hex');
+  res.set('Cache-Control', 'no-store');
+  if (options.known === revision) return res.json({ revision });
+  return res.type('json').send(`{"revision":"${revision}",${serialized.slice(1)}`);
+}
+
 export function installManualConversations(app: Application, sqlite: Database.Database, runtime: RuntimeHost, dataDir = path.dirname(sqlite.name), live?: LiveProjectChanges, fenced?: (id: string) => boolean): ManualConversationStore {
   const store = new ManualConversationStore(sqlite, dataDir, live, fenced);
   const bridge = new ManualProviderBridge(dataDir);
@@ -797,7 +833,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       // CLI never applied. Concrete catalog routes encode their own reasoning.
       const selection = await (adapter as AntigravityAdapter).resolveModelCliRoute(agent.model,
         agent.model === 'antigravity-active-route' ? undefined : agent.reasoning);
-      args = [...selection.args, ...new ManualAntigravityBridge(dataDir).prepare(agent)];
+      args = [...selection.args];
     }
     if (agent.runtimeType === 'codex') {
       await verifyManualCodexCompatibility(installation.path);
@@ -815,15 +851,16 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       codexRuntimeId = endpoint.runtimeId;
     }
     if (agent.runtimeType === 'opencode') {
-      const prepared = bridge.prepareOpenCode(agent); args = prepared.args; Object.assign(env, prepared.env);
+      const prepared = bridge.prepareOpenCode(agent, installation.version); args = prepared.args; Object.assign(env, prepared.env);
     }
-    if (agent.runtimeType !== 'codex' && manualCoordination.isConfigured()) {
-      const grant = manualCoordination.issue(agent);
-      try {
-        const prepared = prepareManualCoordination(agent, dataDir, grant, installation.version);
-        args.push(...prepared.args); Object.assign(env, prepared.env); launchCwd = prepared.cwd || launchCwd;
-      } catch (error) { manualCoordination.revokeToken(grant.token); throw error; }
-    }
+    const grant = agent.runtimeType !== 'codex' && manualCoordination.isConfigured() ? manualCoordination.issue(agent) : undefined;
+    try {
+      const coordination = grant ? prepareManualCoordination(agent, dataDir, grant, installation.version) : undefined;
+      if (agent.runtimeType === 'antigravity') args.push(...new ManualAntigravityBridge(dataDir).prepare(agent));
+      if (coordination) {
+        args.push(...coordination.args); Object.assign(env, coordination.env); launchCwd = coordination.cwd || launchCwd;
+      }
+    } catch (error) { if (grant) manualCoordination.revokeToken(grant.token); throw error; }
     res.json({ id: agent.id, runtimeType: agent.runtimeType, executable: installation.path, args, cwd: launchCwd, env, ...(codexRuntimeId ? {codexRuntimeId} : {}) });
   }));
   app.get('/api/manual/agents/:id/messages', route((req, res) => {
@@ -837,30 +874,50 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       return fail('Invalid chat history request.');
     }
 
+    const agent = store.agent(id);
     const { messages, ...metadata } = store.readMessages(id);
-    const visible = messages.filter(message => message.role !== 'tool');
-    const latest = visible.at(-1);
-    const recentTools = latest ? messages.slice(messages.lastIndexOf(latest) + 1) : [];
-    const pageSize = 30;
-    const tailStart = Math.max(0, visible.length - pageSize);
-    // Provider journals can append, backfill, or evict old records between polls.
-    // Anchor to an ID rather than a tail offset so new replies cannot shift the page.
-    const index = anchor ? visible.findIndex(message => message.id === anchor) : -1;
-    const start = index < 0 ? tailStart : Math.min(tailStart, Math.max(0, index - (older ? pageSize : 0)));
-    const memory = createHash('sha256');
-    let hasUser = false;
-    for (const message of visible) {
-      if (message.role !== 'user') continue;
-      hasUser = true;
-      memory.update(JSON.stringify([message.id, message.text]));
+    const swarm = agent.runtimeType === 'antigravity'
+      ? new ManualAntigravityBridge(dataDir).readSwarmState(agent)
+      : undefined;
+    return sendPaginatedChatSnapshot(res, { ...metadata, ...(swarm ? { swarm } : {}) }, messages, {
+      anchor: anchor as string | undefined,
+      older: older === '1',
+      known: known as string | undefined,
+    });
+  }));
+  app.get('/api/manual/agents/:id/swarm/board', route((req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    if (agent.runtimeType !== 'antigravity') return fail('Swarm board is only available for Antigravity agents.');
+    const rawBefore = req.query.beforeSeq;
+    const rawLimit = req.query.limit;
+    let beforeSeq: number | undefined;
+    if (rawBefore !== undefined) {
+      beforeSeq = Number(rawBefore);
+      if (!Number.isInteger(beforeSeq) || beforeSeq < 0) return fail('Invalid beforeSeq parameter.');
     }
-    const snapshot = { ...metadata, messages: visible.slice(start), recentTools, hasOlder: start > 0,
-      memoryRevision: hasUser ? memory.digest('hex') : undefined };
-    const serialized = JSON.stringify(snapshot);
-    const revision = createHash('sha256').update(serialized).digest('hex');
+    let limit: number | undefined;
+    if (rawLimit !== undefined) {
+      limit = Number(rawLimit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) return fail('Invalid limit parameter.');
+    }
     res.set('Cache-Control', 'no-store');
-    if (known === revision) return res.json({ revision });
-    return res.type('json').send(`{"revision":"${revision}",${serialized.slice(1)}`);
+    res.json(new ManualAntigravityBridge(dataDir).readSwarmBoard(agent, { beforeSeq, limit }));
+  }));
+  app.get('/api/manual/agents/:id/subagents/:conversationId/messages', route((req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    if (agent.runtimeType !== 'antigravity') return fail('Subagent transcripts are only available for Antigravity agents.');
+    const { anchor, older, known } = req.query;
+    if ((anchor !== undefined && (typeof anchor !== 'string' || !anchor || anchor.length > 2048))
+      || (older !== undefined && (older !== '1' || !anchor))
+      || (known !== undefined && (typeof known !== 'string' || !/^[\da-f]{64}$/.test(known)))) {
+      return fail('Invalid chat history request.');
+    }
+    const { messages, ...metadata } = new ManualAntigravityBridge(dataDir).readSubagentTranscript(agent, idParam(req, 'conversationId'));
+    return sendPaginatedChatSnapshot(res, { supported: true, ...metadata }, messages, {
+      anchor: anchor as string | undefined,
+      older: older === '1',
+      known: known as string | undefined,
+    });
   }));
   app.patch('/api/manual/agents/:id/permissions', route((req, res) => {
     res.json(store.updateCodexPermissions(idParam(req, 'id'), req.body?.mode, req.body?.expectedMode, req.body?.fullAccessConfirmed));

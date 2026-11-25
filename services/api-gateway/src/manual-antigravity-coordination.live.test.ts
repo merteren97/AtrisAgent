@@ -27,7 +27,13 @@ async function run() {
   manualCoordination.configure({endpoint,script});
   const agent = {id:'a',cwd:project,name:'Agy test',runtimeType:'antigravity'} as ManualAgent;
   const grant = manualCoordination.issue(agent);
+  const original = prepareManualCoordination(agent,data,grant);
+  const objectFile = path.join(original.args[1], 'test_driver_headers.obj');
+  fs.writeFileSync(objectFile, 'existing build artifact');
   const prepared = prepareManualCoordination(agent,data,grant);
+  assert.notEqual(prepared.args[1],original.args[1]);
+  assert.equal(fs.readFileSync(objectFile,'utf8'),'existing build artifact');
+  assert.equal(prepareManualCoordination(agent,data,grant).args[1],prepared.args[1]);
   console.log('Starting Antigravity in the test project.');
   const child = spawn(executable,[...prepared.args,'--print','Reply only OK. Do not use tools.','--print-timeout','15s','--output-format','json'],{
     cwd:project,env:{...process.env,...prepared.env},stdio:['ignore','pipe','pipe'],windowsHide:true,

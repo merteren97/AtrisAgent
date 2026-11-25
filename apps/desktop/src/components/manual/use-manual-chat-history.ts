@@ -1,22 +1,8 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
 import { apiRequest } from '@/lib/api-client';
-import { useManualStore, type ManualMessage, type ManualNamingUpdate, type ManualQuestion } from '@/stores/manual-store';
-import type { OpenCodeAutoApprove } from './manual-composer';
+import { useManualStore, type ManualChatSnapshot, type ManualMessage, type ManualQuestion } from '@/stores/manual-store';
 
-interface ChatSnapshot {
-  revision: string;
-  messages: ManualMessage[];
-  recentTools: ManualMessage[];
-  questions?: ManualQuestion[];
-  autoApprove?: OpenCodeAutoApprove;
-  routeStatus?: { pending: boolean; error?: string };
-  truncated: boolean;
-  bound: boolean;
-  loading?: boolean;
-  naming?: ManualNamingUpdate;
-  hasOlder: boolean;
-  memoryRevision?: string;
-}
+export type ChatSnapshot = ManualChatSnapshot;
 
 type UnchangedSnapshot = { revision: string; messages?: never };
 type HistoryStatus = { loading?: boolean; pageError?: boolean; connectionError?: string };

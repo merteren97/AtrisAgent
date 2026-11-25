@@ -353,6 +353,28 @@ try {
   assert.equal(coordinated.env.ATRIS_MANUAL_COORDINATION,'1');
   const config = fs.readFileSync(path.join(coordinated.args[addDir+1],'.agents','mcp_config.json'),'utf8');
   assert(!config.includes(coordinated.env.ATRIS_CONTROL_PLANE_TOKEN),'Agent grant remains outside the config file');
+  const previousLog = coordinated.args[coordinated.args.indexOf('--log-file')+1];
+  const rootSession = randomUUID();
+  fs.writeFileSync(previousLog, `Created conversation ${rootSession}\n`);
+  const oldOverlay = coordinated.args[addDir+1];
+  const artifact = path.join(oldOverlay, 'test_driver_headers.obj');
+  fs.writeFileSync(artifact, 'compiler output');
+  const reopenedResponse = await post(`/agents/${agyAgent.id}/launch`, {});
+  assert.equal(reopenedResponse.status,200);
+  const reopened = await reopenedResponse.json();
+  const newOverlay = reopened.args[reopened.args.indexOf('--add-dir')+1];
+  assert.notEqual(newOverlay,oldOverlay);
+  assert.equal(reopened.args[reopened.args.indexOf('--conversation')+1],rootSession);
+  assert.equal(fs.readFileSync(artifact,'utf8'),'compiler output');
+  const bindingFile = path.join(path.dirname(previousLog),'antigravity-binding.json');
+  const binding = fs.readFileSync(bindingFile,'utf8');
+  const logsBeforeFailure = fs.readdirSync(path.dirname(previousLog)).sort();
+  fs.writeFileSync(path.join(newOverlay,'.agents','mcp_config.json'),'{}');
+  const rejected = await post(`/agents/${agyAgent.id}/launch`, {});
+  assert.ok(rejected.status >= 400);
+  assert.match((await rejected.json()).error,/configuration has changed/);
+  assert.equal(fs.readFileSync(bindingFile,'utf8'),binding);
+  assert.deepEqual(fs.readdirSync(path.dirname(previousLog)).sort(),logsBeforeFailure);
   manualCoordination.configure(undefined);
   model.runtimeModelId = 'gemini-test';
   const routed = await (await post(`/conversations/${conversationId}/agents`, {...input, id: randomUUID()})).json();
@@ -654,6 +676,50 @@ try {
     const attachmentRes = await post('/image-preview', { cwd: '', path: attachmentImg });
     assert.equal(attachmentRes.status, 200);
     assert.equal((await attachmentRes.json()).mimeType, 'image/png');
+
+    // Antigravity Swarm & Subagent HTTP routes + revision stability
+    const swarmSysDir = path.join(fakeHome, '.gemini', 'antigravity-cli', 'brain', rootSession, '.system_generated');
+    const swarmDir = path.join(swarmSysDir, 'swarm');
+    const childWorkerId = randomUUID();
+    fs.mkdirSync(swarmDir, { recursive: true });
+    fs.mkdirSync(path.join(fakeHome, '.gemini', 'antigravity-cli', 'brain', rootSession, '.system_generated', 'logs'), { recursive: true });
+    fs.writeFileSync(path.join(swarmSysDir, 'logs', 'transcript.jsonl'), JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Start swarm' }) + '\n');
+    const membersPath = path.join(swarmDir, 'members.json');
+    const membersBase = {
+      title: 'HTTP Swarm',
+      members: {
+        coordinator: { conversation_id: rootSession, role: 'coordinator', phase: 'RUNNING', wake_mode: 'working', last_read_seq: 1, last_nudged_seq: 1 },
+        'worker-a': { conversation_id: childWorkerId, role: 'worker', applied_model: 'gemini-4-hydrogen-medium', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1 },
+      },
+    };
+    fs.writeFileSync(membersPath, JSON.stringify(membersBase));
+    fs.writeFileSync(path.join(swarmDir, 'board.jsonl'), [
+      JSON.stringify({ seq: 1, agent: 'coordinator', text: '@worker-a hi' }),
+      JSON.stringify({ seq: 2, agent: 'worker-a', text: '@coordinator [done] ok' }),
+    ].join('\n') + '\n');
+    const childLogsDir = path.join(fakeHome, '.gemini', 'antigravity-cli', 'brain', childWorkerId, '.system_generated', 'logs');
+    fs.mkdirSync(childLogsDir, { recursive: true });
+    fs.writeFileSync(path.join(childLogsDir, 'transcript.jsonl'), JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'Worker A output' }) + '\n');
+
+    const chatWithSwarm = await (await fetch(`${base}/agents/${agyAgent.id}/messages?view=chat`)).json();
+    assert.equal(chatWithSwarm.swarm?.title, 'HTTP Swarm');
+    assert.equal(chatWithSwarm.swarm?.totalBoardCount, 2);
+    // Volatile seq fields must NOT churn chat revision
+    membersBase.members.coordinator.last_read_seq = 99;
+    membersBase.members.coordinator.last_nudged_seq = 99;
+    fs.writeFileSync(membersPath, JSON.stringify(membersBase));
+    const knownCheck = await (await fetch(`${base}/agents/${agyAgent.id}/messages?view=chat&known=${chatWithSwarm.revision}`)).json();
+    assert.deepEqual(knownCheck, { revision: chatWithSwarm.revision });
+
+    const boardRes = await (await fetch(`${base}/agents/${agyAgent.id}/swarm/board?limit=1`)).json();
+    assert.equal(boardRes.messages.length, 1);
+    assert.equal(boardRes.messages[0].seq, 2);
+    assert.equal(boardRes.hasMore, true);
+
+    const subagentRes = await (await fetch(`${base}/agents/${agyAgent.id}/subagents/${childWorkerId}/messages?view=chat`)).json();
+    assert.equal(subagentRes.messages[0].text, 'Worker A output');
+    assert.equal((await fetch(`${base}/agents/${agyAgent.id}/subagents/${rootSession}/messages?view=chat`)).status, 400);
+    assert.equal((await fetch(`${base}/agents/${agyAgent.id}/subagents/${randomUUID()}/messages?view=chat`)).status, 404);
   } finally {
     if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
     if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;

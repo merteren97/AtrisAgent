@@ -21,6 +21,59 @@ export interface ManualToolArtifact {
   requestFeedback?: boolean;
 }
 
+export interface ManualSwarmMember {
+  name: string;
+  conversationId: string;
+  role: 'coordinator' | 'worker';
+  model?: string;
+  workspaceMode?: 'inherit' | 'share' | 'branch';
+  state: 'working' | 'waiting' | 'stopped' | 'killed';
+  completedSignaled?: boolean;
+  task?: string;
+  threadTitle?: string;
+}
+
+export interface ManualSwarmSubagent {
+  conversationId: string;
+  role: string;
+  typeName?: string;
+  model?: string;
+  state: 'alive' | 'stopped' | 'unknown';
+}
+
+export interface ManualSwarmThread {
+  id: string;
+  title: string;
+  goal?: string;
+  tasks: string[];
+}
+
+export interface ManualSwarmSummary {
+  title?: string;
+  goal?: { title: string; line: string };
+  threads?: ManualSwarmThread[];
+  members: ManualSwarmMember[];
+  subagents: ManualSwarmSubagent[];
+  totalBoardCount: number;
+  latestBoardSeq: number;
+}
+
+export interface ManualSwarmBoardMessage {
+  seq: number;
+  agent: string;
+  text: string;
+  time?: string;
+  kind?: string;
+}
+
+export interface ManualSwarmBoardResponse {
+  messages: ManualSwarmBoardMessage[];
+  totalCount: number;
+  hasMore: boolean;
+  oldestSeq?: number;
+  latestSeq?: number;
+}
+
 export interface ManualToolItem {
   id: string;
   name: string;
@@ -38,6 +91,68 @@ interface Binding { launchId: string; sessionId?: string }
 interface CachedTranscript { mtimeMs: number; size: number; truncated: boolean; parsed: ParsedTranscriptState }
 const TRANSCRIPT_CACHE = new Map<string, CachedTranscript>();
 const TRANSCRIPT_CACHE_LIMIT = 32;
+interface CachedFileValue { mtimeMs: number; size: number; value: unknown }
+const SWARM_FILE_CACHE = new Map<string, CachedFileValue>();
+const SWARM_FILE_CACHE_LIMIT = 64;
+
+function readCachedSwarmFile<T>(filename: string, parse: (raw: string) => T): T | undefined {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4 * 1024 * 1024) return undefined;
+  } catch {
+    return undefined;
+  }
+  const cached = SWARM_FILE_CACHE.get(filename);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    SWARM_FILE_CACHE.delete(filename);
+    SWARM_FILE_CACHE.set(filename, cached);
+    return cached.value as T;
+  }
+  try {
+    const raw = fs.readFileSync(filename, 'utf8');
+    const value = parse(raw);
+    SWARM_FILE_CACHE.delete(filename);
+    SWARM_FILE_CACHE.set(filename, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+    if (SWARM_FILE_CACHE.size > SWARM_FILE_CACHE_LIMIT) {
+      const oldest = SWARM_FILE_CACHE.keys().next().value;
+      if (oldest) SWARM_FILE_CACHE.delete(oldest);
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseBoardJsonl(raw: string): ManualSwarmBoardMessage[] {
+  const messages: ManualSwarmBoardMessage[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const item = JSON.parse(line);
+      if (!item || typeof item !== 'object') continue;
+      if (typeof item.seq !== 'number' || !Number.isFinite(item.seq)) continue;
+      if (typeof item.agent !== 'string' || typeof item.text !== 'string') continue;
+      messages.push({
+        seq: item.seq,
+        agent: item.agent,
+        text: item.text,
+        ...(typeof item.time === 'string' && item.time ? { time: item.time } : {}),
+        ...(typeof item.kind === 'string' && item.kind ? { kind: item.kind } : {}),
+      });
+    } catch {
+      // Ignore partial mid-write JSONL lines.
+    }
+  }
+  return messages;
+}
+
+function normalizeSubagentState(rawState: unknown): ManualSwarmSubagent['state'] {
+  if (typeof rawState !== 'string') return 'unknown';
+  if (/alive/i.test(rawState)) return 'alive';
+  if (/stop|done|finish|cancel|fail|error|kill/i.test(rawState)) return 'stopped';
+  return 'unknown';
+}
 
 function readParsedTranscript(filename: string, sessionId: string): { parsed: ParsedTranscriptState; truncated: boolean; mtimeIso?: string } {
   let stat: fs.Stats | undefined;
@@ -988,5 +1103,285 @@ export class ManualAntigravityBridge {
     }
 
     return { state: 'working', at };
+  }
+
+  private resolveBrainSubpath(sessionId: string, ...segments: string[]): string | undefined {
+    const normalized = sessionId.toLowerCase();
+    if (!UUID.test(normalized)) return undefined;
+    let root: string;
+    try {
+      root = fs.realpathSync(this.transcriptRoot);
+    } catch {
+      return undefined;
+    }
+    const relative = path.join('brain', normalized, '.system_generated', ...segments);
+    const candidate = path.join(this.transcriptRoot, relative);
+    try {
+      fs.lstatSync(candidate);
+      const actual = fs.realpathSync(candidate);
+      const rel = path.relative(root, actual);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
+      return candidate;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private readSubagentRecords(sessionId: string): ManualSwarmSubagent[] {
+    const dir = this.resolveBrainSubpath(sessionId, 'subagents');
+    if (!dir) return [];
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+    const result: ManualSwarmSubagent[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith('.json')) continue;
+      const fullPath = path.join(dir, entry);
+      const record = readCachedSwarmFile(fullPath, (raw) => JSON.parse(raw) as Record<string, any>);
+      if (!record || typeof record !== 'object') continue;
+      const conversationId = typeof record.conversationId === 'string' ? record.conversationId.toLowerCase() : '';
+      if (!UUID.test(conversationId)) continue;
+      const desc = record.subagentDescriptor && typeof record.subagentDescriptor === 'object'
+        ? record.subagentDescriptor as Record<string, any>
+        : {};
+      const role = typeof desc.role === 'string' && desc.role.trim() ? desc.role.trim() : 'Subagent';
+      const typeName = typeof desc.typeName === 'string' && desc.typeName.trim() ? desc.typeName.trim() : undefined;
+      const model = typeof desc.model === 'string' && desc.model.trim() ? desc.model.trim() : undefined;
+      result.push({
+        conversationId,
+        role,
+        ...(typeName ? { typeName } : {}),
+        ...(model ? { model } : {}),
+        state: normalizeSubagentState(record.state),
+      });
+    }
+    return result;
+  }
+
+  private readTranscriptSubagents(sessionId: string): ManualSwarmSubagent[] {
+    const filename = this.resolveTranscriptFile(sessionId);
+    if (!filename) return [];
+    const { parsed } = readParsedTranscript(filename, sessionId);
+    const result: ManualSwarmSubagent[] = [];
+    for (const message of parsed.messages) {
+      for (const tool of message.tools || []) {
+        const convId = tool.subagent?.conversationId?.toLowerCase();
+        if (!convId || !UUID.test(convId)) continue;
+        result.push({
+          conversationId: convId,
+          role: tool.subagent?.role || 'Subagent',
+          ...(tool.subagent?.typeName ? { typeName: tool.subagent.typeName } : {}),
+          ...(tool.subagent?.model ? { model: tool.subagent.model } : {}),
+          state: tool.status === 'running' ? 'alive' : tool.status === 'completed' || tool.status === 'failed' ? 'stopped' : 'unknown',
+        });
+      }
+    }
+    return result;
+  }
+
+  private readSwarmBoardAll(sessionId: string): ManualSwarmBoardMessage[] {
+    const boardFile = this.resolveBrainSubpath(sessionId, 'swarm', 'board.jsonl');
+    if (!boardFile) return [];
+    return readCachedSwarmFile(boardFile, parseBoardJsonl) || [];
+  }
+
+  readSwarmState(agent: ManualAgent): ManualSwarmSummary | undefined {
+    const sessionId = this.session(agent);
+    if (!sessionId) return undefined;
+
+    const membersFile = this.resolveBrainSubpath(sessionId, 'swarm', 'members.json');
+    const membersRecord = membersFile
+      ? readCachedSwarmFile(membersFile, (raw) => JSON.parse(raw) as Record<string, any>)
+      : undefined;
+    const planFile = this.resolveBrainSubpath(sessionId, 'swarm', 'plan.json');
+    const planRecord = planFile
+      ? readCachedSwarmFile(planFile, (raw) => JSON.parse(raw) as Record<string, any>)
+      : undefined;
+    const boardMessages = this.readSwarmBoardAll(sessionId);
+
+    const latestTextByAgent = new Map<string, string>();
+    let latestBoardSeq = 0;
+    for (const msg of boardMessages) {
+      if (msg.seq > latestBoardSeq) latestBoardSeq = msg.seq;
+      latestTextByAgent.set(msg.agent, msg.text);
+    }
+
+    const tasksMap = planRecord?.tasks && typeof planRecord.tasks === 'object' && !Array.isArray(planRecord.tasks)
+      ? planRecord.tasks as Record<string, unknown>
+      : {};
+    const threads: ManualSwarmThread[] = [];
+    const threadByMember = new Map<string, string>();
+    if (Array.isArray(planRecord?.threads)) {
+      for (const rawThread of planRecord.threads) {
+        if (!rawThread || typeof rawThread !== 'object') continue;
+        const id = typeof rawThread.id === 'string' ? rawThread.id : '';
+        const title = typeof rawThread.title === 'string' ? rawThread.title : '';
+        if (!id || !title) continue;
+        const threadTasks = Array.isArray(rawThread.tasks)
+          ? rawThread.tasks.filter((t: unknown): t is string => typeof t === 'string')
+          : [];
+        for (const memberName of threadTasks) threadByMember.set(memberName, title);
+        threads.push({
+          id,
+          title,
+          ...(typeof rawThread.goal === 'string' && rawThread.goal ? { goal: rawThread.goal } : {}),
+          tasks: threadTasks,
+        });
+      }
+    }
+
+    const members: ManualSwarmMember[] = [];
+    const rawMembers = membersRecord?.members && typeof membersRecord.members === 'object' && !Array.isArray(membersRecord.members)
+      ? membersRecord.members as Record<string, any>
+      : {};
+    for (const [name, raw] of Object.entries(rawMembers)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const conversationId = typeof raw.conversation_id === 'string' ? raw.conversation_id.toLowerCase() : '';
+      const role: ManualSwarmMember['role'] = raw.role === 'coordinator' ? 'coordinator' : 'worker';
+      const model = (typeof raw.applied_model === 'string' && raw.applied_model)
+        || (typeof raw.model === 'string' && raw.model)
+        || (typeof raw.desired_model === 'string' && raw.desired_model)
+        || undefined;
+      const workspaceMode = raw.workspace_mode === 'share' || raw.workspace_mode === 'branch' || raw.workspace_mode === 'inherit'
+        ? raw.workspace_mode
+        : undefined;
+      const state: ManualSwarmMember['state'] = raw.killed
+        ? 'killed'
+        : raw.phase !== 'RUNNING'
+          ? 'stopped'
+          : raw.wake_mode === 'working'
+            ? 'working'
+            : 'waiting';
+      const latestText = latestTextByAgent.get(name);
+      const completedSignaled = state === 'waiting' && typeof latestText === 'string' && latestText.includes('[done]')
+        ? true
+        : undefined;
+      const task = typeof tasksMap[name] === 'string' ? tasksMap[name] as string : undefined;
+      const threadTitle = threadByMember.get(name);
+      members.push({
+        name,
+        conversationId,
+        role,
+        ...(model ? { model } : {}),
+        ...(workspaceMode ? { workspaceMode } : {}),
+        state,
+        ...(completedSignaled ? { completedSignaled } : {}),
+        ...(task ? { task } : {}),
+        ...(threadTitle ? { threadTitle } : {}),
+      });
+    }
+
+    const subagentMap = new Map<string, ManualSwarmSubagent>();
+    for (const item of this.readTranscriptSubagents(sessionId)) {
+      subagentMap.set(item.conversationId, item);
+    }
+    for (const item of this.readSubagentRecords(sessionId)) {
+      const existing = subagentMap.get(item.conversationId);
+      subagentMap.set(item.conversationId, existing ? { ...existing, ...item } : item);
+    }
+    const subagents = [...subagentMap.values()];
+
+    if (!members.length && !boardMessages.length && !subagents.length) {
+      return undefined;
+    }
+
+    const goal = planRecord?.goal && typeof planRecord.goal === 'object'
+      && typeof planRecord.goal.title === 'string' && typeof planRecord.goal.line === 'string'
+      ? { title: planRecord.goal.title, line: planRecord.goal.line }
+      : undefined;
+    const title = typeof membersRecord?.title === 'string' && membersRecord.title.trim()
+      ? membersRecord.title.trim()
+      : undefined;
+
+    return {
+      ...(title ? { title } : {}),
+      ...(goal ? { goal } : {}),
+      ...(threads.length ? { threads } : {}),
+      members,
+      subagents,
+      totalBoardCount: boardMessages.length,
+      latestBoardSeq,
+    };
+  }
+
+  readSwarmBoard(agent: ManualAgent, options: { beforeSeq?: number; limit?: number } = {}): ManualSwarmBoardResponse {
+    const sessionId = this.session(agent);
+    if (!sessionId) return { messages: [], totalCount: 0, hasMore: false };
+    const all = this.readSwarmBoardAll(sessionId);
+    const limit = Math.min(200, Math.max(1, Math.floor(options.limit ?? 50)));
+    const filtered = options.beforeSeq !== undefined
+      ? all.filter((m) => m.seq < options.beforeSeq!)
+      : all;
+    const messages = filtered.slice(-limit);
+    return {
+      messages,
+      totalCount: all.length,
+      hasMore: filtered.length > messages.length,
+      ...(messages.length ? { oldestSeq: messages[0].seq } : {}),
+      ...(all.length ? { latestSeq: all[all.length - 1].seq } : {}),
+    };
+  }
+
+  private isAuthorizedSubagent(parentSessionId: string, targetId: string): boolean {
+    const queue = [parentSessionId.toLowerCase()];
+    const visited = new Set<string>();
+    const MAX_DEPTH_NODES = 64;
+    while (queue.length && visited.size < MAX_DEPTH_NODES) {
+      const current = queue.shift()!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+
+      const children = new Set<string>();
+      const membersFile = this.resolveBrainSubpath(current, 'swarm', 'members.json');
+      const membersRecord = membersFile
+        ? readCachedSwarmFile(membersFile, (raw) => JSON.parse(raw) as Record<string, any>)
+        : undefined;
+      if (membersRecord?.members && typeof membersRecord.members === 'object') {
+        for (const raw of Object.values(membersRecord.members as Record<string, any>)) {
+          if (raw && typeof raw === 'object' && typeof raw.conversation_id === 'string' && UUID.test(raw.conversation_id)) {
+            children.add(raw.conversation_id.toLowerCase());
+          }
+        }
+      }
+      for (const item of this.readSubagentRecords(current)) children.add(item.conversationId);
+      for (const item of this.readTranscriptSubagents(current)) children.add(item.conversationId);
+
+      if (children.has(targetId)) return true;
+      for (const child of children) {
+        if (!visited.has(child)) queue.push(child);
+      }
+    }
+    return false;
+  }
+
+  readSubagentTranscript(agent: ManualAgent, childConversationId: string): {
+    messages: ManualMessage[];
+    questions: ManualQuestion[];
+    truncated: boolean;
+    bound: boolean;
+  } {
+    const targetId = childConversationId.toLowerCase();
+    if (!UUID.test(targetId)) {
+      throw Object.assign(new Error('Invalid subagent conversation ID.'), { status: 400 });
+    }
+    const parentSessionId = this.session(agent);
+    if (!parentSessionId) {
+      throw Object.assign(new Error('Parent Antigravity session is not bound yet.'), { status: 404 });
+    }
+    if (targetId === parentSessionId.toLowerCase()) {
+      throw Object.assign(new Error('Cannot inspect the parent conversation as a subagent.'), { status: 400 });
+    }
+    if (!this.isAuthorizedSubagent(parentSessionId, targetId)) {
+      throw Object.assign(new Error('Subagent conversation was not found in this agent.'), { status: 404 });
+    }
+    const filename = this.resolveTranscriptFile(targetId);
+    if (!filename) {
+      return { messages: [], questions: [], truncated: false, bound: false };
+    }
+    const { parsed, truncated } = readParsedTranscript(filename, targetId);
+    return { messages: parsed.messages, questions: parsed.questions, truncated, bound: true };
   }
 }

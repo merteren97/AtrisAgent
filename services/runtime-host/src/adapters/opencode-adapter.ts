@@ -1,3 +1,5 @@
+import { hasOpenCodeConnections, isOpenCodeV2, v2FormAnswer, v2ModelRef, v2Models, v2Questions, v2Reasoning, type V2Field } from './opencode-v2';
+import { normalizeV2Event } from './opencode-v2-events';
 import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -101,7 +103,9 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   readonly runtimeType: RuntimeType = 'opencode';
 
   private servers = new Map<string, ServerInstance>();
-  private authResults = new Map<string, AuthInitiationResult & { profileId: string }>();
+  private authResults = new Map<string, AuthInitiationResult & { profileId: string; integrationId?: string; attemptId?: string }>();
+  private v2Forms = new Map<string, V2Field[]>();
+  private v2ToolNames = new Map<string, Map<string, string>>();
   private abortControllers = new Map<string, AbortController>();
   private sessionContext = new Map<string, { missionId: string; taskId: string; attemptId?: string; runId?: string; serverKey: string; runtimeSessionId: string }>();
   private pendingQuestions = new Map<string, QuestionAsked>();
@@ -120,8 +124,8 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     const server = context ? this.servers.get(context.serverKey) : undefined;
     if (!server || server.process.exitCode !== null || server.process.killed || !this.activeSessions.has(sessionId)) return false;
     try {
-      const response = await this.fetchServer(server, '/global/health', {}, 1_000);
-      return response.ok;
+      await this.checkServerHealth(server, 1_000);
+      return true;
     } catch {
       return false;
     }
@@ -131,14 +135,31 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     return { reuseWhileAlive: true, resumeAfterRestart: true };
   }
 
+  private apiPath(server: ServerInstance, pathname: string): string {
+    return isOpenCodeV2(server.version) ? `/api${pathname}` : pathname;
+  }
+
+  private async checkServerHealth(server: ServerInstance, timeoutMs = 1_000): Promise<{ version?: string }> {
+    const pathname = isOpenCodeV2(server.version) ? '/api/info' : '/global/health';
+    const response = await this.fetchServer(server, pathname, {}, timeoutMs);
+    if (!response.ok) throw new Error(`OpenCode health check failed (${response.status}).`);
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType && !contentType.toLowerCase().includes('json')) {
+      throw new Error(`OpenCode health endpoint returned unexpected content-type (${contentType}).`);
+    }
+    return (await response.json()) as { version?: string };
+  }
+
   override async probeProviderSession(providerSessionId: string, options: { profileId?: string; cwd?: string } = {}): Promise<boolean> {
     try {
       const remembered = this.reusableSessions.get(providerSessionId);
       const server = remembered
         ? this.getServer(remembered.serverKey)
         : await this.ensureServer(options.profileId || 'default', options.cwd);
-      const response = await this.fetchServer(server, `/session/${encodeURIComponent(providerSessionId)}`, {}, 1_000);
+      const response = await this.fetchServer(server, this.apiPath(server, `/session/${encodeURIComponent(providerSessionId)}`), {}, 1_000);
       if (!response.ok) return false;
+      const sessionInfo = await response.json() as any;
+      if ((isOpenCodeV2(server.version) ? sessionInfo.data?.id : sessionInfo.id) !== providerSessionId) return false;
       this.reusableSessions.set(providerSessionId, { serverKey: server.key, profileId: server.profileId, cwd: server.cwd });
       return true;
     } catch {
@@ -151,7 +172,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     this.reusableSessions.delete(providerSessionId);
     if (!remembered) return;
     const server = this.servers.get(remembered.serverKey);
-    if (server) await this.fetchServer(server, `/session/${encodeURIComponent(providerSessionId)}`, { method: 'DELETE' }, 2_000).catch(() => undefined);
+    if (server) await this.fetchServer(server, this.apiPath(server, `/session/${encodeURIComponent(providerSessionId)}`), { method: 'DELETE' }, 2_000).catch(() => undefined);
   }
 
   constructor(eventBus?: LocalEventBus) {
@@ -231,15 +252,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     }
 
     const server = await this.ensureServer(profileId);
+    const v2 = isOpenCodeV2(server.version);
     const providerId = typeof options.providerId === 'string' ? options.providerId : '';
     if (!providerId) return { authId, method, status: 'failed', instructions: 'providerId is required.' };
     if (method === 'provider_secret') {
       const secret = typeof options.secret === 'string' ? options.secret : '';
       if (!secret) return { authId, method, status: 'failed', instructions: 'A provider secret is required.' };
       const schema = typeof options.authPayload === 'object' && options.authPayload ? options.authPayload as Record<string, unknown> : { key: secret };
-      const response = await this.fetchServer(server, `/auth/${encodeURIComponent(providerId)}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schema),
-      });
+      const response = v2
+        ? await this.fetchServer(server, `/api/integration/${encodeURIComponent(providerId)}/connect/key`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schema),
+        })
+        : await this.fetchServer(server, `/auth/${encodeURIComponent(providerId)}`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schema),
+        });
       const result = {
         authId, method, status: response.ok ? 'completed' as const : 'failed' as const,
         instructions: response.ok ? 'Credentials were handed to OpenCode and were not persisted by AtrisAgent.' : `OpenCode rejected credentials (${response.status}).`,
@@ -250,11 +276,17 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     }
 
     const authIndex = Number(options.authIndex ?? 0);
-    const response = await this.fetchServer(server, `/provider/${encodeURIComponent(providerId)}/oauth/authorize`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method: authIndex }),
-    });
+    const methodID = typeof options.methodId === 'string' && options.methodId ? options.methodId : String(options.authIndex ?? 'oauth');
+    const response = v2
+      ? await this.fetchServer(server, `/api/integration/${encodeURIComponent(providerId)}/connect/oauth`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ methodID }),
+      })
+      : await this.fetchServer(server, `/provider/${encodeURIComponent(providerId)}/oauth/authorize`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method: authIndex }),
+      });
     if (!response.ok) return { authId, method, status: 'failed', instructions: `OAuth authorization failed (${response.status}).` };
-    const authorization = await response.json() as any;
+    const rawAuthorization = await response.json() as any;
+    const authorization = v2 && rawAuthorization?.data ? rawAuthorization.data : rawAuthorization;
     const result = {
       authId,
       method,
@@ -262,6 +294,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       url: authorization.url,
       instructions: authorization.instructions || authorization.message || 'Complete the provider OAuth flow, then return to AtrisAgent.',
       profileId,
+      ...(v2 ? { integrationId: providerId, attemptId: typeof authorization.attemptID === 'string' ? authorization.attemptID : undefined } : {}),
     };
     this.authResults.set(authId, result);
     return result;
@@ -270,6 +303,24 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   async pollAuthentication(authId: string): Promise<AuthPollResult> {
     const flow = this.authResults.get(authId);
     if (!flow) return { authId, status: 'error', message: 'Authentication flow not found.' };
+    if (flow.integrationId && flow.attemptId) {
+      try {
+        const server = await this.ensureServer(flow.profileId);
+        if (isOpenCodeV2(server.version)) {
+          const response = await this.fetchServer(
+            server,
+            `/api/integration/${encodeURIComponent(flow.integrationId)}/connect/oauth/${encodeURIComponent(flow.attemptId)}`,
+          );
+          if (response.ok) {
+            const payload = await response.json() as any;
+            const statusValue = payload?.data?.status || payload?.status;
+            if (statusValue === 'failed' || statusValue === 'cancelled') {
+              return { authId, status: 'error', message: payload?.data?.error || 'OpenCode OAuth flow failed.' };
+            }
+          }
+        }
+      } catch { /* Fall back to verifyAuthentication below. */ }
+    }
     const status = await this.verifyAuthentication(flow.profileId);
     return {
       authId,
@@ -283,10 +334,12 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (!install.installed || !install.path) return 'not_installed';
     try {
       if (this.profileModes.get(profileId) === 'shared_cli') {
-        const result = await runCommand(install.path, ['auth', 'list'], {
+        const v2 = isOpenCodeV2(install.version);
+        const result = await runCommand(install.path, v2 ? ['auth', 'list', '--format', 'json'] : ['auth', 'list'], {
           env: this.profileEnv(profileId),
           timeoutMs: 12_000,
         });
+        if (v2) return hasOpenCodeConnections(JSON.parse(result.stdout)) ? 'connected' : 'login_required';
         const output = `${result.stdout}\n${result.stderr}`.trim().toLowerCase();
         return !output || /no\s+(?:auth|credential|provider)|not\s+connected/.test(output)
           ? 'login_required'
@@ -294,6 +347,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       }
 
       const server = await this.ensureServer(profileId);
+      const v2 = isOpenCodeV2(server.version);
+      if (v2) {
+        let rows: unknown[] = [];
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const response = await this.fetchServer(server, '/api/integration');
+          if (!response.ok) return 'error';
+          const data = await response.json() as any;
+          if (!Array.isArray(data?.data)) return 'error';
+          rows = data.data;
+          if (rows.length > 0) break;
+          if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+        return hasOpenCodeConnections(rows) ? 'connected' : 'login_required';
+      }
       const response = await this.fetchServer(server, '/provider');
       if (!response.ok) return 'error';
       const data = await response.json() as any;
@@ -327,8 +394,9 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     }
 
     const server = await this.ensureServer(profileId);
+    if (isOpenCodeV2(server.version)) return this.v2Descriptors(server, profileId);
     const response = await this.fetchServer(server, '/config/providers');
-    if (!response.ok) return [];
+    if (!response.ok) throw new Error(`OpenCode catalog request failed (${response.status}).`);
     const data = await response.json() as any;
     const providers: OpenCodeProvider[] = Array.isArray(data.providers) ? data.providers : [];
     const descriptors: ModelDescriptor[] = [];
@@ -367,10 +435,35 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     return descriptors;
   }
 
+  private async v2Descriptors(server: ServerInstance, profileId: string): Promise<ModelDescriptor[]> {
+    let payload: any;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const response = await this.fetchServer(server, '/api/model');
+      if (!response.ok) throw new Error(`OpenCode catalog request failed (${response.status}).`);
+      payload = await response.json();
+      if (Array.isArray(payload?.data) && payload.data.length > 0) break;
+      if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+    return v2Models(payload).map(model => {
+      const runtimeModelId = `${model.providerID}/${model.id}`;
+      const variants = v2Reasoning(model);
+      return {
+        catalogId: `${this.id}:${profileId}:${runtimeModelId}`, runtimeId: this.runtimeType, accountProfileId: profileId,
+        providerId: this.mapProvider(model.providerID), runtimeModelId, displayName: model.name || model.id,
+        supportedRoles: ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'],
+        supportedReasoning: variants, defaultReasoning: variants.includes('medium') ? 'medium' : variants[0],
+        inputModalities: model.capabilities?.input || ['text'], outputModalities: model.capabilities?.output,
+        contextWindow: model.limit?.context, maxOutputTokens: model.limit?.output,
+        source: 'discovered', availability: 'available', discoveredAt: new Date().toISOString(),
+        routeLabel: `OpenCode · ${model.providerID}`,
+      };
+    });
+  }
+
   private async discoverModelsFromCli(profileId: string): Promise<ModelDescriptor[]> {
     const install = await this.discoverInstallation();
     if (!install.installed || !install.path) return [];
-    const result = await runCommand(install.path, ['models', '--refresh'], {
+    const result = await runCommand(install.path, isOpenCodeV2(install.version) ? ['models'] : ['models', '--refresh'], {
       env: this.profileEnv(profileId),
       timeoutMs: 45_000,
     });
@@ -409,6 +502,10 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (models.length) {
       try {
         const server = await this.ensureServer(profileId);
+        if (isOpenCodeV2(server.version)) {
+          const enriched = new Map((await this.v2Descriptors(server, profileId)).map(m => [m.runtimeModelId, m]));
+          return models.map(model => enriched.get(model.runtimeModelId) || model);
+        }
         const response = await this.fetchServer(server, '/config/providers');
         if (response.ok) {
           const data = await response.json() as {providers?: OpenCodeProvider[]};
@@ -440,7 +537,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     try {
       const response = await this.fetchServer(
         server,
-        `/session/${encodeURIComponent(context.runtimeSessionId)}/message`,
+        this.apiPath(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/message`),
         {},
         3_000,
       );
@@ -448,7 +545,8 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       const data = (await response.json()) as unknown;
       const list = Array.isArray(data)
         ? data
-        : data && typeof data === 'object' && Array.isArray((data as any).messages)
+        : isOpenCodeV2(server.version) && Array.isArray((data as any)?.data) ? (data as any).data
+          : data && typeof data === 'object' && Array.isArray((data as any).messages)
           ? (data as any).messages
           : [];
       if (!list.length) return null;
@@ -510,12 +608,20 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   async startSession(request: StartSessionRequest): Promise<AgentSession> {
     const profileId = 'default';
     const server = await this.ensureServer(profileId);
-    const response = await this.fetchServer(server, '/session', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: `AtrisAgent · ${request.model}` }),
+    const v2 = isOpenCodeV2(server.version);
+    const createBody: Record<string, unknown> = { title: `AtrisAgent · ${request.model}` };
+    if (v2 && request.model) {
+      try {
+        const ref = v2ModelRef(request.model);
+        if (ref) createBody.model = ref;
+      } catch { /* Non-provider/model route falls back to OpenCode default. */ }
+    }
+    const response = await this.fetchServer(server, this.apiPath(server, '/session'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(createBody),
     });
     if (!response.ok) throw new Error(`OpenCode failed to create a session (${response.status}).`);
     const created = await response.json() as any;
-    const id = created.id || created.sessionID || crypto.randomUUID();
+    const id = (v2 ? created?.data?.id : created?.id || created?.sessionID) || crypto.randomUUID();
     const session: AgentSession = { id, agentInstanceId: id, runtimeSessionId: id, startedAt: new Date().toISOString(), endedAt: null };
     this.activeSessions.set(id, session);
     return session;
@@ -526,6 +632,26 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     const server = context ? this.getServer(context.serverKey) : await this.ensureServer('default');
     const runtimeSessionId = context?.runtimeSessionId || sessionId;
     const model = input.metadata?.model;
+    if (isOpenCodeV2(server.version)) {
+      if (model) {
+        const modelRef = typeof model === 'string'
+          ? v2ModelRef(model)
+          : typeof model === 'object' && typeof (model as any).providerID === 'string' && (typeof (model as any).id === 'string' || typeof (model as any).modelID === 'string')
+            ? { providerID: (model as any).providerID, id: (model as any).id || (model as any).modelID, ...((model as any).variant ? { variant: (model as any).variant } : {}) }
+            : undefined;
+        if (modelRef) {
+          const switchRes = await this.fetchServer(server, `/api/session/${encodeURIComponent(runtimeSessionId)}/model`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: modelRef }),
+          });
+          if (!switchRes.ok) throw new Error(`OpenCode model switch failed (${switchRes.status}).`);
+        }
+      }
+      const response = await this.fetchServer(server, `/api/session/${encodeURIComponent(runtimeSessionId)}/prompt`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: input.content }),
+      });
+      if (!response.ok) throw new Error(`OpenCode message failed (${response.status}).`);
+      return;
+    }
     const body: Record<string, unknown> = {
       parts: [{ type: 'text', text: input.content }],
       noReply: false,
@@ -558,10 +684,16 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     const context = this.sessionContext.get(sessionId);
     if (!context || !permissionId) throw new Error('OpenCode approval request must be `<sessionId>:<permissionId>`.');
     const server = this.getServer(context.serverKey);
-    const response = await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/permissions/${encodeURIComponent(permissionId)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ response: decision === 'approved' ? 'once' : 'reject', remember: false }),
-    });
+    const v2 = isOpenCodeV2(server.version);
+    const response = v2
+      ? await this.fetchServer(server, `/api/session/${encodeURIComponent(context.runtimeSessionId)}/permission/${encodeURIComponent(permissionId)}/reply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: decision === 'approved' ? 'once' : 'reject' }),
+      })
+      : await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/permissions/${encodeURIComponent(permissionId)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ response: decision === 'approved' ? 'once' : 'reject', remember: false }),
+      });
     if (!response.ok) throw new Error(`OpenCode permission response failed (${response.status}).`);
   }
 
@@ -592,6 +724,34 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     this.questionDeliveries.add(key);
     try {
       const server = this.getServer(context.serverKey);
+      if (isOpenCodeV2(server.version)) {
+        let response: Response;
+        if (action === 'reply') {
+          const fields = this.v2Forms.get(key);
+          if (!fields) throw new Error('OpenCode form schema is no longer available for this question.');
+          const answer = v2FormAnswer(fields, answers!);
+          response = await this.fetchServer(
+            server,
+            `/api/session/${encodeURIComponent(context.runtimeSessionId)}/form/${encodeURIComponent(requestId)}/reply`,
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answer }) },
+          );
+        } else {
+          response = await this.fetchServer(
+            server,
+            `/api/session/${encodeURIComponent(context.runtimeSessionId)}/form/${encodeURIComponent(requestId)}`,
+            { method: 'DELETE' },
+          );
+        }
+        if (!response.ok) throw new Error(`OpenCode form ${action} failed (${response.status}).`);
+        this.v2Forms.delete(key);
+        if (this.pendingQuestions.get(key) === question) {
+          this.pendingQuestions.delete(key);
+          this.emitEvent(action === 'reply'
+            ? { ...question, id: crypto.randomUUID(), type: 'question_replied', answers: answers!, timestamp: new Date().toISOString() }
+            : { ...question, id: crypto.randomUUID(), type: 'question_rejected', reason: 'Question cancelled by user', outcome: 'rejected', timestamp: new Date().toISOString() });
+        }
+        return;
+      }
       // Use this session's authenticated server AND directory; never a new unauthenticated client.
       const response = await this.fetchServer(server, `/question/${encodeURIComponent(requestId)}/${action}?directory=${encodeURIComponent(server.cwd)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -616,7 +776,10 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     if (context) {
       const server = this.servers.get(context.serverKey);
       if (server && server.process.exitCode === null && !server.process.killed) {
-        const aborted = await this.fetchServer(server, `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`, { method: 'POST' }, 2_000)
+        const cancelPath = isOpenCodeV2(server.version)
+          ? `/api/session/${encodeURIComponent(context.runtimeSessionId)}/interrupt`
+          : `/session/${encodeURIComponent(context.runtimeSessionId)}/abort`;
+        const aborted = await this.fetchServer(server, cancelPath, { method: 'POST' }, 2_000)
           .then((response) => response.ok, () => false);
         if (server.dedicated) await terminateProcessTree(server.process);
         else if (!aborted) throw new Error('OpenCode did not confirm session cancellation; retry before cleaning its worktree.');
@@ -647,19 +810,35 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
     try {
       const server = await this.ensureServer(profileId, workspaceCwd, controlPlane, agentInstanceId);
+      const v2 = isOpenCodeV2(server.version);
       let runtimeSessionId = options.providerSessionId;
       if (runtimeSessionId && !(await this.probeProviderSession(runtimeSessionId, { profileId, cwd: workspaceCwd }))) {
         throw new Error('OpenCode provider session is unavailable or failed health validation.');
       }
       if (!runtimeSessionId) {
-        const createResponse = await this.fetchServer(server, '/session', {
+        const createBody: Record<string, unknown> = { title: `${options.role || 'agent'} · ${options.taskId}` };
+        if (v2) {
+          createBody.agent = this.mapAgentMode(options.role);
+          if (options.model) {
+            const ref = v2ModelRef(options.model, options.reasoningLevel);
+            if (ref) createBody.model = ref;
+          }
+        }
+        const createResponse = await this.fetchServer(server, this.apiPath(server, '/session'), {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: `${options.role || 'agent'} · ${options.taskId}` }),
+          body: JSON.stringify(createBody),
         });
         if (!createResponse.ok) throw new Error(`OpenCode failed to create a session (${createResponse.status}).`);
         const created = await createResponse.json() as any;
-        runtimeSessionId = created.id || created.sessionID;
+        runtimeSessionId = v2 ? created?.data?.id : created?.id || created?.sessionID;
         if (!runtimeSessionId) throw new Error('OpenCode session response did not contain an id.');
+      } else if (v2 && options.model) {
+        const ref = v2ModelRef(options.model, options.reasoningLevel);
+        if (ref) {
+          await this.fetchServer(server, `/api/session/${encodeURIComponent(runtimeSessionId)}/model`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: ref }),
+          }).catch(() => undefined);
+        }
       }
 
       const session: AgentSession = {
@@ -692,14 +871,19 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         this.reusableSessions.set(runtimeSessionId, { serverKey: server.key, profileId, cwd: workspaceCwd });
       }
       const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
-      const response = await this.fetchServer(server, `/session/${encodeURIComponent(runtimeSessionId)}/prompt_async`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...openCodePromptRoute(options.model, options.reasoningLevel),
-          agent: this.mapAgentMode(options.role),
-          parts: [{ type: 'text', text: prompt }],
-        }),
-      });
+      const response = v2
+        ? await this.fetchServer(server, `/api/session/${encodeURIComponent(runtimeSessionId)}/prompt`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: prompt }),
+        })
+        : await this.fetchServer(server, `/session/${encodeURIComponent(runtimeSessionId)}/prompt_async`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...openCodePromptRoute(options.model, options.reasoningLevel),
+            agent: this.mapAgentMode(options.role),
+            parts: [{ type: 'text', text: prompt }],
+          }),
+        });
       if (!response.ok) {
         await this.cancel(agentInstanceId);
         throw new Error(`OpenCode prompt submission failed (${response.status}).`);
@@ -728,7 +912,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     const existing = this.servers.get(key);
     if (existing && !existing.process.killed) {
       try {
-        await waitForHttp(`${existing.url}/global/health`, { headers: { Authorization: basicAuthHeader(existing.username, existing.password) } }, 1_000);
+        await this.checkServerHealth(existing, 1_000);
         return existing;
       } catch {
         await terminateProcessTree(existing.process).catch(() => undefined);
@@ -785,11 +969,16 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
       child.once('close', (code) => reject(new Error(`OpenCode server exited with code ${code}. ${instance.diagnostics.trim()}`.trim())));
     });
     let health: Response;
+    const healthPath = isOpenCodeV2(install.version) ? '/api/info' : '/global/health';
     try {
       health = await Promise.race([
-        waitForHttp(`${instance.url}/global/health`, { headers: { Authorization: basicAuthHeader(username, password) }, signal: startupController.signal }, 15_000),
+        waitForHttp(`${instance.url}${healthPath}`, { headers: { Authorization: basicAuthHeader(username, password) }, signal: startupController.signal }, 15_000),
         exited,
       ]);
+      const contentType = health.headers.get('content-type') || '';
+      if (contentType && !contentType.toLowerCase().includes('json')) {
+        throw new Error(`OpenCode health endpoint ${healthPath} returned non-JSON (${contentType}).`);
+      }
     } catch (error) {
       if (this.servers.get(key)?.process === child) this.servers.delete(key);
       await terminateProcessTree(child).catch(() => undefined);
@@ -833,7 +1022,8 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
   private async startEventStream(sessionId: string, server: ServerInstance, ready?: () => void): Promise<void> {
     const controller = new AbortController();
     this.abortControllers.set(sessionId, controller);
-    const response = await this.fetchServer(server, '/event', { signal: controller.signal, headers: { Accept: 'text/event-stream' } });
+    const v2 = isOpenCodeV2(server.version);
+    const response = await this.fetchServer(server, this.apiPath(server, '/event'), { signal: controller.signal, headers: { Accept: 'text/event-stream' } });
     if (!response.ok || !response.body) throw new Error(`OpenCode event stream failed (${response.status}).`);
     ready?.();
     const reader = response.body.getReader();
@@ -853,7 +1043,7 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         for (const frame of frames) {
           const data = frame.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
           if (!data) continue;
-          try { this.handleServerEvent(sessionId, JSON.parse(data)); } catch { /* ignore malformed SSE */ }
+          try { this.handleServerEvent(sessionId, JSON.parse(data), v2); } catch { /* ignore malformed SSE */ }
         }
       }
     } catch (error) {
@@ -867,14 +1057,56 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     }
   }
 
-  private handleServerEvent(sessionId: string, envelope: any): void {
+  private handleServerEvent(sessionId: string, envelope: any, isV2 = false): void {
     const context = this.sessionContext.get(sessionId);
     if (!context) return;
-    const event = envelope.payload || envelope;
+    let effectiveEnvelope = envelope;
+    if (isV2) {
+      const rawData = envelope?.data;
+      let toolNames = this.v2ToolNames.get(sessionId);
+      if (envelope?.type === 'session.tool.called' && typeof rawData?.id === 'string') {
+        const name = (typeof rawData.tool === 'string' && rawData.tool) || (typeof rawData.name === 'string' && rawData.name) || 'tool';
+        if (!toolNames) { toolNames = new Map(); this.v2ToolNames.set(sessionId, toolNames); }
+        toolNames.set(rawData.id, name);
+      }
+      const knownToolName = typeof rawData?.id === 'string' ? toolNames?.get(rawData.id) : undefined;
+      const normalized = normalizeV2Event(envelope, knownToolName);
+      if (!normalized) return;
+      if (normalized.type === 'form.created') {
+        const props = normalized.properties as { sessionID: string; id: string; title?: string; fields: V2Field[] };
+        if (props.sessionID !== context.runtimeSessionId || typeof props.id !== 'string') return;
+        const converted = v2Questions(props.fields, props.title || 'Question');
+        const questions = converted ? normalizeOpenCodeQuestions(converted) : undefined;
+        if (!questions) {
+          this.emitFailure(sessionId, 'OpenCode form payload is unsupported or exceeds question limits.');
+          this.cleanupSession(sessionId);
+          return;
+        }
+        const key = JSON.stringify([sessionId, props.id]);
+        if (this.pendingQuestions.has(key)) return;
+        if ([...this.pendingQuestions.values()].filter(q => q.agentInstanceId === sessionId).length >= 32) {
+          this.emitFailure(sessionId, 'OpenCode exceeded the limit of 32 pending question requests per session.');
+          this.cleanupSession(sessionId);
+          return;
+        }
+        const question: QuestionAsked = {
+          id: crypto.randomUUID(), type: 'question_asked', missionId: context.missionId,
+          taskId: context.taskId, attemptId: context.attemptId, runId: context.runId,
+          agentInstanceId: sessionId, runtimeSessionId: context.runtimeSessionId, adapterId: this.id,
+          requestId: props.id, questionId: `${sessionId}:${props.id}`, questions, timestamp: new Date().toISOString(),
+        };
+        this.v2Forms.set(key, props.fields);
+        this.pendingQuestions.set(key, question);
+        this.emitEvent(question);
+        return;
+      }
+      effectiveEnvelope = normalized;
+    }
+    const event = effectiveEnvelope.payload || effectiveEnvelope;
     const properties = event.properties || event;
     const relatedSessionId = properties.sessionID || properties.sessionId || properties.info?.sessionID || properties.part?.sessionID;
     if (relatedSessionId && relatedSessionId !== context.runtimeSessionId) return;
-    const type = event.type || envelope.type;
+    const type = event.type || effectiveEnvelope.type;
     const timestamp = new Date().toISOString();
     if (type === 'question.asked') {
       // Global streams may contain other sessions; questions require an explicit session match.
@@ -964,8 +1196,13 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
     for (const [key, question] of this.pendingQuestions) {
       if (question.agentInstanceId !== sessionId) continue;
       this.pendingQuestions.delete(key);
+      this.v2Forms.delete(key);
       this.emitEvent({ ...question, id: crypto.randomUUID(), type: 'question_rejected', reason: 'Originating runtime session ended', outcome: 'cancelled', timestamp: new Date().toISOString() });
     }
+    for (const key of [...this.v2Forms.keys()]) {
+      if (key.startsWith(`["${sessionId}",`)) this.v2Forms.delete(key);
+    }
+    this.v2ToolNames.delete(sessionId);
     this.abortControllers.get(sessionId)?.abort();
     this.abortControllers.delete(sessionId);
     this.activeSessions.delete(sessionId);

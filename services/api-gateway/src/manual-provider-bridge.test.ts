@@ -110,7 +110,10 @@ try {
 
   const openAgent = {...agent,id:randomUUID(),runtimeType:'opencode',model:'test/model',reasoning:'high'};
   const prepared = bridge.prepareOpenCode(openAgent);
+  assert.ok(prepared.args.includes('--model'), 'OpenCode v1 includes --model flag');
   assert.ok(!prepared.args.includes('--variant'), 'TUI does not support run-only variant flag');
+  const preparedV2 = bridge.prepareOpenCode(openAgent, '2.4.1');
+  assert.ok(!preparedV2.args.includes('--model'), 'OpenCode v2 omits unsupported top-level --model flag');
   assert.ok(bridge.prepareCodex({...agent,reasoning:'high'}).includes('model_reasoning_effort="high"'));
   assert.ok(!('OPENCODE_CONFIG_CONTENT' in prepared.env),'Inherited config values never cross the UI transport');
   const plugin = await import(prepared.env.ATRIS_MANUAL_OPENCODE_PLUGIN);

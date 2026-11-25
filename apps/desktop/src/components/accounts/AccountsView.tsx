@@ -13,6 +13,7 @@ import {
   RefreshCw,
   ShieldCheck,
   Trash2,
+  X,
   XCircle,
 } from 'lucide-react';
 import { useAccountStore, type AuthFlowResult } from '@/stores/account-store';
@@ -27,6 +28,15 @@ import { RuntimeBrandIcon } from '@/components/runtime/runtime-brand-icon';
 import { cn } from '@/lib/utils';
 
 const ROLES = ['Orchestrator', 'Builder', 'Reviewer', 'Researcher', 'QA'];
+
+type FeedbackKind = 'success' | 'error' | 'info';
+
+function AccountFeedback({ message, kind }: { message: string; kind: FeedbackKind }) {
+  const Icon = kind === 'error' ? AlertTriangle : kind === 'success' ? CheckCircle2 : Activity;
+  return <><Icon aria-hidden="true" className={cn('mt-0.5 h-4 w-4 shrink-0', {
+    'text-destructive': kind === 'error', 'text-emerald-400': kind === 'success', 'text-primary': kind === 'info',
+  })} /><span className="whitespace-pre-wrap break-words">{message}</span></>;
+}
 
 export function AccountsView() {
   const {
@@ -60,7 +70,7 @@ export function AccountsView() {
   const [secret, setSecret] = useState('');
   const [providerId, setProviderId] = useState('');
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [feedback, setFeedback] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<{ message: string; kind: FeedbackKind } | null>(null);
   const mountedRef = useRef(true);
   const notifyTimerRef = useRef<number | null>(null);
 
@@ -90,14 +100,19 @@ export function AccountsView() {
     if (!selectedMethods.some((method) => method.id === authMethod)) setAuthMethod(selectedMethods[0]?.id || '');
   }, [authMethod, selectedMethods]);
 
-  const notify = (message: string) => {
+  const notify = (message: string, kind: FeedbackKind = 'info') => {
     if (!mountedRef.current) return;
-    setFeedback(message);
-    if (notifyTimerRef.current !== null) window.clearTimeout(notifyTimerRef.current);
-    notifyTimerRef.current = window.setTimeout(() => {
+    setFeedback({ message, kind });
+    if (notifyTimerRef.current !== null) {
+      window.clearTimeout(notifyTimerRef.current);
       notifyTimerRef.current = null;
-      if (mountedRef.current) setFeedback(null);
-    }, 4_000);
+    }
+    if (kind !== 'error') {
+      notifyTimerRef.current = window.setTimeout(() => {
+        notifyTimerRef.current = null;
+        if (mountedRef.current) setFeedback(null);
+      }, 4_000);
+    }
   };
 
   const openWizard = (type: RuntimeType) => {
@@ -130,21 +145,21 @@ export function AccountsView() {
       const flow = await beginAuthentication(profile.id, authMethod, options);
       if (!mountedRef.current) return;
       setAuthFlow(flow);
-      notify(flow.status === 'failed' ? (flow.instructions || 'Connection could not be started.') : flow.status === 'completed' ? 'Account connected.' : 'Official authentication flow started.');
+      notify(flow.status === 'failed' ? (flow.instructions || 'Connection could not be started.') : flow.status === 'completed' ? 'Account connected.' : 'Official authentication flow started.', flow.status === 'failed' ? 'error' : flow.status === 'completed' ? 'success' : 'info');
       if (flow.status === 'completed') await refreshModels(profile.id);
       if (!mountedRef.current) return;
       if (runtimeType === 'antigravity' && flow.status === 'pending') {
         notify('Checking your existing Antigravity session in the background…');
         const result = await pollAuthentication(profile.id, flow.authId);
         if (!mountedRef.current) return;
-        notify(result.message || `Connection: ${result.status}`);
+        notify(result.message || `Connection: ${result.status}`, result.status === 'connected' ? 'success' : result.status === 'error' ? 'error' : 'info');
         if (result.status === 'connected') {
           await refreshModels(profile.id);
           if (mountedRef.current) setDialogOpen(false);
         }
       }
     } catch (cause: any) {
-      notify(cause?.message || 'Profile creation failed.');
+      notify(cause?.message || 'Profile creation failed.', 'error');
     } finally {
       if (mountedRef.current) setBusyAction(null);
     }
@@ -159,13 +174,13 @@ export function AccountsView() {
       if (result.status === 'connected') {
         await refreshModels(createdProfileId);
         if (!mountedRef.current) return;
-        notify(result.message || 'Authentication verified and live model catalog refreshed.');
+        notify(result.message || 'Authentication verified and live model catalog refreshed.', 'success');
         setDialogOpen(false);
       } else {
-        notify(result.message || `Current authentication status: ${result.status}`);
+        notify(result.message || `Current authentication status: ${result.status}`, result.status === 'error' ? 'error' : 'info');
       }
     } catch (cause: any) {
-      notify(cause?.message || 'Authentication check failed.');
+      notify(cause?.message || 'Authentication check failed.', 'error');
     } finally { if (mountedRef.current) setBusyAction(null); }
   };
 
@@ -176,18 +191,18 @@ export function AccountsView() {
       const flow = await beginAuthentication(createdProfileId, authMethod, {});
       if (!mountedRef.current) return;
       setAuthFlow(flow);
-      notify(flow.instructions || 'Connection check prepared.');
+      notify(flow.instructions || 'Connection check prepared.', flow.status === 'failed' ? 'error' : 'info');
       if (runtimeType === 'antigravity' && flow.status === 'pending') {
         const result = await pollAuthentication(createdProfileId, flow.authId);
         if (!mountedRef.current) return;
-        notify(result.message || `Connection: ${result.status}`);
+        notify(result.message || `Connection: ${result.status}`, result.status === 'connected' ? 'success' : result.status === 'error' ? 'error' : 'info');
         if (result.status === 'connected') {
           await refreshModels(createdProfileId);
           if (mountedRef.current) setDialogOpen(false);
         }
       }
     } catch (cause: any) {
-      notify(cause?.message || 'Authentication could not be restarted.');
+      notify(cause?.message || 'Authentication could not be restarted.', 'error');
     } finally {
       if (mountedRef.current) setBusyAction(null);
     }
@@ -195,8 +210,8 @@ export function AccountsView() {
 
   const runAction = async (key: string, action: () => Promise<unknown>, success: string) => {
     setBusyAction(key);
-    try { await action(); notify(success); }
-    catch (cause: any) { notify(cause?.message || 'Operation failed.'); }
+    try { await action(); notify(success, 'success'); }
+    catch (cause: any) { notify(cause?.message || 'Operation failed.', 'error'); }
     finally { if (mountedRef.current) setBusyAction(null); }
   };
 
@@ -204,7 +219,7 @@ export function AccountsView() {
     const runtime = runtimes.find((item) => item.runtimeType === profile.runtimeType);
     const method = profile.authMethod || runtime?.authMethods[0]?.id;
     if (!method) {
-      notify('The installed runtime did not expose an authentication method. Scan runtimes again.');
+      notify('The installed runtime did not expose an authentication method. Scan runtimes again.', 'error');
       return;
     }
     setBusyAction(`connect-${profile.id}`);
@@ -217,19 +232,19 @@ export function AccountsView() {
       setCreatedProfileId(profile.id);
       setAuthFlow(flow);
       setDialogOpen(true);
-      notify(flow.instructions || 'Official authentication flow started.');
+      notify(flow.instructions || 'Official authentication flow started.', flow.status === 'failed' ? 'error' : 'info');
       if (profile.runtimeType === 'antigravity' && flow.status === 'pending') {
         notify('Checking your existing Antigravity session in the background…');
         const result = await pollAuthentication(profile.id, flow.authId);
         if (!mountedRef.current) return;
-        notify(result.message || `Connection: ${result.status}`);
+        notify(result.message || `Connection: ${result.status}`, result.status === 'connected' ? 'success' : result.status === 'error' ? 'error' : 'info');
         if (result.status === 'connected') {
           await refreshModels(profile.id);
           if (mountedRef.current) setDialogOpen(false);
         }
       }
     } catch (cause: any) {
-      notify(cause?.message || 'Authentication could not be started.');
+      notify(cause?.message || 'Authentication could not be started.', 'error');
     } finally {
       if (mountedRef.current) setBusyAction(null);
     }
@@ -252,7 +267,7 @@ export function AccountsView() {
       setDialogOpen(true);
       notify('The previous Antigravity keyring session was signed out. Complete Google Sign-In for the account you want to use.');
     } catch (cause: any) {
-      notify(cause?.message || 'Antigravity account switching could not be started.');
+      notify(cause?.message || 'Antigravity account switching could not be started.', 'error');
     } finally {
       if (mountedRef.current) setBusyAction(null);
     }
@@ -411,8 +426,26 @@ export function AccountsView() {
       </div>
 
       {feedback && !dialogOpen && (
-        <div className="fixed bottom-5 right-5 z-[120] flex max-w-md items-start gap-2 rounded-xl border border-primary/30 bg-card px-4 py-3 text-sm shadow-2xl">
-          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" /><span>{feedback}</span>
+        <div
+          role={feedback.kind === 'error' ? 'alert' : 'status'}
+          className={cn(
+            'fixed bottom-5 right-5 z-[120] flex max-w-md items-start gap-2 rounded-xl border px-4 py-3 text-sm shadow-2xl backdrop-blur-md',
+            feedback.kind === 'error'
+              ? 'border-destructive/30 bg-destructive/10 text-destructive'
+              : 'border-primary/30 bg-card',
+          )}
+        >
+          <AccountFeedback {...feedback} />
+          {feedback.kind === 'error' && (
+            <button
+              type="button"
+              aria-label="Dismiss error"
+              onClick={() => setFeedback(null)}
+              className="ml-auto shrink-0 rounded-md p-0.5 text-destructive/80 hover:text-destructive"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
         </div>
       )}
 
@@ -443,8 +476,26 @@ export function AccountsView() {
             </div>
           )}
           {feedback && (
-            <div className="flex items-start gap-2 rounded-xl border border-primary/30 bg-primary/10 px-3 py-2 text-xs">
-              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" /><span className="whitespace-pre-wrap">{feedback}</span>
+            <div
+              role={feedback.kind === 'error' ? 'alert' : 'status'}
+              className={cn(
+                'flex items-start gap-2 rounded-xl border px-3 py-2 text-xs',
+                feedback.kind === 'error'
+                  ? 'border-destructive/30 bg-destructive/10 text-destructive'
+                  : 'border-primary/30 bg-primary/10',
+              )}
+            >
+              <AccountFeedback {...feedback} />
+              {feedback.kind === 'error' && (
+                <button
+                  type="button"
+                  aria-label="Dismiss error"
+                  onClick={() => setFeedback(null)}
+                  className="ml-auto shrink-0 rounded-md p-0.5 text-destructive/80 hover:text-destructive"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           )}
           <DialogFooter>

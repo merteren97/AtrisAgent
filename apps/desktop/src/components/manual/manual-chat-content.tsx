@@ -1,12 +1,13 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { AlertCircle, Bot, Brain, Check, ChevronRight, FileText, ImageIcon, Loader2, Wrench } from 'lucide-react';
+import { AlertCircle, Brain, Check, ChevronRight, FileText, ImageIcon, Loader2, Wrench } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { MarkdownContent, normalizeFileUri } from '@/components/chat/markdown-content';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { extractChatImages, loadLocalImagePreviewBlob, normalizeImagePath } from '@/components/chat/chat-image-preview';
 import { useWorkspaceStore } from '@/stores/workspace-store';
-import type { ManualToolArtifact, ManualToolItem } from '@/stores/manual-store';
+import type { ManualSwarmSummary, ManualToolArtifact, ManualToolItem } from '@/stores/manual-store';
+import { SWARM_COORDINATION_TOOLS, SubagentActivityCards, SwarmCoordinationGroup } from './manual-swarm-cards';
 
 interface Attachment { name: string; path: string }
 interface ProjectImage { name: string; path: string }
@@ -172,6 +173,8 @@ export function AssistantTurnProcess({
   thinkingTokens,
   tools,
   cwd,
+  swarm,
+  onOpenSubagent,
   openArtifact: controlledArtifact,
   onOpenArtifact,
 }: {
@@ -179,6 +182,8 @@ export function AssistantTurnProcess({
   thinkingTokens?: number;
   tools?: ManualToolItem[];
   cwd?: string;
+  swarm?: ManualSwarmSummary;
+  onOpenSubagent?: (conversationId: string, label?: string) => void;
   openArtifact?: ManualToolArtifact | null;
   onOpenArtifact?: (artifact: ManualToolArtifact | null) => void;
 }) {
@@ -190,9 +195,14 @@ export function AssistantTurnProcess({
   const trimmedThinking = thinking?.trim() ? thinking : undefined;
   const subagents = (tools || []).filter(t => t.name === 'invoke_subagent' || Boolean(t.subagent));
   const artifacts = (tools || []).filter(t => Boolean(t.artifact));
-  const otherTools = (tools || []).filter(t => t.name !== 'invoke_subagent' && !t.subagent && !t.artifact);
+  const coordinationTools = (tools || []).filter(
+    t => t.name !== 'invoke_subagent' && !t.subagent && !t.artifact && SWARM_COORDINATION_TOOLS.has(t.name),
+  );
+  const otherTools = (tools || []).filter(
+    t => t.name !== 'invoke_subagent' && !t.subagent && !t.artifact && !SWARM_COORDINATION_TOOLS.has(t.name),
+  );
 
-  if (!trimmedThinking && !subagents.length && !otherTools.length && !artifacts.length) {
+  if (!trimmedThinking && !subagents.length && !coordinationTools.length && !otherTools.length && !artifacts.length) {
     return null;
   }
 
@@ -225,32 +235,13 @@ export function AssistantTurnProcess({
         </details>
       )}
 
-      {subagents.length > 0 && (
-        <div className="space-y-1.5" aria-label="Subagents">
-          {subagents.map(t => {
-            const badge = [t.subagent?.typeName, t.subagent?.model].filter(Boolean).join(' · ');
-            return (
-              <div
-                key={t.id}
-                className="flex items-center justify-between gap-2 rounded-xl border border-border/70 bg-card/70 px-3 py-2 text-xs"
-              >
-                <div className="flex min-w-0 items-center gap-2">
-                  <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
-                  <span className="truncate font-medium text-foreground">
-                    {t.subagent?.role || t.summary}
-                  </span>
-                  {badge && (
-                    <span className="shrink-0 rounded-md border border-border/70 bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                      {badge}
-                    </span>
-                  )}
-                </div>
-                <ToolStatusIcon status={t.status} />
-              </div>
-            );
-          })}
-        </div>
-      )}
+      <SubagentActivityCards
+        subagents={subagents}
+        swarm={swarm}
+        onOpenSubagent={onOpenSubagent}
+      />
+
+      <SwarmCoordinationGroup tools={coordinationTools} />
 
       {otherTools.length > 0 && (
         otherTools.length <= 2 ? (
@@ -346,6 +337,9 @@ export const ManualChatContent = memo(function ManualChatContent({
   tools,
   conversationTools,
   findOlderArtifact,
+  swarm,
+  readOnly,
+  onOpenSubagent,
 }: {
   text: string;
   agentId: string;
@@ -356,6 +350,9 @@ export const ManualChatContent = memo(function ManualChatContent({
   tools?: ManualToolItem[];
   conversationTools?: ManualToolItem[];
   findOlderArtifact?: (path: string) => Promise<ManualToolArtifact | undefined>;
+  swarm?: ManualSwarmSummary;
+  readOnly?: boolean;
+  onOpenSubagent?: (conversationId: string, label?: string) => void;
 }) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [openArtifact, setOpenArtifact] = useState<ManualToolArtifact | null>(null);
@@ -371,7 +368,7 @@ export const ManualChatContent = memo(function ManualChatContent({
     const lookup = ++artifactLookup.current;
     const matched = findMatchingArtifact(tools, path) ?? findMatchingArtifact(conversationTools, path);
     if (matched) setOpenArtifact(matched);
-    else void findOlderArtifact?.(path).then(found => {
+    else if (!readOnly) void findOlderArtifact?.(path).then(found => {
       if (found && artifactLookup.current === lookup) setOpenArtifact(found);
     }).catch(() => {});
   };
@@ -383,6 +380,8 @@ export const ManualChatContent = memo(function ManualChatContent({
           thinkingTokens={thinkingTokens}
           tools={tools}
           cwd={cwd}
+          swarm={swarm}
+          onOpenSubagent={onOpenSubagent}
           openArtifact={openArtifact}
           onOpenArtifact={setOpenArtifact}
         />

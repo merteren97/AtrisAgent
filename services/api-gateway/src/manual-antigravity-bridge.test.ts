@@ -249,5 +249,99 @@ try {
   assert.equal(providerBridge.activity(third).state, 'completed');
   assert.deepEqual(providerBridge.pendingQuestions(third), []);
 
+  // Swarm & Subagent readSwarmState / readSwarmBoard / readSubagentTranscript tests
+  const swarmRoot = path.join(provider, 'brain', thirdSession, '.system_generated', 'swarm');
+  const subagentsRoot = path.join(provider, 'brain', thirdSession, '.system_generated', 'subagents');
+  fs.mkdirSync(swarmRoot, { recursive: true });
+  fs.mkdirSync(subagentsRoot, { recursive: true });
+  const workerId = randomUUID();
+  const swarmSubagentId = randomUUID();
+  fs.writeFileSync(path.join(swarmRoot, 'members.json'), JSON.stringify({
+    title: 'Audit Swarm',
+    members: {
+      coordinator: {
+        conversation_id: thirdSession,
+        role: 'coordinator',
+        applied_model: 'gemini-4-neon-high',
+        workspace_mode: 'inherit',
+        phase: 'RUNNING',
+        wake_mode: 'working',
+        last_read_seq: 3,
+      },
+      'worker-1': {
+        conversation_id: workerId,
+        role: 'worker',
+        applied_model: 'gemini-4-hydrogen-medium',
+        workspace_mode: 'share',
+        phase: 'RUNNING',
+        wake_mode: 'mentions',
+        last_read_seq: 2,
+      },
+    },
+  }));
+  fs.writeFileSync(path.join(swarmRoot, 'plan.json'), JSON.stringify({
+    goal: { title: 'Audit Goal', line: 'Check everything' },
+    tasks: { 'worker-1': 'Inspect API' },
+    threads: [{ id: 't1', title: 'Thread 1', goal: 'Backend', tasks: ['worker-1'] }],
+  }));
+  fs.writeFileSync(path.join(swarmRoot, 'board.jsonl'), [
+    JSON.stringify({ seq: 1, agent: 'coordinator', text: '@worker-1 go', time: '2026-11-26 00:00:01', kind: 'brief' }),
+    JSON.stringify({ seq: 2, agent: 'worker-1', text: '@coordinator working', time: '2026-11-26 00:00:02' }),
+    JSON.stringify({ seq: 3, agent: 'worker-1', text: '@coordinator [done] finished', time: '2026-11-26 00:00:03' }),
+  ].join('\n') + '\n');
+  fs.writeFileSync(path.join(subagentsRoot, `${swarmSubagentId}.json`), JSON.stringify({
+    conversationId: swarmSubagentId,
+    subagentDescriptor: { typeName: 'researcher', role: 'Code Researcher', model: 'gemini-4-hydrogen-medium' },
+    state: 'SUBAGENT_STATE_ALIVE',
+  }));
+  const childTranscriptDir = path.join(provider, 'brain', workerId, '.system_generated', 'logs');
+  fs.mkdirSync(childTranscriptDir, { recursive: true });
+  fs.writeFileSync(path.join(childTranscriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'Inspect API' }),
+    JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'API looks clean.' }),
+  ].join('\n') + '\n');
+
+  const swarmSummary = bridge.readSwarmState(third);
+  assert.ok(swarmSummary);
+  assert.equal(swarmSummary.title, 'Audit Swarm');
+  assert.equal(swarmSummary.goal?.title, 'Audit Goal');
+  assert.equal(swarmSummary.threads?.[0].title, 'Thread 1');
+  assert.equal(swarmSummary.totalBoardCount, 3);
+  assert.equal(swarmSummary.latestBoardSeq, 3);
+  const coordMember = swarmSummary.members.find(m => m.name === 'coordinator');
+  const workerMember = swarmSummary.members.find(m => m.name === 'worker-1');
+  assert.equal(coordMember?.role, 'coordinator');
+  assert.equal(coordMember?.state, 'working');
+  assert.equal(workerMember?.role, 'worker');
+  assert.equal(workerMember?.state, 'waiting');
+  assert.equal(workerMember?.completedSignaled, true);
+  assert.equal(workerMember?.task, 'Inspect API');
+  assert.equal(workerMember?.threadTitle, 'Thread 1');
+  assert.equal(swarmSummary.subagents[0].conversationId, swarmSubagentId);
+  assert.equal(swarmSummary.subagents[0].state, 'alive');
+
+  const boardPage1 = bridge.readSwarmBoard(third, { limit: 2 });
+  assert.deepEqual(boardPage1.messages.map(m => m.seq), [2, 3]);
+  assert.equal(boardPage1.hasMore, true);
+  assert.equal(boardPage1.oldestSeq, 2);
+  assert.equal(boardPage1.latestSeq, 3);
+  const boardPage2 = bridge.readSwarmBoard(third, { beforeSeq: boardPage1.oldestSeq, limit: 2 });
+  assert.deepEqual(boardPage2.messages.map(m => m.seq), [1]);
+  assert.equal(boardPage2.hasMore, false);
+
+  const childChat = bridge.readSubagentTranscript(third, workerId);
+  assert.equal(childChat.bound, true);
+  assert.equal(childChat.messages.at(-1)?.text, 'API looks clean.');
+  assert.throws(() => bridge.readSubagentTranscript(third, 'not-a-uuid'), (err: any) => err.status === 400);
+  assert.throws(() => bridge.readSubagentTranscript(third, thirdSession), (err: any) => err.status === 400);
+  assert.throws(() => bridge.readSubagentTranscript(third, randomUUID()), (err: any) => err.status === 404);
+
+  // Optional missing plan.json & subagents/ handled cleanly
+  fs.rmSync(path.join(swarmRoot, 'plan.json'));
+  fs.rmSync(subagentsRoot, { recursive: true, force: true });
+  const minimalSwarm = bridge.readSwarmState(third);
+  assert.ok(minimalSwarm);
+  assert.equal(minimalSwarm.members.length, 2);
+
   console.log('Antigravity transcript parsing, isolated log binding, resume and ambiguity tests passed.');
 } finally { fs.rmSync(root,{recursive:true,force:true}); }

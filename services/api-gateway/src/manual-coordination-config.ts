@@ -14,6 +14,54 @@ function ordinaryDirectory(parent: string, part: string) {
   return directory;
 }
 
+const MAX_GENERATIONS = 64;
+
+function antigravityWorkspace(storage: string, key: string, content: string): string {
+  // A tool may leave build output in the extra workspace. Preserve it and use
+  // a clean sibling. Concurrent opens publish the same generation atomically.
+  for (let generation = 0; generation < MAX_GENERATIONS; generation++) {
+    const configDir = path.join(storage, generation === 0 ? key : `${key}-${generation}`);
+    if (!fs.lstatSync(configDir, {throwIfNoEntry:false})) {
+      const temporary = fs.mkdtempSync(path.join(storage, '.creating-'));
+      try {
+        const config = ordinaryDirectory(temporary, '.agents');
+        fs.writeFileSync(path.join(config, 'mcp_config.json'), content, {mode:0o600,flag:'wx'});
+        try { fs.renameSync(temporary, configDir); }
+        catch (error) { if (!fs.lstatSync(configDir, {throwIfNoEntry:false})) throw error; }
+      } finally { fs.rmSync(temporary, {recursive:true,force:true}); }
+    }
+    const agents = path.join(configDir, '.agents');
+    const filename = path.join(agents, 'mcp_config.json');
+    const dirStat = fs.lstatSync(configDir);
+    if (!dirStat.isDirectory() || fs.realpathSync.native(configDir) !== configDir) {
+      throw new Error('The Antigravity coordination directory has changed.');
+    }
+    const agentsStat = fs.lstatSync(agents, {throwIfNoEntry:false});
+    if (!agentsStat) continue;
+    if (!agentsStat.isDirectory() || fs.realpathSync.native(agents) !== agents) {
+      throw new Error('The Antigravity coordination directory has changed.');
+    }
+    if (!fs.lstatSync(filename, {throwIfNoEntry:false})) continue;
+    const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    let matches: boolean;
+    try {
+      const stat = fs.fstatSync(fd, { bigint: true });
+      const named = fs.lstatSync(filename, { bigint: true });
+      const expected = Buffer.from(content);
+      const bytes = Buffer.alloc(expected.length + 1);
+      matches = stat.isFile() && named.isFile() && stat.ino === named.ino && stat.dev === named.dev && stat.size === BigInt(expected.length)
+        && fs.readSync(fd, bytes) === expected.length && bytes.subarray(0, expected.length).equals(expected);
+    } finally { fs.closeSync(fd); }
+    if (!matches) throw new Error('The Antigravity coordination configuration has changed.');
+    const onlyEntry = (directory: string, name: string) => {
+      const entries = fs.readdirSync(directory);
+      return entries.length === 1 && entries[0] === name;
+    };
+    if (onlyEntry(configDir, '.agents') && onlyEntry(agents, 'mcp_config.json')) return configDir;
+  }
+  throw new Error('Could not allocate a clean Antigravity coordination directory.');
+}
+
 /** Provider config contains no credentials; bearer grants travel in the child environment. */
 export function prepareManualCoordination(agent: ManualAgent, dataDir: string, grant: Grant, version?: string): {env:Record<string,string>;args:string[];cwd?:string} {
   const env: Record<string,string> = {
@@ -31,35 +79,7 @@ export function prepareManualCoordination(agent: ManualAgent, dataDir: string, g
     const content = JSON.stringify({mcpServers:{atris_workspace:server}});
     const key = createHash('sha256').update(JSON.stringify([cwd,content])).digest('hex');
     const storage = ordinaryDirectory(root, 'manual-antigravity-coordination');
-    const configDir = path.join(storage, key);
-    if (!fs.existsSync(configDir)) {
-      const temporary = fs.mkdtempSync(path.join(storage, '.creating-'));
-      try {
-        const config = ordinaryDirectory(temporary, '.agents');
-        fs.writeFileSync(path.join(config, 'mcp_config.json'), content, {mode:0o600,flag:'wx'});
-        try { fs.renameSync(temporary, configDir); }
-        catch (error) { if (!fs.existsSync(configDir)) throw error; }
-      } finally { fs.rmSync(temporary, {recursive:true,force:true}); }
-    }
-    const agents = path.join(configDir, '.agents');
-    const filename = path.join(agents, 'mcp_config.json');
-    if (![configDir, agents].every(dir => fs.lstatSync(dir).isDirectory() && fs.realpathSync.native(dir) === dir)) {
-      throw new Error('The Antigravity coordination directory has changed.');
-    }
-    const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    let matches: boolean;
-    try {
-      const stat = fs.fstatSync(fd, { bigint: true });
-      const named = fs.lstatSync(filename, { bigint: true });
-      const expected = Buffer.from(content);
-      const bytes = Buffer.alloc(expected.length + 1);
-      matches = stat.isFile() && named.isFile() && stat.ino === named.ino && stat.dev === named.dev && stat.size === BigInt(expected.length)
-        && fs.readSync(fd, bytes) === expected.length && bytes.subarray(0, expected.length).equals(expected);
-    } finally { fs.closeSync(fd); }
-    if (!matches
-      || fs.readdirSync(configDir).some(entry => entry !== '.agents') || fs.readdirSync(agents).some(entry => entry !== 'mcp_config.json')) {
-      throw new Error('The Antigravity coordination configuration has changed.');
-    }
+    const configDir = antigravityWorkspace(storage, key, content);
     return {env,args:['--add-dir',configDir]};
   }
   let directory = root;
