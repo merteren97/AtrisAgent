@@ -25,6 +25,8 @@ import { ChatChangeSummary } from '@/components/chat/chat-change-summary';
 import { useManualChatHistory } from './use-manual-chat-history';
 import { ManualQuestionCard, buildAntigravityQuestionKeystrokes } from './manual-question';
 import { CodexPermissions, type CodexLivePermissions } from './codex-permissions';
+import { ManualSwarmPanel } from './manual-swarm-panel';
+import { ManualSwarmInspector, type SwarmInspectorTab, type SwarmInspectorTarget } from './manual-swarm-inspector';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 
 export { buildAntigravityQuestionKeystrokes };
@@ -153,6 +155,9 @@ export function ManualWorkspace() {
   const [inputReady, setInputReady] = useState<Record<string, boolean | null | undefined>>({});
   const [memory, setMemory] = useState<{message?:ManualMessage} | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ManualAgent | null>(null);
+  const [swarmInspectorOpen, setSwarmInspectorOpen] = useState(false);
+  const [swarmInspectorTab, setSwarmInspectorTab] = useState<SwarmInspectorTab>('overview');
+  const [swarmTranscriptStack, setSwarmTranscriptStack] = useState<SwarmInspectorTarget[]>([]);
   const observations = useManualActivity(state => state.agents);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const dragDepth = useRef(0);
@@ -197,8 +202,8 @@ export function ManualWorkspace() {
     return () => { document.removeEventListener('visibilitychange', acknowledgeVisible); window.removeEventListener('focus', acknowledgeVisible); };
   }, [agentId, surface]);
 
-  useEffect(() => { setError(null); }, [agentId]);
-  useEffect(() => { setAdding(false); setHandoff(null); setMemory(null); setDeleteTarget(null); }, [conversation?.id]);
+  useEffect(() => { setError(null); setAdding(false); setHandoff(null); setMemory(null); setDeleteTarget(null); }, [conversation?.id]);
+  useEffect(() => { setSwarmInspectorOpen(false); setSwarmInspectorTab('overview'); setSwarmTranscriptStack([]); }, [agentId, conversation?.id]);
   useEffect(() => {
     if (!native || !agentIds) return;
     const ids = agentIds.split(',');
@@ -267,7 +272,7 @@ export function ManualWorkspace() {
         }));
       }
     } finally { setPending(null); actionPending.current = false; }
-    if (failures.length) setError(`Agents saved. ${failures.join(' · ')}. Select the offline agent in Chat and use Open agent to retry.`);
+    if (failures.length) setError(`Agents saved. ${failures.map(f => f.replace(/\.+$/, '')).join(' · ')}. Select the offline agent in Chat and use Open agent to retry.`);
   };
   const closeDialog = () => { if (creating) useManualStore.getState().setMode('choose'); setCreating(false); setAdding(false); };
   const interrupt = (target: ManualAgent) => {
@@ -410,7 +415,28 @@ export function ManualWorkspace() {
       </div>
     </header>
     {pending?.startsWith('Opening') && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs text-muted-foreground">{pending}</p>}
-    {(error || connectionError) && <div role="alert" className="flex shrink-0 items-start justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive"><span className="break-words">{error || connectionError}</span><button aria-label="Dismiss error" onClick={() => { setError(null); dismissConnectionError(); }}><X className="h-4 w-4" /></button></div>}
+    {(error || connectionError) && (
+      <div role="alert" className="flex shrink-0 items-center justify-between gap-2 border-b border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive">
+        <span className="min-w-0 break-words">{error || connectionError}</span>
+        <div className="flex shrink-0 items-center gap-2">
+          {error && agent && !live && native && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 border-destructive/30 px-2 text-[11px] text-destructive hover:bg-destructive/10 hover:text-destructive"
+              disabled={Boolean(pending)}
+              onClick={() => void action('open', () => launch(agent))}
+            >
+              <RotateCcw className="mr-1 h-3 w-3" />
+              Open agent
+            </Button>
+          )}
+          <button type="button" aria-label="Dismiss error" onClick={() => { setError(null); dismissConnectionError(); }}>
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+    )}
     {!conversation || !agent ? <div className="flex flex-1 items-center justify-center p-6"><div className="max-w-md text-center"><Bot className="mx-auto mb-4 h-8 w-8 text-muted-foreground" /><h2 className="text-lg font-medium">Your agents, your workflow</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">Group independent agents in a conversation. Each agent keeps its own context and stays under your control.</p><Button className="mt-5" disabled={!workspaceId} onClick={() => conversation ? setAdding(true) : setCreating(true)}><Plus className="mr-2 h-4 w-4" />{conversation ? 'Add first agent' : 'New manual conversation'}</Button></div></div> : <>
        {surface === 'code' ? native ? visibleAgents.length ? <TerminalCanvas agents={visibleAgents} statuses={statuses} selectedId={agentId} pending={Boolean(pending)} generation={generation} onSelect={item => selectAgent(conversation.id, item.id)} onOpen={item => void action('open', () => launch(item))} onInterrupt={interrupt} onClose={setDeleteTarget} onRestart={restart} onHandoff={setHandoff} onMove={(source, target) => useManualStore.getState().moveAgent(conversation.id, source, target)} /> : <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6"><Bot className="h-8 w-8 text-muted-foreground" /><h2 className="text-base font-medium">All terminal panes closed</h2><p className="text-sm text-muted-foreground">No terminals are running. Open an offline agent in Chat or add a new one.</p><Button variant="outline" onClick={() => setSurface(conversation.id, 'chat')}>View agents</Button></div> : <p className="p-6 text-sm text-muted-foreground">Interactive Code is available in the desktop app.</p> : (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col p-2 sm:p-2.5">
@@ -419,6 +445,24 @@ export function ManualWorkspace() {
                <span className="flex items-center gap-2 text-xs text-muted-foreground"><span className={`h-1.5 w-1.5 rounded-full ${observations[agent.id]?.state === 'attention' && live ? 'bg-amber-500' : live ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} />{pending === 'model' ? 'Applying model…' : live && observations[agent.id]?.state === 'attention' ? 'Needs your response' : live && observations[agent.id]?.state === 'completed' ? 'Turn finished' : live ? 'CLI connected' : 'CLI closed'}<span className="hidden sm:inline">· Independent session</span></span>
               {!live ? <Button size="sm" variant="ghost" disabled={!native || Boolean(pending)} onClick={() => void action('open', () => launch(agent))}><RotateCcw className="mr-1 h-3 w-3" />Open agent</Button> : <Button size="sm" variant="ghost" disabled={Boolean(pending) && pending !== 'send'} onClick={() => interrupt(agent)}><Square className="mr-1 h-3 w-3" />Interrupt</Button>}
             </div>
+            {snapshot?.swarm && (
+              <ManualSwarmPanel
+                swarm={snapshot.swarm}
+                onOpenOverview={() => {
+                  setSwarmInspectorTab('overview');
+                  setSwarmInspectorOpen(true);
+                }}
+                onOpenBoard={() => {
+                  setSwarmInspectorTab('board');
+                  setSwarmInspectorOpen(true);
+                }}
+                onInspectWorker={(conversationId, label) => {
+                  setSwarmTranscriptStack([{ conversationId, label }]);
+                  setSwarmInspectorTab('transcript');
+                  setSwarmInspectorOpen(true);
+                }}
+              />
+            )}
             <div className="relative flex min-h-0 flex-1 flex-col">
             <div ref={scroll.viewport} onScroll={scroll.onScroll} className="min-h-0 flex-1 overflow-y-auto select-text">
               <div ref={scroll.content} className="mx-auto w-full max-w-3xl space-y-7 px-6 py-8">
@@ -447,6 +491,12 @@ export function ManualWorkspace() {
                               tools={message.tools}
                               conversationTools={conversationTools}
                               findOlderArtifact={findOlderArtifact}
+                              swarm={snapshot?.swarm}
+                              onOpenSubagent={(childConvId, label) => {
+                                setSwarmTranscriptStack([{ conversationId: childConvId, label: label || 'Subagent' }]);
+                                setSwarmInspectorTab('transcript');
+                                setSwarmInspectorOpen(true);
+                              }}
                             />
                           </article>
                         );
@@ -468,6 +518,30 @@ export function ManualWorkspace() {
     </>}
     {handoff && conversation && <ContextTransfer source={handoff} agents={conversation.agents} onClose={() => setHandoff(null)} />}
     {memory && conversation && <ManualMemory key={conversation.id+':'+(memory.message?.id||'notes')} conversation={conversation} agent={agent} message={memory.message} onClose={()=>setMemory(null)}/>}
+    {snapshot?.swarm && agent && (
+      <ManualSwarmInspector
+        open={swarmInspectorOpen}
+        onOpenChange={setSwarmInspectorOpen}
+        agentId={agent.id}
+        cwd={agent.cwd}
+        swarm={snapshot.swarm}
+        tab={swarmInspectorTab}
+        onTabChange={setSwarmInspectorTab}
+        transcriptStack={swarmTranscriptStack}
+        onSelectTranscript={(target) => {
+          setSwarmTranscriptStack([target]);
+          setSwarmInspectorTab('transcript');
+          setSwarmInspectorOpen(true);
+        }}
+        onPushTranscript={(target) => {
+          setSwarmTranscriptStack((prev) => [...prev, target]);
+          setSwarmInspectorTab('transcript');
+          setSwarmInspectorOpen(true);
+        }}
+        onPopTranscript={() => setSwarmTranscriptStack((prev) => (prev.length > 1 ? prev.slice(0, -1) : prev))}
+        onJumpTranscriptStack={(index) => setSwarmTranscriptStack((prev) => prev.slice(0, index + 1))}
+      />
+    )}
     {deleteTarget && <Dialog open onOpenChange={open => { if (!open && pending !== 'close') setDeleteTarget(null); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>Delete agent?</DialogTitle><DialogDescription>This agent’s CLI will stop and its AtrisAgent record will be removed. Provider-owned history and saved project memory are retained.</DialogDescription></DialogHeader><div className="break-words rounded-xl border border-border bg-muted/30 p-4 text-sm font-medium">{deleteTarget.name}</div>{error && <p role="alert" className="break-words text-xs text-destructive">{error}</p>}<DialogFooter><Button variant="outline" disabled={pending === 'close'} onClick={() => setDeleteTarget(null)}>Cancel</Button><Button variant="destructive" disabled={pending === 'close'} onClick={() => close(deleteTarget)}><Trash2 className="mr-2 h-4 w-4" />{pending === 'close' ? 'Removing…' : 'Delete agent'}</Button></DialogFooter></DialogContent></Dialog>}
   </section>;
 }

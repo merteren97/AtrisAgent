@@ -1,5 +1,6 @@
 import { apiBaseUrl, normalizeApiOrigin } from '@/lib/api-base';
 import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
+import type { ManualChatSnapshot, ManualSwarmBoardResponse } from '@/stores/manual-store';
 
 const configuredBase = import.meta.env?.VITE_ATRIS_API_URL as string | undefined;
 let apiOrigin = normalizeApiOrigin(configuredBase);
@@ -141,4 +142,32 @@ export async function checkApiHealth(): Promise<{ status: string; version?: stri
     if (!response.ok) throw new ApiError(`Local service returned ${response.status}`, response.status);
     return response.json();
   });
+}
+
+export async function fetchSwarmBoard(
+  agentId: string,
+  beforeSeq?: number,
+  limit = 50,
+): Promise<ManualSwarmBoardResponse> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (beforeSeq !== undefined) query.set('beforeSeq', String(beforeSeq));
+  return apiRequest<ManualSwarmBoardResponse>(
+    `/manual/agents/${encodeURIComponent(agentId)}/swarm/board?${query}`,
+    { cache: 'no-store' },
+  );
+}
+
+export async function fetchSubagentMessages(
+  agentId: string,
+  conversationId: string,
+  params: { anchor?: string; older?: boolean; known?: string; signal?: AbortSignal } = {},
+): Promise<ManualChatSnapshot | { revision: string; messages?: never }> {
+  const query = new URLSearchParams({ view: 'chat' });
+  if (params.anchor) query.set('anchor', params.anchor);
+  if (params.older && params.anchor) query.set('older', '1');
+  if (params.known && !params.older) query.set('known', params.known);
+  return apiRequest<ManualChatSnapshot | { revision: string; messages?: never }>(
+    `/manual/agents/${encodeURIComponent(agentId)}/subagents/${encodeURIComponent(conversationId)}/messages?${query}`,
+    { signal: params.signal, cache: 'no-store' },
+  );
 }

@@ -26,6 +26,7 @@ const WINDOWS_RUNTIME_ARGUMENT_BRIDGE_SOURCE = [
 ].join('\n');
 
 const WINDOWS_RUNTIME_BRIDGE_SCRIPT = [
+  '$ProgressPreference = "SilentlyContinue"',
   '$ErrorActionPreference = "Stop"',
   'function DecodeAtris([string]$value) { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
   '$runtimeCommand = DecodeAtris $env:ATRIS_RUNTIME_COMMAND_B64',
@@ -54,6 +55,7 @@ const WINDOWS_RUNTIME_BRIDGE_SCRIPT = [
 ].join('; ');
 
 const WINDOWS_TERMINAL_LAUNCHER_SCRIPT = [
+  '$ProgressPreference = "SilentlyContinue"',
   '$ErrorActionPreference = "Stop"',
   'function DecodeAtris([string]$value) { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }',
   '$targetCommand = DecodeAtris $env:ATRIS_TERMINAL_COMMAND_B64',
@@ -289,6 +291,8 @@ function prepareWindowsPowerShellBridge(
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
+      '-OutputFormat',
+      'Text',
       '-ExecutionPolicy',
       'Bypass',
       '-EncodedCommand',
@@ -458,16 +462,29 @@ export async function runCommand(
       stderrBytes = next.usedBytes;
       if (next.exceeded) failForOutputLimit('stderr');
     });
-    child.on('error', (error) => finish(() => reject(Object.assign(new Error(describeRuntimeLaunchError(command, error, options.cwd)), { cause: error, stdout, stderr, exitCode: 1 }))));
+    child.on('error', (error) => finish(() => reject(Object.assign(new Error(describeRuntimeLaunchError(command, error, options.cwd)), { cause: error, stdout: stripPowerShellClixml(stdout), stderr: stripPowerShellClixml(stderr), exitCode: 1 }))));
     child.on('close', (code) => finish(() => {
-      const result = { stdout, stderr, exitCode: code ?? 1 };
+      const cleanStdout = stripPowerShellClixml(stdout);
+      const cleanStderr = stripPowerShellClixml(stderr);
+      const result = { stdout: cleanStdout, stderr: cleanStderr, exitCode: code ?? 1 };
       if (code === 0) resolve(result);
-      else reject(Object.assign(new Error(stderr || stdout || `${command} failed`), result));
+      else reject(Object.assign(new Error(cleanStderr || cleanStdout || `${command} failed`), result));
     }));
 
     if (options.input !== undefined) child.stdin?.end(options.input);
     else child.stdin?.end();
   });
+}
+
+export function stripPowerShellClixml(text: string): string {
+  if (!text || (!text.includes('#< CLIXML') && !text.includes('schemas.microsoft.com/powershell/2004/04'))) {
+    return text;
+  }
+  return text
+    .replace(/^#< CLIXML\r?\n?/gm, '')
+    .replace(/#< CLIXML\s*/g, '')
+    .replace(/<Objs\b[^>]*xmlns="http:\/\/schemas\.microsoft\.com\/powershell\/2004\/04"[^>]*>[\s\S]*?<\/Objs>/g, '')
+    .trim();
 }
 
 export async function getHelpText(command: string, env?: NodeJS.ProcessEnv): Promise<string> {

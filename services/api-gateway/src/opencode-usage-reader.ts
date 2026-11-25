@@ -97,10 +97,113 @@ export function resolveOpenCodeDbPaths(options: OpenCodeUsageLookupOptions = {})
   return [...new Set(candidates)];
 }
 
-function tableColumns(db: Database.Database, table: 'session' | 'message'): Set<string> {
-  // SECURITY: Only inspect 'session' and 'message' tables. Never touch 'account' or 'control_account'.
+type OpenCodeTableName = 'session' | 'message' | 'session_v2' | 'session_message';
+
+function tableColumns(db: Database.Database, table: OpenCodeTableName): Set<string> {
+  // SECURITY: Only inspect session/message tables. Never touch 'account' or 'control_account'.
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
   return new Set(rows.map((r) => r.name).filter((n): n is string => Boolean(n)));
+}
+
+const SESSION_USAGE_COLUMNS = [
+  'id', 'title', 'directory', 'time_created', 'time_updated',
+  'tokens_input', 'tokens_output', 'tokens_reasoning',
+  'tokens_cache_read', 'tokens_cache_write', 'cost',
+] as const;
+
+function readSessionUsageFromTables(
+  db: Database.Database,
+  sessionId: string,
+  sessionTable: 'session' | 'session_v2',
+  messageTable: 'message' | 'session_message',
+): OpenCodeSessionUsage | null {
+  const sessCols = tableColumns(db, sessionTable);
+  const msgCols = tableColumns(db, messageTable);
+  if (!sessCols.size && !msgCols.size) return null;
+
+  let sessionRow: Record<string, any> | undefined;
+  if (sessCols.has('id')) {
+    const selectSessCols = SESSION_USAGE_COLUMNS.filter((col) => sessCols.has(col));
+    sessionRow = db
+      .prepare(`SELECT ${selectSessCols.join(', ')} FROM ${sessionTable} WHERE id = ?`)
+      .get(sessionId) as Record<string, any> | undefined;
+  }
+
+  let msgRows: Array<{ data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }> = [];
+  if (msgCols.has('session_id') && msgCols.has('data')) {
+    const selectMsgCols = ['data', 'time_created', 'time_updated'].filter((col) => msgCols.has(col));
+    msgRows = db
+      .prepare(`SELECT ${selectMsgCols.join(', ')} FROM ${messageTable} WHERE session_id = ?`)
+      .all(sessionId) as Array<{ data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }>;
+  }
+
+  return buildSessionUsageFromParts(sessionId, sessionRow, aggregateMessageRows(msgRows));
+}
+
+function listSessionsFromTables(
+  db: Database.Database,
+  sessionTable: 'session' | 'session_v2',
+  messageTable: 'message' | 'session_message',
+  cutoffMs: number | null,
+  limit: number,
+): OpenCodeSessionUsage[] {
+  const sessCols = tableColumns(db, sessionTable);
+  const msgCols = tableColumns(db, messageTable);
+  if (!sessCols.has('id')) return [];
+
+  const selectSessCols = SESSION_USAGE_COLUMNS.filter((col) => sessCols.has(col));
+  const orderCol = sessCols.has('time_updated')
+    ? 'time_updated'
+    : sessCols.has('time_created')
+      ? 'time_created'
+      : 'rowid';
+
+  const whereClause = cutoffMs !== null && sessCols.has('time_updated')
+    ? 'WHERE time_updated >= ?'
+    : '';
+  const params: unknown[] = cutoffMs !== null && sessCols.has('time_updated')
+    ? [cutoffMs, limit]
+    : [limit];
+
+  const sessionRows = db
+    .prepare(`SELECT ${selectSessCols.join(', ')} FROM ${sessionTable} ${whereClause} ORDER BY ${orderCol} DESC LIMIT ?`)
+    .all(...params) as Array<Record<string, any>>;
+
+  const messagesBySession = new Map<string, Array<{ data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }>>();
+  if (sessionRows.length && msgCols.has('session_id') && msgCols.has('data')) {
+    const selectMsgCols = ['session_id', 'data', 'time_created', 'time_updated'].filter((col) => msgCols.has(col));
+    const ids = sessionRows.map((r) => String(r.id));
+    const chunkSize = 100;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      const rows = db
+        .prepare(`SELECT ${selectMsgCols.join(', ')} FROM ${messageTable} WHERE session_id IN (${placeholders})`)
+        .all(...chunk) as Array<{ session_id: string; data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }>;
+      for (const row of rows) {
+        let bucket = messagesBySession.get(row.session_id);
+        if (!bucket) {
+          bucket = [];
+          messagesBySession.set(row.session_id, bucket);
+        }
+        bucket.push(row);
+      }
+    }
+  }
+
+  const results: OpenCodeSessionUsage[] = [];
+  for (const sRow of sessionRows) {
+    const sid = String(sRow.id);
+    const msgRows = messagesBySession.get(sid) || [];
+    const usage = buildSessionUsageFromParts(sid, sRow, aggregateMessageRows(msgRows));
+    if (!usage) continue;
+    if (cutoffMs !== null && usage.lastRecordedAt) {
+      const recMs = Date.parse(usage.lastRecordedAt);
+      if (Number.isFinite(recMs) && recMs < cutoffMs) continue;
+    }
+    results.push(usage);
+  }
+  return results;
 }
 
 function aggregateMessageRows(
@@ -271,34 +374,8 @@ export function readOpenCodeSessionUsage(
     let db: Database.Database | undefined;
     try {
       db = new Database(dbPath, { readonly: true, fileMustExist: true });
-      const sessCols = tableColumns(db, 'session');
-      const msgCols = tableColumns(db, 'message');
-      if (!sessCols.size && !msgCols.size) {
-        setBoundedCache(SESSION_CACHE, cacheKey, sig, null);
-        continue;
-      }
-
-      let sessionRow: Record<string, any> | undefined;
-      if (sessCols.has('id')) {
-        const selectSessCols = [
-          'id', 'title', 'directory', 'time_created', 'time_updated',
-          'tokens_input', 'tokens_output', 'tokens_reasoning',
-          'tokens_cache_read', 'tokens_cache_write', 'cost',
-        ].filter((col) => sessCols.has(col));
-        sessionRow = db
-          .prepare(`SELECT ${selectSessCols.join(', ')} FROM session WHERE id = ?`)
-          .get(sessionId) as Record<string, any> | undefined;
-      }
-
-      let msgRows: Array<{ data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }> = [];
-      if (msgCols.has('session_id') && msgCols.has('data')) {
-        const selectMsgCols = ['data', 'time_created', 'time_updated'].filter((col) => msgCols.has(col));
-        msgRows = db
-          .prepare(`SELECT ${selectMsgCols.join(', ')} FROM message WHERE session_id = ?`)
-          .all(sessionId) as Array<{ data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }>;
-      }
-
-      const result = buildSessionUsageFromParts(sessionId, sessionRow, aggregateMessageRows(msgRows));
+      const result = readSessionUsageFromTables(db, sessionId, 'session_v2', 'session_message')
+        || readSessionUsageFromTables(db, sessionId, 'session', 'message');
       setBoundedCache(SESSION_CACHE, cacheKey, sig, result);
       if (result) return result;
     } catch {
@@ -333,70 +410,18 @@ export function listRecentOpenCodeSessions(
     let db: Database.Database | undefined;
     try {
       db = new Database(dbPath, { readonly: true, fileMustExist: true });
-      const sessCols = tableColumns(db, 'session');
-      const msgCols = tableColumns(db, 'message');
-      if (!sessCols.has('id')) {
-        setBoundedCache(LIST_CACHE, cacheKey, sig, []);
-        return [];
-      }
-
-      const selectSessCols = [
-        'id', 'title', 'directory', 'time_created', 'time_updated',
-        'tokens_input', 'tokens_output', 'tokens_reasoning',
-        'tokens_cache_read', 'tokens_cache_write', 'cost',
-      ].filter((col) => sessCols.has(col));
-
-      const orderCol = sessCols.has('time_updated')
-        ? 'time_updated'
-        : sessCols.has('time_created')
-          ? 'time_created'
-          : 'rowid';
-
-      const whereClause = cutoffMs !== null && sessCols.has('time_updated')
-        ? 'WHERE time_updated >= ?'
-        : '';
-      const params: unknown[] = cutoffMs !== null && sessCols.has('time_updated')
-        ? [cutoffMs, limit]
-        : [limit];
-
-      const sessionRows = db
-        .prepare(`SELECT ${selectSessCols.join(', ')} FROM session ${whereClause} ORDER BY ${orderCol} DESC LIMIT ?`)
-        .all(...params) as Array<Record<string, any>>;
-
-      const messagesBySession = new Map<string, Array<{ data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }>>();
-      if (sessionRows.length && msgCols.has('session_id') && msgCols.has('data')) {
-        const selectMsgCols = ['session_id', 'data', 'time_created', 'time_updated'].filter((col) => msgCols.has(col));
-        const ids = sessionRows.map((r) => String(r.id));
-        const chunkSize = 100;
-        for (let i = 0; i < ids.length; i += chunkSize) {
-          const chunk = ids.slice(i, i + chunkSize);
-          const placeholders = chunk.map(() => '?').join(', ');
-          const rows = db
-            .prepare(`SELECT ${selectMsgCols.join(', ')} FROM message WHERE session_id IN (${placeholders})`)
-            .all(...chunk) as Array<{ session_id: string; data?: string | null; time_created?: number | string | null; time_updated?: number | string | null }>;
-          for (const row of rows) {
-            let bucket = messagesBySession.get(row.session_id);
-            if (!bucket) {
-              bucket = [];
-              messagesBySession.set(row.session_id, bucket);
-            }
-            bucket.push(row);
-          }
-        }
-      }
-
-      const results: OpenCodeSessionUsage[] = [];
-      for (const sRow of sessionRows) {
-        const sid = String(sRow.id);
-        const msgRows = messagesBySession.get(sid) || [];
-        const usage = buildSessionUsageFromParts(sid, sRow, aggregateMessageRows(msgRows));
-        if (!usage) continue;
-        if (cutoffMs !== null && usage.lastRecordedAt) {
-          const recMs = Date.parse(usage.lastRecordedAt);
-          if (Number.isFinite(recMs) && recMs < cutoffMs) continue;
-        }
-        results.push(usage);
-      }
+      const v2 = listSessionsFromTables(db, 'session_v2', 'session_message', cutoffMs, limit);
+      const v1 = listSessionsFromTables(db, 'session', 'message', cutoffMs, limit);
+      const merged = new Map<string, OpenCodeSessionUsage>();
+      for (const item of v1) merged.set(item.sessionId, item);
+      for (const item of v2) merged.set(item.sessionId, item);
+      const results = [...merged.values()]
+        .sort((a, b) => {
+          const aTs = a.lastRecordedAt ? Date.parse(a.lastRecordedAt) : 0;
+          const bTs = b.lastRecordedAt ? Date.parse(b.lastRecordedAt) : 0;
+          return bTs - aTs;
+        })
+        .slice(0, limit);
 
       setBoundedCache(LIST_CACHE, cacheKey, sig, results);
       return results;

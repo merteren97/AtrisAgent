@@ -59,6 +59,68 @@ export interface ManualMessage {
   model?: string;
 }
 export interface ManualNamingUpdate { conversationId: string; agentId: string; agentName?: string; conversationTitle?: string }
+export interface ManualSwarmMember {
+  name: string;
+  conversationId: string;
+  role: 'coordinator' | 'worker';
+  model?: string;
+  workspaceMode?: 'inherit' | 'share' | 'branch';
+  state: 'working' | 'waiting' | 'stopped' | 'killed';
+  completedSignaled?: boolean;
+  task?: string;
+  threadTitle?: string;
+}
+export interface ManualSwarmSubagent {
+  conversationId: string;
+  role: string;
+  typeName?: string;
+  model?: string;
+  state: 'alive' | 'stopped' | 'unknown';
+}
+export interface ManualSwarmThread {
+  id: string;
+  title: string;
+  goal?: string;
+  tasks: string[];
+}
+export interface ManualSwarmSummary {
+  title?: string;
+  goal?: { title: string; line: string };
+  threads?: ManualSwarmThread[];
+  members: ManualSwarmMember[];
+  subagents: ManualSwarmSubagent[];
+  totalBoardCount: number;
+  latestBoardSeq: number;
+}
+export interface ManualSwarmBoardMessage {
+  seq: number;
+  agent: string;
+  text: string;
+  time?: string;
+  kind?: string;
+}
+export interface ManualSwarmBoardResponse {
+  messages: ManualSwarmBoardMessage[];
+  totalCount: number;
+  hasMore: boolean;
+  oldestSeq?: number;
+  latestSeq?: number;
+}
+export interface ManualChatSnapshot {
+  revision: string;
+  messages: ManualMessage[];
+  recentTools: ManualMessage[];
+  questions?: ManualQuestion[];
+  autoApprove?: { available: boolean; enabled: boolean; reason?: string };
+  routeStatus?: { pending: boolean; error?: string };
+  truncated: boolean;
+  bound: boolean;
+  loading?: boolean;
+  naming?: ManualNamingUpdate;
+  hasOlder: boolean;
+  memoryRevision?: string;
+  swarm?: ManualSwarmSummary;
+}
 export type ManualMode = 'choose' | 'manual' | 'orchestrator' | 'planning';
 interface ManualState {
   creating: boolean;

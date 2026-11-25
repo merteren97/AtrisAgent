@@ -291,6 +291,20 @@ async function runTests() {
         'forwards arguments to a non-Node .cmd wrapper without relying on NODE_OPTIONS',
       );
 
+      const failingShim = path.join(root, 'catalog-error.ps1');
+      fs.writeFileSync(failingShim, [
+        'Write-Progress -Activity "Loading model catalog" -PercentComplete 50',
+        '[Console]::Error.WriteLine("Unknown catalog option")',
+        'exit 1',
+      ].join('\n'));
+      try {
+        await runCommand(failingShim, [], { cwd: root, timeoutMs: liveBridgeSuccessTimeoutMs });
+        assert(false, 'surfaces a failed model catalog command');
+      } catch (error: any) {
+        assert(error.exitCode === 1 && error.message.trim() === 'Unknown catalog option',
+          'reports the CLI error without PowerShell progress or CLIXML');
+      }
+
       const cancellationMarker = path.join(root, 'descendant-survived.txt');
       const cancellationWorker = path.join(root, 'cancellation-worker.cjs');
       const cancellationWrapper = path.join(root, 'cancellation-wrapper.cmd');
