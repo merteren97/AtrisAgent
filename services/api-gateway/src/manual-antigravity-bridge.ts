@@ -96,21 +96,22 @@ const SWARM_FILE_CACHE = new Map<string, CachedFileValue>();
 const SWARM_FILE_CACHE_LIMIT = 64;
 
 function readCachedSwarmFile<T>(filename: string, parse: (raw: string) => T): T | undefined {
-  let stat: fs.Stats;
+  let fd: number;
   try {
-    stat = fs.lstatSync(filename);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4 * 1024 * 1024) return undefined;
+    fd = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
   } catch {
     return undefined;
   }
-  const cached = SWARM_FILE_CACHE.get(filename);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-    SWARM_FILE_CACHE.delete(filename);
-    SWARM_FILE_CACHE.set(filename, cached);
-    return cached.value as T;
-  }
   try {
-    const raw = fs.readFileSync(filename, 'utf8');
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) return undefined;
+    const cached = SWARM_FILE_CACHE.get(filename);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      SWARM_FILE_CACHE.delete(filename);
+      SWARM_FILE_CACHE.set(filename, cached);
+      return cached.value as T;
+    }
+    const raw = fs.readFileSync(fd, 'utf8');
     const value = parse(raw);
     SWARM_FILE_CACHE.delete(filename);
     SWARM_FILE_CACHE.set(filename, { mtimeMs: stat.mtimeMs, size: stat.size, value });
@@ -121,6 +122,8 @@ function readCachedSwarmFile<T>(filename: string, parse: (raw: string) => T): T 
     return value;
   } catch {
     return undefined;
+  } finally {
+    try { fs.closeSync(fd); } catch {}
   }
 }
 

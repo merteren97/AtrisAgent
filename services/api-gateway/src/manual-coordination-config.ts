@@ -41,8 +41,14 @@ function antigravityWorkspace(storage: string, key: string, content: string): st
     if (!agentsStat.isDirectory() || fs.realpathSync.native(agents) !== agents) {
       throw new Error('The Antigravity coordination directory has changed.');
     }
-    if (!fs.lstatSync(filename, {throwIfNoEntry:false})) continue;
-    const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    let fd: number;
+    try {
+      fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') continue;
+      if (error?.code === 'ELOOP') throw new Error('The Antigravity coordination configuration has changed.');
+      throw error;
+    }
     let matches: boolean;
     try {
       const stat = fs.fstatSync(fd, { bigint: true });
