@@ -4,6 +4,14 @@ import type { AgentRole } from './agent';
 export type CanonicalReasoning = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type ReasoningLevel = CanonicalReasoning;
 export type SpeedClass = 'fast' | 'standard' | 'slow';
+export type ModelRoutingTier = 'fast' | 'balanced' | 'deep';
+export type ModelStrengthTag =
+  | 'code_edit'
+  | 'shell_test'
+  | 'deep_reasoning'
+  | 'long_context'
+  | 'multimodal'
+  | 'fast_iteration';
 
 export interface ModelDescriptor {
   /** Stable route identifier: runtime + account profile + provider model id. */
@@ -31,6 +39,19 @@ export interface ModelDescriptor {
   discoveredAt?: string;
   catalogRevision?: string;
   warning?: string;
+  tier?: ModelRoutingTier;
+  strengths?: ModelStrengthTag[];
+}
+
+export interface TierRouteDefault {
+  modelCatalogId?: string;
+  reasoningLevel?: CanonicalReasoning;
+  fallbackCatalogIds?: string[];
+}
+
+export interface OrchestratorRoutingDefaults {
+  worker?: TierRouteDefault;
+  review?: TierRouteDefault;
 }
 
 export interface ModelProfile {

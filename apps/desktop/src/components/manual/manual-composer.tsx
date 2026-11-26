@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type ChangeEvent, type PointerEvent } from 'react';
-import { Brain, FileText, GripHorizontal, ImagePlus, Loader2, Send, Shield, ShieldCheck, X } from 'lucide-react';
+import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { Brain, FileText, ImagePlus, Loader2, Send, Shield, ShieldCheck, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ChatSessionControls, type ChatControlAgent } from './chat-session-controls';
 import type { DiscoveredModel } from '@/stores/account-store';
@@ -7,6 +7,8 @@ import type { ReactNode } from 'react';
 import { IntegrationMentionOptions, matchingIntegrationMentions, useConnectedIntegrationMentions } from '@/components/integrations/integration-mentions';
 import { MentionTextarea } from '@/components/integrations/mention-textarea';
 import { extractClipboardFiles } from '@/lib/clipboard-files';
+import { ComposerResizeHandle } from '@/components/shared/ComposerResizeHandle';
+import { ImageLightbox } from '@/components/shared/ImageLightbox';
 
 export const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 export const MAX_ATTACHMENTS = 10;
@@ -42,26 +44,6 @@ function FilePreview({ file, onOpen, onRemove }: { file: File; onOpen: () => voi
   </div>;
 }
 
-function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }) {
-  const [url, setUrl] = useState<string>();
-  useEffect(() => {
-    if (!file.type.startsWith('image/')) return;
-    const objectUrl = URL.createObjectURL(file);
-    setUrl(objectUrl);
-    return () => URL.revokeObjectURL(objectUrl);
-  }, [file]);
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-  return <div role="dialog" aria-modal="true" aria-label={`Preview ${file.name}`} className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-3 bg-black/85 p-6 backdrop-blur-sm" onClick={onClose}>
-    <button type="button" autoFocus aria-label="Close preview" onClick={onClose} className="absolute right-5 top-5 rounded-lg bg-white/10 p-2 text-white hover:bg-white/20"><X className="h-5 w-5" /></button>
-    {url ? <img src={url} alt={file.name} onClick={event => event.stopPropagation()} className="max-h-[80vh] max-w-full rounded-xl object-contain shadow-2xl" /> : <FileText className="h-16 w-16 text-white" />}
-    <p className="max-w-full truncate text-sm text-white/80">{file.name}</p>
-  </div>;
-}
-
 export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, routeStatus, permissionControl, setupPending, onOpenCode, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply, surface = 'manual', sendDisabled = false, statusText }: {
   agent: ChatControlAgent & { name: string }; agents: readonly unknown[]; live: boolean; native: boolean; pending: boolean;
   autoApprove?: OpenCodeAutoApprove; onAutoApprove?: (enabled: boolean) => Promise<void>;
@@ -82,8 +64,6 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
   const [integrationNotice, setIntegrationNotice] = useState(false);
   const mentionQuery = draft.match(/(?:^|\s)@([\w-]*)$/)?.[1] || '';
   const chooseIntegration = (mention:string) => { onDraft(draft.replace(/@[\w-]*$/, `@${mention} `)); setMentionOpen(false); setIntegrationNotice(mention !== 'github'); textarea.current?.focus(); };
-  const drag = useRef<{ start: number; height: number } | null>(null);
-  const ignoreClick = useRef(false);
   const canSend = native && live && !pending && !sendDisabled && !setupPending && (draft.trim().length > 0 || files.length > 0);
   useEffect(() => {
     if (requestedMode === null) return;
@@ -100,11 +80,6 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
     setModeError(undefined); setRequestedMode(next);
     void onAutoApprove(next).catch(error => { setRequestedMode(null); setModeError(error instanceof Error ? error.message : String(error)); });
   };
-  const resize = (event: PointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0) return;
-    drag.current = { start: event.clientY, height };
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
   return <form aria-label={surface === 'manual' ? 'Manual message composer' : 'Planning message composer'} className={`shrink-0 px-4 pb-3 pt-2 ${surface === 'planning' ? 'flex min-h-0 max-h-[70%] flex-col' : ''}`} onSubmit={event => { event.preventDefault(); if (canSend) onSend(); }}>
     <div className={`relative mx-auto w-full max-w-3xl rounded-2xl border border-input bg-card p-3 shadow-sm transition-colors focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-ring/15 ${surface === 'planning' ? 'flex min-h-0 flex-1 flex-col' : ''}`}>
       {mentionOpen && <div className="absolute bottom-full left-0 z-20 mb-2 w-[min(300px,calc(100vw-2rem))] rounded-lg border border-border bg-popover p-1 shadow-lg"><IntegrationMentionOptions {...integrations} query={mentionQuery} onSelect={chooseIntegration} /></div>}
@@ -114,7 +89,7 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
       </div>}
       <MentionTextarea ref={textarea} aria-label={`Message ${agent.name}`} onPaste={event => { const pastedFiles = extractClipboardFiles(event.clipboardData); if (pastedFiles.length) { event.preventDefault(); onAddFiles(pastedFiles); } }} value={draft} onChange={event => { const value = event.target.value; onDraft(value); setMentionOpen(/(?:^|\s)@([\w-]*)$/.test(value)); if (!value) setIntegrationNotice(false); }} onKeyDown={event => { if (event.key === 'Escape' && mentionOpen) { event.preventDefault(); event.stopPropagation(); setMentionOpen(false); return; } if (event.nativeEvent.isComposing) return; if (event.key === 'Tab' && !event.shiftKey && mentionOpen) { const match = matchingIntegrationMentions(integrations.items, mentionQuery)[0]; if (match) { event.preventDefault(); chooseIntegration(match.mention); } return; } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (mentionOpen) { const match = matchingIntegrationMentions(integrations.items, mentionQuery)[0]; if (match) { chooseIntegration(match.mention); return; } setMentionOpen(false); } if (canSend) onSend(); } }} placeholder={live ? 'Message this agent…' : 'Open the agent to continue…'} maxLength={32000} style={{ height }} className="block w-full resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground" />
       </div>
-      <button type="button" aria-label="Resize message area" title="Drag to resize · click to expand or collapse" onClick={() => { if (ignoreClick.current) { ignoreClick.current = false; return; } setHeight(value => value < 150 ? 216 : 72); }} onPointerDown={resize} onPointerMove={event => { if (drag.current) setHeight(Math.max(72, Math.min(320, drag.current.height + drag.current.start - event.clientY))); }} onPointerUp={event => { if (drag.current) { ignoreClick.current = Math.abs(event.clientY - drag.current.start) > 4; drag.current = null; } }} onLostPointerCapture={() => { drag.current = null; }} className="mx-auto flex h-5 w-16 shrink-0 cursor-ns-resize items-center justify-center rounded-full text-muted-foreground/60 hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"><GripHorizontal className="h-4 w-4" /></button>
+      <ComposerResizeHandle height={height} onHeightChange={setHeight} />
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-2"><ChatSessionControls key={agent.id} agent={agent} agents={agents} pending={pending || !native} onApply={onApply}/><div className="ml-auto flex items-center gap-1">
         <input ref={input} type="file" multiple className="sr-only" aria-label="Choose files to attach" onChange={(event: ChangeEvent<HTMLInputElement>) => { onAddFiles(Array.from(event.target.files || [])); event.target.value = ''; }} />
         <Button type="button" variant="ghost" size="icon" aria-label="Attach files or images" title="Attach files or images" onClick={() => input.current?.click()}><ImagePlus className="h-4 w-4" /></Button>

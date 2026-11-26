@@ -29,6 +29,7 @@ import {
   type MissionRoutingPreference,
   type RuntimeHostConfig,
 } from './runtime-host';
+import { classifyRuntimeFailure } from './runtime-failure';
 import { Scheduler } from './scheduler';
 import { BaseRuntimeAdapter } from './adapters/base-adapter';
 import { CodexAdapter } from './adapters/codex-adapter';
@@ -365,6 +366,50 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
   }
 
   async runSupervisorTurn(request: SupervisorTurnRuntimeRequest): Promise<string> {
+    const maxRetries = Math.max(0, Math.floor(this.config.maxRateLimitRetries ?? 2));
+    const cooldownMs = Math.max(1_000, this.config.rateLimitCooldownMs ?? 90_000);
+    const excludedCatalogIds = new Set<string>();
+    let preferredTier: import('@atris-agent-code/domain').ModelRoutingTier | undefined;
+    let lastRateLimitError: unknown;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      const selectedRouteRef: { catalogId?: string; tier?: import('@atris-agent-code/domain').ModelRoutingTier; adapterId?: string } = {};
+      try {
+        return await this.runSupervisorTurnOnce(request, { excludedCatalogIds, preferredTier, selectedRouteRef });
+      } catch (error) {
+        const classification = classifyRuntimeFailure(error, selectedRouteRef.adapterId);
+        if (!classification.rateLimited || attempt >= maxRetries || !selectedRouteRef.catalogId) {
+          if (lastRateLimitError) {
+            const origMsg = lastRateLimitError instanceof Error ? lastRateLimitError.message : String(lastRateLimitError);
+            const currMsg = error instanceof Error ? error.message : String(error);
+            throw new Error(`${origMsg} (fallback unavailable: ${currMsg})`);
+          }
+          throw error;
+        }
+        lastRateLimitError = error;
+        const catalog = this.getModelCatalogService();
+        if (typeof catalog.markRateLimited === 'function') {
+          catalog.markRateLimited(
+            selectedRouteRef.catalogId,
+            classification.retryAfterMs ?? cooldownMs,
+            classification.reason,
+          );
+        }
+        excludedCatalogIds.add(selectedRouteRef.catalogId);
+        preferredTier = preferredTier || selectedRouteRef.tier;
+      }
+    }
+    throw new Error('Supervisor turn failed after rate-limit retries.');
+  }
+
+  private async runSupervisorTurnOnce(
+    request: SupervisorTurnRuntimeRequest,
+    retryContext: {
+      excludedCatalogIds: Set<string>;
+      preferredTier?: import('@atris-agent-code/domain').ModelRoutingTier;
+      selectedRouteRef: { catalogId?: string; tier?: import('@atris-agent-code/domain').ModelRoutingTier; adapterId?: string };
+    },
+  ): Promise<string> {
     const persistedSupervisor = await this.v2WorkspaceManager?.getLatestSupervisorSessionMetadata(request.missionId);
     const agentProfileId = String(request.agentProfileId || request.profileId || persistedSupervisor?.agentProfileId || '').trim() || undefined;
     const agentProfile = await this.resolveAgentProfileForDispatch({
@@ -429,7 +474,17 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     };
 
     const scheduler = new Scheduler({ availableAdapters: ADAPTER_IDS });
-    const route = scheduler.resolveRoute(workerRequest, profiles, models);
+    const rateLimitedCatalogIds = typeof catalog.getActiveRateLimitedCatalogIds === 'function'
+      ? catalog.getActiveRateLimitedCatalogIds()
+      : undefined;
+    const route = scheduler.resolveRoute(workerRequest, profiles, models, {
+      preferredTier: retryContext.preferredTier,
+      excludedCatalogIds: retryContext.excludedCatalogIds,
+      rateLimitedCatalogIds,
+    });
+    retryContext.selectedRouteRef.catalogId = route.model?.catalogId;
+    retryContext.selectedRouteRef.tier = route.model?.tier;
+    retryContext.selectedRouteRef.adapterId = route.adapterId;
     if (isUnverifiedCatalogRoute(route.model)) {
       throw new Error(
         `The selected ${route.model?.displayName || route.model?.runtimeModelId || 'model'} route is not verified by a live runtime catalog. Refresh the connected runtime before starting the supervisor.`,
@@ -583,6 +638,9 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
     try {
       try {
         emitObservation({ type: 'process_started', model: route.model?.displayName || route.model?.runtimeModelId, phase: 'turn', agentProfileId: agentProfile.profile.id, agentProfileName: agentProfile.profile.name });
+        const requestAttachments = Array.isArray((request as SupervisorTurnRuntimeRequest & { attachments?: unknown[] }).attachments)
+          ? (request as SupervisorTurnRuntimeRequest & { attachments?: any[] }).attachments
+          : undefined;
         const spawned = await adapter.spawnAgent({
           sessionId,
           attemptId: supervisorAttemptId,
@@ -605,6 +663,7 @@ export class RuntimeHostV2 extends LegacyRuntimeHost {
           allowedRoutePolicy: (agentProfile.profile.allowedRoutePolicy || agentProfile.profile.routePolicy) as Record<string, unknown> | undefined,
           isolated: false,
           cwd,
+          attachments: requestAttachments,
           enableCoordinationMcp: false,
           providerSessionId: continuity?.providerSessionId,
           preserveProviderSession: capabilities.reuseWhileAlive,

@@ -4,14 +4,10 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { AppShell } from '@/components/layout/app-shell';
 import { Sidebar } from '@/components/layout/sidebar';
 import { Titlebar } from '@/components/layout/titlebar';
-import { ChatTimeline } from '@/components/chat/chat-timeline';
-import { ChatChangeSummary } from '@/components/chat/chat-change-summary';
-import { ChatComposer } from '@/components/composer/chat-composer';
 import { MissionStateStrip } from '@/components/mission/mission-state-strip';
 import { LiveProcesses } from '@/components/processes/live-processes';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { OnboardingModal } from '@/components/onboarding/OnboardingModal';
-import { InspectorPanel } from '@/components/inspector/inspector-panel';
 import { initEventListener, reconnectEventListener } from '@/lib/event-listener';
 import { startConversationDeletionMonitor } from '@/lib/deletion-monitor';
 import { checkApiHealth } from '@/lib/api-client';
@@ -44,6 +40,7 @@ const DeveloperConsole = lazy(() => import('@/components/developer/DeveloperCons
 const ManualWorkspace = lazy(() => import('@/components/manual/manual-workspace').then(module => ({ default: module.ManualWorkspace })));
 const ConversationChoice = lazy(() => import('@/components/layout/workspace-home').then(module => ({ default: module.ConversationChoice })));
 const PlanningWorkspace = lazy(() => import('@/components/planning/planning-workspace').then(module => ({ default: module.PlanningWorkspace })));
+const OrchestratorWorkspace = lazy(() => import('@/components/orchestrator/orchestrator-workspace').then(module => ({ default: module.OrchestratorWorkspace })));
 
 function ViewLoading() {
   return <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground" role="status" aria-live="polite"><Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />Loading view…</div>;
@@ -205,22 +202,13 @@ function WorkspaceApp() {
                  ) : conversationMode === 'choose' ? (
                    <ConversationChoice />
                  ) : (
-                    missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : (
-                      <div className="flex min-h-0 min-w-0 flex-1 flex-col p-2 sm:p-2.5">
-                        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card/60 shadow-sm">
-                          <ChatTimeline />
-                          {activeMissionId && <ChatChangeSummary endpoint={`/missions/${encodeURIComponent(activeMissionId)}/changes`} />}
-                          <ChatComposer />
-                        </div>
-                      </div>
-                    )
+                    missionSurface === 'processes' && activeMissionId ? <LiveProcesses /> : <OrchestratorWorkspace />
                  )}
                </Suspense>
              </ErrorBoundary>
              {devMode ? <ErrorBoundary scope="developer-console" fallback={null}><Suspense fallback={null}><DeveloperConsole /></Suspense></ErrorBoundary> : null}
           </main>
         }
-        inspector={activeView === 'chat' && orchestrated && activeMissionId ? <InspectorPanel /> : null}
       />
     </>
   );

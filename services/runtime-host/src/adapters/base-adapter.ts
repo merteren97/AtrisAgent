@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import type { ChildProcess } from 'child_process';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent, QuestionAsked } from '@atris-agent-code/event-schema';
@@ -19,6 +21,8 @@ import type {
   AuthInitiationResult,
   AuthPollResult,
   CodexPermissionMode,
+  ProviderAttachment,
+  RuntimeAdapterCapabilities,
 } from '@atris-agent-code/domain';
 import { terminateProcessTree } from '../runtime-utils';
 
@@ -54,6 +58,122 @@ export interface SpawnAgentOptions {
   allowedRoutePolicy?: Record<string, unknown>;
   providerSessionId?: string;
   preserveProviderSession?: boolean;
+  attachments?: ProviderAttachment[];
+}
+
+export interface StagedWorkspaceAttachment {
+  attachment: ProviderAttachment;
+  relativePath: string;
+  stagedPath: string;
+}
+
+/** Returns attachments whose resolved `providerPath` points to an existing regular file. */
+export function validateLocalAttachments(attachments?: ProviderAttachment[]): ProviderAttachment[] {
+  if (!Array.isArray(attachments) || !attachments.length) return [];
+  const valid: ProviderAttachment[] = [];
+  for (const attachment of attachments) {
+    if (!attachment || typeof attachment.providerPath !== 'string') continue;
+    const rawPath = attachment.providerPath.trim();
+    if (!rawPath || rawPath.includes('\0')) continue;
+    const resolved = path.resolve(rawPath);
+    try {
+      if (fs.statSync(resolved).isFile()) {
+        valid.push({ ...attachment, providerPath: resolved });
+      }
+    } catch {
+      // Skip missing or inaccessible attachment files.
+    }
+  }
+  return valid;
+}
+
+function sanitizeAttachmentFilename(rawName: string | undefined, fallbackId: string): string {
+  const normalized = String(rawName || '').replace(/[\0\r\n]/g, '').trim();
+  const base = path.basename(normalized.replace(/\\/g, '/'));
+  const cleaned = base.replace(/^\.+/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!cleaned || cleaned === '.' || cleaned === '..') {
+    const safeId = String(fallbackId || 'attachment').replace(/[^a-zA-Z0-9._-]/g, '_') || 'attachment';
+    return safeId;
+  }
+  return cleaned;
+}
+
+export interface StagedWorkspaceAttachments {
+  staged: StagedWorkspaceAttachment[];
+  cleanup: () => void;
+}
+
+/**
+ * Safely copies validated attachments into `<workspacePath>/.atris-attachments/`
+ * with strict path-traversal guards so CLI runtimes without native file parts
+ * can inspect them inside their assigned workspace, and returns an idempotent
+ * `cleanup()` handle so staged files never pollute Git repos/worktrees.
+ */
+export function stageWorkspaceAttachments(
+  workspacePath: string,
+  attachments?: ProviderAttachment[],
+): StagedWorkspaceAttachments {
+  const valid = validateLocalAttachments(attachments);
+  if (!valid.length) return { staged: [], cleanup: () => undefined };
+  const workspaceRoot = path.resolve(workspacePath);
+  const stageDir = path.resolve(workspaceRoot, '.atris-attachments');
+  const stageRel = path.relative(workspaceRoot, stageDir);
+  if (!stageRel || stageRel.startsWith('..') || path.isAbsolute(stageRel)) {
+    throw new Error('Invalid attachment staging directory.');
+  }
+  fs.mkdirSync(stageDir, { recursive: true });
+  const usedNames = new Set<string>();
+  const staged: StagedWorkspaceAttachment[] = [];
+  for (let index = 0; index < valid.length; index += 1) {
+    const attachment = valid[index];
+    let fileName = sanitizeAttachmentFilename(attachment.name, attachment.id || `file-${index + 1}`);
+    if (usedNames.has(fileName.toLowerCase())) {
+      fileName = `${index + 1}-${fileName}`;
+    }
+    usedNames.add(fileName.toLowerCase());
+    const targetPath = path.resolve(stageDir, fileName);
+    const relativeToStage = path.relative(stageDir, targetPath);
+    if (!relativeToStage || relativeToStage.startsWith('..') || path.isAbsolute(relativeToStage) || relativeToStage !== fileName) {
+      throw new Error(`Refusing unsafe attachment path for ${attachment.name}`);
+    }
+    fs.copyFileSync(attachment.providerPath, targetPath);
+    staged.push({
+      attachment,
+      relativePath: `.atris-attachments/${fileName}`,
+      stagedPath: targetPath,
+    });
+  }
+  let cleaned = false;
+  return {
+    staged,
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      for (const item of staged) {
+        try {
+          fs.rmSync(item.stagedPath, { force: true, maxRetries: 3, retryDelay: 30 });
+        } catch {
+          // Best-effort cleanup on Windows file locks.
+        }
+      }
+      try {
+        if (fs.existsSync(stageDir) && fs.readdirSync(stageDir).length === 0) {
+          fs.rmdirSync(stageDir);
+        }
+      } catch {
+        // Leave non-empty or concurrently used directory intact.
+      }
+    },
+  };
+}
+
+export function appendStagedAttachmentsToPrompt(prompt: string, staged: StagedWorkspaceAttachment[]): string {
+  if (!staged.length) return prompt;
+  const lines = staged.map(
+    ({ attachment, relativePath }) =>
+      `- ${relativePath} (${attachment.name || path.basename(relativePath)}, ${attachment.mimeType || 'application/octet-stream'}, ${attachment.byteSize} bytes)`,
+  );
+  return `${prompt}\n\n[Attachments staged in workspace]\n${lines.join('\n')}`;
 }
 
 export interface SessionContinuityCapabilities {
@@ -130,6 +250,18 @@ export abstract class BaseRuntimeAdapter implements RuntimeAdapter {
 
   getSessionContinuityCapabilities(): SessionContinuityCapabilities {
     return { reuseWhileAlive: false, resumeAfterRestart: false };
+  }
+
+  /** Explicit runtime capability matrix used for orchestration & policy degradation. */
+  getAdapterCapabilities(): RuntimeAdapterCapabilities {
+    const continuity = this.getSessionContinuityCapabilities();
+    return {
+      liveSteer: false,
+      interactiveApproval: false,
+      sessionResume: continuity.resumeAfterRestart,
+      reuseWhileAlive: continuity.reuseWhileAlive,
+      nativeAttachments: false,
+    };
   }
 
   getPendingQuestion(_sessionId: string, _requestId: string): QuestionAsked | undefined {

@@ -1,8 +1,72 @@
 import fs from 'fs';
 import path from 'path';
-import type { ModelDescriptor, AccountProfile, RuntimeType } from '@atris-agent-code/domain';
+import type {
+  ModelDescriptor,
+  AccountProfile,
+  RuntimeType,
+  ModelRoutingTier,
+  ModelStrengthTag,
+} from '@atris-agent-code/domain';
 import type { BaseRuntimeAdapter } from './adapters/base-adapter';
 import { getAtrisDataDir, redactSecrets } from './runtime-utils';
+
+export function inferModelTierAndStrengths(
+  model: Pick<ModelDescriptor, 'runtimeId' | 'runtimeModelId' | 'displayName' | 'supportedReasoning' | 'inputModalities' | 'contextWindow' | 'tier' | 'strengths'>,
+): { tier: ModelRoutingTier; strengths: ModelStrengthTag[] } {
+  const idAndName = `${model.runtimeModelId} ${model.displayName}`.toLowerCase();
+  const reasoning = model.supportedReasoning || [];
+  const modalities = model.inputModalities || [];
+
+  let tier: ModelRoutingTier = model.tier || 'balanced';
+  if (!model.tier) {
+    if (/(?:^|[-_/\s.])(mini|flash|haiku|nano|lite|fast|20b|4o-mini)(?:$|[-_/\s.])/i.test(idAndName)) {
+      tier = 'fast';
+    } else if (
+      /(?:^|[-_/\s.])(opus|o1|o3|o4|pro|thinking|deep|reason|codex-max)(?:$|[-_/\s.])/i.test(idAndName)
+      || reasoning.includes('xhigh')
+      || reasoning.includes('max')
+    ) {
+      tier = 'deep';
+    } else {
+      tier = 'balanced';
+    }
+  }
+
+  let strengths: ModelStrengthTag[];
+  if (model.strengths && model.strengths.length > 0) {
+    strengths = [...new Set(model.strengths)];
+  } else {
+    const inferred = new Set<ModelStrengthTag>();
+    if (
+      ['codex', 'claude_code', 'opencode'].includes(model.runtimeId)
+      || /codex|sonnet|opus|coder|qwen|deepseek|gpt-5|claude/i.test(idAndName)
+    ) {
+      inferred.add('code_edit');
+    }
+    if (['codex', 'claude_code', 'opencode'].includes(model.runtimeId)) {
+      inferred.add('shell_test');
+    }
+    if (
+      tier === 'deep'
+      || reasoning.some((level) => level === 'high' || level === 'xhigh' || level === 'max')
+      || /thinking|reason|opus|o1|o3|o4|pro\b/i.test(idAndName)
+    ) {
+      inferred.add('deep_reasoning');
+    }
+    if ((model.contextWindow && model.contextWindow >= 128_000) || /gemini|claude|sonnet|opus|gpt-4\.1|gpt-5/i.test(idAndName)) {
+      inferred.add('long_context');
+    }
+    if (modalities.includes('image') || /gemini|gpt-4o|gpt-5|claude|sonnet|opus/i.test(idAndName)) {
+      inferred.add('multimodal');
+    }
+    if (tier === 'fast' || /flash|mini|haiku|nano|lite|fast/i.test(idAndName)) {
+      inferred.add('fast_iteration');
+    }
+    strengths = [...inferred];
+  }
+
+  return { tier, strengths };
+}
 
 const MAX_DISCOVERY_DIAGNOSTIC_CHARS = 1_500;
 
@@ -21,6 +85,7 @@ export class ModelCatalogService {
   private cacheFilePath: string;
   private cachedCatalog = new Map<string, ModelDescriptor>();
   private adapters = new Map<string, BaseRuntimeAdapter>();
+  private rateLimitedUntil = new Map<string, { expiresAt: number; reason?: string; previousAvailability: ModelDescriptor['availability'] }>();
 
   constructor(adapters?: Map<string, BaseRuntimeAdapter>, customStorageDir?: string) {
     if (adapters) this.adapters = adapters;
@@ -42,8 +107,11 @@ export class ModelCatalogService {
       this.cachedCatalog.clear();
       for (const model of list) {
         const documented = model.source === 'documented';
+        const { tier, strengths } = inferModelTierAndStrengths(model);
         this.cachedCatalog.set(model.catalogId, {
           ...model,
+          tier,
+          strengths,
           // Documented aliases remain documented across restarts. Routes that
           // came from a prior live discovery become cached and unverified.
           source: documented ? 'documented' : 'cached',
@@ -98,7 +166,7 @@ export class ModelCatalogService {
         catalogChanged = catalogChanged || this.getModelsForProfile(profile.id).length > 0 || models.length > 0;
         this.removeProfile(profile.id, false);
         for (const model of models) {
-          const descriptor: ModelDescriptor = {
+          const baseDescriptor: ModelDescriptor = {
             ...model,
             accountProfileId: profile.id,
             runtimeId: profile.runtimeType,
@@ -106,6 +174,8 @@ export class ModelCatalogService {
             routeLabel: model.routeLabel || `${adapter.name} · ${profile.profileName}`,
             discoveredAt: model.discoveredAt || new Date().toISOString(),
           };
+          const { tier, strengths } = inferModelTierAndStrengths(baseDescriptor);
+          const descriptor = this.applyRateLimitState({ ...baseDescriptor, tier, strengths });
           this.cachedCatalog.set(descriptor.catalogId, descriptor);
         }
       } else {
@@ -138,7 +208,7 @@ export class ModelCatalogService {
     this.removeProfile(profile.id, false);
     const normalized: ModelDescriptor[] = [];
     for (const model of models) {
-      const descriptor: ModelDescriptor = {
+      const baseDescriptor: ModelDescriptor = {
         ...model,
         accountProfileId: profile.id,
         runtimeId: profile.runtimeType,
@@ -146,6 +216,8 @@ export class ModelCatalogService {
         routeLabel: model.routeLabel || `${adapter.name} · ${profile.profileName}`,
         discoveredAt: model.discoveredAt || new Date().toISOString(),
       };
+      const { tier, strengths } = inferModelTierAndStrengths(baseDescriptor);
+      const descriptor = this.applyRateLimitState({ ...baseDescriptor, tier, strengths });
       normalized.push(descriptor);
       this.cachedCatalog.set(descriptor.catalogId, descriptor);
     }
@@ -153,7 +225,80 @@ export class ModelCatalogService {
     return normalized;
   }
 
-  getCachedCatalog(): ModelDescriptor[] {
+  markRateLimited(catalogId: string, cooldownMs = 90_000, reason?: string, now = Date.now()): void {
+    const boundedCooldown = Math.max(1_000, Math.min(cooldownMs, 10 * 60_000));
+    const existing = this.cachedCatalog.get(catalogId);
+    const prev = this.rateLimitedUntil.get(catalogId);
+    const previousAvailability = existing && existing.availability !== 'rate_limited'
+      ? existing.availability
+      : prev?.previousAvailability || 'available';
+    this.rateLimitedUntil.set(catalogId, {
+      expiresAt: now + boundedCooldown,
+      reason,
+      previousAvailability,
+    });
+    if (existing) {
+      this.cachedCatalog.set(catalogId, {
+        ...existing,
+        availability: 'rate_limited',
+        warning: reason || existing.warning || 'Temporarily rate-limited.',
+      });
+    }
+  }
+
+  isRateLimited(catalogId: string, now = Date.now()): boolean {
+    const entry = this.rateLimitedUntil.get(catalogId);
+    if (!entry) return false;
+    if (now >= entry.expiresAt) {
+      this.clearExpiredCooldown(catalogId, entry);
+      return false;
+    }
+    return true;
+  }
+
+  getActiveRateLimitedCatalogIds(now = Date.now()): Set<string> {
+    const active = new Set<string>();
+    for (const [catalogId, entry] of this.rateLimitedUntil.entries()) {
+      if (now >= entry.expiresAt) {
+        this.clearExpiredCooldown(catalogId, entry);
+      } else {
+        active.add(catalogId);
+      }
+    }
+    return active;
+  }
+
+  private clearExpiredCooldown(
+    catalogId: string,
+    entry: { expiresAt: number; reason?: string; previousAvailability: ModelDescriptor['availability'] },
+  ): void {
+    this.rateLimitedUntil.delete(catalogId);
+    const existing = this.cachedCatalog.get(catalogId);
+    if (existing && existing.availability === 'rate_limited') {
+      this.cachedCatalog.set(catalogId, {
+        ...existing,
+        availability: entry.previousAvailability,
+        warning: existing.warning === entry.reason ? undefined : existing.warning,
+      });
+    }
+  }
+
+  private applyRateLimitState(descriptor: ModelDescriptor, now = Date.now()): ModelDescriptor {
+    const entry = this.rateLimitedUntil.get(descriptor.catalogId);
+    if (!entry) return descriptor;
+    if (now >= entry.expiresAt) {
+      this.rateLimitedUntil.delete(descriptor.catalogId);
+      return descriptor;
+    }
+    return {
+      ...descriptor,
+      availability: 'rate_limited',
+      warning: entry.reason || descriptor.warning || 'Temporarily rate-limited.',
+    };
+  }
+
+  getCachedCatalog(now = Date.now()): ModelDescriptor[] {
+    this.getActiveRateLimitedCatalogIds(now);
     return [...this.cachedCatalog.values()];
   }
 

@@ -14,6 +14,7 @@ import { runtimeProfileEnv } from './runtime-utils';
 import { isReadOnlyAgentRole } from './adapters/base-adapter';
 import { RuntimeHost } from './runtime-host';
 import { RuntimeHostV2 } from './runtime-host-v2';
+import { classifyRuntimeFailure } from './runtime-failure';
 import { ActionBroker } from '@atris-agent-code/policy-engine';
 
 async function runTests() {
@@ -1258,6 +1259,323 @@ async function runTests() {
   const targetExecution = await (targetAwareHost as any).resolveTaskExecutionContext({ taskId: 'task-new', missionId: 'mission-new' }, 'builder');
   assert((dispatchedTarget as any)?.kind === 'new_sibling_project' && (dispatchedTarget as any)?.projectName === 'AtrisTask', 'RuntimeHost dispatch preserves the persisted structured new sibling target');
   assert(targetExecution.cwd === siblingStagingPath && targetExecution.worktreePath === siblingStagingPath, 'RuntimeHost runs the Builder in the managed new sibling staging directory');
+
+  // --- Phase A: Bounded Concurrency Semaphore (maxConcurrentSessions) ---
+  {
+    const bus = new LocalEventBus();
+    const host = new RuntimeHost(bus, { maxConcurrentSessions: 2, watchdogInterval: 0 });
+    const started: string[] = [];
+    const adapter: any = {
+      id: 'codex',
+      runtimeType: 'codex',
+      name: 'Bounded Codex',
+      setEventBus() {},
+      configureProfile() {},
+      getAdapterCapabilities: () => ({
+        liveSteer: false, interactiveApproval: false, sessionResume: true, reuseWhileAlive: false, nativeAttachments: false,
+      }),
+      async probeCapabilities() { return { worktreeAwareness: true, structuredEventStreaming: true }; },
+      async spawnAgent(input: any) {
+        started.push(input.taskId);
+        return { id: `session-${input.taskId}`, agentInstanceId: input.sessionId || input.taskId };
+      },
+      async cancel() {},
+      async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-conc', provider: 'openai', runtimeType: 'codex', profileName: 'Conc', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-5-codex'], usageScope: null, createdAt: '', updatedAt: '',
+      schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true, structuredEventStreaming: true },
+    }];
+    (host as any).catalogService.getCachedCatalog = () => [{
+      catalogId: 'codex:profile-conc:gpt-5-codex', runtimeId: 'codex', accountProfileId: 'profile-conc',
+      providerId: 'openai', runtimeModelId: 'gpt-5-codex', displayName: 'GPT-5 Codex',
+      supportedRoles: ['researcher'], supportedReasoning: ['medium'], inputModalities: ['text'],
+      availability: 'available', source: 'discovered',
+    }];
+
+    const makeTaskEvent = (taskId: string) => ({
+      id: `evt-${taskId}`, type: 'task_created', missionId: 'mission-conc', taskId,
+      agentInstanceId: `agent-${taskId}`, assignedRole: 'researcher', title: taskId, timestamp: new Date().toISOString(),
+    } as any);
+
+    const p1 = host.handleTaskCreated(makeTaskEvent('t1'));
+    const p2 = host.handleTaskCreated(makeTaskEvent('t2'));
+    await Promise.all([p1, p2]);
+    const p3 = host.handleTaskCreated(makeTaskEvent('t3'));
+    await new Promise((r) => setTimeout(r, 25));
+    const metricsWhileFull = host.getConcurrencyMetrics();
+    assert(
+      started.length === 2 && metricsWhileFull.activeSessions === 2 && metricsWhileFull.queuedSessions === 1 && metricsWhileFull.workerUtilization === 1,
+      'maxConcurrentSessions=2 caps active workers at 2 and queues the 3rd task with workerUtilization=1',
+    );
+
+    bus.emit({
+      id: 'done-t1', type: 'task_completed', missionId: 'mission-conc', taskId: 't1',
+      agentInstanceId: 'agent-t1', result: 'ok', timestamp: new Date().toISOString(),
+    } as any);
+    await p3;
+    assert(started.includes('t3'), 'Completing an active task releases its concurrency slot and unblocks queued tasks');
+    await host.stopAll();
+  }
+
+  // --- Phase A: Runtime 429 / Quota Classifier + Cooldown + Automatic Fallback Retry ---
+  {
+    assert(classifyRuntimeFailure('HTTP 429 Too Many Requests; retry-after: 15s', 'codex').rateLimited, '429 classifier detects Codex rate limits and Retry-After');
+    assert(classifyRuntimeFailure('RESOURCE_EXHAUSTED: quota exceeded', 'antigravity').rateLimited, '429 classifier detects Antigravity RESOURCE_EXHAUSTED');
+    assert(classifyRuntimeFailure('overloaded_error (529)', 'claude_code').rateLimited, '429 classifier detects Claude Code overloaded_error');
+    assert(!classifyRuntimeFailure('401 Unauthorized: invalid_api_key', 'opencode').rateLimited, '429 classifier does not misclassify auth errors as rate limits');
+
+    const bus = new LocalEventBus();
+    const host = new RuntimeHost(bus, { rateLimitCooldownMs: 60_000, maxRateLimitRetries: 2, watchdogInterval: 0 });
+    const attemptedModels: string[] = [];
+    const adapter: any = {
+      id: 'codex',
+      runtimeType: 'codex',
+      name: 'Fallback Codex',
+      setEventBus() {},
+      configureProfile() {},
+      getAdapterCapabilities: () => ({
+        liveSteer: false, interactiveApproval: false, sessionResume: true, reuseWhileAlive: false, nativeAttachments: false,
+      }),
+      async probeCapabilities() { return { worktreeAwareness: true, structuredEventStreaming: true }; },
+      async spawnAgent(input: any) {
+        attemptedModels.push(input.model);
+        if (input.model === 'gpt-5-primary') {
+          throw new Error('HTTP 429 rate limit exceeded');
+        }
+        return { id: `session-${input.model}`, agentInstanceId: input.sessionId };
+      },
+      async cancel() {},
+      async shutdown() {},
+    };
+    host.registerAdapter(adapter);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-fb', provider: 'openai', runtimeType: 'codex', profileName: 'Fallback', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-5-primary', 'gpt-5-secondary'], usageScope: null, createdAt: '', updatedAt: '',
+      schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true, structuredEventStreaming: true },
+    }];
+    (host as any).catalogService.getCachedCatalog = () => [
+      {
+        catalogId: 'codex:profile-fb:gpt-5-primary', runtimeId: 'codex', accountProfileId: 'profile-fb',
+        providerId: 'openai', runtimeModelId: 'gpt-5-primary', displayName: 'GPT-5 Primary',
+        supportedRoles: ['researcher'], supportedReasoning: ['medium'], inputModalities: ['text'],
+        availability: 'available', source: 'discovered', isDefault: true, tier: 'balanced',
+      },
+      {
+        catalogId: 'codex:profile-fb:gpt-5-secondary', runtimeId: 'codex', accountProfileId: 'profile-fb',
+        providerId: 'openai', runtimeModelId: 'gpt-5-secondary', displayName: 'GPT-5 Secondary',
+        supportedRoles: ['researcher'], supportedReasoning: ['medium'], inputModalities: ['text'],
+        availability: 'available', source: 'discovered', tier: 'balanced',
+      },
+    ];
+    const session = await host.handleTaskCreated({
+      id: 'evt-fb', type: 'task_created', missionId: 'mission-fb', taskId: 'task-fb',
+      agentInstanceId: 'agent-fb', assignedRole: 'researcher', title: 'Fallback test',
+      modelCatalogId: 'codex:profile-fb:gpt-5-primary',
+      fallbackCatalogIds: ['codex:profile-fb:gpt-5-secondary'],
+      routeSelectionMode: 'fixed',
+      timestamp: new Date().toISOString(),
+    } as any);
+    assert(
+      attemptedModels[0] === 'gpt-5-primary' && attemptedModels[1] === 'gpt-5-secondary' && session.id === 'session-gpt-5-secondary',
+      '429 during spawn marks primary route rate_limited and automatically retries with fallbackCatalogIds',
+    );
+    assert(
+      (host as any).catalogService.isRateLimited('codex:profile-fb:gpt-5-primary'),
+      'Failed 429 route is placed in bounded cooldown in ModelCatalogService',
+    );
+    await host.stopAll();
+  }
+
+  // --- Phase A: Explicit Capability Matrix & Graceful Governed Approval Degradation ---
+  {
+    const bus = new LocalEventBus();
+    const host = new RuntimeHost(bus, { watchdogInterval: 0 });
+    const caps = host.getAllAdapterCapabilities();
+    assert(
+      caps.opencode?.interactiveApproval === true
+      && caps.opencode?.liveSteer === true
+      && caps.opencode?.sessionResume === true
+      && caps.codex?.interactiveApproval === true
+      && caps.codex?.liveSteer === true
+      && caps.codex?.sessionResume === true
+      && caps.codex?.nativeAttachments === true
+      && caps.claude_code?.interactiveApproval === false
+      && caps.claude_code?.sessionResume === true
+      && caps.antigravity?.interactiveApproval === false
+      && caps.antigravity?.sessionResume === false,
+      'Adapter capability matrix accurately reports interactiveApproval, liveSteer, and sessionResume across all 4 runtimes',
+    );
+
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-governed-degrade-'));
+    const worktreePath = path.join(tempRoot, 'builder-worktree');
+    fs.mkdirSync(worktreePath);
+    const task = {
+      id: 'task-degrade', missionId: 'mission-degrade', assignedRole: 'builder',
+      description: 'Review mode builder task', priority: 'medium', requiredCapabilities: [],
+      assignedAgentId: null, worktreeId: null, dependsOn: [], title: 'Degrade task',
+    };
+    const manager: any = {
+      async getTask() { return task; },
+      async getMission() { return { workspaceId: 'ws-degrade', executionMode: 'review', automationPolicy: { profile: 'ask' } }; },
+      async getWorkspace() { return { path: tempRoot }; },
+      async listTasks() { return [task]; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+      async createWorktreeForTask() { return worktreePath; },
+      async claimTaskAttempt() { return { id: 'attempt-degrade', attemptNumber: 1 }; },
+      async markTaskAttemptRunning() { return true; },
+      async finishTaskAttempt() { return true; },
+      async updateTask() {},
+    };
+    const degradedHost = new RuntimeHost(bus, { workspaceManager: manager, watchdogInterval: 0 });
+    let spawnedPrompt = '';
+    const codexStub: any = {
+      id: 'codex', runtimeType: 'codex', name: 'Codex',
+      setEventBus() {}, configureProfile() {},
+      getAdapterCapabilities: () => ({ liveSteer: false, interactiveApproval: false, sessionResume: true, reuseWhileAlive: false, nativeAttachments: false }),
+      async probeCapabilities() { return { worktreeAwareness: true, structuredEventStreaming: true, interactiveApproval: false }; },
+      async spawnAgent(input: any) { spawnedPrompt = input.prompt; return { id: 'session-degrade', agentInstanceId: input.sessionId }; },
+      async cancel() {}, async shutdown() {},
+    };
+    degradedHost.registerAdapter(codexStub);
+    (degradedHost as any).profileManager.getProfiles = async () => [{
+      id: 'profile-degrade', provider: 'openai', runtimeType: 'codex', profileName: 'Degrade', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-degrade'], usageScope: null, createdAt: '', updatedAt: '',
+      schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true, structuredEventStreaming: true },
+    }];
+    (degradedHost as any).catalogService.getCachedCatalog = () => [{
+      catalogId: 'codex:profile-degrade:gpt-degrade', runtimeId: 'codex', accountProfileId: 'profile-degrade',
+      providerId: 'openai', runtimeModelId: 'gpt-degrade', displayName: 'GPT Degrade',
+      supportedRoles: ['builder'], supportedReasoning: ['medium'], inputModalities: ['text'],
+      availability: 'available', source: 'discovered',
+    }];
+    const logs: any[] = [];
+    const unsubLog = bus.on('log' as any, (evt: any) => { logs.push(evt); });
+    try {
+      const session = await degradedHost.handleTaskCreated({
+        id: 'evt-degrade', type: 'task_created', missionId: 'mission-degrade', taskId: task.id,
+        agentInstanceId: 'agent-degrade', assignedRole: 'builder', title: task.title, timestamp: new Date().toISOString(),
+      } as any);
+      assert(
+        session.id === 'session-degrade'
+        && spawnedPrompt.includes('Governed approval notice:')
+        && logs.some((l) => l.code === 'governed_approval_degraded'),
+        'Governed policy requiring approval degrades cleanly on non-interactive adapters instead of throwing pre-spawn',
+      );
+    } finally {
+      unsubLog();
+      await degradedHost.stopAll();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  }
+
+  // --- Regression: Post-queue claimedAt lease freshness & fallback exhaustion error preservation ---
+  {
+    const bus = new LocalEventBus();
+    const claimedTimestamps = new Map<string, number>();
+    const manager: any = {
+      async getTask(id: string) {
+        return {
+          id, missionId: 'mission-lease', assignedRole: 'researcher',
+          description: 'Lease test', priority: 'medium', requiredCapabilities: [],
+          assignedAgentId: null, worktreeId: null, dependsOn: [], title: id,
+        };
+      },
+      async getMission() { return { workspaceId: 'ws-lease', executionMode: 'autonomous' }; },
+      async getWorkspace() { return { path: process.cwd() }; },
+      async listTasks() { return []; },
+      async resolveRoleExecutionPolicy() { return undefined; },
+      async claimTaskAttempt(input: any) {
+        claimedTimestamps.set(input.taskId, Date.parse(input.now));
+        return { id: `attempt-${input.taskId}`, attemptNumber: 1 };
+      },
+      async markTaskAttemptRunning() { return true; },
+      async finishTaskAttempt() { return true; },
+      async updateTask() {},
+    };
+    const host = new RuntimeHost(bus, { maxConcurrentSessions: 1, workspaceManager: manager, watchdogInterval: 0 });
+    host.registerAdapter({
+      id: 'codex', runtimeType: 'codex', name: 'Lease Codex',
+      setEventBus() {}, configureProfile() {},
+      getAdapterCapabilities: () => ({ liveSteer: false, interactiveApproval: false, sessionResume: false, reuseWhileAlive: false, nativeAttachments: false }),
+      async probeCapabilities() { return { worktreeAwareness: true, structuredEventStreaming: true }; },
+      async spawnAgent(input: any) { return { id: `session-${input.taskId}`, agentInstanceId: input.sessionId || input.taskId }; },
+      async cancel() {}, async shutdown() {},
+    } as any);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-lease', provider: 'openai', runtimeType: 'codex', profileName: 'Lease', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-lease'], usageScope: null, createdAt: '', updatedAt: '',
+      schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true, structuredEventStreaming: true },
+    }];
+    (host as any).catalogService.getCachedCatalog = () => [{
+      catalogId: 'codex:profile-lease:gpt-lease', runtimeId: 'codex', accountProfileId: 'profile-lease',
+      providerId: 'openai', runtimeModelId: 'gpt-lease', displayName: 'GPT Lease',
+      supportedRoles: ['researcher'], supportedReasoning: ['medium'], inputModalities: ['text'],
+      availability: 'available', source: 'discovered',
+    }];
+
+    await host.handleTaskCreated({
+      id: 'evt-l1', type: 'task_created', missionId: 'mission-lease', taskId: 'l1',
+      agentInstanceId: 'agent-l1', assignedRole: 'researcher', title: 'l1', timestamp: new Date().toISOString(),
+    } as any);
+    const queuedPromise = host.handleTaskCreated({
+      id: 'evt-l2', type: 'task_created', missionId: 'mission-lease', taskId: 'l2',
+      agentInstanceId: 'agent-l2', assignedRole: 'researcher', title: 'l2', timestamp: new Date().toISOString(),
+    } as any);
+    await new Promise((r) => setTimeout(r, 40));
+    const beforeUnblock = Date.now();
+    bus.emit({
+      id: 'done-l1', type: 'task_completed', missionId: 'mission-lease', taskId: 'l1',
+      agentInstanceId: 'agent-l1', result: 'ok', timestamp: new Date().toISOString(),
+    } as any);
+    await queuedPromise;
+    assert(
+      (claimedTimestamps.get('l2') ?? 0) >= beforeUnblock - 5,
+      'Queued task computes claimedAt/leaseExpiresAt after acquiring semaphore slot instead of pre-queue',
+    );
+    await host.stopAll();
+  }
+
+  {
+    const bus = new LocalEventBus();
+    const host = new RuntimeHost(bus, { rateLimitCooldownMs: 60_000, maxRateLimitRetries: 2, watchdogInterval: 0 });
+    host.registerAdapter({
+      id: 'codex', runtimeType: 'codex', name: 'Exhausted Codex',
+      setEventBus() {}, configureProfile() {},
+      getAdapterCapabilities: () => ({ liveSteer: false, interactiveApproval: false, sessionResume: false, reuseWhileAlive: false, nativeAttachments: false }),
+      async probeCapabilities() { return { worktreeAwareness: true, structuredEventStreaming: true }; },
+      async spawnAgent() { throw new Error('HTTP 429 Too Many Requests'); },
+      async cancel() {}, async shutdown() {},
+    } as any);
+    (host as any).profileManager.getProfiles = async () => [{
+      id: 'profile-ex', provider: 'openai', runtimeType: 'codex', profileName: 'Ex', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-only'], usageScope: null, createdAt: '', updatedAt: '',
+      schedulerAuto: true, capabilitySnapshot: { worktreeAwareness: true, structuredEventStreaming: true },
+    }];
+    (host as any).catalogService.getCachedCatalog = () => [{
+      catalogId: 'codex:profile-ex:gpt-only', runtimeId: 'codex', accountProfileId: 'profile-ex',
+      providerId: 'openai', runtimeModelId: 'gpt-only', displayName: 'GPT Only',
+      supportedRoles: ['researcher'], supportedReasoning: ['medium'], inputModalities: ['text'],
+      availability: 'available', source: 'discovered',
+    }];
+    let caughtError = '';
+    try {
+      await host.handleTaskCreated({
+        id: 'evt-ex', type: 'task_created', missionId: 'mission-ex', taskId: 'task-ex',
+        agentInstanceId: 'agent-ex', assignedRole: 'researcher', title: 'Ex',
+        modelCatalogId: 'codex:profile-ex:gpt-only', routeSelectionMode: 'fixed', timestamp: new Date().toISOString(),
+      } as any);
+    } catch (error) {
+      caughtError = error instanceof Error ? error.message : String(error);
+    }
+    assert(
+      caughtError.includes('429') && caughtError.includes('fallback unavailable'),
+      'Fallback exhaustion preserves the original 429 error message alongside fallback-unavailable reason',
+    );
+    await host.stopAll();
+  }
 
   console.log(`\nRuntimeHost & Adapters Test Results: ${passed} passed, ${failed} failed.`);
   if (failed > 0) process.exit(1);

@@ -24,6 +24,8 @@ import type {
   RouteSelectionMode,
   EffectiveRoutingPreference,
   TaskRoutePreference,
+  ModelRoutingTier,
+  RuntimeAdapterCapabilities,
 } from '@atris-agent-code/domain';
 import {
   defaultAgentProfile,
@@ -46,6 +48,7 @@ import { OpenCodeAdapter } from './adapters/opencode-adapter';
 import { AccountProfileManager } from './account-profile-manager';
 import { ModelCatalogService } from './model-catalog-service';
 import { Scheduler } from './scheduler';
+import { classifyRuntimeFailure } from './runtime-failure';
 
 export interface MissionRoutingPreference {
   modelCatalogId?: string;
@@ -89,6 +92,8 @@ export type AgentProfileResolver = (input: {
 
 export interface RuntimeHostConfig {
   maxConcurrentSessions?: number;
+  rateLimitCooldownMs?: number;
+  maxRateLimitRetries?: number;
   sessionTimeout?: number;
   watchdogInterval?: number;
   sessionIdleGrace?: number;
@@ -177,6 +182,7 @@ export class RuntimeHost {
   private activeSessions = new Map<string, {
     adapterId: string;
     session: AgentSession;
+    slotId?: string;
     missionId?: string;
     runId?: string;
     taskId?: string;
@@ -194,7 +200,22 @@ export class RuntimeHost {
     lastProtocolResponseAt: number;
     lastHeartbeatAt?: number;
     probeFailures: number;
+    taskEvent?: TaskCreated;
+    excludedCatalogIds?: Set<string>;
+    rateLimitRetries?: number;
+    preferredTier?: ModelRoutingTier;
   }>();
+  private activeSessionSlots = new Set<string>();
+  private sessionWaitQueue: Array<{
+    slotId: string;
+    missionId: string;
+    runId?: string;
+    taskId: string;
+    priority: number;
+    queuedAt: number;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }> = [];
   private static readonly ACTIVITY_HEARTBEAT_THROTTLE_MS = 5_000;
   private inFlightTaskSpawns = new Set<{
     missionId: string;
@@ -555,6 +576,7 @@ export class RuntimeHost {
           console.error('[RuntimeHost] Failed to finalize completed task session:', sessionId, error);
           this.activeSessions.delete(sessionId);
         } finally {
+          if (active.slotId) this.releaseSessionSlot(active.slotId);
           this.finishingSessions.delete(sessionId);
         }
       }
@@ -565,7 +587,59 @@ export class RuntimeHost {
         if (!this.isCorrelatedTerminalEvent(event, sessionId, active)) continue;
         if (this.finishingSessions.has(sessionId)) continue;
         this.finishingSessions.add(sessionId);
+        let retriedOnRateLimit = false;
         try {
+          const classification = classifyRuntimeFailure(event.error, active.adapterId);
+          const currentRetries = active.rateLimitRetries ?? 0;
+          if (classification.rateLimited && active.taskEvent && currentRetries < this.maxRateLimitRetries()) {
+            const failedCatalogId = active.route?.modelCatalogId;
+            if (failedCatalogId && typeof this.catalogService.markRateLimited === 'function') {
+              this.catalogService.markRateLimited(
+                failedCatalogId,
+                classification.retryAfterMs ?? this.rateLimitCooldownMs(),
+                classification.reason,
+              );
+            }
+            const nextExcluded = new Set(active.excludedCatalogIds || []);
+            if (failedCatalogId) nextExcluded.add(failedCatalogId);
+            await this.finishAttempt(active, 'failed', { error: event.error, retryable: true });
+            this.activeSessions.delete(sessionId);
+            if (active.slotId) this.releaseSessionSlot(active.slotId);
+            retriedOnRateLimit = true;
+            this.finishingSessions.delete(sessionId);
+            this.eventBus?.emit({
+              id: crypto.randomUUID(),
+              type: 'log',
+              level: 'warn',
+              missionId: event.missionId,
+              taskId: event.taskId,
+              agentInstanceId: sessionId,
+              message: `Rate limit detected on ${active.adapterId}/${failedCatalogId || 'default'}; retrying with fallback route (attempt ${currentRetries + 1}/${this.maxRateLimitRetries()}).`,
+              timestamp: new Date().toISOString(),
+            } as any);
+            try {
+              await this.handleTaskCreatedWithRetry(active.taskEvent, {
+                excludedCatalogIds: nextExcluded,
+                rateLimitRetries: currentRetries + 1,
+                preferredTier: active.preferredTier,
+              });
+              continue;
+            } catch (fallbackError) {
+              const fallbackMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+              console.error('[RuntimeHost] Rate-limit fallback retry failed:', fallbackError);
+              eventBus.emit({
+                id: crypto.randomUUID(),
+                type: 'task_failed',
+                missionId: event.missionId,
+                taskId: event.taskId,
+                agentInstanceId: sessionId,
+                agentProfileId: active.agentProfileId,
+                error: `${event.error} (fallback unavailable: ${fallbackMsg})`,
+                timestamp: new Date().toISOString(),
+              });
+              continue;
+            }
+          }
           await this.finishAttempt(active, 'failed', { error: event.error, retryable: true });
           eventBus.emit({
             id: crypto.randomUUID(),
@@ -583,7 +657,10 @@ export class RuntimeHost {
           console.error('[RuntimeHost] Failed to finalize failed task session:', sessionId, error);
           this.activeSessions.delete(sessionId);
         } finally {
-          this.finishingSessions.delete(sessionId);
+          if (!retriedOnRateLimit) {
+            if (active.slotId) this.releaseSessionSlot(active.slotId);
+            this.finishingSessions.delete(sessionId);
+          }
         }
       }
     });
@@ -666,7 +743,7 @@ export class RuntimeHost {
     } catch {
       // Usage discovery is best effort; lifecycle telemetry remains durable.
     }
-    const maxSessions = Math.max(1, this.config.maxConcurrentSessions || 1);
+    const maxSessions = this.maxConcurrentSessions();
     this.eventBus.emit({
       id: `runtime-telemetry:${active.attemptId || active.session.id}`,
       type: 'runtime_telemetry',
@@ -690,21 +767,56 @@ export class RuntimeHost {
       queueWaitMs: Math.max(0, active.startedAt - active.queuedAt),
       durationMs: Math.max(0, now - active.startedAt),
       retryCount: Math.max(0, active.retryCount - 1),
-      workerUtilization: Math.min(1, this.activeSessions.size / maxSessions),
+      workerUtilization: Math.min(1, Math.max(this.activeSessions.size, this.activeSessionSlots.size) / maxSessions),
+      queuedSessions: this.sessionWaitQueue.length,
       timestamp: new Date(now).toISOString(),
-    });
+    } as any);
   }
 
-  async discoverRuntimeStatuses(): Promise<RuntimeStatus[]> {
+  getConcurrencyMetrics(): {
+    activeSessions: number;
+    queuedSessions: number;
+    maxConcurrentSessions: number;
+    workerUtilization: number;
+  } {
+    const maxSessions = this.maxConcurrentSessions();
+    const activeCount = Math.max(this.activeSessions.size, this.activeSessionSlots.size);
+    return {
+      activeSessions: activeCount,
+      queuedSessions: this.sessionWaitQueue.length,
+      maxConcurrentSessions: maxSessions,
+      workerUtilization: Math.min(1, activeCount / maxSessions),
+    };
+  }
+
+  getAdapterCapabilities(adapterId: string): RuntimeAdapterCapabilities | undefined {
+    return this.adapters.get(adapterId)?.getAdapterCapabilities();
+  }
+
+  getAllAdapterCapabilities(): Record<string, RuntimeAdapterCapabilities> {
+    const result: Record<string, RuntimeAdapterCapabilities> = {};
+    for (const [id, adapter] of this.adapters.entries()) {
+      result[id] = adapter.getAdapterCapabilities();
+    }
+    return result;
+  }
+
+  async getRuntimeStatuses(): Promise<Array<RuntimeStatus & { adapterCapabilities: RuntimeAdapterCapabilities }>> {
+    return this.discoverRuntimeStatuses();
+  }
+
+  async discoverRuntimeStatuses(): Promise<Array<RuntimeStatus & { adapterCapabilities: RuntimeAdapterCapabilities }>> {
     return Promise.all([...this.adapters.values()].map(async (adapter) => {
       const installation = await adapter.discoverInstallation();
       const capabilities = installation.installed ? await adapter.probeCapabilities() : await adapter.getCapabilities();
+      const adapterCapabilities = adapter.getAdapterCapabilities();
       const authMethods = await adapter.getAuthMethods();
       return {
         runtimeType: adapter.runtimeType,
         name: adapter.name,
         installation,
         capabilities: capabilities as unknown as Record<string, boolean>,
+        adapterCapabilities,
         authMethods,
       };
     }));
@@ -884,6 +996,13 @@ export class RuntimeHost {
   }
 
   async handleTaskCreated(event: TaskCreated): Promise<AgentSession> {
+    return this.handleTaskCreatedWithRetry(event);
+  }
+
+  private async handleTaskCreatedWithRetry(
+    event: TaskCreated,
+    retryState: { excludedCatalogIds?: Set<string>; rateLimitRetries?: number; preferredTier?: ModelRoutingTier } = {},
+  ): Promise<AgentSession> {
     let resolveDone!: () => void;
     const spawnToken = {
       missionId: event.missionId,
@@ -893,7 +1012,7 @@ export class RuntimeHost {
     };
     this.inFlightTaskSpawns.add(spawnToken);
     try {
-      return await this.handleTaskCreatedInner(event, spawnToken);
+      return await this.handleTaskCreatedInner(event, spawnToken, retryState);
     } finally {
       this.inFlightTaskSpawns.delete(spawnToken);
       resolveDone();
@@ -903,6 +1022,7 @@ export class RuntimeHost {
   private async handleTaskCreatedInner(
     event: TaskCreated,
     spawnToken: { missionId: string; runId?: string; cancelled: boolean },
+    retryState: { excludedCatalogIds?: Set<string>; rateLimitRetries?: number; preferredTier?: ModelRoutingTier } = {},
   ): Promise<AgentSession> {
     const missionPreference = this.missionRouting.get(event.missionId);
     const task = this.workspaceManager ? await this.workspaceManager.getTask(event.taskId) : null;
@@ -1025,7 +1145,14 @@ export class RuntimeHost {
       models = await this.catalogService.discoverLiveModels(profiles);
     }
     models = this.constrainProfileRoutes(agentProfile, profiles, models).models;
-    const route = this.scheduler.resolveRoute(workerRequest, profiles, models);
+    const rateLimitedCatalogIds = typeof this.catalogService.getActiveRateLimitedCatalogIds === 'function'
+      ? this.catalogService.getActiveRateLimitedCatalogIds()
+      : undefined;
+    const route = this.scheduler.resolveRoute(workerRequest, profiles, models, {
+      preferredTier: retryState.preferredTier,
+      excludedCatalogIds: retryState.excludedCatalogIds,
+      rateLimitedCatalogIds,
+    });
     if (isUnverifiedCatalogRoute(route.model)) {
       throw new Error(
         `The selected ${route.model?.displayName || route.model?.runtimeModelId || 'model'} route is not verified by a live runtime catalog. Refresh the connected runtime before starting the task.`,
@@ -1064,8 +1191,22 @@ export class RuntimeHost {
     if (denied) throw new Error(`Mission policy denies ${role} action '${denied.action}': ${denied.reason || 'policy denied'}`);
     const approvalRequired = actionDecisions.filter((item) => item.requiresApproval);
     const unsupportedApproval = approvalRequired.filter((item) => !item.allowed);
-    if (unsupportedApproval.length > 0) {
-      throw new Error(`The selected runtime cannot pause for governed approvals (${unsupportedApproval.map((item) => item.action).join(', ')}). Select a runtime with interactive approval support or use Review mode.`);
+    const degradedApprovalActions = unsupportedApproval.map((item) => item.action);
+    if (degradedApprovalActions.length > 0) {
+      this.eventBus?.emit({
+        id: crypto.randomUUID(),
+        type: 'log',
+        level: 'warn',
+        missionId: event.missionId,
+        taskId: event.taskId,
+        agentInstanceId: event.agentInstanceId || event.taskId,
+        code: 'governed_approval_degraded',
+        adapterId: adapter.id,
+        actions: degradedApprovalActions,
+        interactiveApproval: adapter.getAdapterCapabilities().interactiveApproval,
+        message: `${adapter.name} does not support mid-turn interactive approvals for (${degradedApprovalActions.join(', ')}); degrading cleanly to isolated worktree + post-task review gating.`,
+        timestamp: new Date().toISOString(),
+      } as any);
     }
     if (route.profile) adapter.configureProfile(route.profile);
     const execution = await this.resolveTaskExecutionContext(event, role);
@@ -1085,7 +1226,7 @@ export class RuntimeHost {
       agentProfile.instructions ? `Profile instructions:\n${agentProfile.instructions}` : undefined,
       execution.promptContext,
       role === 'builder'
-         ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed. Inspect installed framework versions and project scripts before selecting checks. Fix invalid verification scripts rather than deleting or bypassing checks; Next.js 16+ requires a configured ESLint CLI or another supported linter, not next lint. Build success is not evidence that lint passed.${approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
+         ? `Work only inside the assigned isolated worktree. Preserve the existing architecture, make the smallest correct change, run relevant checks, and report exactly what changed. Inspect installed framework versions and project scripts before selecting checks. Fix invalid verification scripts rather than deleting or bypassing checks; Next.js 16+ requires a configured ESLint CLI or another supported linter, not next lint. Build success is not evidence that lint passed.${degradedApprovalActions.length ? ` Governed approval notice: ${adapter.name} cannot pause mid-turn for (${degradedApprovalActions.join(', ')}); work strictly inside the isolated worktree and report all changes for post-task review.${degradedApprovalActions.includes('gitCommit') ? ' Do not run git commit; leave changes uncommitted for review.' : ''}` : approvalRequired.length ? ` Request approval before: ${approvalRequired.map((item) => item.action).join(', ')}.` : ''}`
         : role === 'reviewer'
           ? 'Review only. Do not modify source files. Return exactly one QualityResultEnvelope JSON object: {"type":"quality_result","version":1,"role":"reviewer","verdict":"pass|fail","summary":"...","findings":["..."],"evidence":["file:line ..."]}. Do not wrap it in prose or Markdown.'
           : role === 'qa'
@@ -1095,7 +1236,6 @@ export class RuntimeHost {
               : 'Investigate and report evidence. Do not modify source files.',
     ].filter(Boolean).join('\n\n');
 
-    const claimedAt = new Date().toISOString();
     const routeSource = effectivePreference?.source
       || (profileResolution.source === 'workspace' || profileResolution.source === 'team_template' ? profileResolution.source : 'scheduler');
     const routeSnapshot: EffectiveAttemptRoute = {
@@ -1109,109 +1249,168 @@ export class RuntimeHost {
       selectionMode: effectivePreference?.selectionMode || 'auto',
       agentProfileId: agentProfile.id,
     };
-    const attempt = this.workspaceManager ? await this.workspaceManager.claimTaskAttempt({
-      taskId: event.taskId,
-      missionId: event.missionId,
-      agentInstanceId: event.agentInstanceId || event.taskId,
-      worktreePath: execution.worktreePath ?? null,
-      leaseExpiresAt: new Date(Date.parse(claimedAt) + this.sessionTimeoutMs()).toISOString(),
-      now: claimedAt,
-      agentProfileId: agentProfile.id,
-      route: routeSnapshot,
-    }) : undefined;
-    await this.recordAgentDispatch({
-      missionId: event.missionId,
-      taskId: event.taskId,
-      agentInstanceId: event.agentInstanceId || event.taskId,
-      role,
-      agentProfileId: agentProfile.id,
-      profileId: agentProfile.id,
-      profileName: agentProfile.name,
-      profileSource: profileResolution.source,
-      route: routeSnapshot,
-    });
-    if (spawnToken.cancelled) {
-      if (attempt && this.workspaceManager) {
-        await this.workspaceManager.finishTaskAttempt(attempt.id, 'cancelled').catch(() => undefined);
-      }
-      throw new Error(`Mission ${event.missionId} was cancelled before task ${event.taskId} spawned.`);
-    }
-    let session: AgentSession;
-    try {
-      session = await adapter.spawnAgent({
-        sessionId: event.agentInstanceId,
-        attemptId: attempt?.id,
-        runId: event.runId,
-        taskId: event.taskId,
-        missionId: event.missionId,
-        prompt,
-        role: executionAccess.role,
-        accessMode: executionAccess.accessMode,
-        model: route.model?.runtimeModelId,
-        reasoningLevel: route.reasoningLevel,
-        profileId: route.profile?.id,
-        agentProfileId: agentProfile.id,
-        isolated: executionAccess.requiresIsolatedWorktree,
-        worktreePath: execution.worktreePath,
-        cwd: execution.cwd,
-        // Additive metadata for adapters/auditors that understand named
-        // profiles; older adapters safely ignore these fields.
-        profileName: agentProfile.name,
-        specialty: agentProfile.specialty,
-        profileInstructions: agentProfile.instructions,
-        profileCapabilities: agentProfile.capabilities,
-        allowedRoutePolicy: (agentProfile.allowedRoutePolicy || agentProfile.routePolicy) as Record<string, unknown> | undefined,
-      });
-    } catch (error) {
-      if (attempt && this.workspaceManager) {
-        await this.workspaceManager.finishTaskAttempt(attempt.id, 'failed', {
-          error: error instanceof Error ? error.message : String(error), retryable: true,
-        }).catch(() => undefined);
-      }
-      throw error;
-    }
-    if (spawnToken.cancelled) {
-      await adapter.cancel(session.id).catch(() => undefined);
-      if (attempt && this.workspaceManager) {
-        await this.workspaceManager.finishTaskAttempt(attempt.id, 'cancelled').catch(() => undefined);
-      }
-      throw new Error(`Mission ${event.missionId} was cancelled while task ${event.taskId} was starting.`);
-    }
-    const startedAt = Date.now();
-    if (attempt && this.workspaceManager) {
-      const heartbeatAt = new Date(startedAt).toISOString();
-      const attemptStarted = await this.workspaceManager.markTaskAttemptRunning(
-        attempt.id, session.id, heartbeatAt, new Date(startedAt + this.sessionTimeoutMs()).toISOString(), session.runtimeSessionId || session.id,
-      );
-      if (!attemptStarted) {
-        await adapter.cancel(session.id).catch(() => undefined);
-        throw new Error(`Task attempt ${attempt.id} expired before runtime startup completed.`);
-      }
-    }
-      this.activeSessions.set(session.id, {
-      adapterId: adapter.id,
-      session,
+    const slotId = `${event.agentInstanceId || event.taskId || 'slot'}:${crypto.randomUUID()}`;
+    await this.acquireSessionSlot({
+      slotId,
       missionId: event.missionId,
       runId: event.runId,
       taskId: event.taskId,
-      accountProfileId: route.profile?.id,
-      agentProfileId: agentProfile.id,
-      profileId: agentProfile.id,
-      profileName: agentProfile.name,
-      profileSource: profileResolution.source,
-      route: routeSnapshot,
-      queuedAt: queuedAtMs,
-      startedAt,
+      priority: workerRequest.priority,
+      spawnToken,
+    });
+    let slotTransferred = false;
+    try {
+      const claimedAt = new Date().toISOString();
+      const attempt = this.workspaceManager ? await this.workspaceManager.claimTaskAttempt({
+        taskId: event.taskId,
+        missionId: event.missionId,
+        agentInstanceId: event.agentInstanceId || event.taskId,
+        worktreePath: execution.worktreePath ?? null,
+        leaseExpiresAt: new Date(Date.parse(claimedAt) + this.sessionTimeoutMs()).toISOString(),
+        now: claimedAt,
+        agentProfileId: agentProfile.id,
+        route: routeSnapshot,
+      }) : undefined;
+      await this.recordAgentDispatch({
+        missionId: event.missionId,
+        taskId: event.taskId,
+        agentInstanceId: event.agentInstanceId || event.taskId,
+        role,
+        agentProfileId: agentProfile.id,
+        profileId: agentProfile.id,
+        profileName: agentProfile.name,
+        profileSource: profileResolution.source,
+        route: routeSnapshot,
+      });
+      if (spawnToken.cancelled) {
+        if (attempt && this.workspaceManager) {
+          await this.workspaceManager.finishTaskAttempt(attempt.id, 'cancelled').catch(() => undefined);
+        }
+        throw new Error(`Mission ${event.missionId} was cancelled before task ${event.taskId} spawned.`);
+      }
+      const attachments = Array.isArray(eventRecord.attachments) ? (eventRecord.attachments as any[]) : undefined;
+      let session: AgentSession;
+      try {
+        session = await adapter.spawnAgent({
+          sessionId: event.agentInstanceId,
+          attemptId: attempt?.id,
+          runId: event.runId,
+          taskId: event.taskId,
+          missionId: event.missionId,
+          prompt,
+          role: executionAccess.role,
+          accessMode: executionAccess.accessMode,
+          model: route.model?.runtimeModelId,
+          reasoningLevel: route.reasoningLevel,
+          profileId: route.profile?.id,
+          agentProfileId: agentProfile.id,
+          isolated: executionAccess.requiresIsolatedWorktree,
+          worktreePath: execution.worktreePath,
+          cwd: execution.cwd,
+          attachments,
+          // Additive metadata for adapters/auditors that understand named
+          // profiles; older adapters safely ignore these fields.
+          profileName: agentProfile.name,
+          specialty: agentProfile.specialty,
+          profileInstructions: agentProfile.instructions,
+          profileCapabilities: agentProfile.capabilities,
+          allowedRoutePolicy: (agentProfile.allowedRoutePolicy || agentProfile.routePolicy) as Record<string, unknown> | undefined,
+        });
+      } catch (error) {
+        if (attempt && this.workspaceManager) {
+          await this.workspaceManager.finishTaskAttempt(attempt.id, 'failed', {
+            error: error instanceof Error ? error.message : String(error), retryable: true,
+          }).catch(() => undefined);
+        }
+        const classification = classifyRuntimeFailure(error, adapter.id);
+        const currentRetries = retryState.rateLimitRetries ?? 0;
+        if (classification.rateLimited && currentRetries < this.maxRateLimitRetries()) {
+          if (route.model?.catalogId && typeof this.catalogService.markRateLimited === 'function') {
+            this.catalogService.markRateLimited(
+              route.model.catalogId,
+              classification.retryAfterMs ?? this.rateLimitCooldownMs(),
+              classification.reason,
+            );
+          }
+          const nextExcluded = new Set(retryState.excludedCatalogIds || []);
+          if (route.model?.catalogId) nextExcluded.add(route.model.catalogId);
+          this.releaseSessionSlot(slotId);
+          slotTransferred = true;
+          this.eventBus?.emit({
+            id: crypto.randomUUID(),
+            type: 'log',
+            level: 'warn',
+            missionId: event.missionId,
+            taskId: event.taskId,
+            agentInstanceId: event.agentInstanceId || event.taskId,
+            message: `Rate limit detected during spawn on ${adapter.id}/${route.model?.catalogId || 'default'}; retrying with fallback route (attempt ${currentRetries + 1}/${this.maxRateLimitRetries()}).`,
+            timestamp: new Date().toISOString(),
+          } as any);
+          try {
+            return await this.handleTaskCreatedWithRetry(event, {
+              excludedCatalogIds: nextExcluded,
+              rateLimitRetries: currentRetries + 1,
+              preferredTier: retryState.preferredTier || route.model?.tier,
+            });
+          } catch (fallbackError) {
+            const origMsg = error instanceof Error ? error.message : String(error);
+            const fallbackMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+            throw new Error(`${origMsg} (fallback unavailable: ${fallbackMsg})`);
+          }
+        }
+        throw error;
+      }
+      if (spawnToken.cancelled) {
+        await adapter.cancel(session.id).catch(() => undefined);
+        if (attempt && this.workspaceManager) {
+          await this.workspaceManager.finishTaskAttempt(attempt.id, 'cancelled').catch(() => undefined);
+        }
+        throw new Error(`Mission ${event.missionId} was cancelled while task ${event.taskId} was starting.`);
+      }
+      const startedAt = Date.now();
+      if (attempt && this.workspaceManager) {
+        const heartbeatAt = new Date(startedAt).toISOString();
+        const attemptStarted = await this.workspaceManager.markTaskAttemptRunning(
+          attempt.id, session.id, heartbeatAt, new Date(startedAt + this.sessionTimeoutMs()).toISOString(), session.runtimeSessionId || session.id,
+        );
+        if (!attemptStarted) {
+          await adapter.cancel(session.id).catch(() => undefined);
+          throw new Error(`Task attempt ${attempt.id} expired before runtime startup completed.`);
+        }
+      }
+      this.activeSessions.set(session.id, {
+        adapterId: adapter.id,
+        session,
+        slotId,
+        missionId: event.missionId,
+        runId: event.runId,
+        taskId: event.taskId,
+        accountProfileId: route.profile?.id,
+        agentProfileId: agentProfile.id,
+        profileId: agentProfile.id,
+        profileName: agentProfile.name,
+        profileSource: profileResolution.source,
+        route: routeSnapshot,
+        queuedAt: queuedAtMs,
+        startedAt,
         retryCount: attempt?.attemptNumber ?? 1,
         attemptId: attempt?.id,
         role,
         lastProtocolResponseAt: startedAt,
         probeFailures: 0,
-    });
-    if (this.workspaceManager && task?.assignedAgentId !== session.id) {
-      await this.workspaceManager.updateTask(event.taskId, { assignedAgentId: session.id }).catch(() => undefined);
+        taskEvent: event,
+        excludedCatalogIds: retryState.excludedCatalogIds,
+        rateLimitRetries: retryState.rateLimitRetries ?? 0,
+        preferredTier: retryState.preferredTier || route.model?.tier,
+      });
+      slotTransferred = true;
+      if (this.workspaceManager && task?.assignedAgentId !== session.id) {
+        await this.workspaceManager.updateTask(event.taskId, { assignedAgentId: session.id }).catch(() => undefined);
+      }
+      return session;
+    } finally {
+      if (!slotTransferred) this.releaseSessionSlot(slotId);
     }
-    return session;
   }
 
   private assertBuilderWorktreeWritable(worktreePath: string, taskId: string): void {
@@ -1393,6 +1592,7 @@ export class RuntimeHost {
       await this.finishAttempt(active, 'cancelled');
     } finally {
       this.activeSessions.delete(sessionId);
+      if (active.slotId) this.releaseSessionSlot(active.slotId);
       this.finishingSessions.delete(sessionId);
     }
   }
@@ -1411,7 +1611,11 @@ export class RuntimeHost {
     if (!this.workspaceManager) return 0;
     const expired = await this.workspaceManager.expireOrphanedTaskAttempts(now.toISOString());
     for (const attempt of expired) {
-      if (attempt.runtimeSessionId) this.activeSessions.delete(attempt.runtimeSessionId);
+      if (attempt.runtimeSessionId) {
+        const active = this.activeSessions.get(attempt.runtimeSessionId);
+        this.activeSessions.delete(attempt.runtimeSessionId);
+        if (active?.slotId) this.releaseSessionSlot(active.slotId);
+      }
     }
     return expired.length;
   }
@@ -1459,6 +1663,7 @@ export class RuntimeHost {
               retryable: true,
             }).catch(() => false);
             this.activeSessions.delete(sessionId);
+            if (active.slotId) this.releaseSessionSlot(active.slotId);
             if (finished) {
               const failure = {
                 id: crypto.randomUUID(), type: 'task_failed', missionId: active.missionId || '',
@@ -1488,6 +1693,7 @@ export class RuntimeHost {
         if (active && ownsExpiredAttempt && !this.finishingSessions.has(sessionId!)) {
           await this.adapters.get(active.adapterId)?.cancel(sessionId!).catch(() => undefined);
           this.activeSessions.delete(sessionId!);
+          if (active.slotId) this.releaseSessionSlot(active.slotId);
         }
         this.eventBus?.emit({
           id: crypto.randomUUID(), type: 'task_failed', missionId: attempt.missionId,
@@ -1577,6 +1783,10 @@ export class RuntimeHost {
   }
 
   async stopMission(missionId: string, runId?: string): Promise<void> {
+    this.cancelQueuedSessions(
+      (entry) => entry.missionId === missionId && (!runId || entry.runId === runId),
+      `Mission ${missionId} was cancelled while queued.`,
+    );
     const matchingSpawns = [...this.inFlightTaskSpawns].filter(
       (entry) => entry.missionId === missionId && (!runId || entry.runId === runId),
     );
@@ -1620,6 +1830,7 @@ export class RuntimeHost {
   async stopAll(): Promise<void> {
     if (this.watchdog) clearInterval(this.watchdog);
     this.watchdog = undefined;
+    this.cancelQueuedSessions(() => true, 'RuntimeHost stopped while task was queued.');
     const failures: unknown[] = [];
     await Promise.all([...this.activeSessions.keys()].map(async (sessionId) => {
       try {
@@ -1665,6 +1876,99 @@ export class RuntimeHost {
     if (runtimeType === 'claude_code') return 'Structured CLI stream-json';
     if (runtimeType === 'antigravity') return capabilities?.structuredEventStreaming ? 'Print mode stream-json' : 'TUI only (update required)';
     return 'Local HTTP server + SSE';
+  }
+
+  private maxConcurrentSessions(): number {
+    return Math.max(1, Math.floor(this.config.maxConcurrentSessions ?? 4));
+  }
+
+  private rateLimitCooldownMs(): number {
+    return Math.max(1_000, this.config.rateLimitCooldownMs ?? 90_000);
+  }
+
+  private maxRateLimitRetries(): number {
+    return Math.max(0, Math.floor(this.config.maxRateLimitRetries ?? 2));
+  }
+
+  private priorityRank(priority: string | undefined): number {
+    switch (String(priority || 'medium').toLowerCase()) {
+      case 'critical': return 4;
+      case 'high': return 3;
+      case 'medium': return 2;
+      case 'low': return 1;
+      default: return 2;
+    }
+  }
+
+  private async acquireSessionSlot(input: {
+    slotId: string;
+    missionId: string;
+    runId?: string;
+    taskId: string;
+    priority?: string;
+    spawnToken: { cancelled: boolean };
+  }): Promise<void> {
+    if (input.spawnToken.cancelled) {
+      throw new Error(`Mission ${input.missionId} was cancelled before task ${input.taskId} acquired a slot.`);
+    }
+    if (this.activeSessionSlots.size < this.maxConcurrentSessions()) {
+      this.activeSessionSlots.add(input.slotId);
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const waiter = {
+        slotId: input.slotId,
+        missionId: input.missionId,
+        runId: input.runId,
+        taskId: input.taskId,
+        priority: this.priorityRank(input.priority),
+        queuedAt: Date.now(),
+        resolve,
+        reject,
+      };
+      this.sessionWaitQueue.push(waiter);
+      this.sessionWaitQueue.sort((a, b) => b.priority - a.priority || a.queuedAt - b.queuedAt);
+      this.eventBus?.emit({
+        id: crypto.randomUUID(),
+        type: 'log',
+        level: 'info',
+        missionId: input.missionId,
+        taskId: input.taskId,
+        queuedSessions: this.sessionWaitQueue.length,
+        workerUtilization: Math.min(1, this.activeSessionSlots.size / this.maxConcurrentSessions()),
+        message: `Task ${input.taskId} queued for worker slot (${this.activeSessionSlots.size}/${this.maxConcurrentSessions()} active, ${this.sessionWaitQueue.length} queued).`,
+        timestamp: new Date().toISOString(),
+      } as any);
+    });
+    if (input.spawnToken.cancelled) {
+      this.releaseSessionSlot(input.slotId);
+      throw new Error(`Mission ${input.missionId} was cancelled while task ${input.taskId} was queued.`);
+    }
+  }
+
+  private releaseSessionSlot(slotId: string): void {
+    this.activeSessionSlots.delete(slotId);
+    while (this.activeSessionSlots.size < this.maxConcurrentSessions() && this.sessionWaitQueue.length > 0) {
+      const next = this.sessionWaitQueue.shift();
+      if (!next) break;
+      this.activeSessionSlots.add(next.slotId);
+      next.resolve();
+    }
+  }
+
+  private cancelQueuedSessions(
+    predicate: (entry: { missionId: string; runId?: string; taskId: string }) => boolean,
+    reason: string,
+  ): void {
+    const remaining: typeof this.sessionWaitQueue = [];
+    for (const waiter of this.sessionWaitQueue) {
+      if (predicate(waiter)) {
+        waiter.reject(new Error(reason));
+      } else {
+        remaining.push(waiter);
+      }
+    }
+    this.sessionWaitQueue = remaining;
   }
 
   private sessionTimeoutMs(): number {

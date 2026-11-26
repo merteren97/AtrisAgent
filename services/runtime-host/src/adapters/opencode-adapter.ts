@@ -3,6 +3,7 @@ import { normalizeV2Event } from './opencode-v2-events';
 import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import type { ChildProcess } from 'child_process';
 import type { LocalEventBus } from '@atris-agent-code/event-bus';
 import type { AgentEvent, QuestionAsked, QuestionInfo } from '@atris-agent-code/event-schema';
@@ -24,7 +25,7 @@ import type {
   CanonicalReasoning,
   Provider,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, type SessionContinuityCapabilities, type SpawnAgentOptions } from './base-adapter';
+import { BaseRuntimeAdapter, validateLocalAttachments, type SessionContinuityCapabilities, type SpawnAgentOptions } from './base-adapter';
 import {
   appendControlPlaneInstructions,
   controlPlaneEnv,
@@ -133,6 +134,16 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
 
   override getSessionContinuityCapabilities(): SessionContinuityCapabilities {
     return { reuseWhileAlive: true, resumeAfterRestart: true };
+  }
+
+  override getAdapterCapabilities() {
+    return {
+      liveSteer: true,
+      interactiveApproval: true,
+      sessionResume: true,
+      reuseWhileAlive: true,
+      nativeAttachments: true,
+    };
   }
 
   private apiPath(server: ServerInstance, pathname: string): string {
@@ -871,17 +882,27 @@ export class OpenCodeAdapter extends BaseRuntimeAdapter {
         this.reusableSessions.set(runtimeSessionId, { serverKey: server.key, profileId, cwd: workspaceCwd });
       }
       const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
+      const validAttachments = validateLocalAttachments(options.attachments);
+      const fileParts = validAttachments.map((att) => ({
+        type: 'file',
+        mime: att.mimeType || 'application/octet-stream',
+        url: pathToFileURL(att.providerPath).href,
+        filename: att.name,
+      }));
       const response = v2
         ? await this.fetchServer(server, `/api/session/${encodeURIComponent(runtimeSessionId)}/prompt`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: prompt }),
+          body: JSON.stringify({
+            text: prompt,
+            ...(fileParts.length ? { parts: fileParts } : {}),
+          }),
         })
         : await this.fetchServer(server, `/session/${encodeURIComponent(runtimeSessionId)}/prompt_async`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             ...openCodePromptRoute(options.model, options.reasoningLevel),
             agent: this.mapAgentMode(options.role),
-            parts: [{ type: 'text', text: prompt }],
+            parts: [{ type: 'text', text: prompt }, ...fileParts],
           }),
         });
       if (!response.ok) {

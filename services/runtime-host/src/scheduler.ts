@@ -6,11 +6,19 @@ import type {
   ModelDescriptor,
   CanonicalReasoning,
   RouteSelectionMode,
+  ModelRoutingTier,
 } from '@atris-agent-code/domain';
 import { missingRuntimeCapabilities, normalizeRuntimeCapability } from '@atris-agent-code/policy-engine';
+import { inferModelTierAndStrengths } from './model-catalog-service';
 
 export interface SchedulerConfig {
   availableAdapters: string[];
+}
+
+export interface ResolveRouteOptions {
+  preferredTier?: ModelRoutingTier;
+  excludedCatalogIds?: ReadonlySet<string>;
+  rateLimitedCatalogIds?: ReadonlySet<string>;
 }
 
 export interface ResolvedRuntimeRoute {
@@ -28,7 +36,12 @@ export class Scheduler {
 
   setTeamRoles(roles: TeamRole[]): void { this.teamRoles = roles; }
 
-  resolveRoute(request: WorkerRequest, profiles: AccountProfile[], models: ModelDescriptor[]): ResolvedRuntimeRoute {
+  resolveRoute(
+    request: WorkerRequest,
+    profiles: AccountProfile[],
+    models: ModelDescriptor[],
+    options: ResolveRouteOptions = {},
+  ): ResolvedRuntimeRoute {
     const roleName = request.role.toLowerCase();
     const routes: ResolvedRuntimeRoute[] = [];
     const selectionMode: RouteSelectionMode = request.routeSelectionMode
@@ -56,8 +69,14 @@ export class Scheduler {
 
       const accountMatches = !request.preferredAccountProfileId || request.preferredAccountProfileId === profile.id;
 
-      for (const model of models.filter((item) => item.accountProfileId === profile.id)) {
+      for (const rawModel of models.filter((item) => item.accountProfileId === profile.id)) {
+        const inferred = inferModelTierAndStrengths(rawModel);
+        const model: ModelDescriptor = rawModel.tier && rawModel.strengths?.length
+          ? rawModel
+          : { ...rawModel, tier: rawModel.tier || inferred.tier, strengths: rawModel.strengths?.length ? rawModel.strengths : inferred.strengths };
         if (!model.supportedRoles.some((role) => role.toLowerCase() === roleName)) continue;
+        if (options.excludedCatalogIds?.has(model.catalogId)) continue;
+        if (options.rateLimitedCatalogIds?.has(model.catalogId)) continue;
         if (model.availability === 'unavailable' || model.availability === 'deprecated' || model.availability === 'rate_limited') continue;
 
         const preferredModel = Boolean(useConfiguredPreferences && request.preferredCatalogId && request.preferredCatalogId === model.catalogId);
@@ -120,6 +139,21 @@ export class Scheduler {
         if (model.defaultReasoning === 'high') score += 4;
         if (request.role === 'builder' && ['codex', 'claude_code', 'opencode'].includes(profile.runtimeType)) score += 8;
         if (request.role === 'researcher' && model.inputModalities.includes('image')) score += 3;
+
+        if (options.preferredTier && model.tier === options.preferredTier) {
+          score += 60;
+          reasons.push(`matched tier '${options.preferredTier}'`);
+        }
+        const strengths = model.strengths || [];
+        if (roleName === 'builder' && (strengths.includes('code_edit') || strengths.includes('shell_test'))) {
+          score += (strengths.includes('code_edit') ? 5 : 0) + (strengths.includes('shell_test') ? 3 : 0);
+        }
+        if ((roleName === 'orchestrator' || roleName === 'reviewer') && strengths.includes('deep_reasoning')) {
+          score += 6;
+        }
+        if (roleName === 'researcher' && (strengths.includes('long_context') || strengths.includes('multimodal'))) {
+          score += 4;
+        }
 
         const requestedReasoning = useConfiguredPreferences ? request.preferredReasoning : undefined;
         const reasoningLevel = requestedReasoning && model.supportedReasoning.includes(requestedReasoning)

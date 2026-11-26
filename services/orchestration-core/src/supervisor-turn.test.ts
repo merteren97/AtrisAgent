@@ -428,6 +428,67 @@ function runTests() {
     );
   }
 
+  const dynamicPersonaDecision = parseSupervisorDecision(JSON.stringify({
+    action: 'execute',
+    delegations: [
+      {
+        id: 'sec-audit-1',
+        role: 'researcher',
+        displayName: 'Security Auditor',
+        sandboxTier: 'inspect',
+        objective: 'Audit auth boundaries',
+        requiredCapabilities: ['security-review'],
+      },
+      {
+        id: 'impl-1',
+        role: 'builder',
+        displayName: 'Schema Architect',
+        sandboxTier: 'implement',
+        objective: 'Implement schema changes',
+        requiredCapabilities: ['TypeScript'],
+        dependsOnDelegationIds: ['sec-audit-1'],
+      },
+    ],
+  }), 'turn-dynamic-persona');
+  assert(
+    dynamicPersonaDecision?.delegations?.[0]?.displayName === 'Security Auditor'
+      && dynamicPersonaDecision?.delegations?.[0]?.sandboxTier === 'inspect'
+      && dynamicPersonaDecision?.delegations?.[1]?.displayName === 'Schema Architect'
+      && dynamicPersonaDecision?.delegations?.[1]?.sandboxTier === 'implement',
+    'parseSupervisorDecision preserves optional displayName and sandboxTier on delegations',
+  );
+
+  const enrichedPrompt = buildSupervisorDecisionPrompt({
+    turnId: 'turn-enriched-catalog',
+    userMessage: 'Refactor auth',
+    conversationContext: '',
+    workspaceContext: '',
+    planningResources: {
+      models: [
+        {
+          catalogId: 'codex:default:gpt-5.4',
+          accountProfileId: 'acc-1',
+          runtimeId: 'codex',
+          runtimeModelId: 'gpt-5.4',
+          displayName: 'GPT-5.4',
+          supportedRoles: ['builder'],
+          supportedReasoning: ['medium', 'high'],
+          defaultReasoning: 'high',
+          tier: 'deep',
+          strengths: ['code_edit', 'deep_reasoning'],
+          quotaHealth: 'healthy',
+        } as any,
+      ],
+      specialists: [],
+    },
+  });
+  assert(
+    enrichedPrompt.includes('"tier":"deep"')
+      && enrichedPrompt.includes('"strengths":["code_edit","deep_reasoning"]')
+      && enrichedPrompt.includes('"quotaHealth":"healthy"'),
+    'buildSupervisorDecisionPrompt passes tier, strengths, and quotaHealth to the supervisor catalog',
+  );
+
   console.log(`--- Supervisor Turn Policy Tests Complete: ${passed} passed, ${failed} failed ---`);
   if (failed > 0) process.exitCode = 1;
 }

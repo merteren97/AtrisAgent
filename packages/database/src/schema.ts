@@ -109,6 +109,19 @@ export const missionCommands = sqliteTable('mission_commands', {
   error: text('error'),
 });
 
+export const turnDirectives = sqliteTable('turn_directives', {
+  id: text('id').primaryKey(),
+  missionId: text('mission_id').notNull().references(() => missions.id, { onDelete: 'cascade' }),
+  turnId: text('turn_id').references(() => conversationTurns.id, { onDelete: 'set null' }),
+  targetAgentId: text('target_agent_id'),
+  delivery: text('delivery').$type<'steer' | 'queue' | 'stop_and_replan' | 'agent_message'>().notNull().default('steer'),
+  content: text('content').notNull(),
+  attachmentIdsJson: text('attachment_ids_json').notNull().default('[]'),
+  status: text('status').$type<'pending' | 'applied' | 'expired' | 'cancelled'>().notNull().default('pending'),
+  createdAt: text('created_at').notNull(),
+  appliedAt: text('applied_at'),
+});
+
 export const tasks = sqliteTable('tasks', {
   id: text('id').primaryKey(),
   missionId: text('mission_id')
@@ -515,6 +528,12 @@ export const checkpoints = sqliteTable('checkpoints', {
   isRollbackTarget: integer('is_rollback_target', { mode: 'boolean' }).notNull().default(false),
 });
 
+export const orchestratorSettings = sqliteTable('orchestrator_settings', {
+  key: text('key').primaryKey(),
+  valueJson: text('value_json').notNull(),
+  updatedAt: text('updated_at').notNull(),
+});
+
 export type WorkspaceSelect = typeof workspaces.$inferSelect;
 export type WorkspaceInsert = typeof workspaces.$inferInsert;
 
@@ -592,3 +611,6 @@ export type WorktreeInsert = typeof worktrees.$inferInsert;
 
 export type CheckpointSelect = typeof checkpoints.$inferSelect;
 export type CheckpointInsert = typeof checkpoints.$inferInsert;
+
+export type OrchestratorSettingSelect = typeof orchestratorSettings.$inferSelect;
+export type OrchestratorSettingInsert = typeof orchestratorSettings.$inferInsert;

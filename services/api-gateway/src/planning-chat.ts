@@ -5,7 +5,7 @@ import { validatePlanningBoard, type PlanningBoardVersion } from './planning-sto
 import { CONVERSATION_UUID, type PlanningConversation } from './planning-conversations';
 export type { PlanningConversation } from './planning-conversations';
 import type { Application, Request, Response } from 'express';
-import type { AccountProfile, ModelDescriptor, RuntimeType } from '@atris-agent-code/domain';
+import { isRoleAllowedByProfile, type AccountProfile, type ModelDescriptor, type RuntimeType } from '@atris-agent-code/domain';
 import { LocalEventBus, redactSensitiveValue } from '@atris-agent-code/event-bus';
 import {
   AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, OpenCodeAdapter,
@@ -715,7 +715,7 @@ export class PlanningChatController {
     const profile = await this.options.runtimeHost.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
     if (!profile || profile.authStatus !== 'connected') return fail('The selected model account is not connected.');
     if (profile.runtimeType !== descriptor.runtimeId || !['codex', 'claude_code', 'opencode', 'antigravity'].includes(profile.runtimeType)) return fail('The model account does not match a supported headless runtime.', 422);
-    if (profile.allowedRoles?.length && !profile.allowedRoles.some(role => role.toLowerCase() === 'researcher')) return fail('The selected account does not permit the researcher role.', 422);
+    if (!isRoleAllowedByProfile(profile, 'researcher')) return fail('The selected account does not permit the researcher role.', 422);
     if (profile.runtimeType === 'antigravity' && profile.profileMode === 'isolated') return fail('Antigravity headless chat uses its native signed-in account and cannot isolate account profiles.', 422);
     const resolvedReasoning = reasoning || descriptor.defaultReasoning;
     if (resolvedReasoning && !descriptor.supportedReasoning.includes(resolvedReasoning as never)) return fail('This model does not support the selected reasoning level.');

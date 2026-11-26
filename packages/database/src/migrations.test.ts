@@ -119,7 +119,31 @@ sqliteWithoutApprovals.exec(`
 `);
 assert.doesNotThrow(() => migrateDatabase(sqliteWithoutApprovals as any));
 assert.equal(sqliteWithoutApprovals.pragma('user_version', { simple: true }), DATABASE_SCHEMA_VERSION);
-assert.equal((sqliteWithoutApprovals.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('agent_profiles', 'agent_profile_bindings')").get() as { count: number }).count, 2);
+assert.equal((sqliteWithoutApprovals.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('agent_profiles', 'agent_profile_bindings', 'turn_directives', 'orchestrator_settings')").get() as { count: number }).count, 4);
 sqliteWithoutApprovals.close();
+
+// Single-DDL parity: migrating a completely empty database creates all base + migrated tables.
+const emptyDb = new Database(':memory:');
+assert.doesNotThrow(() => migrateDatabase(emptyDb as any));
+assert.equal(emptyDb.pragma('user_version', { simple: true }), DATABASE_SCHEMA_VERSION);
+const expectedTables = [
+  'workspaces', 'missions', 'tasks', 'account_profiles', 'team_templates', 'team_roles',
+  'execution_policies', 'approvals', 'approval_operations', 'mission_completions',
+  'mission_events', 'task_dependencies', 'task_attempts', 'model_profiles',
+  'agent_instances', 'resource_leases', 'artifacts', 'usage_snapshots',
+  'worktrees', 'checkpoints', 'conversation_turns', 'mission_runs', 'mission_commands',
+  'turn_directives', 'orchestrator_settings',
+];
+const createdCount = (emptyDb.prepare(
+  `SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN (${expectedTables.map(() => '?').join(', ')})`,
+).get(...expectedTables) as { count: number }).count;
+assert.equal(createdCount, expectedTables.length, 'empty DB migration creates all base and versioned tables');
+assert.equal((emptyDb.prepare(
+  "SELECT COUNT(*) AS count FROM pragma_table_info('turn_directives') WHERE name IN ('id', 'mission_id', 'turn_id', 'target_agent_id', 'delivery', 'content', 'attachment_ids_json', 'status', 'created_at', 'applied_at')",
+).get() as { count: number }).count, 10);
+assert.equal((emptyDb.prepare(
+  "SELECT COUNT(*) AS count FROM pragma_table_info('orchestrator_settings') WHERE name IN ('key', 'value_json', 'updated_at')",
+).get() as { count: number }).count, 3);
+emptyDb.close();
 
 console.log('[PASS] migrations preserve data, backfill stable sequences, enforce uniqueness, and are idempotent');

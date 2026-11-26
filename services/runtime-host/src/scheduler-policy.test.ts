@@ -163,6 +163,29 @@ function run(): void {
   }
   assert(rejected, 'Fixed mode fails explicitly when no permitted route is runnable');
 
+  // Empty/omitted allowedRoles allows all roles (zero-config local CLI readiness).
+  const zeroConfigProfile: AccountProfile = { ...codex, id: 'codex-zero', allowedRoles: [] };
+  const zeroConfigModel: ModelDescriptor = {
+    ...codexModel,
+    catalogId: 'cat-zero',
+    accountProfileId: 'codex-zero',
+    supportedRoles: ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'],
+    tier: 'fast',
+  };
+  const zeroConfigRoute = scheduler.resolveRoute(request({ role: 'qa' }), [zeroConfigProfile], [zeroConfigModel]);
+  assert(zeroConfigRoute.profile?.id === 'codex-zero', 'Empty allowedRoles allows all roles for zero-config CLI readiness');
+
+  // Tier matching and rateLimitedCatalogIds exclusion.
+  const deepModel: ModelDescriptor = { ...zeroConfigModel, catalogId: 'cat-deep', runtimeModelId: 'o3-pro', displayName: 'o3 Pro', tier: 'deep', strengths: ['deep_reasoning'] };
+  const fastModel: ModelDescriptor = { ...zeroConfigModel, catalogId: 'cat-fast', runtimeModelId: 'gpt-5-mini', displayName: 'GPT-5 Mini', tier: 'fast', strengths: ['fast_iteration'] };
+  const tierRoute = scheduler.resolveRoute(
+    request({ role: 'builder' }),
+    [zeroConfigProfile],
+    [deepModel, fastModel],
+    { preferredTier: 'fast', rateLimitedCatalogIds: new Set(['cat-deep']) },
+  );
+  assert(tierRoute.model?.catalogId === 'cat-fast', 'Scheduler respects preferredTier and skips rateLimitedCatalogIds');
+
   console.log('\nScheduler policy tests passed.');
 }
 

@@ -25,8 +25,12 @@ export function parseQualityResultEnvelope(rawResult: unknown): QualityResultEnv
     candidates.push(rawResult);
   } else {
     const trimmed = rawResult.trim();
-    const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    const text = fenced?.[1] || trimmed;
+    let text = trimmed;
+    if (trimmed.startsWith('```') && trimmed.endsWith('```') && trimmed.length >= 6) {
+      let innerStart = 3;
+      if (trimmed.slice(3, 7).toLowerCase() === 'json') innerStart = 7;
+      text = trimmed.slice(innerStart, -3).trim();
+    }
     // Scan each object independently: quotes in surrounding prose must not
     // swallow the envelope's opening brace.
     for (let index = 0; index < text.length; index += 1) {

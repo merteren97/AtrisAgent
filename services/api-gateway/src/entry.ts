@@ -1,6 +1,6 @@
 import { CoordinationMCP, getControlPlaneBridgeScriptPath } from '@atris-agent-code/coordination-mcp';
 import { configureRuntimeControlPlaneBridge } from '@atris-agent-code/runtime-host';
-import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, startupRecovery, db, manualConversationStore } from './index';
+import { app, server, eventBus, workspaceManager, orchestrator, shutdownCoordinator, startupRecovery, startBackgroundStartupRecovery, db, manualConversationStore } from './index';
 import { ControlPlaneGrantRegistry } from './control-plane-grants';
 import { installControlPlaneRoutes } from './control-plane-router';
 import { installProjectMemoryRoutes } from './project-memory-routes';
@@ -111,6 +111,7 @@ async function bootstrap(): Promise<void> {
       console.log(`[API-Gateway] Native CLI control plane ready through session-scoped MCP grants`);
       console.log(`[API-Gateway] WebSocket stream ready at ${actualOrigin.replace(/^http:/, 'ws:')}/ws/events`);
       console.log(`[API-Gateway] SSE event stream ready at ${actualOrigin}/api/events/stream`);
+      void startBackgroundStartupRecovery();
     });
   } else {
     configureBridgeForListeningServer();
