@@ -28,3 +28,11 @@ export type {
   ManualMemoryInput,
 } from './project-memory';
 export { hasExplicitImplementationIntent } from './supervisor-turn';
+export {
+  parseQualityResultEnvelope,
+  inferQualityVerdict,
+  hasQualityFailureSignal,
+  clearNegatedQualitySignals,
+  type QualityResultEnvelope,
+  type QualityVerdict,
+} from './quality-gate';

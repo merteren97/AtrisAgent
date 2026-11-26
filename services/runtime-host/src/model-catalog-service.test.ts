@@ -124,6 +124,41 @@ async function runTests() {
     }
   }
 
+  // Tier/strength tagging and bounded rate-limit cooldown recovery.
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-model-tier-cooldown-'));
+    try {
+      const codexProfile = { ...profile, id: 'codex-prof', runtimeType: 'codex' as const, provider: 'openai' as const, profileName: 'Codex' };
+      const adapter: any = {
+        id: 'codex',
+        name: 'Fake Codex',
+        configureProfile() {},
+        async discoverModels() {
+          return [
+            { ...model(codexProfile.id, 'gpt-5-mini'), runtimeId: 'codex', displayName: 'GPT-5 Mini', supportedReasoning: ['low', 'medium'] },
+            { ...model(codexProfile.id, 'o3-pro'), runtimeId: 'codex', displayName: 'o3 Pro', supportedReasoning: ['high', 'xhigh'], contextWindow: 200_000 },
+          ];
+        },
+      };
+      const service = new ModelCatalogService(undefined, dir);
+      service.registerAdapter(adapter);
+      const discovered = await service.discoverForProfile(codexProfile);
+      const mini = discovered.find((m) => m.runtimeModelId === 'gpt-5-mini')!;
+      const pro = discovered.find((m) => m.runtimeModelId === 'o3-pro')!;
+      assert(Boolean(mini.tier === 'fast' && mini.strengths?.includes('fast_iteration')), 'Mini model is tagged with fast tier and fast_iteration strength');
+      assert(Boolean(pro.tier === 'deep' && pro.strengths?.includes('deep_reasoning') && pro.strengths?.includes('long_context')), 'Pro/xhigh model is tagged with deep tier and deep_reasoning/long_context strengths');
+
+      const now = 1_000_000;
+      service.markRateLimited(mini.catalogId, 30_000, 'HTTP 429', now);
+      assert(service.isRateLimited(mini.catalogId, now + 10_000), 'Model remains rate_limited during cooldown window');
+      assert(!service.isRateLimited(mini.catalogId, now + 31_000), 'Model automatically recovers once cooldown expires');
+      const recovered = service.getCachedCatalog(now + 31_000).find((m) => m.catalogId === mini.catalogId);
+      assert(recovered?.availability === 'available', 'Recovered model availability is restored to available');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`Model catalog cache tests: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }

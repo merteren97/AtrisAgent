@@ -18,8 +18,16 @@ import type {
   AuthInitiationResult,
   AuthPollResult,
   CanonicalReasoning,
+  RuntimeAdapterCapabilities,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, isReadOnlyAgentRole, type SpawnAgentOptions } from './base-adapter';
+import {
+  appendStagedAttachmentsToPrompt,
+  BaseRuntimeAdapter,
+  isReadOnlyAgentRole,
+  stageWorkspaceAttachments,
+  type SessionContinuityCapabilities,
+  type SpawnAgentOptions,
+} from './base-adapter';
 import {
   appendControlPlaneInstructions,
   claudeAllowedMcpTools,
@@ -50,7 +58,10 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
   private toolNamesBySession = new Map<string, Map<string, string>>();
   private terminalSessions = new Set<string>();
 
-  constructor(eventBus?: LocalEventBus) {
+  constructor(
+    eventBus?: LocalEventBus,
+    private readonly spawnProcess: typeof spawnHidden = spawnHidden,
+  ) {
     super(eventBus);
   }
 
@@ -74,6 +85,24 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     } catch (error: any) {
       return { installed: true, path: executable, error: error?.message || 'Could not read Claude Code version.' };
     }
+  }
+
+  override getSessionContinuityCapabilities(): SessionContinuityCapabilities {
+    return { reuseWhileAlive: false, resumeAfterRestart: true };
+  }
+
+  override getAdapterCapabilities(): RuntimeAdapterCapabilities {
+    return {
+      liveSteer: false,
+      interactiveApproval: false,
+      sessionResume: true,
+      reuseWhileAlive: false,
+      nativeAttachments: false,
+    };
+  }
+
+  override async probeProviderSession(providerSessionId: string): Promise<boolean> {
+    return Boolean(providerSessionId && typeof providerSessionId === 'string' && providerSessionId.trim());
   }
 
   async probeCapabilities(profileId?: string): Promise<CapabilitySnapshot> {
@@ -299,24 +328,21 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
     const cwd = options.worktreePath || options.cwd || process.cwd();
     const controlPlane = prepareControlPlaneSession(options, sessionId);
     const mcpConfig = createClaudeMcpConfig(controlPlane);
-    const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, cwd);
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
-    if (options.model) args.push('--model', options.model);
-    if (options.reasoningLevel && capabilities.reasoningControl) args.push('--effort', options.reasoningLevel);
-    const readOnly = isReadOnlyAgentRole(options.role);
-    args.push('--permission-mode', readOnly ? 'plan' : 'acceptEdits');
-    if (mcpConfig.path) {
-      args.push('--mcp-config', mcpConfig.path, '--allowedTools', ...claudeAllowedMcpTools());
-    }
+    const stagedAttachments = stageWorkspaceAttachments(cwd, options.attachments);
+    const prompt = appendStagedAttachmentsToPrompt(
+      appendControlPlaneInstructions(options.prompt, controlPlane, cwd),
+      stagedAttachments.staged,
+    );
+    const args = buildClaudeSpawnArgs(options, prompt, capabilities, mcpConfig.path);
 
     const session: AgentSession = {
-      id: sessionId, agentInstanceId: sessionId, runtimeSessionId: '',
+      id: sessionId, agentInstanceId: sessionId, runtimeSessionId: options.providerSessionId || '',
       startedAt: new Date().toISOString(), endedAt: null,
     };
 
     let child: ChildProcess;
     try {
-      child = spawnHidden('claude', args, {
+      child = this.spawnProcess('claude', args, {
         cwd,
         env: {
           ...process.env,
@@ -327,6 +353,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (error) {
+      stagedAttachments.cleanup();
       mcpConfig.cleanup();
       revokeControlPlaneAgent(sessionId);
       throw error;
@@ -356,6 +383,7 @@ export class ClaudeCodeAdapter extends BaseRuntimeAdapter {
       this.unregisterProcess(sessionId);
       session.endedAt = new Date().toISOString();
       this.activeSessions.delete(sessionId);
+      stagedAttachments.cleanup();
       mcpConfig.cleanup();
       revokeControlPlaneAgent(sessionId);
       this.toolNamesBySession.delete(sessionId);
@@ -501,4 +529,49 @@ function correlationFields(message: Record<string, any>): { runId?: string; atte
     ...(runId ? { runId } : {}),
     ...(attemptId ? { attemptId } : {}),
   };
+}
+
+const CLAUDE_BUILDER_SAFE_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'MultiEdit', 'Glob', 'Grep'] as const;
+const CLAUDE_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep'] as const;
+const SHELL_CAPABILITY_HINTS = new Set(['run_command', 'testing', 'build', 'lint']);
+
+export function buildClaudeSpawnArgs(
+  options: Pick<SpawnAgentOptions, 'model' | 'reasoningLevel' | 'role' | 'accessMode' | 'providerSessionId' | 'profileCapabilities'>,
+  prompt: string,
+  capabilities: Pick<CapabilitySnapshot, 'reasoningControl'>,
+  mcpConfigPath?: string,
+): string[] {
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
+  if (options.providerSessionId && options.providerSessionId.trim()) {
+    args.push('--resume', options.providerSessionId.trim());
+  }
+  if (options.model) args.push('--model', options.model);
+  if (options.reasoningLevel && capabilities.reasoningControl) args.push('--effort', options.reasoningLevel);
+
+  const roleLower = String(options.role || '').toLowerCase();
+  const readOnly = isReadOnlyAgentRole(options.role) && options.accessMode !== 'workspace-write';
+  args.push('--permission-mode', readOnly ? 'plan' : 'acceptEdits');
+
+  const needsShellForQa = roleLower === 'qa' && (
+    !options.profileCapabilities?.length
+    || options.profileCapabilities.some((cap) => SHELL_CAPABILITY_HINTS.has(String(cap).toLowerCase()))
+  );
+  const allowedTools: string[] = [];
+  if (!readOnly && (roleLower === 'builder' || roleLower === 'qa' || options.accessMode === 'workspace-write')) {
+    allowedTools.push(...CLAUDE_BUILDER_SAFE_TOOLS);
+  } else if (needsShellForQa) {
+    allowedTools.push('Bash', ...CLAUDE_READ_ONLY_TOOLS);
+  } else if (mcpConfigPath) {
+    allowedTools.push(...CLAUDE_READ_ONLY_TOOLS);
+  }
+
+  if (mcpConfigPath) {
+    args.push('--mcp-config', mcpConfigPath);
+    allowedTools.push(...claudeAllowedMcpTools());
+  }
+
+  if (allowedTools.length) {
+    args.push('--allowedTools', ...[...new Set(allowedTools)]);
+  }
+  return args;
 }

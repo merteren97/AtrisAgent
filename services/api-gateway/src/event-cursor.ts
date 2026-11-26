@@ -29,10 +29,10 @@ export function decodeEventCursor(value: unknown): EventCursor | null {
   }
 }
 
-export function cursorFromQuery(query: { cursor?: unknown; afterSequence?: unknown }): EventCursor {
+export function cursorFromQuery(query: { cursor?: unknown; afterSequence?: unknown; sinceSequence?: unknown }): EventCursor {
   const cursor = decodeEventCursor(query.cursor);
   if (cursor) return cursor;
-  const legacy = Number(query.afterSequence || 0);
+  const legacy = Number(query.afterSequence ?? query.sinceSequence ?? 0);
   return { sequence: Number.isSafeInteger(legacy) && legacy > 0 ? legacy : 0 };
 }
 

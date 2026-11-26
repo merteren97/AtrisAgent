@@ -15,6 +15,8 @@ import { ArrowDown, Sparkles, Loader2, Check, AlertCircle, Search, Wrench, Ban, 
 import { OrchestratorQuestions } from '@/components/orchestrator/orchestrator-questions';
 import { OrchestratorWorkCard } from '@/components/orchestrator/orchestrator-work-card';
 import { useAccountStore } from '@/stores/account-store';
+import { TurnProcessView } from '@/components/shared/TurnProcessView';
+import { ArtifactPreviewDialog, type SharedToolArtifact, type SharedToolItem } from '@/components/shared/ArtifactPreviewDialog';
 
 const COMPACT_EVENT_TYPES = new Set([
   'task_created',
@@ -49,6 +51,61 @@ type RenderEntry =
 function metadataString(item: TimelineItem, key: string): string | undefined {
   const value = item.metadata?.[key];
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function extractTurnProcessProps(item: TimelineItem): {
+  thinking?: string;
+  thinkingTokens?: number;
+  tools?: SharedToolItem[];
+} {
+  const meta = item.metadata;
+  if (!meta) return {};
+  const thinking = typeof meta.thinking === 'string' && meta.thinking.trim() ? meta.thinking : undefined;
+  const thinkingTokens = typeof meta.thinkingTokens === 'number' && Number.isFinite(meta.thinkingTokens)
+    ? meta.thinkingTokens
+    : undefined;
+  const tools: SharedToolItem[] = [];
+  if (Array.isArray(meta.tools)) {
+    for (const raw of meta.tools) {
+      if (raw && typeof raw === 'object') {
+        const record = raw as Record<string, unknown>;
+        tools.push({
+          id: String(record.id || crypto.randomUUID()),
+          name: String(record.name || 'tool'),
+          summary: String(record.summary || record.name || 'Tool call'),
+          detail: typeof record.detail === 'string' ? record.detail : undefined,
+          output: typeof record.output === 'string' ? record.output : undefined,
+          status: record.status === 'running' || record.status === 'failed' ? record.status : 'completed',
+          artifact: record.artifact && typeof record.artifact === 'object'
+            ? (record.artifact as SharedToolArtifact)
+            : undefined,
+          subagent: record.subagent && typeof record.subagent === 'object'
+            ? (record.subagent as SharedToolItem['subagent'])
+            : undefined,
+        });
+      }
+    }
+  }
+  if (Array.isArray(meta.artifacts)) {
+    for (const raw of meta.artifacts) {
+      if (raw && typeof raw === 'object') {
+        const record = raw as Record<string, unknown>;
+        tools.push({
+          id: String(record.id || crypto.randomUUID()),
+          name: 'artifact',
+          summary: String(record.title || record.name || 'Artifact'),
+          status: 'completed',
+          artifact: {
+            title: String(record.title || record.name || 'Artifact'),
+            summary: typeof record.summary === 'string' ? record.summary : undefined,
+            path: typeof record.path === 'string' ? record.path : undefined,
+            content: typeof record.content === 'string' ? record.content : undefined,
+          },
+        });
+      }
+    }
+  }
+  return { thinking, thinkingTokens, tools: tools.length ? tools : undefined };
 }
 
 function streamIdentity(item: TimelineItem): string {
@@ -168,6 +225,7 @@ export function ChatTimeline() {
   const shouldFollowRef = useRef(true);
   const [isDetached, setIsDetached] = useState(false);
   const [visibleEntryCount, setVisibleEntryCount] = useState(DEFAULT_TIMELINE_WINDOW);
+  const [openArtifact, setOpenArtifact] = useState<SharedToolArtifact | null>(null);
 
   const activeMission = missions.find((mission) => mission.id === activeMissionId);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
@@ -390,7 +448,45 @@ export function ChatTimeline() {
               return <MessageCard key={item.id} role="user" content={item.content} timestamp={item.timestamp} deliveryState={deliveryState} metadata={item.metadata} workspaceId={activeWorkspace?.id} />;
             }
             if (item.type === 'orchestrator_message') {
-              return <MessageCard key={item.id} role="orchestrator" content={item.content} timestamp={item.timestamp} metadata={item.metadata} workspaceId={activeWorkspace?.id} />;
+              const processProps = extractTurnProcessProps(item);
+              const hasProcess = Boolean(processProps.thinking || processProps.tools?.length);
+              return (
+                <div key={item.id} className="space-y-1">
+                  {hasProcess && (
+                    <div className="pl-11">
+                      <TurnProcessView
+                        thinking={processProps.thinking}
+                        thinkingTokens={processProps.thinkingTokens}
+                        tools={processProps.tools}
+                        cwd={activeWorkspace?.path}
+                        openArtifact={openArtifact}
+                        onOpenArtifact={setOpenArtifact}
+                      />
+                    </div>
+                  )}
+                  <MessageCard role="orchestrator" content={item.content} timestamp={item.timestamp} metadata={item.metadata} workspaceId={activeWorkspace?.id} />
+                </div>
+              );
+            }
+            if (item.type === 'event' && (item.eventType === 'artifact_published' || item.eventType === 'artifact_created' || item.metadata?.artifact)) {
+              const rawArtifact = (item.metadata?.artifact && typeof item.metadata.artifact === 'object'
+                ? item.metadata.artifact
+                : item.metadata) as Record<string, unknown> | undefined;
+              const artifact: SharedToolArtifact = {
+                title: String(rawArtifact?.title || rawArtifact?.name || item.content || 'Published artifact'),
+                summary: typeof rawArtifact?.summary === 'string' ? rawArtifact.summary : (item.content || undefined),
+                path: typeof rawArtifact?.path === 'string' ? rawArtifact.path : undefined,
+                content: typeof rawArtifact?.content === 'string' ? rawArtifact.content : undefined,
+              };
+              return (
+                <TurnProcessView
+                  key={item.id}
+                  tools={[{ id: item.id, name: 'artifact', summary: artifact.title, status: 'completed', artifact }]}
+                  cwd={activeWorkspace?.path}
+                  openArtifact={openArtifact}
+                  onOpenArtifact={setOpenArtifact}
+                />
+              );
             }
             return (
               <EventCard
@@ -405,6 +501,11 @@ export function ChatTimeline() {
           })}
         </div>
       </ScrollArea>
+      <ArtifactPreviewDialog
+        artifact={openArtifact}
+        cwd={activeWorkspace?.path}
+        onClose={() => setOpenArtifact(null)}
+      />
       {isDetached && (
         <Button
           type="button"

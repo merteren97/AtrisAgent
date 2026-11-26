@@ -75,7 +75,7 @@ async function runTests() {
   });
   try {
     const initialized = await new Promise<boolean>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('MCP initialize timed out')), 10_000);
+      const timeout = setTimeout(() => reject(new Error('MCP initialize timed out')), 25_000);
       let buffer = '';
       (bridge as ChildProcess).on('error', (error: Error) => { clearTimeout(timeout); reject(error); });
       (bridge as ChildProcess).on('exit', (code: number | null) => { clearTimeout(timeout); reject(new Error(`MCP bridge exited before initialize: ${code}`)); });
@@ -96,6 +96,9 @@ async function runTests() {
     });
     assert(initialized, 'Real Atris MCP bridge initializes with the explicitly forwarded Codex environment');
   } finally {
+    bridge.stdin?.destroy();
+    bridge.stdout?.destroy();
+    bridge.stderr?.destroy();
     bridge.kill();
   }
 

@@ -22,8 +22,9 @@ import type {
   CanonicalReasoning,
   Provider,
   AgentRole,
+  RuntimeAdapterCapabilities,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, type SpawnAgentOptions } from './base-adapter';
+import { appendStagedAttachmentsToPrompt, BaseRuntimeAdapter, stageWorkspaceAttachments, type SpawnAgentOptions } from './base-adapter';
 import { parseAntigravityStreamLine } from './antigravity-stream';
 import { resolveAntigravityPrintTimeout } from '../antigravity-run-policy';
 
@@ -235,6 +236,16 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         error: `Antigravity version probe failed: ${commandDiagnostic(error, 'Could not read Antigravity version.')}`,
       };
     }
+  }
+
+  override getAdapterCapabilities(): RuntimeAdapterCapabilities {
+    return {
+      liveSteer: false,
+      interactiveApproval: false,
+      sessionResume: false,
+      reuseWhileAlive: false,
+      nativeAttachments: false,
+    };
   }
 
   async probeCapabilities(): Promise<CapabilitySnapshot> {
@@ -676,7 +687,11 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
     const controlPlane = prepareControlPlaneSession(options, sessionId);
     const overlay = createAntigravityMcpOverlay(controlPlane, sessionId, workspaceCwd);
     const cwd = overlay?.cwd || workspaceCwd;
-    const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd);
+    const stagedAttachments = stageWorkspaceAttachments(workspaceCwd, options.attachments);
+    const prompt = appendStagedAttachmentsToPrompt(
+      appendControlPlaneInstructions(options.prompt, controlPlane, workspaceCwd),
+      stagedAttachments.staged,
+    );
     const printTimeout = resolveAntigravityPrintTimeout(options.env?.ATRIS_ANTIGRAVITY_PRINT_TIMEOUT);
     const args = [
       '--print',
@@ -704,6 +719,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) {
+      stagedAttachments.cleanup();
       overlay?.cleanup();
       revokeControlPlaneAgent(sessionId);
       const message = error instanceof Error ? error.message : String(error);
@@ -732,7 +748,10 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       timestamp: new Date().toISOString(),
     });
 
-    if (overlay) this.sessionOverlays.set(sessionId, () => overlay.cleanup());
+    this.sessionOverlays.set(sessionId, () => {
+      stagedAttachments.cleanup();
+      overlay?.cleanup();
+    });
 
     const stdoutDecoder = new StringDecoder('utf8');
     const stderrDecoder = new StringDecoder('utf8');
@@ -775,6 +794,7 @@ export class AntigravityAdapter extends BaseRuntimeAdapter {
       this.activeSessions.delete(sessionId);
       this.sessionOverlays.delete(sessionId);
       this.sessionReleaseHandlers.delete(sessionId);
+      stagedAttachments.cleanup();
       overlay?.cleanup();
       revokeControlPlaneAgent(sessionId);
       this.sessionContext.delete(sessionId);

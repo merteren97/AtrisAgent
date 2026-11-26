@@ -1,6 +1,7 @@
 import { useMissionStore, type TimelineItem } from '@/stores/mission-store';
 import { useAgentStore } from '@/stores/agent-store';
 import { useAccountStore } from '@/stores/account-store';
+import { useOrchestrationGraphStore } from '@/stores/orchestration-graph-store';
 import { getApiOrigin, isAccountSessionRejection, runtimeHeaders } from '@/lib/api-client';
 import { getAuthToken, notifyUnauthorized } from '@/lib/token-provider';
 import { consumeSseFrames } from '@/lib/sse-parser';
@@ -166,6 +167,10 @@ export function handleIncomingEvent(eventData: any): void {
     if (eventData.sequence <= previous) return;
     if (previous > 0 && eventData.sequence > previous + 1) {
       markTransportGap(eventData.missionId);
+      useOrchestrationGraphStore.getState().applyMissionEvent(eventData.missionId, {
+        type: 'stream_gap',
+        missionId: eventData.missionId,
+      });
       streamAbortController?.abort();
       scheduleReconnect();
       return;
@@ -581,6 +586,9 @@ export function handleIncomingEvent(eventData: any): void {
     default:
       append(eventData, `Event: ${eventData.type}`);
   }
+  if (eventData.missionId) {
+    useOrchestrationGraphStore.getState().applyMissionEvent(eventData.missionId, eventData);
+  }
   recordSequence(eventData);
 }
 
@@ -619,7 +627,14 @@ function handleSseFrame(frame: string): void {
   try {
     const parsed = JSON.parse(data);
     if (eventType === 'stream_gap' || parsed?.type === 'stream_gap') {
-      markTransportGap();
+      const gapMissionId = optionalString(parsed?.missionId) || useMissionStore.getState().activeMissionId;
+      markTransportGap(gapMissionId);
+      if (gapMissionId) {
+        useOrchestrationGraphStore.getState().applyMissionEvent(gapMissionId, {
+          type: 'stream_gap',
+          missionId: gapMissionId,
+        });
+      }
       streamAbortController?.abort();
       scheduleReconnect();
       return;

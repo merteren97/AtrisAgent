@@ -27,6 +27,7 @@ import type {
   AgentProfilePatch,
   AgentProfileRoutePolicy,
   AgentRole,
+  RuntimeAdapterCapabilities,
 } from '@atris-agent-code/domain';
 import type { AgentEvent } from '@atris-agent-code/event-schema';
 import { AtrisAuthService, extractBearerHeader, installAuthRoutes } from './auth';
@@ -72,6 +73,12 @@ import { installActivityRoutes } from './activity-routes';
 import { installInsightsRoutes, recordPlanningTurnTelemetry } from './insights-routes';
 import { LocalCliInsightsScanner } from './local-cli-insights-scanner';
 import { installUsageLimitsRoutes } from './usage-limits-routes';
+import {
+  getOrchestratorRoutingDefaults,
+  installOrchestratorGraphRoutes,
+  normalizeFallbackCatalogIds,
+} from './orchestrator-graph-routes';
+import { createStartupRecovery, type StartupRecoverySyncContext } from './startup-recovery';
 
 import path from 'path';
 import fs from 'fs';
@@ -89,252 +96,6 @@ sqlite.exec(`
   PRAGMA foreign_keys = ON;
   PRAGMA journal_mode = WAL;
   PRAGMA busy_timeout = 5000;
-
-  CREATE TABLE IF NOT EXISTS workspaces (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    path TEXT NOT NULL,
-    git_initialized INTEGER NOT NULL DEFAULT 0,
-    last_opened_at TEXT,
-    last_team_template_id TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS missions (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'draft',
-    team_template_id TEXT NOT NULL DEFAULT '',
-    plan_id TEXT,
-    execution_mode TEXT NOT NULL DEFAULT 'balanced',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    completed_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    plan_id TEXT NOT NULL DEFAULT '',
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'planned',
-    priority TEXT NOT NULL DEFAULT 'medium',
-    assigned_agent_id TEXT,
-    assigned_role TEXT,
-    required_capabilities TEXT NOT NULL,
-    depends_on TEXT NOT NULL,
-    worktree_id TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    completed_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS account_profiles (
-    id TEXT PRIMARY KEY,
-    provider TEXT NOT NULL,
-    runtime_type TEXT NOT NULL,
-    profile_name TEXT NOT NULL,
-    auth_status TEXT NOT NULL DEFAULT 'not_installed',
-    config_dir TEXT NOT NULL DEFAULT '',
-    supported_models TEXT NOT NULL,
-    usage_scope TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS team_templates (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    max_parallel_agents INTEGER,
-    worker_pools TEXT,
-    is_default INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS team_roles (
-    id TEXT PRIMARY KEY,
-    template_id TEXT NOT NULL REFERENCES team_templates(id) ON DELETE CASCADE,
-    role TEXT NOT NULL,
-    model_profile_id TEXT DEFAULT '',
-    account_profile_id TEXT DEFAULT '',
-    default_capabilities TEXT NOT NULL,
-    access_level TEXT NOT NULL DEFAULT 'read'
-  );
-
-  CREATE TABLE IF NOT EXISTS execution_policies (
-    id TEXT PRIMARY KEY,
-    scope_type TEXT NOT NULL,
-    scope_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    model_catalog_id TEXT,
-    account_profile_id TEXT,
-    reasoning_level TEXT,
-    fallback_catalog_ids TEXT NOT NULL DEFAULT '[]',
-    selection_mode TEXT NOT NULL DEFAULT 'auto',
-    source TEXT NOT NULL DEFAULT 'team_template',
-    updated_at TEXT NOT NULL
-  );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_policies_scope_role
-    ON execution_policies(scope_type, scope_id, role);
-
-  CREATE TABLE IF NOT EXISTS approvals (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    task_id TEXT,
-    run_id TEXT,
-    type TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    status TEXT DEFAULT 'pending',
-    decided_by TEXT,
-    requested_decision TEXT,
-    claimed_at TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    execution_error TEXT,
-    created_at TEXT NOT NULL,
-    decided_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS approval_operations (
-    approval_id TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
-    decision TEXT NOT NULL,
-    status TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    error TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS mission_completions (
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    plan_id TEXT NOT NULL,
-    status TEXT NOT NULL,
-    summary TEXT,
-    tasks_completed INTEGER NOT NULL,
-    total_tasks INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    completed_at TEXT,
-    PRIMARY KEY (mission_id, plan_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS mission_events (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    task_id TEXT,
-    agent_instance_id TEXT,
-    type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_mission_events_mission_created ON mission_events(mission_id, created_at);
-
-  CREATE TABLE IF NOT EXISTS task_dependencies (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS task_attempts (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    agent_instance_id TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL DEFAULT 1,
-    status TEXT NOT NULL DEFAULT 'running',
-    worktree_path TEXT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    error TEXT,
-    result_summary TEXT,
-    review_pack TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS model_profiles (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    runtime_type TEXT NOT NULL,
-    account_profile_id TEXT,
-    suitable_roles TEXT NOT NULL,
-    available INTEGER DEFAULT 1,
-    supports_reasoning INTEGER DEFAULT 0,
-    reasoning_levels TEXT NOT NULL,
-    context_class TEXT DEFAULT 'medium',
-    speed_class TEXT DEFAULT 'standard',
-    is_subscription INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS agent_instances (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    role TEXT NOT NULL,
-    model_profile_id TEXT DEFAULT '',
-    account_profile_id TEXT DEFAULT '',
-    runtime_adapter_id TEXT DEFAULT '',
-    session_id TEXT,
-    status TEXT DEFAULT 'idle',
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS resource_leases (
-    id TEXT PRIMARY KEY,
-    resource_type TEXT NOT NULL,
-    resource_id TEXT NOT NULL,
-    held_by_agent_id TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    heartbeat_at TEXT NOT NULL,
-    status TEXT DEFAULT 'active',
-    metadata TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS artifacts (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    task_id TEXT,
-    run_id TEXT,
-    type TEXT NOT NULL,
-    name TEXT NOT NULL,
-    path TEXT,
-    content TEXT,
-    size_bytes INTEGER,
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS usage_snapshots (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    agent_instance_id TEXT,
-    account_profile_id TEXT,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    cost INTEGER,
-    currency TEXT DEFAULT 'USD',
-    recorded_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS worktrees (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    task_id TEXT NOT NULL,
-    branch_name TEXT NOT NULL,
-    path TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS checkpoints (
-    id TEXT PRIMARY KEY,
-    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-    workspace_id TEXT NOT NULL,
-    label TEXT NOT NULL,
-    git_ref TEXT,
-    snapshot_path TEXT,
-    created_at TEXT NOT NULL,
-    is_rollback_target INTEGER NOT NULL DEFAULT 0
-  );
 `);
 migrateDatabase(sqlite as any);
 
@@ -436,6 +197,7 @@ const orchestrator = new Orchestrator(
       for (const id of context.builderTaskIds) liveProjectChanges.quality(`builder:${id}`, result.passed ? 'verified' : 'failed');
       return result;
     },
+    getRoutingDefaults: () => getOrchestratorRoutingDefaults(sqlite),
   },
   eventBus,
   db,
@@ -609,7 +371,15 @@ server.requestTimeout = 120_000;
 server.headersTimeout = 35_000;
 server.keepAliveTimeout = 65_000;
 const shutdownCoordinator = createRuntimeShutdownCoordinator({
-  stopRuntimeHost: async () => { await planningChat.close(); await manualConversationStore.codexSessions.closeAll(); await runtimeHost.stopAll(); await liveProjectChanges.close(); await manualConversationStore.projectReview.close(); },
+  stopRuntimeHost: async () => {
+    startupAbortController.abort();
+    orchestrator.dispose?.();
+    await planningChat.close();
+    await manualConversationStore.codexSessions.closeAll();
+    await runtimeHost.stopAll();
+    await liveProjectChanges.close();
+    await manualConversationStore.projectReview.close();
+  },
   closeServer: () => new Promise<void>((resolve) => {
     if (!server.listening) {
       resolve();
@@ -707,13 +477,10 @@ function routeParam(value: string | string[]): string {
   return Array.isArray(value) ? value[0] || '' : value;
 }
 
-function normalizeFallbackCatalogIds(value: unknown, primaryCatalogId?: string): string[] {
-  const values: unknown[] = Array.isArray(value) ? value : [];
-  return Array.from(new Set(
-    values
-      .map((item: unknown) => String(item).trim())
-      .filter((item: string) => item.length > 0 && item !== primaryCatalogId),
-  ));
+function safeGetRuntimeCapabilities(): Record<string, RuntimeAdapterCapabilities> {
+  return typeof (runtimeHost as { getAllAdapterCapabilities?: () => Record<string, RuntimeAdapterCapabilities> })?.getAllAdapterCapabilities === 'function'
+    ? (runtimeHost as { getAllAdapterCapabilities: () => Record<string, RuntimeAdapterCapabilities> }).getAllAdapterCapabilities()
+    : {};
 }
 
 type AgentProfileIdMap = Partial<Record<AgentRole, string>>;
@@ -2094,7 +1861,17 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     );
     const queuedRequestOptions = active && delivery === 'steer' && Boolean(turnOptions.attachmentIds.length
       || requestedOptions.workMode !== undefined || requestedOptions.teamLaunch !== undefined);
-    if (queuedImplementationFollowUp || queuedRoutingFollowUp || queuedRequestOptions) delivery = 'queue';
+    let deliveryDowngradeReason: string | undefined;
+    if (queuedImplementationFollowUp) {
+      delivery = 'queue';
+      deliveryDowngradeReason = 'Active run is read-only research; implementation follow-up queued as a new turn.';
+    } else if (queuedRoutingFollowUp) {
+      delivery = 'queue';
+      deliveryDowngradeReason = 'Message includes route or model overrides; queued as a new turn.';
+    } else if (queuedRequestOptions) {
+      delivery = 'queue';
+      deliveryDowngradeReason = 'Message includes attachments or mode/launch overrides; queued as a new turn.';
+    }
     const requestHash = turnRequestHash(missionId, content, requestedDelivery, turnOptions);
     if (idempotencyKey) {
       const existing = sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?')
@@ -2103,7 +1880,12 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
         if (existing.request_hash && existing.request_hash !== requestHash) {
           return void res.status(409).json({ code: 'IDEMPOTENCY_KEY_REUSED', error: 'Idempotency key was already used for a different message.' });
         }
-        return void res.status(200).json(turnDto(existing));
+        return void res.status(200).json({
+          ...turnDto(existing),
+          requestedDelivery,
+          effectiveDelivery: existing.delivery,
+          ...(existing.delivery !== requestedDelivery && deliveryDowngradeReason ? { deliveryDowngradeReason } : {}),
+        });
       }
     }
     const priorityPending = active && delivery === 'steer';
@@ -2113,6 +1895,7 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       : undefined;
     if (priorityPending && !activeRun) throw new Error('Active run metadata is unavailable for steering.');
     const turnStatus = priorityPending ? 'pending_priority' : 'queued';
+    const directiveId = priorityPending ? crypto.randomUUID() : undefined;
     sqlite.transaction(() => {
       sqlite.prepare(`INSERT INTO conversation_turns
         (id, mission_id, content, delivery, options, status, idempotency_key, request_hash, command_id, created_at)
@@ -2121,6 +1904,12 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       sqlite.prepare(`INSERT INTO mission_commands
         (id, mission_id, turn_id, type, status, priority, request_hash, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`)
         .run(commandId, missionId, turnId, delivery, priorityPending ? 100 : delivery === 'stop_and_replan' ? 200 : 0, requestHash, now);
+      if (directiveId) {
+        sqlite.prepare(`INSERT INTO turn_directives
+          (id, mission_id, turn_id, target_agent_id, delivery, content, attachment_ids_json, status, created_at)
+          VALUES (?, ?, ?, NULL, 'steer', ?, ?, 'pending', ?)`)
+          .run(directiveId, missionId, activeRun?.turn_id || turnId, content, JSON.stringify(turnOptions.attachmentIds || []), now);
+      }
     })();
     emitTurnEvent({ id: crypto.randomUUID(), type: 'turn_queued', missionId, turnId, content,
       delivery: delivery as any, priorityPending, clientMessageId: idempotencyKey || undefined, timestamp: now });
@@ -2130,7 +1919,13 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       emitTurnEvent({ id: crypto.randomUUID(), type: 'user_message', missionId, turnId,
         clientMessageId: idempotencyKey || undefined, content, timestamp: now });
       try {
-        const applied = await orchestrator.steerActiveTurn({ missionId, targetTurnId: activeRun.turn_id, content });
+        const applied = await orchestrator.steerActiveTurn({
+          missionId,
+          targetTurnId: activeRun.turn_id,
+          content,
+          attachmentIds: turnOptions.attachmentIds || [],
+          directiveId,
+        });
         const appliedAt = new Date().toISOString();
         sqlite.transaction(() => {
           sqlite.prepare("UPDATE mission_commands SET status = 'completed', processed_at = ? WHERE id = ?").run(appliedAt, commandId);
@@ -2199,6 +1994,9 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
     }
     res.status(202).json({
       ...turnDto(sqlite.prepare('SELECT * FROM conversation_turns WHERE id = ?').get(turnId), { id: commandId }),
+      requestedDelivery,
+      effectiveDelivery: delivery,
+      ...(deliveryDowngradeReason ? { deliveryDowngradeReason } : {}),
       ...(queuedImplementationFollowUp || queuedRoutingFollowUp || queuedRequestOptions ? { requiresNewTurn: true, disposition: 'queued_new_turn' } : {}),
     });
   } catch (error: any) {
@@ -2211,20 +2009,35 @@ app.post('/api/missions/:id/messages', async (req: Request, res: Response) => {
       const existing = key ? sqlite.prepare('SELECT * FROM conversation_turns WHERE mission_id = ? AND idempotency_key = ?').get(missionId, key) as any : null;
       if (existing) {
         const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
-        const delivery = String(req.body?.delivery || '');
+        const requestedDelivery = String(req.body?.delivery || '');
         const mission = await workspaceManager.getMission(missionId);
         const requested = resolveTurnAttachments(req.body?.options && typeof req.body.options === 'object' ? { ...req.body.options } : {}, mission!.workspaceId);
         requested.modelCatalogId = requested.modelCatalogId || requested.model || undefined;
         delete requested.model;
-        if (existing.request_hash && existing.request_hash !== turnRequestHash(missionId, content, delivery, requested)) {
+        if (existing.request_hash && existing.request_hash !== turnRequestHash(missionId, content, requestedDelivery, requested)) {
           return void res.status(409).json({ code: 'IDEMPOTENCY_KEY_REUSED', error: 'Idempotency key was already used for a different message.' });
         }
-        return void res.status(200).json(turnDto(existing));
+        return void res.status(200).json({
+          ...turnDto(existing),
+          requestedDelivery,
+          effectiveDelivery: existing.delivery,
+        });
       }
       return void res.status(409).json({ error: 'Idempotency key conflict' });
     }
     res.status(500).json({ error: error?.message || 'Failed to queue message' });
   }
+});
+
+installOrchestratorGraphRoutes(app, {
+  sqlite,
+  workspaceManager,
+  runtimeHost,
+  eventBus,
+  attachmentStore,
+  isDeletionFenced,
+  turnDto,
+  safeGetRuntimeCapabilities,
 });
 
 app.post('/api/missions/:id/start', async (req: Request, res: Response) => {
@@ -2431,8 +2244,14 @@ app.post('/api/tasks/:id/merge', async (req: Request, res: Response) => {
 });
 
 app.get('/api/runtimes', async (_req, res) => {
-  try { res.json(await runtimeHost.discoverRuntimeStatuses()); }
-  catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to discover runtimes' }); }
+  try {
+    const statuses = await runtimeHost.discoverRuntimeStatuses();
+    const caps = safeGetRuntimeCapabilities();
+    res.json(statuses.map((status) => ({
+      ...status,
+      ...(caps[status.runtimeType] ? { adapterCapabilities: caps[status.runtimeType] } : {}),
+    })));
+  } catch (error: any) { res.status(500).json({ error: error?.message || 'Failed to discover runtimes' }); }
 });
 
 app.post('/api/runtimes/discover', async (_req, res) => {
@@ -3558,9 +3377,20 @@ app.get('/api/events/stream', (req: Request, res: Response) => {
   const unsubscribe = eventBus.on('*', (event: AgentEvent) => {
     enqueue(event);
   });
+  const requestedSinceSequence = lastSequence;
   if (missionId) {
-    highWaterSequence = Number((sqlite.prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM mission_events WHERE mission_id = ?')
-      .get(missionId) as { sequence: number }).sequence);
+    const bounds = sqlite.prepare('SELECT MIN(sequence) AS min_sequence, COALESCE(MAX(sequence), 0) AS max_sequence FROM mission_events WHERE mission_id = ?')
+      .get(missionId) as { min_sequence: number | null; max_sequence: number };
+    highWaterSequence = Number(bounds.max_sequence);
+    if (requestedSinceSequence > 0 && bounds.min_sequence !== null && Number(bounds.min_sequence) > requestedSinceSequence + 1 && highWaterSequence > requestedSinceSequence) {
+      res.write(`event: stream_gap\ndata: ${JSON.stringify({
+        type: 'stream_gap',
+        reason: 'history_pruned',
+        afterSequence: requestedSinceSequence,
+        earliestAvailableSequence: Number(bounds.min_sequence),
+        latestSequence: highWaterSequence,
+      })}\n\n`);
+    }
   }
   const onDrain = () => flush();
   res.on('drain', onDrain);
@@ -3809,83 +3639,58 @@ function isPostApplyVerificationPending(missionId: string): boolean {
   return Boolean(operation);
 }
 
-export async function recoverGatewayStartup(): Promise<void> {
-  liveProjectChanges.resume();
-  const recoveredAt = new Date().toISOString();
-  deletionStore.recoverInterrupted();
-  const pendingDeletions = deletionStore.listIncomplete();
-  const deletingMissionIds = new Set(pendingDeletions.flatMap(deletionMissionIds));
-  // Restore durable fences before any command/completion recovery, but keep
-  // potentially large filesystem cleanup outside the sidecar readiness budget.
-  for (const missionId of deletingMissionIds) fenceDeletionMission(missionId, recoveredAt);
-  applyVerificationStore.recoverInterrupted();
-  await runtimeHost.reconcileStartup(new Date(recoveredAt));
-  sqlite.transaction(() => {
-    sqlite.prepare("UPDATE mission_commands SET status = 'failed', processed_at = ?, error = COALESCE(error, 'Gateway restarted while command was starting') WHERE status = 'processing'")
-      .run(recoveredAt);
-    sqlite.prepare("UPDATE conversation_turns SET status = 'failed', completed_at = ? WHERE status IN ('starting', 'running')")
-      .run(recoveredAt);
-    sqlite.prepare("UPDATE mission_runs SET status = 'failed', completed_at = ?, heartbeat_at = ?, error = COALESCE(error, 'Gateway restarted before run completion') WHERE status IN ('starting', 'running', 'stopping')")
-      .run(recoveredAt, recoveredAt);
-    sqlite.prepare(`UPDATE missions SET active_run_id = NULL, status = CASE
-        WHEN status IN ('planning', 'running', 'reviewing', 'revising') THEN 'ready' ELSE status END,
-        completed_at = CASE WHEN status IN ('planning', 'running', 'reviewing', 'revising', 'verifying') THEN NULL ELSE completed_at END
-      WHERE active_run_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM mission_runs WHERE mission_runs.id = missions.active_run_id
-          AND mission_runs.status IN ('starting', 'running', 'stopping')
-      )`).run();
-  })();
-  const expiredAttempts = sqlite.prepare(`SELECT id, mission_id, task_id, agent_instance_id, error
-    FROM task_attempts WHERE status = 'expired' AND completed_at = ?`).all(recoveredAt) as Array<{
-      id: string; mission_id: string; task_id: string; agent_instance_id: string; error: string | null;
-    }>;
-  for (const attempt of expiredAttempts) {
-    if (deletingMissionIds.has(attempt.mission_id)) continue;
-    const failure = {
-      id: `restart-${attempt.id}`,
-      type: 'task_failed' as const,
-      missionId: attempt.mission_id,
-      taskId: attempt.task_id,
-      agentInstanceId: attempt.agent_instance_id,
-      error: attempt.error || 'Runtime host restarted before session completion was confirmed',
-      timestamp: recoveredAt,
-    };
-    await orchestrator.handleTaskFailed(failure);
-    eventBus.emit(failure);
-  }
-  approvalOutbox.recoverInterrupted();
-  await orchestrator.recoverPendingCompletions();
-  const activePlans = sqlite.prepare(`SELECT id, plan_id, status FROM missions
-    WHERE status IN ('planning', 'ready', 'running', 'reviewing', 'revising', 'verifying', 'blocked') AND plan_id IS NOT NULL`)
-    .all() as Array<{ id: string; plan_id: string; status: string }>;
-  for (const mission of activePlans) {
-    if ((mission.status === 'verifying' || mission.status === 'blocked') && isPostApplyVerificationPending(mission.id)) {
-      await orchestrator.retryPostApplyVerification(mission.id).catch((error) => {
-        console.warn(`[API-Gateway] Post-apply verification remains pending for mission ${mission.id}:`, error);
-      });
-    }
-    else if (mission.status !== 'blocked') await orchestrator.reconcileMissionPlan(mission.id, mission.plan_id);
-  }
-  const pending = sqlite.prepare("SELECT DISTINCT mission_id FROM mission_commands WHERE status = 'pending'").all() as Array<{ mission_id: string }>;
-  for (const row of pending) await drainMissionCommands(row.mission_id);
-  for (const operation of pendingDeletions) scheduleDeletion(operation);
+const startupAbortController = new AbortController();
+
+export type { StartupRecoverySyncContext };
+
+export const {
+  recoverGatewayStartupSync,
+  recoverGatewayStartupAsync,
+  recoverGatewayStartup,
+} = createStartupRecovery({
+  sqlite,
+  liveProjectChanges,
+  deletionStore,
+  deletionMissionIds,
+  fenceDeletionMission,
+  applyVerificationStore,
+  approvalOutbox,
+  runtimeHost,
+  orchestrator,
+  eventBus,
+  isPostApplyVerificationPending,
+  drainMissionCommands,
+  scheduleDeletion,
+  startupAbortSignal: startupAbortController.signal,
+  isShuttingDown: () => shutdownCoordinator.shuttingDown,
+});
+
+const startupSyncContext = recoverGatewayStartupSync();
+let backgroundStartupRecovery: Promise<void> = Promise.resolve();
+const startupRecovery: Promise<void> = process.env.NODE_ENV === 'test'
+  ? recoverGatewayStartupAsync(startupSyncContext, { signal: startupAbortController.signal })
+  : Promise.resolve();
+
+export function startBackgroundStartupRecovery(): Promise<void> {
+  if (process.env.NODE_ENV === 'test') return startupRecovery;
+  backgroundStartupRecovery = recoverGatewayStartupAsync(startupSyncContext, { signal: startupAbortController.signal })
+    .catch((error) => {
+      console.error('[API-Gateway] Background startup recovery failed:', error);
+    });
+  return backgroundStartupRecovery;
 }
 
-const startupRecovery = recoverGatewayStartup();
 if (isMain && process.env.NODE_ENV !== 'test' && !server.listening) {
-  startupRecovery.then(() => {
-    if (shutdownCoordinator.shuttingDown || server.listening) return;
+  if (!shutdownCoordinator.shuttingDown) {
     server.listen(PORT, '127.0.0.1', () => {
       const ready = emitRuntimeReady(server, gatewayVersion());
       const origin = ready?.origin || `http://127.0.0.1:${PORT}`;
       console.log(`[API-Gateway] Server running on ${origin}`);
       console.log(`[API-Gateway] WebSocket stream ready at ${origin.replace(/^http:/, 'ws:')}/ws/events`);
       console.log(`[API-Gateway] SSE event stream ready at ${origin}/api/events/stream`);
+      void startBackgroundStartupRecovery();
     });
-  }).catch((error) => {
-    console.error('[API-Gateway] Startup recovery failed:', error);
-    void shutdownCoordinator.shutdown('startup-recovery-failed');
-  });
+  }
 }
 
-export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator, startupRecovery, db };
+export { app, server, eventBus, workspaceManager, orchestrator, runtimeHost, shutdownCoordinator, startupRecovery, backgroundStartupRecovery, db };

@@ -16,8 +16,9 @@ export {
 } from './adapters/antigravity-stream';
 export { OpenCodeAdapter } from './adapters/opencode-adapter';
 export { AccountProfileManager } from './account-profile-manager';
-export { ModelCatalogService } from './model-catalog-service';
+export { ModelCatalogService, inferModelTierAndStrengths } from './model-catalog-service';
 export { Scheduler } from './scheduler';
+export { classifyRuntimeFailure, type RuntimeFailureClassification, type RuntimeFailureKind } from './runtime-failure';
 export { getAtrisDataDir, resolveAtrisDataDir, runCommand, findExecutable, launchInteractiveTerminal } from './runtime-utils';
 export {
   ATRIS_MCP_SERVER_NAME,

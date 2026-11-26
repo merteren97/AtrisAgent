@@ -21,8 +21,16 @@ import type {
   AuthPollResult,
   CanonicalReasoning,
   CodexPermissionMode,
+  ProviderAttachment,
+  RuntimeAdapterCapabilities,
 } from '@atris-agent-code/domain';
-import { BaseRuntimeAdapter, isReadOnlyAgentRole, type SpawnAgentOptions } from './base-adapter';
+import {
+  BaseRuntimeAdapter,
+  isReadOnlyAgentRole,
+  validateLocalAttachments,
+  type SessionContinuityCapabilities,
+  type SpawnAgentOptions,
+} from './base-adapter';
 import {
   appendControlPlaneInstructions,
   codexControlPlaneArgs,
@@ -43,6 +51,37 @@ import {
 
 const MAX_AUTH_OUTPUT_CHARS = 32_768;
 const MAX_STREAM_BUFFER_CHARS = 2 * 1024 * 1024;
+const APP_SERVER_RPC_TIMEOUT_MS = 15_000;
+
+interface PendingRpcRequest {
+  resolve: (result: any) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingApprovalRequest {
+  rpcId: string | number;
+  method: string;
+  params: Record<string, any>;
+}
+
+interface AppServerSessionState {
+  sessionId: string;
+  child: ChildProcess;
+  missionId: string;
+  taskId: string;
+  cwd: string;
+  profileId?: string;
+  preserveProviderSession: boolean;
+  threadId?: string;
+  activeTurnId?: string;
+  finalMessage?: string;
+  rpcCounter: number;
+  closed: boolean;
+  pendingRpc: Map<string, PendingRpcRequest>;
+  pendingApprovals: Map<string, PendingApprovalRequest>;
+  cleanupControlPlane: () => void;
+}
 
 interface PendingAuth {
   process?: ChildProcess;
@@ -74,8 +113,13 @@ export class CodexAdapter extends BaseRuntimeAdapter {
   private terminalSessions = new Set<string>();
   private finalMessages = new Map<string, string>();
   private fallbackToolEventSequence = new Map<string, number>();
+  private appServerBySession = new Map<string, AppServerSessionState>();
+  private reusableAppServers = new Map<string, AppServerSessionState>();
 
-  constructor(eventBus?: LocalEventBus) {
+  constructor(
+    eventBus?: LocalEventBus,
+    private readonly spawnProcess: typeof spawnHidden = spawnHidden,
+  ) {
     super(eventBus);
   }
 
@@ -94,21 +138,35 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     }
   }
 
+  override getSessionContinuityCapabilities(): SessionContinuityCapabilities {
+    return { reuseWhileAlive: true, resumeAfterRestart: true };
+  }
+
+  override getAdapterCapabilities(): RuntimeAdapterCapabilities {
+    return {
+      liveSteer: true,
+      interactiveApproval: true,
+      sessionResume: true,
+      reuseWhileAlive: true,
+      nativeAttachments: true,
+    };
+  }
+
   async probeCapabilities(profileId?: string): Promise<CapabilitySnapshot> {
     const install = await this.discoverInstallation();
     if (!install.installed) return this.emptyCapabilities();
     const help = (await getHelpText('codex', this.env(profileId))).toLowerCase();
     const execHelp = await this.commandHelp(['exec', '--help'], profileId);
+    const appServerHelp = await this.commandHelp(['app-server', '--help'], profileId);
+    const supportsAppServer = /app-server/.test(help) || /--stdio\b|app-server/.test(appServerHelp);
     return {
-      structuredEventStreaming: /--json\b/.test(execHelp),
-      sessionResume: /resume/.test(execHelp) || /resume/.test(help),
-      modelSelection: /--model\b/.test(execHelp) || /-m,?\s+--model/.test(execHelp),
-      reasoningControl: /reasoning/.test(help) || /reasoning/.test(execHelp),
-      toolCallEvents: /--json\b/.test(execHelp),
-      // Codex exec approvals must be configured before launch; this adapter
-      // cannot answer an in-flight approval request.
-      interactiveApproval: false,
-      usageInfo: /--json\b/.test(execHelp),
+      structuredEventStreaming: /--json\b/.test(execHelp) || supportsAppServer,
+      sessionResume: /resume/.test(execHelp) || /resume/.test(help) || supportsAppServer,
+      modelSelection: /--model\b/.test(execHelp) || /-m,?\s+--model/.test(execHelp) || supportsAppServer,
+      reasoningControl: /reasoning/.test(help) || /reasoning/.test(execHelp) || supportsAppServer,
+      toolCallEvents: /--json\b/.test(execHelp) || supportsAppServer,
+      interactiveApproval: supportsAppServer,
+      usageInfo: /--json\b/.test(execHelp) || supportsAppServer,
       cancellation: true,
       worktreeAwareness: true,
       headlessAuth: /device-auth|with-api-key|with-access-token/.test(help),
@@ -219,11 +277,49 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     };
   }
 
+  override async cancel(sessionId: string): Promise<void> {
+    const appServer = this.appServerBySession.get(sessionId);
+    if (appServer) {
+      this.markSessionCancelled(sessionId);
+      await this.closeAppServer(appServer);
+      this.activeSessions.delete(sessionId);
+      this.sessionContext.delete(sessionId);
+      this.terminalSessions.delete(sessionId);
+      this.finalMessages.delete(sessionId);
+      this.fallbackToolEventSequence.delete(sessionId);
+      return;
+    }
+    await super.cancel(sessionId);
+  }
+
   override async shutdown(): Promise<void> {
     const flows = [...this.authFlows.values()];
     this.authFlows.clear();
     await Promise.all(flows.map((flow) => (flow.process ? terminateProcessTree(flow.process).catch(() => undefined) : Promise.resolve())));
+    const servers = new Set<AppServerSessionState>([
+      ...this.appServerBySession.values(),
+      ...this.reusableAppServers.values(),
+    ]);
+    await Promise.all([...servers].map((state) => this.closeAppServer(state).catch(() => undefined)));
+    this.appServerBySession.clear();
+    this.reusableAppServers.clear();
     await super.shutdown();
+  }
+
+  override async probeProviderSession(providerSessionId: string): Promise<boolean> {
+    const existing = this.reusableAppServers.get(providerSessionId);
+    if (existing && !existing.closed && existing.child.exitCode === null && !existing.child.killed) {
+      return true;
+    }
+    return Boolean(providerSessionId && typeof providerSessionId === 'string' && providerSessionId.trim());
+  }
+
+  override async releaseProviderSession(providerSessionId: string): Promise<void> {
+    const existing = this.reusableAppServers.get(providerSessionId);
+    this.reusableAppServers.delete(providerSessionId);
+    if (existing) {
+      await this.closeAppServer(existing).catch(() => undefined);
+    }
   }
 
   async verifyAuthentication(profileId?: string): Promise<AccountProfileStatus> {
@@ -348,6 +444,27 @@ export class CodexAdapter extends BaseRuntimeAdapter {
   }
 
   async sendInput(sessionId: string, input: AgentInput): Promise<void> {
+    const appServer = this.appServerBySession.get(sessionId);
+    if (appServer && !appServer.closed && appServer.child.exitCode === null && !appServer.child.killed && appServer.threadId) {
+      const rpcInput = buildCodexTurnInput(
+        input.content,
+        (input as AgentInput & { attachments?: ProviderAttachment[] }).attachments,
+      );
+      if (appServer.activeTurnId) {
+        await this.sendAppServerRpc(appServer, 'turn/steer', {
+          threadId: appServer.threadId,
+          expectedTurnId: appServer.activeTurnId,
+          input: rpcInput,
+        });
+      } else {
+        const result = await this.sendAppServerRpc(appServer, 'turn/start', {
+          threadId: appServer.threadId,
+          input: rpcInput,
+        });
+        if (result?.turn?.id) appServer.activeTurnId = String(result.turn.id);
+      }
+      return;
+    }
     const child = this.activeProcesses.get(sessionId);
     if (!child?.stdin || child.killed) throw new Error(`Codex session ${sessionId} is not interactive.`);
     child.stdin.write(`${input.content}\n`);
@@ -373,15 +490,41 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     }
   }
 
-  async respondToApproval(): Promise<void> {
-    throw new Error('Codex exec approvals must be configured before the run; interactive app-server approvals are not enabled in this adapter yet.');
+  async respondToApproval(
+    requestIdOrSessionId?: string,
+    decisionOrApprovalId?: ApprovalDecision | string,
+    approvedOverride?: boolean,
+  ): Promise<void> {
+    let sessionId = '';
+    let approvalId = '';
+    let approved = false;
+    if (typeof approvedOverride === 'boolean') {
+      sessionId = String(requestIdOrSessionId || '');
+      approvalId = String(decisionOrApprovalId || '');
+      approved = approvedOverride;
+    } else if (typeof requestIdOrSessionId === 'string' && requestIdOrSessionId.includes(':')) {
+      const colonIdx = requestIdOrSessionId.indexOf(':');
+      sessionId = requestIdOrSessionId.slice(0, colonIdx);
+      approvalId = requestIdOrSessionId.slice(colonIdx + 1);
+      approved = decisionOrApprovalId === 'approved';
+    }
+    const appServer = sessionId ? this.appServerBySession.get(sessionId) : undefined;
+    const pending = appServer && approvalId ? appServer.pendingApprovals.get(approvalId) : undefined;
+    if (!appServer || !pending || appServer.closed || !appServer.child.stdin || appServer.child.stdin.destroyed) {
+      throw new Error('Codex exec approvals must be configured before the run; no pending interactive app-server approval request was found.');
+    }
+    appServer.pendingApprovals.delete(approvalId);
+    this.writeAppServerMessage(appServer, {
+      id: pending.rpcId,
+      result: { decision: approved ? 'accept' : 'decline' },
+    });
   }
 
   async spawnAgent(options: SpawnAgentOptions): Promise<AgentSession> {
     const permissionMode = planningPermissionMode(options);
     const capabilities = await this.probeCapabilities(options.profileId);
     if (!capabilities.structuredEventStreaming) {
-      throw new Error('Installed Codex CLI does not expose `codex exec --json`; update Codex before running a background agent.');
+      throw new Error('Installed Codex CLI does not expose `codex exec --json` or `codex app-server`; update Codex before running a background agent.');
     }
     if (permissionMode !== undefined) {
       await this.assertPlanningPermissionsSupported(permissionMode, options.profileId);
@@ -390,10 +533,285 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     const sessionId = options.sessionId || crypto.randomUUID();
     const cwd = options.worktreePath || options.cwd || process.cwd();
     const model = options.model || '';
+
+    // 1. Reuse an already-live app-server process if providerSessionId matches
+    // before minting a new control-plane session grant.
+    if (options.providerSessionId) {
+      const reusable = this.reusableAppServers.get(options.providerSessionId);
+      if (reusable && !reusable.closed && reusable.child.exitCode === null && !reusable.child.killed && reusable.threadId) {
+        this.reusableAppServers.delete(options.providerSessionId);
+        return await this.reuseAppServerSession(reusable, sessionId, options);
+      }
+    }
+
+    // 2. Try persistent `codex app-server --stdio` JSON-RPC mode first.
+    try {
+      return await this.spawnAppServerAgent(sessionId, options, cwd, model, permissionMode);
+    } catch (appServerError: any) {
+      // Automatic fallback to one-shot `codex exec --json` ONLY when app-server
+      // probe/startup fails before the session/turn has started.
+      if (this.isSessionCancelled(sessionId) || !appServerError?.appServerStartupFailed) {
+        throw appServerError;
+      }
+    }
+
+    // 3. Fallback to one-shot `codex exec --json` with its own fresh control-plane grant.
+    return await this.spawnExecFallbackAgent(sessionId, options, cwd, model);
+  }
+
+  private async reuseAppServerSession(
+    state: AppServerSessionState,
+    sessionId: string,
+    options: SpawnAgentOptions,
+  ): Promise<AgentSession> {
+    const previousSessionId = state.sessionId;
+    if (previousSessionId !== sessionId) {
+      this.appServerBySession.delete(previousSessionId);
+      this.activeProcesses.delete(previousSessionId);
+    }
+    state.sessionId = sessionId;
+    state.missionId = options.missionId;
+    state.taskId = options.taskId;
+    state.preserveProviderSession = Boolean(options.preserveProviderSession);
+    state.finalMessage = undefined;
+
+    const session: AgentSession = {
+      id: sessionId,
+      agentInstanceId: sessionId,
+      runtimeSessionId: state.threadId || options.providerSessionId || '',
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+    };
+    this.activeSessions.set(sessionId, session);
+    this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
+    this.terminalSessions.delete(sessionId);
+    this.finalMessages.delete(sessionId);
+    this.fallbackToolEventSequence.set(sessionId, 0);
+    this.appServerBySession.set(sessionId, state);
+    this.registerProcess(sessionId, state.child);
+
+    this.emitEvent({
+      id: crypto.randomUUID(),
+      type: 'agent_started',
+      missionId: options.missionId,
+      agentInstanceId: sessionId,
+      role: String(options.role || 'builder'),
+      model: options.model || 'Codex default',
+      timestamp: new Date().toISOString(),
+    });
+
+    const turnResult = await this.sendAppServerRpc(state, 'turn/start', {
+      threadId: state.threadId,
+      input: buildCodexTurnInput(options.prompt, options.attachments),
+    });
+    if (turnResult?.turn?.id) state.activeTurnId = String(turnResult.turn.id);
+    return session;
+  }
+
+  private async spawnAppServerAgent(
+    sessionId: string,
+    options: SpawnAgentOptions,
+    cwd: string,
+    model: string,
+    permissionMode: CodexPermissionMode | undefined,
+  ): Promise<AgentSession> {
+    const controlPlane = prepareControlPlaneSession(options, sessionId);
+    const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, cwd);
+    const args = buildCodexAppServerArgs(options, cwd, codexControlPlaneArgs(controlPlane), permissionMode);
+    let child: ChildProcess;
+    try {
+      child = this.spawnProcess('codex', args, {
+        cwd,
+        env: {
+          ...process.env,
+          ...this.env(options.profileId),
+          ...options.env,
+          ...controlPlaneEnv(controlPlane),
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      revokeControlPlaneAgent(sessionId);
+      throw Object.assign(error instanceof Error ? error : new Error(String(error)), { appServerStartupFailed: true });
+    }
+
+    const state: AppServerSessionState = {
+      sessionId,
+      child,
+      missionId: options.missionId,
+      taskId: options.taskId,
+      cwd,
+      profileId: options.profileId,
+      preserveProviderSession: Boolean(options.preserveProviderSession),
+      rpcCounter: 0,
+      closed: false,
+      pendingRpc: new Map(),
+      pendingApprovals: new Map(),
+      cleanupControlPlane: () => revokeControlPlaneAgent(sessionId),
+    };
+
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+    let stdoutBuffer = '';
+    let stderrBuffer = '';
+    let startupCompleted = false;
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBuffer += stdoutDecoder.write(chunk);
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || '';
+      if (stdoutBuffer.length > MAX_STREAM_BUFFER_CHARS) stdoutBuffer = stdoutBuffer.slice(-MAX_STREAM_BUFFER_CHARS);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const message = JSON.parse(line);
+          this.handleAppServerMessage(state, message);
+        } catch {
+          // Ignore non-JSON diagnostic lines.
+        }
+      }
+    });
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrBuffer += stderrDecoder.write(chunk);
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() || '';
+      if (stderrBuffer.length > MAX_STREAM_BUFFER_CHARS) stderrBuffer = stderrBuffer.slice(-MAX_STREAM_BUFFER_CHARS);
+      if (startupCompleted) {
+        for (const line of lines) this.handleDiagnosticLine(state.sessionId, line);
+      }
+    });
+
+    child.on('error', (error) => {
+      this.failPendingAppServerRpcs(state, error);
+      if (startupCompleted) {
+        this.emitFailure(state.sessionId, error.message);
+      }
+    });
+
+    child.on('close', (code, signal) => {
+      const stdoutTail = stdoutDecoder.end();
+      if (stdoutTail) stdoutBuffer += stdoutTail;
+      if (stdoutBuffer.trim()) {
+        try {
+          this.handleAppServerMessage(state, JSON.parse(stdoutBuffer));
+        } catch {
+          // Ignore trailing non-JSON text.
+        }
+      }
+      const stderrTail = stderrDecoder.end();
+      if (stderrTail) stderrBuffer += stderrTail;
+      if (startupCompleted && stderrBuffer.trim()) {
+        this.handleDiagnosticLine(state.sessionId, stderrBuffer);
+      }
+      const exitError = new Error(signal ? `Codex app-server terminated by signal ${signal}` : `Codex app-server exited with code ${code}`);
+      this.failPendingAppServerRpcs(state, exitError);
+      state.closed = true;
+      if (state.threadId && this.reusableAppServers.get(state.threadId) === state) {
+        this.reusableAppServers.delete(state.threadId);
+      }
+      if (startupCompleted) {
+        this.unregisterProcess(state.sessionId);
+        this.appServerBySession.delete(state.sessionId);
+        const activeSession = this.activeSessions.get(state.sessionId);
+        if (activeSession) {
+          activeSession.endedAt = new Date().toISOString();
+          this.activeSessions.delete(state.sessionId);
+        }
+        state.cleanupControlPlane();
+        if (!this.terminalSessions.has(state.sessionId) && !this.isSessionCancelled(state.sessionId)) {
+          this.handleProcessExit(state.sessionId, code, signal);
+        }
+        this.sessionContext.delete(state.sessionId);
+        this.terminalSessions.delete(state.sessionId);
+        this.finalMessages.delete(state.sessionId);
+        this.fallbackToolEventSequence.delete(state.sessionId);
+        this.clearSessionCancellation(state.sessionId);
+      }
+    });
+
+    try {
+      await this.sendAppServerRpc(state, 'initialize', {
+        clientInfo: { name: 'AtrisAgent', version: '0.2.0' },
+        capabilities: { experimentalApi: true },
+      });
+      this.writeAppServerMessage(state, { method: 'initialized', params: {} });
+
+      const sandbox = resolveCodexSandboxMode(options, permissionMode);
+      const approvalPolicy = permissionMode === undefined || permissionMode === 'full-access' ? 'never' : 'on-request';
+      const threadResult = options.providerSessionId
+        ? await this.sendAppServerRpc(state, 'thread/resume', {
+          threadId: options.providerSessionId,
+          cwd,
+          ...(model ? { model } : {}),
+          approvalPolicy,
+          sandbox,
+        })
+        : await this.sendAppServerRpc(state, 'thread/start', {
+          cwd,
+          ...(model ? { model } : {}),
+          approvalPolicy,
+          sandbox,
+        });
+
+      const threadId = String(threadResult?.thread?.id || threadResult?.threadId || '');
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id.');
+      }
+      state.threadId = threadId;
+
+      const session: AgentSession = {
+        id: sessionId,
+        agentInstanceId: sessionId,
+        runtimeSessionId: threadId,
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+      };
+
+      startupCompleted = true;
+      this.activeSessions.set(sessionId, session);
+      this.sessionContext.set(sessionId, { missionId: options.missionId, taskId: options.taskId });
+      this.fallbackToolEventSequence.set(sessionId, 0);
+      this.appServerBySession.set(sessionId, state);
+      this.registerProcess(sessionId, child);
+      this.emitEvent({
+        id: crypto.randomUUID(),
+        type: 'agent_started',
+        missionId: options.missionId,
+        agentInstanceId: sessionId,
+        role: String(options.role || 'builder'),
+        model: model || 'Codex default',
+        timestamp: new Date().toISOString(),
+      });
+
+      const turnResult = await this.sendAppServerRpc(state, 'turn/start', {
+        threadId,
+        input: buildCodexTurnInput(prompt, options.attachments),
+      });
+      if (turnResult?.turn?.id) state.activeTurnId = String(turnResult.turn.id);
+      return session;
+    } catch (error) {
+      await this.closeAppServer(state).catch(() => undefined);
+      this.appServerBySession.delete(sessionId);
+      this.activeSessions.delete(sessionId);
+      this.sessionContext.delete(sessionId);
+      this.unregisterProcess(sessionId);
+      if (!startupCompleted) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { appServerStartupFailed: true });
+      }
+      throw error;
+    }
+  }
+
+  private async spawnExecFallbackAgent(
+    sessionId: string,
+    options: SpawnAgentOptions,
+    cwd: string,
+    model: string,
+  ): Promise<AgentSession> {
     const controlPlane = prepareControlPlaneSession(options, sessionId);
     const prompt = appendControlPlaneInstructions(options.prompt, controlPlane, cwd);
     const args = buildCodexExecArgs(options, prompt, codexControlPlaneArgs(controlPlane));
-
     const session: AgentSession = {
       id: sessionId,
       agentInstanceId: sessionId,
@@ -407,7 +825,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
 
     let child: ChildProcess;
     try {
-      child = spawnHidden('codex', args, {
+      child = this.spawnProcess('codex', args, {
         cwd,
         env: {
           ...process.env,
@@ -579,6 +997,157 @@ export class CodexAdapter extends BaseRuntimeAdapter {
     return `codex:${sessionId}:${item.type}:${event.type}:${sequence}`;
   }
 
+  private writeAppServerMessage(state: AppServerSessionState, message: Record<string, unknown>): void {
+    if (state.closed || !state.child.stdin || state.child.stdin.destroyed) {
+      throw new Error('Codex app-server stdin is closed.');
+    }
+    state.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private sendAppServerRpc(state: AppServerSessionState, method: string, params: Record<string, unknown>): Promise<any> {
+    const id = `atris-rpc-${++state.rpcCounter}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        state.pendingRpc.delete(id);
+        reject(new Error(`Codex app-server RPC '${method}' timed out.`));
+      }, APP_SERVER_RPC_TIMEOUT_MS);
+      state.pendingRpc.set(id, { resolve, reject, timer });
+      try {
+        this.writeAppServerMessage(state, { id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        state.pendingRpc.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  private failPendingAppServerRpcs(state: AppServerSessionState, error: Error): void {
+    for (const pending of state.pendingRpc.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    state.pendingRpc.clear();
+  }
+
+  private async closeAppServer(state: AppServerSessionState): Promise<void> {
+    if (state.closed) return;
+    state.closed = true;
+    this.failPendingAppServerRpcs(state, new Error('Codex app-server closed.'));
+    state.pendingApprovals.clear();
+    if (state.threadId && this.reusableAppServers.get(state.threadId) === state) {
+      this.reusableAppServers.delete(state.threadId);
+    }
+    this.appServerBySession.delete(state.sessionId);
+    this.unregisterProcess(state.sessionId);
+    state.cleanupControlPlane();
+    if (state.child.exitCode === null && !state.child.killed) {
+      await terminateProcessTree(state.child, true).catch(() => undefined);
+    }
+  }
+
+  private handleAppServerMessage(state: AppServerSessionState, message: Record<string, any>): void {
+    if (!message || typeof message !== 'object') return;
+    if (message.id !== undefined && !message.method) {
+      const pending = state.pendingRpc.get(String(message.id));
+      if (pending) {
+        state.pendingRpc.delete(String(message.id));
+        clearTimeout(pending.timer);
+        if (message.error) {
+          pending.reject(new Error(String(message.error.message || `Codex app-server error (${message.error.code ?? 'unknown'})`)));
+        } else {
+          pending.resolve(message.result);
+        }
+      }
+      return;
+    }
+
+    const sessionId = state.sessionId;
+    const context = this.sessionContext.get(sessionId);
+    if (message.id !== undefined && typeof message.method === 'string') {
+      if (message.method.includes('requestApproval') && context && !this.isSessionCancelled(sessionId)) {
+        const approvalId = String(message.id);
+        const params = message.params || {};
+        state.pendingApprovals.set(approvalId, { rpcId: message.id, method: message.method, params });
+        this.emitEvent({
+          id: crypto.randomUUID(),
+          type: 'approval_requested',
+          missionId: context.missionId,
+          taskId: context.taskId,
+          agentInstanceId: sessionId,
+          approvalId: `${sessionId}:${approvalId}`,
+          approvalType: message.method.toLowerCase().includes('file') ? 'file_change' : 'command_execution',
+          toolName: message.method.toLowerCase().includes('file') ? 'file_change' : 'shell',
+          command: typeof params.command === 'string' ? params.command : Array.isArray(params.parsedCmd) ? params.parsedCmd.join(' ') : undefined,
+          path: typeof params.path === 'string' ? params.path : typeof params.filePath === 'string' ? params.filePath : undefined,
+          description: typeof params.reason === 'string' ? params.reason : typeof params.description === 'string' ? params.description : `Codex requested approval (${message.method})`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
+    if (!context || this.isSessionCancelled(sessionId)) return;
+    const method = String(message.method || '');
+    const params = message.params || {};
+    const timestamp = new Date().toISOString();
+
+    if (method === 'turn/started') {
+      state.activeTurnId = identifierValue(params.turn?.id, params.turnId) || state.activeTurnId || 'active';
+      return;
+    }
+    if (method === 'item/agentMessage/delta' || method === 'agent_message_delta') {
+      const delta = typeof params.delta === 'string' ? params.delta : typeof params.text === 'string' ? params.text : '';
+      if (delta) {
+        state.finalMessage = `${state.finalMessage || ''}${delta}`;
+        this.emitEvent({ id: crypto.randomUUID(), type: 'text_delta', missionId: context.missionId, agentInstanceId: sessionId, content: delta, timestamp });
+      }
+      return;
+    }
+    if (method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
+      const thought = typeof params.delta === 'string' ? params.delta : typeof params.text === 'string' ? params.text : '';
+      if (thought) {
+        this.emitEvent({ id: crypto.randomUUID(), type: 'agent_thought', missionId: context.missionId, taskId: context.taskId, agentInstanceId: sessionId, thought, timestamp });
+      }
+      return;
+    }
+    if (method === 'item/started' || method === 'item/completed' || method === 'item.started' || method === 'item.completed') {
+      const normalizedType = method.replace('/', '.');
+      this.handleJsonLine(sessionId, JSON.stringify({ type: normalizedType, ...params, item: normalizeAppServerItem(params.item || params) }));
+      if (normalizedType === 'item.completed' && (params.item?.type === 'agentMessage' || params.item?.type === 'agent_message') && params.item?.text) {
+        state.finalMessage = redactSecrets(String(params.item.text));
+      }
+      return;
+    }
+    if (method === 'turn/completed') {
+      state.activeTurnId = undefined;
+      this.recordProviderUsage(sessionId, params, { accumulate: true });
+      const status = String(params.turn?.status || params.status || '').toLowerCase();
+      if (status === 'failed') {
+        this.emitFailure(sessionId, params.turn?.error?.message || params.error?.message || 'Codex turn failed');
+      } else {
+        this.emitCompleted(sessionId, state.finalMessage || params.turn?.finalMessage || this.finalMessages.get(sessionId) || 'Codex turn completed');
+      }
+      const session = this.activeSessions.get(sessionId);
+      if (session) session.endedAt = timestamp;
+      this.activeSessions.delete(sessionId);
+      this.sessionContext.delete(sessionId);
+      this.terminalSessions.delete(sessionId);
+      this.finalMessages.delete(sessionId);
+      this.fallbackToolEventSequence.delete(sessionId);
+      if (state.preserveProviderSession && state.threadId) {
+        this.reusableAppServers.set(state.threadId, state);
+      } else {
+        void this.closeAppServer(state);
+      }
+      return;
+    }
+    if (method === 'error' && !params.willRetry) {
+      state.activeTurnId = undefined;
+      this.emitFailure(sessionId, params.error?.message || params.message || 'Codex app-server error');
+    }
+  }
+
   private emitCompleted(sessionId: string, result: string): void {
     if (this.isSessionCancelled(sessionId) || this.terminalSessions.has(sessionId)) return;
     const context = this.sessionContext.get(sessionId);
@@ -596,17 +1165,92 @@ export class CodexAdapter extends BaseRuntimeAdapter {
   }
 }
 
-export function buildCodexExecArgs(
+export function resolveCodexSandboxMode(
+  options: Pick<SpawnAgentOptions, 'accessMode' | 'role' | 'planningControls'>,
+  explicitMode?: CodexPermissionMode,
+): 'read-only' | 'workspace-write' | 'danger-full-access' {
+  const mode = explicitMode ?? planningPermissionMode(options);
+  return mode === undefined
+    ? options.accessMode || (isReadOnlyAgentRole(options.role) ? 'read-only' : 'workspace-write')
+    : mode === 'read-only' ? 'read-only' : mode === 'full-access' ? 'danger-full-access' : 'workspace-write';
+}
+
+export function buildCodexAppServerArgs(
   options: Pick<SpawnAgentOptions, 'accessMode' | 'model' | 'reasoningLevel' | 'role' | 'planningControls'>,
+  cwd: string,
+  controlPlaneArgs: string[] = [],
+  explicitMode?: CodexPermissionMode,
+): string[] {
+  const mode = explicitMode ?? planningPermissionMode(options);
+  const sandbox = resolveCodexSandboxMode(options, mode);
+  const approvalPolicy = mode === undefined || mode === 'full-access' ? 'never' : 'on-request';
+  return [
+    'app-server',
+    '--stdio',
+    ...controlPlaneArgs,
+    ...(options.model ? ['-c', `model=${JSON.stringify(options.model)}`] : []),
+    ...(options.reasoningLevel ? ['-c', `model_reasoning_effort=${JSON.stringify(options.reasoningLevel)}`] : []),
+    '-c', `projects.${JSON.stringify(cwd)}.trust_level="trusted"`,
+    '-c', `sandbox_mode=${JSON.stringify(sandbox)}`,
+    '-c', `approval_policy=${JSON.stringify(approvalPolicy)}`,
+    ...(mode === undefined ? [] : ['-c', `approvals_reviewer=${JSON.stringify(mode === 'approve-for-me' ? 'auto_review' : 'user')}`]),
+  ];
+}
+
+export function buildCodexTurnInput(
+  prompt: string,
+  attachments?: ProviderAttachment[],
+): Array<Record<string, unknown>> {
+  const valid = validateLocalAttachments(attachments);
+  const nonImages = valid.filter((att) => !att.mimeType?.toLowerCase().startsWith('image/'));
+  const textWithNonImages = nonImages.length
+    ? `${prompt}\n\n[Attachments]\n${nonImages.map((att) => `- ${att.name} (${att.mimeType || 'application/octet-stream'}): ${att.providerPath}`).join('\n')}`
+    : prompt;
+  const items: Array<Record<string, unknown>> = [{ type: 'text', text: textWithNonImages }];
+  for (const att of valid) {
+    if (att.mimeType?.toLowerCase().startsWith('image/')) {
+      items.push({ type: 'localImage', path: att.providerPath });
+    }
+  }
+  return items;
+}
+
+function normalizeAppServerItem(item: Record<string, any>): Record<string, any> {
+  if (!item || typeof item !== 'object') return {};
+  const typeMap: Record<string, string> = {
+    agentMessage: 'agent_message',
+    commandExecution: 'command_execution',
+    mcpToolCall: 'mcp_tool_call',
+    fileChange: 'file_change',
+  };
+  return {
+    ...item,
+    type: typeMap[item.type] || item.type,
+    aggregated_output: item.aggregated_output ?? item.aggregatedOutput,
+    exit_code: item.exit_code ?? item.exitCode,
+  };
+}
+
+export function buildCodexExecArgs(
+  options: Pick<SpawnAgentOptions, 'accessMode' | 'model' | 'reasoningLevel' | 'role' | 'planningControls' | 'attachments'>,
   prompt: string,
   controlPlaneArgs: string[] = [],
 ): string[] {
   const mode = planningPermissionMode(options);
   // Planning's explicit sandbox preference overrides the role-derived default;
   // the researcher's read-only content instructions remain in the prompt.
-  const accessMode = mode === undefined
-    ? options.accessMode || (isReadOnlyAgentRole(options.role) ? 'read-only' : 'workspace-write')
-    : mode === 'read-only' ? 'read-only' : mode === 'full-access' ? 'danger-full-access' : 'workspace-write';
+  const accessMode = resolveCodexSandboxMode(options, mode);
+  const validAttachments = validateLocalAttachments(options.attachments);
+  const imageArgs: string[] = [];
+  const nonImageLines: string[] = [];
+  for (const att of validAttachments) {
+    if (att.mimeType?.toLowerCase().startsWith('image/')) {
+      imageArgs.push('--image', att.providerPath);
+    } else {
+      nonImageLines.push(`- ${att.name} (${att.mimeType || 'application/octet-stream'}): ${att.providerPath}`);
+    }
+  }
+  const finalPrompt = nonImageLines.length ? `${prompt}\n\n[Attachments]\n${nonImageLines.join('\n')}` : prompt;
   const args = [
     'exec',
     '--json',
@@ -622,7 +1266,8 @@ export function buildCodexExecArgs(
   ];
   if (options.model) args.push('--model', options.model);
   if (options.reasoningLevel) args.push('-c', `model_reasoning_effort="${options.reasoningLevel}"`);
-  args.push(prompt);
+  args.push(...imageArgs);
+  args.push(finalPrompt);
   return args;
 }
 

@@ -10,6 +10,22 @@ import type { RuntimeType } from './account-profile';
 export const AGENT_ROLES = ['orchestrator', 'builder', 'reviewer', 'researcher', 'qa'] as const;
 export type AgentRole = typeof AGENT_ROLES[number];
 
+export type SandboxTier = 'inspect' | 'implement' | 'verify';
+
+export function roleToSandboxTier(role: AgentRole): SandboxTier {
+  switch (role) {
+    case 'builder':
+      return 'implement';
+    case 'reviewer':
+    case 'qa':
+      return 'verify';
+    case 'researcher':
+    case 'orchestrator':
+    default:
+      return 'inspect';
+  }
+}
+
 export function isAgentRole(value: unknown): value is AgentRole {
   return typeof value === 'string' && (AGENT_ROLES as readonly string[]).includes(value.toLowerCase() as AgentRole);
 }

@@ -160,7 +160,7 @@ export function codexControlPlaneArgs(session?: PreparedControlPlaneSession): st
     // Codex filters the MCP child's environment independently of its own.
     // Forward names only: bearer tokens must never appear in argv/config.
     '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.env_vars=${JSON.stringify(Object.keys(controlPlaneEnv(session)))}`,
-    '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.startup_timeout_sec=10`,
+    '-c', `mcp_servers.${ATRIS_MCP_SERVER_NAME}.startup_timeout_sec=30`,
   ];
 }
 

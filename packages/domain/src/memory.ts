@@ -176,6 +176,8 @@ export interface OrchestratorDelegation {
   targetDescriptor?: import('./task').BuilderTargetDescriptor;
   agentProfileId?: string;
   specialty?: string;
+  displayName?: string;
+  sandboxTier?: import('./agent').SandboxTier;
   routePreference?: TaskRoutePreference;
 }
 

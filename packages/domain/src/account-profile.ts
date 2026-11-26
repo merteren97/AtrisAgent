@@ -46,6 +46,14 @@ export interface AccountProfile {
   profileMode?: RuntimeProfileMode;
 }
 
+export interface RuntimeAdapterCapabilities {
+  liveSteer: boolean;
+  interactiveApproval: boolean;
+  sessionResume: boolean;
+  reuseWhileAlive: boolean;
+  nativeAttachments: boolean;
+}
+
 export interface RuntimeStatus {
   runtimeType: RuntimeType;
   name: string;
@@ -56,10 +64,24 @@ export interface RuntimeStatus {
     error?: string;
   };
   capabilities: Record<string, boolean>;
+  adapterCapabilities?: RuntimeAdapterCapabilities;
   authMethods: Array<{
     id: string;
     name: string;
     type: string;
     description?: string;
   }>;
+}
+
+/**
+ * Zero-config local CLI readiness: profiles with empty or omitted allowedRoles
+ * are permitted across all security roles without manual role checkboxes.
+ */
+export function isRoleAllowedByProfile(
+  profile: Pick<AccountProfile, 'allowedRoles'>,
+  role: string,
+): boolean {
+  if (!profile.allowedRoles || profile.allowedRoles.length === 0) return true;
+  const target = role.trim().toLowerCase();
+  return profile.allowedRoles.some((allowed) => allowed.trim().toLowerCase() === target);
 }

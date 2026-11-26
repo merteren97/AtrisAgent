@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import {
   conversationTurns,
   artifacts,
@@ -6,6 +6,7 @@ import {
   missionEvents,
   missionRuns,
   taskAttempts,
+  turnDirectives,
   type AtrisDatabase,
   type MissionSelect,
   type TaskSelect,
@@ -27,8 +28,10 @@ import type {
   WorkMode,
   TeamLaunch,
   ProviderAttachment,
+  OrchestratorRoutingDefaults,
 } from '@atris-agent-code/domain';
-import { normalizeOrchestratorRequestOptions, parseQualityResultEnvelope } from '@atris-agent-code/domain';
+import { normalizeOrchestratorRequestOptions } from '@atris-agent-code/domain';
+import { inferQualityVerdict, MAX_QUALITY_SUMMARY_CHARS, type QualityVerdict } from './quality-gate';
 import { PolicyEngine, resolveAutomationAction, trustProfileForExecutionMode } from '@atris-agent-code/policy-engine';
 import { WorkspaceManager } from '@atris-agent-code/workspace-manager';
 import { Orchestrator as LegacyOrchestrator } from './orchestrator';
@@ -60,18 +63,10 @@ const SCHEDULABLE_MISSION_STATUSES = new Set(['ready', 'running', 'revising', 'r
 const RECONCILABLE_MISSION_STATUSES = new Set([...SCHEDULABLE_MISSION_STATUSES, 'reviewing', 'verifying']);
 const MAX_CONTEXT_EVENTS = 24;
 const MAX_CONTEXT_CHARS = 18_000;
-const MAX_QUALITY_SUMMARY_CHARS = 4_000;
 const MAX_RESEARCH_SOURCE_CHARS = 6_000;
 const MAX_RESEARCH_BUNDLE_CHARS = 16_000;
 const RESEARCH_CONTEXT_START = '[ATRIS_RESEARCH_CONTEXT_START]';
 const RESEARCH_CONTEXT_END = '[ATRIS_RESEARCH_CONTEXT_END]';
-
-interface QualityVerdict {
-  passed: boolean;
-  summary: string;
-  findingCount: number;
-  reason: 'approved' | 'failed' | 'ambiguous';
-}
 
 interface QualityEmissionResult {
   verdict: QualityVerdict;
@@ -98,111 +93,6 @@ function isSchedulableWorkerRole(role: TaskSelect['assignedRole']): role is Sche
   return role === 'researcher' || role === 'builder' || role === 'reviewer' || role === 'qa';
 }
 
-function clearNegatedQualitySignals(text: string): string {
-  return text
-    // Remove ordinary negated failure lists before scanning individual words;
-    // e.g. "no test failures or errors" is a passing report, not a failure.
-    .replace(/\b(?:no|without|zero|none)\s+(?:(?:any|all|the|test|tests|check|checks|build|builds|lint|validation|validations|blocking|major|critical)\s+)*(?:failures?|errors?|issues?|defects?|problems?|concerns?|blockers?)(?:\s+(?:and|or)\s+(?:failures?|errors?|issues?|defects?|problems?|concerns?|blockers?))*/gi, ' ')
-    .replace(/\b(?:no|without|zero)\s+(?:any\s+)?(?:blocking|major|critical)(?:\s*(?:[,/]\s*(?:and|or)?\s*|\b(?:and|or)\b\s*)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
-    .replace(/\b(?:0|no|without|zero)\s+(?:failed|failing)\s+(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\b/gi, ' ')
-    .replace(/\b(?:0|no|without|zero)\s+(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\s+(?:failed|failing)\b/gi, ' ')
-    .replace(/\b(?:no|without|zero)\s+(?:revision|revisions|change|changes)\s+(?:is\s+|are\s+|was\s+|were\s+)?(?:requested|required|needed)\b/gi, ' ')
-    .replace(/\b(?:no|without|zero)\s+(?:(?:test|tests|check|checks|build|builds|command|commands|lint|validation|validations)\s+)?(?:failures?|errors?)(?:\s+(?:or|and|[/,])\s+(?:failures?|errors?))?\b/gi, ' ')
-    .replace(/\b(?:no|without|zero)\s+(?:blocking|blocked|blockers?|major|critical|failure|failures|error|errors|pending)\b/gi, ' ')
-    .replace(/\b(?:0|none)\s+(?:blocking|major|critical)(?:\s*(?:[,/]\s*(?:and|or)?\s*|\b(?:and|or)\b\s*)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
-    .replace(/\b(?:blocking|major|critical)\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\s*(?:[:=(]\s*)?(?:0|none)\b/gi, ' ')
-    .replace(/\b(?:0|none)\s+(?:failed|failing|failure|failures|error|errors|pending)\b/gi, ' ')
-    .replace(/\b(?:blocking|major|critical)\s*[:=-]\s*(?:none|no)\b/gi, ' ');
-}
-
-function hasQualityFailureSignal(text: string, allowResolvedFindings = false): boolean {
-  const evaluableText = clearNegatedQualitySignals(text)
-    // Only explicit structured verdicts may describe completed repairs. Preserve
-    // the rest of each sentence so a later failed check still rejects the pass.
-    .replace(/[^.!?\n]+/g, sentence => {
-      if (!allowResolvedFindings || !/^\s*(?:fixed|resolved|corrected|eliminated|sanitized)\b/i.test(sentence)
-        || /\b(?:not|never|unable|cannot|can't|pending|unresolved|still|should|must|needs?|required)\b/i.test(sentence)) return sentence;
-      return sentence
-        .replace(/\b(?:fixed|resolved|corrected|eliminated)\s+(?:(?:the|a|an|reported|previous|existing|seed|script|syntax|type|runtime|foreign|key|test|build|lint)\s+)*(?:errors?|failures?|defects?|issues?|bugs?)\b/gi, 'resolved finding')
-        .replace(/\bto prevent\s+(?:(?:the|a|an|foreign|key|runtime|syntax|type|validation|InvalidDate|NaN|and)\s+)*(?:errors?|failures?)\b/gi, 'preventive fix');
-    });
-  return [
-    /\b(?:revision|revisions|change|changes)\s+(?:is\s+|are\s+)?(?:requested|required|needed)\b/i,
-    /\brequest(?:ed)?\s+(?:a\s+)?(?:revision|revisions|change|changes)\b/i,
-    /\b(?:cannot|can't|can not|unable to|not enough evidence to|not able to)\s+(?:recommend\s+)?(?:approve|approval|pass|passing)\b/i,
-    /\b(?:not|never)\s+(?:approve|approved|approval|pass|passed|passing)\b/i,
-    /\b(?:approval|verdict|recommendation)\s*[:=-]?\s*(?:pending|unclear|unknown|none|not available)\b/i,
-    /\b(?:no|without|zero)\s+pass(?:ed|es|ing)?\s+(?:was\s+)?(?:reported|provided|given|verdict|result|recommendation)\b/i,
-    /\b(?:pass|approval|verdict)\s*[:=-]\s*(?:no|false|fail(?:ed)?|rejected|blocked|pending)\b/i,
-    /\b(?:reject(?:ed|s|ion)?|denied|declined|unapproved)\b/i,
-    /\b(?:fail(?:ed|s|ure|ures|ing)?)\b/i,
-    /\berrors?\b/i,
-    /\b(?:did not|didn't|does not|doesn't|not)\s+pass(?:ed|es|ing)?\b/i,
-    /\b(?:no|none of the|zero)\s+(?:(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\s+)?pass(?:ed|es|ing)?\b/i,
-    /\b(?:blocked|blocking|blockers?)\b/i,
-    /\b(?:major|critical)\s+(?:finding|findings|issue|issues|defect|defects|problem|problems|concern|concerns|severity)\b/i,
-    /\b(?:finding|findings|issue|issues|defect|defects|problem|problems|concern|concerns)\s+(?:with\s+)?(?:major|critical)\b/i,
-    /\bseverity\s*[:=-]?\s*(?:major|critical)\b/i,
-    /\b(?:unclear|ambiguous|unknown|indeterminate|inconclusive|pending)\b/i,
-    /\b(?:insufficient|not enough)\s+(?:evidence|information)\b/i,
-    /\b(?:pass|passed|approve|approved)\s*[?/]\b/i,
-    /\bpass\s*(?:\/|or)\s*fail\b/i,
-  ].some((pattern) => pattern.test(evaluableText));
-}
-
-function inferQualityVerdict(
-  role: TaskSelect['assignedRole'],
-  rawResult: unknown,
-): QualityVerdict | null {
-  if (role !== 'reviewer' && role !== 'qa') return null;
-
-  const envelope = parseQualityResultEnvelope(rawResult);
-  if (envelope === 'invalid' || (envelope && envelope.role !== role)) {
-    return { passed: false, summary: 'Invalid or mismatched structured quality result.', findingCount: 1, reason: 'ambiguous' };
-  }
-  if (envelope) {
-    const detail = [envelope.summary, ...(envelope.findings || []), ...(envelope.evidence || [])].join('\n');
-    // Evidence is supporting material and commonly contains path names such
-    // as `error-boundary.tsx` or raw command output. Only the summary/findings
-    // express the quality judgment; scanning evidence creates false failures
-    // for an otherwise explicit structured pass.
-    const judgment = [envelope.summary, ...(envelope.findings || [])].join('\n');
-    const contradictory = envelope.verdict === 'pass' && hasQualityFailureSignal(judgment, true);
-    const passed = envelope.verdict === 'pass' && !contradictory;
-    const failureDetails = [envelope.summary, ...(envelope.findings || [])].filter(text => hasQualityFailureSignal(text, true));
-    const resultSummary = contradictory
-      ? `Quality approval was not accepted: the agent reported pass but also reported a failed check or unresolved issue. ${failureDetails.join('\n')}\nResolve the reported issue and rerun the quality gate before applying changes.\n\n${detail}`
-      : detail;
-    return {
-      passed,
-      summary: String(redactSensitiveValue(resultSummary)).slice(0, MAX_QUALITY_SUMMARY_CHARS),
-      findingCount: passed ? 0 : Math.max(1, envelope.findings?.length || 0),
-      reason: passed ? 'approved' : contradictory ? 'ambiguous' : 'failed',
-    };
-  }
-
-  const rawText = typeof rawResult === 'string' ? rawResult.trim() : '';
-  const safeResult = rawText ? String(redactSensitiveValue(rawText)).slice(0, MAX_QUALITY_SUMMARY_CHARS) : '';
-  const hasFailure = hasQualityFailureSignal(rawText);
-  const hasNegatedExplicitPass = /\b(?:no|without|zero)\s+explicit\s+(?:approve|approval|pass|verdict)\b/i.test(rawText);
-  const hasExplicitPass = !hasNegatedExplicitPass && (
-    /\b(?:approve|approved|approves|pass|passed|passes|passing)\b/i.test(rawText)
-    || /\bapproval\s*(?:status\s*)?[:=-]\s*(?:yes|true|granted|approved)\b/i.test(rawText)
-  );
-  const passed = !hasFailure && hasExplicitPass;
-  const reason: QualityVerdict['reason'] = passed ? 'approved' : hasFailure ? 'failed' : 'ambiguous';
-  const summary = `[legacy_compatibility_fallback] ${safeResult || (role === 'reviewer'
-    ? 'No explicit review approval or revision verdict was reported.'
-    : 'No explicit QA pass or failure verdict was reported.')}`.slice(0, MAX_QUALITY_SUMMARY_CHARS);
-
-  return {
-    passed,
-    summary,
-    findingCount: passed || !rawText ? 0 : 1,
-    reason,
-  };
-}
-
 interface StartMissionOptionsV2 {
   attachmentIds?: string[];
   attachments?: ProviderAttachment[];
@@ -210,6 +100,7 @@ interface StartMissionOptionsV2 {
   teamLaunch?: TeamLaunch;
   modelCatalogId?: string;
   reasoningLevel?: string;
+  routingDefaults?: OrchestratorRoutingDefaults;
   targetRole?: string;
   command?: string;
   /** Trusted, pre-validated named profile selection keyed by fixed role. */
@@ -238,9 +129,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
    private readonly v2EventBus?: LocalEventBus;
    private readonly v2Db?: AtrisDatabase;
    private readonly v2WorkspacePath: string;
-   private readonly v2ApplyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
-   private readonly v2PostApplyVerification?: OrchestratorConfig['postApplyVerification'];
-   private readonly v2ExecuteApplyVerificationOperation?: OrchestratorConfig['executeApplyVerificationOperation'];
+  private readonly v2ApplyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
+  private readonly v2PostApplyVerification?: OrchestratorConfig['postApplyVerification'];
+  private readonly v2ExecuteApplyVerificationOperation?: OrchestratorConfig['executeApplyVerificationOperation'];
+  private readonly v2GetRoutingDefaults?: OrchestratorConfig['getRoutingDefaults'];
   private readonly missionQueues = new Map<string, Promise<void>>();
   private readonly planActions = new Map<string, OrchestratorTurnAction>();
   private readonly planRequestOptions = new Map<string, StartMissionOptionsV2>();
@@ -255,6 +147,9 @@ export class OrchestratorV2 extends LegacyOrchestrator {
   private readonly missionPlanIds = new Map<string, Set<string>>();
   private readonly missionTurnIds = new Map<string, Set<string>>();
   private readonly missionRunIds = new Map<string, Set<string>>();
+  private maintenanceTimer?: ReturnType<typeof setInterval>;
+  private maintenanceRunning = false;
+  private readonly maintenanceIntervalMs = 15_000;
 
   constructor(
     config: OrchestratorConfig,
@@ -269,6 +164,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     this.v2ApplyTaskChanges = config.applyTaskChanges;
     this.v2PostApplyVerification = config.postApplyVerification;
     this.v2ExecuteApplyVerificationOperation = config.executeApplyVerificationOperation;
+    this.v2GetRoutingDefaults = config.getRoutingDefaults;
     this.v2WorkspaceManager = workspaceManager
       ?? config.workspaceManager
       ?? (this.v2Db ? new WorkspaceManager(this.v2Db, this.v2EventBus) : undefined);
@@ -357,6 +253,14 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         if (!isPlanOnly || this.planRequestOptions.size > 64) {
           this.planRequestOptions.delete(planId);
         }
+        if (!isPlanOnly || this.planAttachments.size > 64) {
+          this.planAttachments.delete(planId);
+        }
+        for (const [taskId, persona] of this.taskPersonas.entries()) {
+          if (persona.planId === planId && (!isPlanOnly || this.taskPersonas.size > 256)) {
+            this.taskPersonas.delete(taskId);
+          }
+        }
       }
       this.missionPlanIds.delete(missionId);
     }
@@ -365,14 +269,81 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     this.missionTurnIds.delete(missionId);
     this.missionRunIds.delete(missionId);
     this.lifecycleByMission.delete(missionId);
+    if (this.lifecycleByMission.size === 0) this.stopMaintenanceTimer();
     this.deferredCompletions.delete(missionId);
     this.deferredCompletionMissions.delete(missionId);
+  }
+
+  private setMissionLifecycle(missionId: string, lifecycle: { turnId?: string; runId?: string }): void {
+    this.lifecycleByMission.set(missionId, lifecycle);
+    this.ensureMaintenanceTimer();
+  }
+
+  private ensureMaintenanceTimer(): void {
+    if (this.maintenanceTimer || this.lifecycleByMission.size === 0) return;
+    this.maintenanceTimer = setInterval(() => {
+      void this.runMaintenanceTick();
+    }, this.maintenanceIntervalMs);
+    this.maintenanceTimer.unref?.();
+  }
+
+  private stopMaintenanceTimer(): void {
+    if (!this.maintenanceTimer) return;
+    clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = undefined;
+  }
+
+  public dispose(): void {
+    this.stopMaintenanceTimer();
+  }
+
+  private async runMaintenanceTick(): Promise<void> {
+    if (this.maintenanceRunning || this.lifecycleByMission.size === 0) return;
+    this.maintenanceRunning = true;
+    try {
+      const now = new Date().toISOString();
+      const activeRunIds = [...this.lifecycleByMission.values()]
+        .map((item) => item.runId)
+        .filter((runId): runId is string => Boolean(runId));
+      if (this.v2Db && activeRunIds.length > 0) {
+        await this.v2Db.update(missionRuns)
+          .set({ heartbeatAt: now })
+          .where(and(
+            inArray(missionRuns.id, activeRunIds),
+            inArray(missionRuns.status, ['starting', 'running']),
+          ));
+      }
+      for (const missionId of [...this.lifecycleByMission.keys()]) {
+        await this.recoverExpiredTaskAttempts(missionId).catch((error) => {
+          this.trace('maintenance-expired-attempt-recovery-failed', {
+            missionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    } finally {
+      this.maintenanceRunning = false;
+    }
   }
 
   override emitEvent(event: AgentEvent): void {
     if (event.type === 'plan_generated') {
       const requestOptions = this.planRequestOptions.get(event.planId);
       if (requestOptions) Object.assign(event, { requestOptions });
+    }
+    if (event.type === 'task_created') {
+      const persona = this.taskPersonas.get(event.taskId);
+      const planId = persona?.planId;
+      const attachments = planId ? (this.planRequestOptions.get(planId)?.attachments ?? this.planAttachments.get(planId)) : undefined;
+      if (attachments?.length && !(event as { attachments?: ProviderAttachment[] }).attachments) {
+        Object.assign(event, { attachments });
+      }
+      if (persona?.displayName && !event.displayName) {
+        Object.assign(event, { displayName: persona.displayName });
+      }
+      if (persona?.sandboxTier && !(event as { sandboxTier?: unknown }).sandboxTier) {
+        Object.assign(event, { sandboxTier: persona.sandboxTier });
+      }
     }
     if (event.type === 'review_completed' && this.suppressedLegacyReviewEvents.has(event.missionId)) {
       this.trace('legacy-review-event-suppressed', {
@@ -573,7 +544,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     const ready = selected.filter((task) => ((task.dependsOn as string[]) || []).every((id) =>
       planTasks.some((dependency) => dependency.id === id && ['done', 'superseded'].includes(dependency.status))));
     if (!ready.length) throw new Error('Retry tasks have unresolved dependencies.');
-    this.lifecycleByMission.set(missionId, { runId: context.runId, turnId: context.turnId });
+    this.setMissionLifecycle(missionId, { runId: context.runId, turnId: context.turnId });
     const resumable = new Set(ids);
     // A rejected Reviewer cancels its downstream QA. Restore only validation
     // descendants; never restart completed Builders or unrelated cancelled work.
@@ -817,7 +788,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
           continue;
         }
         if (completion.runId || completion.turnId) {
-          this.lifecycleByMission.set(completion.missionId, {
+          this.setMissionLifecycle(completion.missionId, {
             runId: completion.runId || undefined,
             turnId: completion.turnId || undefined,
           });
@@ -827,7 +798,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
             eq(missionRuns.planId, completion.planId),
           ));
           const run = runs[0];
-          if (run) this.lifecycleByMission.set(completion.missionId, { runId: run.id, turnId: run.turnId || undefined });
+          if (run) this.setMissionLifecycle(completion.missionId, { runId: run.id, turnId: run.turnId || undefined });
         }
         const summary = completion.summary || await this.synthesizePlanResult(completion.missionId, completion.planId);
         if (!completion.summary) await this.v2Db.update(missionCompletions).set({ status: 'event_pending', summary })
@@ -883,7 +854,13 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     });
   }
 
-  async steerActiveTurn(params: { missionId: string; targetTurnId: string; content: string }): Promise<{ boundary: 'future_tasks' | 'synthesis' }> {
+  async steerActiveTurn(params: {
+    missionId: string;
+    targetTurnId: string;
+    content: string;
+    attachmentIds?: string[];
+    directiveId?: string;
+  }): Promise<{ boundary: 'future_tasks' | 'synthesis'; directiveId: string }> {
     return this.enqueueMission(params.missionId, async () => {
       const lifecycle = this.lifecycleByMission.get(params.missionId);
       if (!lifecycle?.turnId || lifecycle.turnId !== params.targetTurnId) throw new Error('The active turn changed before steering could be applied.');
@@ -891,16 +868,64 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       if (!manager) throw new Error('Durable orchestration is unavailable.');
       const mission = await manager.getMission(params.missionId);
       if (!mission || TERMINAL_MISSION_STATUSES.has(String(mission.status))) throw new Error('The active turn has already finished.');
+      const directiveId = params.directiveId || crypto.randomUUID();
+      const now = new Date().toISOString();
       const tasks = (await manager.listTasks(params.missionId)).filter((task) => task.planId === mission.planId);
       const future = tasks.filter((task) => task.status === 'planned' || task.status === 'ready');
       for (const task of future) {
         await manager.updateTask(task.id, { description: `${task.description}\n\nOrchestrator steering for the next safe boundary:\n${params.content}` });
       }
+      if (this.v2Db) {
+        await this.v2Db.insert(turnDirectives).values({
+          id: directiveId,
+          missionId: params.missionId,
+          turnId: params.targetTurnId,
+          targetAgentId: null,
+          delivery: 'steer',
+          content: params.content,
+          attachmentIdsJson: JSON.stringify(params.attachmentIds ?? []),
+          status: future.length > 0 ? 'applied' : 'pending',
+          createdAt: now,
+          appliedAt: future.length > 0 ? now : null,
+        }).onConflictDoNothing();
+        if (future.length > 0 && params.directiveId) {
+          await this.v2Db.update(turnDirectives)
+            .set({ status: 'applied', appliedAt: now })
+            .where(and(eq(turnDirectives.id, directiveId), eq(turnDirectives.status, 'pending')));
+        }
+      }
       const pending = this.pendingSteers.get(params.missionId) || [];
       pending.push(params.content);
       this.pendingSteers.set(params.missionId, pending);
-      return { boundary: future.length > 0 ? 'future_tasks' : 'synthesis' };
+      return { boundary: future.length > 0 ? 'future_tasks' : 'synthesis', directiveId };
     });
+  }
+
+  private async consumePendingDirectives(missionId: string): Promise<string[]> {
+    const inMemory = this.pendingSteers.get(missionId) || [];
+    this.pendingSteers.delete(missionId);
+    if (!this.v2Db) return inMemory;
+    const rows = await this.v2Db.select().from(turnDirectives)
+      .where(and(
+        eq(turnDirectives.missionId, missionId),
+        eq(turnDirectives.status, 'pending'),
+        isNull(turnDirectives.targetAgentId),
+      ));
+    if (rows.length > 0) {
+      const now = new Date().toISOString();
+      await this.v2Db.update(turnDirectives)
+        .set({ status: 'applied', appliedAt: now })
+        .where(inArray(turnDirectives.id, rows.map((row) => row.id)));
+    }
+    const merged = [...inMemory];
+    const seen = new Set(inMemory);
+    for (const row of rows) {
+      if (!seen.has(row.content)) {
+        seen.add(row.content);
+        merged.push(row.content);
+      }
+    }
+    return merged;
   }
 
   private async loadConversationContext(missionId: string): Promise<{
@@ -1033,6 +1058,17 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       });
       planningResources = { models: [], specialists: [] };
     }
+    let routingDefaults = options?.routingDefaults;
+    if (!routingDefaults && this.v2GetRoutingDefaults) {
+      try {
+        routingDefaults = await this.v2GetRoutingDefaults();
+      } catch (error) {
+        this.trace('routing-defaults-unavailable', {
+          missionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     const context: SupervisorTurnContext = {
       turnId,
       userMessage: request,
@@ -1041,6 +1077,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       explicitCommand: options?.command,
       explicitTargetRole: options?.targetRole,
       planningResources,
+      routingDefaults,
       workMode: options?.workMode,
       teamLaunch: options?.teamLaunch,
       attachments: options?.attachments,
@@ -1156,9 +1193,14 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     const planId = crypto.randomUUID();
     this.planRequestOptions.set(planId, params.options || {});
+    if (params.options?.attachments?.length) {
+      this.planAttachments.set(planId, params.options.attachments);
+    }
     this.trackMissionPlan(params.missionId, planId);
+    const routingDefaults = params.options?.routingDefaults
+      ?? (this.v2GetRoutingDefaults ? await Promise.resolve(this.v2GetRoutingDefaults()).catch(() => undefined) : undefined);
     const fileContext = attachmentContext(params.options?.attachments);
-    const taskSpecs = decisionToTaskPlan(params.decision).map((task) => ({ ...task,
+    const taskSpecs = decisionToTaskPlan(params.decision, { routingDefaults }).map((task) => ({ ...task,
       description: [task.description, fileContext].filter(Boolean).join('\n\n'),
     }));
     const structuredPlan: StructuredPlan = {
@@ -1189,6 +1231,11 @@ export class OrchestratorV2 extends LegacyOrchestrator {
         : agentProfileIds[spec.role];
       const id = crypto.randomUUID();
       idsByIndex.set(index, id);
+      this.taskPersonas.set(id, {
+        displayName: spec.displayName,
+        sandboxTier: spec.sandboxTier,
+        planId,
+      });
       const dependencies = (spec.dependsOnIndices || [])
         .map((dependencyIndex) => idsByIndex.get(dependencyIndex))
         .filter((dependencyId): dependencyId is string => Boolean(dependencyId));
@@ -1320,7 +1367,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
     // Validate a supplied run before replacing the mission's current
     // correlation. A stale request must not make later events inherit its IDs.
     await this.ensureRunIsCurrent(missionId, options?.runId);
-    this.lifecycleByMission.set(missionId, { turnId, runId: options?.runId });
+    this.setMissionLifecycle(missionId, { turnId, runId: options?.runId });
     await this.ensureTurnUserMessage(missionId, turnId, request, initialPlanId);
     if (initialPlanId && options.workMode !== 'plan' && options.workMode !== 'research'
       && SCHEDULABLE_MISSION_STATUSES.has(String(initialMission.status))) {
@@ -1406,7 +1453,10 @@ export class OrchestratorV2 extends LegacyOrchestrator {
 
     let taskPlan: StructuredTaskPlan[];
     try {
-      taskPlan = decisionToTaskPlan(decision).map((task) => ({ ...task,
+      taskPlan = decisionToTaskPlan(decision, {
+        routingDefaults: turnContext.routingDefaults,
+        planningResources: turnContext.planningResources,
+      }).map((task) => ({ ...task,
         description: [task.description, attachmentContext(options?.attachments),
           options?.workMode === 'research' ? 'This turn is research-only. Do not write files, install packages, execute mutating commands, or implement changes. Return findings and wait for a new user turn.' : '',
         ].filter(Boolean).join('\n\n'),
@@ -1670,8 +1720,7 @@ export class OrchestratorV2 extends LegacyOrchestrator {
       `Completed ${planTasks.length} delegated task${planTasks.length === 1 ? '' : 's'}.`,
       currentResult?.trim(),
     ].filter(Boolean).join('\n\n');
-    const steering = this.pendingSteers.get(missionId) || [];
-    this.pendingSteers.delete(missionId);
+    const steering = await this.consumePendingDirectives(missionId);
     const bundle = await this.getResearchBundle(missionId, planId);
     const activeTurnId = this.lifecycleByMission.get(missionId)?.turnId;
     const activeTurn = this.v2Db && activeTurnId

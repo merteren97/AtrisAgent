@@ -16,6 +16,9 @@ import type {
   ApplyVerificationOperationResult,
   BuilderTargetDescriptor,
   TaskRoutePreference,
+  ProviderAttachment,
+  SandboxTier,
+  OrchestratorRoutingDefaults,
 } from '@atris-agent-code/domain';
 import { parseBuilderTargetDescriptor } from '@atris-agent-code/domain';
 import { PolicyEngine, resolveAutomationAction } from '@atris-agent-code/policy-engine';
@@ -33,6 +36,7 @@ export interface OrchestratorConfig {
   applyTaskChanges?: (taskId: string, operation?: ApplyTaskChangesContext) => Promise<{ success: boolean; output?: string; filesChanged?: number; checkpointId?: string }>;
   postApplyVerification?: (context: PostApplyVerificationContext) => Promise<PostApplyVerificationResult>;
   executeApplyVerificationOperation?: (context: PostApplyVerificationContext) => Promise<ApplyVerificationOperationResult>;
+  getRoutingDefaults?: () => OrchestratorRoutingDefaults | Promise<OrchestratorRoutingDefaults>;
 }
 
 export interface StructuredTaskPlan {
@@ -46,6 +50,8 @@ export interface StructuredTaskPlan {
   targetDescriptor?: BuilderTargetDescriptor;
   agentProfileId?: string;
   specialty?: string;
+  displayName?: string;
+  sandboxTier?: SandboxTier;
   routePreference?: TaskRoutePreference;
 }
 
@@ -334,6 +340,8 @@ export class Orchestrator {
   private reconciledRejectedTaskFailures = new Set<string>();
   private unsubscribeEvents?: Unsubscribe;
   private applyTaskChanges?: OrchestratorConfig['applyTaskChanges'];
+  protected readonly planAttachments = new Map<string, ProviderAttachment[]>();
+  protected readonly taskPersonas = new Map<string, { displayName?: string; sandboxTier?: SandboxTier; planId?: string }>();
 
   /** Seed retry state recovered from durable task-attempt history. */
   protected seedTaskRetryCount(taskId: string, retryCount: number): void {
@@ -434,6 +442,9 @@ export class Orchestrator {
     agentInstanceId?: string;
     agentProfileId?: string | null;
     specialty?: string | null;
+    displayName?: string | null;
+    sandboxTier?: SandboxTier | null;
+    attachments?: ProviderAttachment[];
     routePreference?: TaskRoutePreference | null;
     targetDescriptor?: BuilderTargetDescriptor;
   }): void {
@@ -448,10 +459,13 @@ export class Orchestrator {
       agentInstanceId: params.agentInstanceId,
       agentProfileId: params.agentProfileId || undefined,
       specialty: params.specialty || undefined,
+      ...(params.displayName ? { displayName: params.displayName } : {}),
+      ...(params.sandboxTier ? { sandboxTier: params.sandboxTier } : {}),
+      ...(params.attachments?.length ? { attachments: params.attachments } : {}),
       routePreference: params.routePreference || undefined,
       targetDescriptor: params.targetDescriptor,
       timestamp: new Date().toISOString(),
-    });
+    } as AgentEvent);
   }
 
   emitTaskAssigned(params: {
@@ -811,6 +825,7 @@ export class Orchestrator {
       workMode?: import('@atris-agent-code/domain').WorkMode;
       teamLaunch?: import('@atris-agent-code/domain').TeamLaunch;
       previewOnly?: boolean;
+      attachments?: ProviderAttachment[];
     }
   ): Promise<{
     missionId: string;
@@ -922,6 +937,9 @@ export class Orchestrator {
       : options?.rawModelPlanOutput;
     const structuredPlan = this.generateStructuredPlan(request, directivePlan);
     const planId = structuredPlan.planId;
+    if (options?.attachments?.length) {
+      this.planAttachments.set(planId, options.attachments);
+    }
 
     if (this.workspaceManager) {
       await this.workspaceManager.updateMission(missionId, { planId });
@@ -982,6 +1000,13 @@ export class Orchestrator {
 
       for (let j = 0; j < tasksToCreateCount; j++) {
         const taskId = taskIdsForIndex[j];
+        if (taskSpec.displayName || taskSpec.sandboxTier) {
+          this.taskPersonas.set(taskId, {
+            displayName: taskSpec.displayName,
+            sandboxTier: taskSpec.sandboxTier,
+            planId,
+          });
+        }
         const candidateSuffix = isCandidate ? (j === 0 ? ' (Candidate A)' : ' (Candidate B)') : '';
         const title = taskSpec.title + candidateSuffix;
         const worktreeId = isCandidate ? (j === 0 ? `candidate-a-${taskId}` : `candidate-b-${taskId}`) : null;
@@ -1254,6 +1279,8 @@ export class Orchestrator {
     const missionId = task?.missionId ?? this.config.missionId ?? '';
     const title = task?.title ?? `Task ${taskId}`;
     const displayRole = roleToAssign.charAt(0).toUpperCase() + roleToAssign.slice(1);
+    const persona = this.taskPersonas.get(taskId);
+    const attachments = task?.planId ? this.planAttachments.get(task.planId) : undefined;
 
     this.emitTaskAssigned({
       missionId,
@@ -1270,7 +1297,7 @@ export class Orchestrator {
       agentInstanceId,
       role: roleToAssign,
       agentProfileId: task?.agentProfileId || undefined,
-      displayName: `${displayRole} Agent`,
+      displayName: persona?.displayName || `${displayRole} Agent`,
       spawnReason: `Orchestrator scheduled task: ${title}`,
       taskId,
       workspaceMode: roleToAssign === 'builder' ? 'isolated_worktree' : roleToAssign === 'orchestrator' ? 'shared' : 'read_only',
@@ -1285,6 +1312,9 @@ export class Orchestrator {
       agentInstanceId,
       agentProfileId: task?.agentProfileId,
       specialty: task?.specialty,
+      displayName: persona?.displayName,
+      sandboxTier: persona?.sandboxTier,
+      attachments,
       routePreference: task?.routePreference,
       targetDescriptor: task?.targetDescriptor ?? undefined,
     });
@@ -1899,30 +1929,4 @@ export class Orchestrator {
       });
     }
   }
-
-  /**
-   * Resume session and recover running tasks.
-   */
-  async resumeSession(): Promise<void> {
-    if (!this.workspaceManager) {
-      console.warn('[Orchestrator] No WorkspaceManager available for resumeSession.');
-      return;
-    }
-
-    console.log('[Orchestrator] Attempting to resume session and recover tasks...');
-    const allMissions = await this.workspaceManager.listMissions();
-    const runningMissions = allMissions.filter((m) => m.status === 'running' || m.status === 'revising');
-
-    for (const mission of runningMissions) {
-      console.log(`[Orchestrator] Recovering mission: ${mission.id}`);
-      const tasks = this.tasksForPlan(await this.workspaceManager.listTasks(mission.id), mission.planId);
-
-      const activeTasks = tasks.filter((t) => t.status === 'running' || t.status === 'revision_requested');
-      for (const task of await this.capacityAllowedTasks(mission.id, activeTasks)) {
-        console.log(`[Orchestrator] Resuming active task: ${task.id}`);
-        await this.assignTask(task.id, task.assignedRole ?? undefined);
-      }
-    }
-  }
-
 }

@@ -7,8 +7,13 @@ import type {
   WorkMode,
   TeamLaunch,
   ProviderAttachment,
+  ModelRoutingTier,
+  ModelStrengthTag,
+  SandboxTier,
+  OrchestratorRoutingDefaults,
+  TierRouteDefault,
 } from '@atris-agent-code/domain';
-import { parseBuilderTargetDescriptor, validateDirectChildProjectName } from '@atris-agent-code/domain';
+import { parseBuilderTargetDescriptor, roleToSandboxTier, validateDirectChildProjectName } from '@atris-agent-code/domain';
 import type { SupervisorPlanningModel, SupervisorPlanningResources, SupervisorPlanningSpecialist } from '@atris-agent-code/event-bus';
 import type { StructuredTaskPlan } from './orchestrator';
 import { attachmentContext, effectiveWorkMode } from './request-policy';
@@ -104,6 +109,7 @@ export interface SupervisorTurnContext {
   explicitCommand?: string;
   explicitTargetRole?: string;
   planningResources?: SupervisorPlanningResources;
+  routingDefaults?: OrchestratorRoutingDefaults;
   workMode?: WorkMode;
   teamLaunch?: TeamLaunch;
   attachments?: ProviderAttachment[];
@@ -311,6 +317,13 @@ function normalizeDelegations(
     const specialty = specialist
       ? (specialist.specialty || specialist.name).slice(0, 100)
       : (typeof record.specialty === 'string' ? record.specialty.trim().slice(0, 100) : '') || undefined;
+    const displayName = typeof record.displayName === 'string' && record.displayName.trim()
+      ? record.displayName.trim().slice(0, 80)
+      : undefined;
+    const rawSandboxTier = typeof record.sandboxTier === 'string' ? record.sandboxTier.trim().toLowerCase() : '';
+    const sandboxTier: SandboxTier | undefined = rawSandboxTier === 'inspect' || rawSandboxTier === 'implement' || rawSandboxTier === 'verify'
+      ? rawSandboxTier
+      : undefined;
     const routeSpecialist = specialist || resources.defaultSpecialists?.[role];
     result.push({
       id,
@@ -322,6 +335,8 @@ function normalizeDelegations(
       targetDescriptor: role === 'builder' ? parseBuilderTargetDescriptor(record.targetDescriptor) : undefined,
       agentProfileId: resources.requestedProfileIds?.[role] ? undefined : specialist?.id,
       specialty,
+      ...(displayName ? { displayName } : {}),
+      ...(sandboxTier ? { sandboxTier } : {}),
       routePreference: normalizeRoutePreference(record.routePreference ?? record.route, role, resources, routeSpecialist),
     });
     roleCounts.set(role, currentRoleCount + 1);
@@ -375,14 +390,24 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
   const resources = context.planningResources || EMPTY_PLANNING_RESOURCES;
   const modelsByRole = Object.fromEntries([...WORKER_ROLES].map((role) => [
     role,
-    resources.models.filter((model) => model.supportedRoles.includes(role)).map((model) => ({
-      catalogId: model.catalogId,
-      displayName: model.displayName,
-      routeLabel: model.routeLabel,
-      accountProfileId: model.accountProfileId,
-      supportedReasoning: model.supportedReasoning,
-      defaultReasoning: model.defaultReasoning,
-    })),
+    resources.models.filter((model) => model.supportedRoles.includes(role)).map((model) => {
+      const enriched = model as SupervisorPlanningModel & {
+        tier?: ModelRoutingTier;
+        strengths?: ModelStrengthTag[];
+        quotaHealth?: unknown;
+      };
+      return {
+        catalogId: model.catalogId,
+        displayName: model.displayName,
+        routeLabel: model.routeLabel,
+        accountProfileId: model.accountProfileId,
+        supportedReasoning: model.supportedReasoning,
+        defaultReasoning: model.defaultReasoning,
+        ...(enriched.tier ? { tier: enriched.tier } : {}),
+        ...(Array.isArray(enriched.strengths) && enriched.strengths.length ? { strengths: enriched.strengths } : {}),
+        ...(enriched.quotaHealth !== undefined ? { quotaHealth: enriched.quotaHealth } : {}),
+      };
+    }),
   ]));
   const specialists = resources.specialists.map(({ id, name, role, specialty, description, capabilities, allowedRoutePolicy }) => ({
     id, name, role, specialty, description, capabilities, allowedRoutePolicy,
@@ -410,6 +435,8 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '- For execute, Builder dependencies should reference only research that is actually required.',
     '- When the user explicitly names a new child project in English or Turkish (for example, "Create AtrisTask under this workspace" or "AtrisTask klasörü içine kurulacak"), preserve that name as the Builder new-sibling target. Ask for a direct-child name when the wording is ambiguous.',
     '- Assign a named specialist only by choosing an exact id from the available bound specialist list; the fixed role remains unchanged. If no listed specialist fits, provide a concise task specialty instead.',
+    '- You may give any worker a custom dynamic persona using `displayName`, `specialty`, and `sandboxTier` (`inspect` | `implement` | `verify`) while keeping `role` (`researcher`|`builder`|`reviewer`|`qa`) as the enforced sandbox boundary.',
+    '- In `execute` or `plan_only`, you may include tailored `reviewer` or `qa` (`verify`) delegations with `dependsOnDelegationIds` pointing at builder lanes (or at a custom reviewer covering a builder lane); they will be preserved. Any builder lane without an explicit reviewer or QA will automatically receive default verification nodes.',
     '- Choose task model routes only from the live, role-compatible catalog below. For an explicit model requested by the user, choose its exact catalogId when available. Otherwise select the best route for the task. Never invent catalog IDs or account profiles.',
     '- Keep model selection dynamic per task: use the task objective, required capabilities, specialist constraints and explicit user model instructions. Do not copy the Orchestrator model to workers unless the user requests that.',
     '- Ask for a human routing checkpoint only when live compatible choices have a material unresolved trade-off and no route clearly matches the user’s goals. In that case set needsUserApproval=true, choose and explain the best current recommendation in routePreference, and make response state why the user is being asked. Do not ask for approval for routine, clear route choices.',
@@ -438,6 +465,8 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '      "dependsOnDelegationIds": ["..."],',
     '      "preferredParallelGroup": "optional-group",',
     '      "agentProfileId": "optional-id-from-available-specialists",',
+    '      "displayName": "optional dynamic specialist persona label (e.g. Security Auditor, Schema Architect)",',
+    '      "sandboxTier": "optional inspect|implement|verify",',
     '      "specialty": "optional task focus when no profile is selected",',
     '      "routePreference": { "modelCatalogId": "catalog-id", "reasoningLevel": "medium", "fallbackCatalogIds": [], "reason": "..." },',
     '      "targetDescriptor": { "kind": "workspace_root|existing_project|new_sibling_project", "projectName": "direct-child name except for workspace_root" }',
@@ -460,6 +489,13 @@ export function buildSupervisorDecisionPrompt(context: SupervisorTurnContext): s
     '',
     'Effective role-default specialists used when a task does not name one (or an explicit user profile selection):',
     JSON.stringify(defaultSpecialists),
+    ...(context.routingDefaults && (context.routingDefaults.worker || context.routingDefaults.review)
+      ? [
+          '',
+          'Tier routing defaults (applied when no explicit per-task or role override is set):',
+          JSON.stringify(context.routingDefaults),
+        ]
+      : []),
     '',
     'Workspace context:',
     context.workspaceContext || '(workspace context unavailable)',
@@ -577,43 +613,101 @@ function topologicallyOrderDelegations(delegations: OrchestratorDelegation[]): O
   return orderedInputIndices.map((index) => delegations[index]);
 }
 
+export interface DecisionToTaskPlanOptions {
+  routingDefaults?: OrchestratorRoutingDefaults;
+  planningResources?: SupervisorPlanningResources;
+}
+
+function resolveTierRouteDefault(
+  role: OrchestratorDelegation['role'],
+  sandboxTier: SandboxTier | undefined,
+  routingDefaults?: OrchestratorRoutingDefaults,
+  planningResources?: SupervisorPlanningResources,
+): TaskRoutePreference | undefined {
+  if (!routingDefaults) return undefined;
+  const effectiveTier = sandboxTier || roleToSandboxTier(role);
+  const tierDefault: TierRouteDefault | undefined = effectiveTier === 'verify'
+    ? routingDefaults.review
+    : routingDefaults.worker;
+  const modelCatalogId = tierDefault?.modelCatalogId?.trim();
+  if (!modelCatalogId) return undefined;
+
+  const models = planningResources?.models || [];
+  const matched = models.find((candidate) => candidate.catalogId === modelCatalogId
+    && candidate.supportedRoles.includes(role));
+  if (models.length > 0 && !matched) return undefined;
+
+  const reasoningLevel = tierDefault?.reasoningLevel && (!matched || matched.supportedReasoning.includes(tierDefault.reasoningLevel))
+    ? tierDefault.reasoningLevel
+    : matched?.defaultReasoning ?? tierDefault?.reasoningLevel;
+  const fallbackCatalogIds = Array.isArray(tierDefault?.fallbackCatalogIds)
+    ? Array.from(new Set(tierDefault.fallbackCatalogIds
+        .map((id) => id.trim())
+        .filter((id) => id && id !== modelCatalogId)))
+      .slice(0, 4)
+    : [];
+
+  return {
+    modelCatalogId,
+    accountProfileId: matched?.accountProfileId || '',
+    reasoningLevel,
+    fallbackCatalogIds,
+    selectionMode: 'prefer',
+    modelDisplayName: matched?.displayName || modelCatalogId,
+    routeLabel: matched?.routeLabel,
+    reason: effectiveTier === 'verify' ? 'Review tier routing default' : 'Worker tier routing default',
+  };
+}
+
 function toStructuredTaskPlan(
   delegations: OrchestratorDelegation[],
   workerRoutes: OrchestratorDecision['workerRoutes'] = {},
+  options?: DecisionToTaskPlanOptions,
 ): StructuredTaskPlan[] {
   const orderedDelegations = topologicallyOrderDelegations(delegations);
   const idToIndex = new Map(orderedDelegations.map((item, index) => [item.id, index]));
 
-  return orderedDelegations.map((item) => ({
-    title: `${item.role.charAt(0).toUpperCase() + item.role.slice(1)}${item.specialty ? ` · ${item.specialty}` : ''}: ${item.objective}`,
-    description: item.objective,
-    role: item.role,
-    priority: item.role === 'builder' || item.role === 'reviewer' || item.role === 'qa' ? 'high' : 'medium',
-    requiredCapabilities: item.requiredCapabilities.length
-      ? item.requiredCapabilities
-      : item.role === 'builder'
-        ? ['write_to_file', 'replace_file_content', 'run_command']
-        : ['read_file', 'grep_search', 'view_file'],
-    dependsOnIndices: (item.dependsOnDelegationIds || []).map((id) => {
-      const index = idToIndex.get(id);
-      if (index === undefined) {
-        throw new Error(`Invalid delegation dependency graph: delegation "${item.id}" depends on missing delegation "${id}".`);
-      }
-      return index;
-    }),
-    targetDescriptor: item.role === 'builder' ? item.targetDescriptor : undefined,
-    agentProfileId: item.agentProfileId,
-    specialty: item.specialty,
-    routePreference: item.routePreference || workerRoutes?.[item.role],
-  }));
+  return orderedDelegations.map((item) => {
+    const effectiveSandboxTier = item.sandboxTier || roleToSandboxTier(item.role);
+    return {
+      title: `${item.role.charAt(0).toUpperCase() + item.role.slice(1)}${item.specialty ? ` · ${item.specialty}` : ''}: ${item.objective}`,
+      description: item.objective,
+      role: item.role,
+      priority: item.role === 'builder' || item.role === 'reviewer' || item.role === 'qa' ? 'high' : 'medium',
+      requiredCapabilities: item.requiredCapabilities.length
+        ? item.requiredCapabilities
+        : item.role === 'builder'
+          ? ['write_to_file', 'replace_file_content', 'run_command']
+          : ['read_file', 'grep_search', 'view_file'],
+      dependsOnIndices: (item.dependsOnDelegationIds || []).map((id) => {
+        const index = idToIndex.get(id);
+        if (index === undefined) {
+          throw new Error(`Invalid delegation dependency graph: delegation "${item.id}" depends on missing delegation "${id}".`);
+        }
+        return index;
+      }),
+      targetDescriptor: item.role === 'builder' ? item.targetDescriptor : undefined,
+      agentProfileId: item.agentProfileId,
+      specialty: item.specialty,
+      ...(item.displayName ? { displayName: item.displayName } : {}),
+      sandboxTier: effectiveSandboxTier,
+      routePreference: item.routePreference
+        || workerRoutes?.[item.role]
+        || resolveTierRouteDefault(item.role, effectiveSandboxTier, options?.routingDefaults, options?.planningResources),
+    };
+  });
 }
 
 /**
  * Normalizes model delegations into a runtime-safe task graph.
  * Builder lanes are isolated. Each lane gets its own Reviewer and QA dependency,
- * which keeps multi-Builder execution compatible with worktree-local review/QA.
+ * preserving explicit tailored Reviewer/QA delegations that target builder lanes
+ * and auto-generating missing verification nodes for uncovered lanes.
  */
-export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTaskPlan[] {
+export function decisionToTaskPlan(
+  decision: OrchestratorDecision,
+  options?: DecisionToTaskPlanOptions,
+): StructuredTaskPlan[] {
   let delegations = [...(decision.delegations || [])];
   // Validate before action-specific role normalization so malformed references in
   // discarded quality roles cannot silently disappear.
@@ -635,29 +729,79 @@ export function decisionToTaskPlan(decision: OrchestratorDecision): StructuredTa
 
   if (decision.action === 'execute' || decision.action === 'plan_only') {
     const builders = delegations.filter((item) => item.role === 'builder');
+    const builderIds = new Set(builders.map((item) => item.id));
     const nonQuality = delegations.filter((item) => isRetainedDelegationRole(item.role, decision.action));
-    delegations = [...nonQuality];
+
+    // Preserve explicit reviewer delegations that depend on at least one builder lane.
+    const explicitReviewers = delegations.filter((item) =>
+      item.role === 'reviewer' && (item.dependsOnDelegationIds || []).some((depId) => builderIds.has(depId)));
+    const explicitReviewerIds = new Set(explicitReviewers.map((item) => item.id));
+    const explicitReviewerBuildersById = new Map<string, string[]>();
+    const coveredByReviewer = new Set<string>();
+    const explicitReviewerIdsByBuilder = new Map<string, string[]>();
+    for (const reviewer of explicitReviewers) {
+      const covered = (reviewer.dependsOnDelegationIds || []).filter((depId) => builderIds.has(depId));
+      explicitReviewerBuildersById.set(reviewer.id, covered);
+      for (const builderId of covered) {
+        coveredByReviewer.add(builderId);
+        const list = explicitReviewerIdsByBuilder.get(builderId) || [];
+        list.push(reviewer.id);
+        explicitReviewerIdsByBuilder.set(builderId, list);
+      }
+    }
+
+    // Preserve explicit QA delegations that depend on a builder lane or a preserved reviewer.
+    const explicitQas = delegations.filter((item) =>
+      item.role === 'qa' && (item.dependsOnDelegationIds || []).some((depId) => builderIds.has(depId) || explicitReviewerIds.has(depId)));
+    const coveredByQa = new Set<string>();
+    for (const qa of explicitQas) {
+      for (const depId of qa.dependsOnDelegationIds || []) {
+        if (builderIds.has(depId)) coveredByQa.add(depId);
+        for (const builderId of explicitReviewerBuildersById.get(depId) || []) {
+          coveredByQa.add(builderId);
+        }
+      }
+    }
+
+    const retainedIds = new Set([
+      ...nonQuality.map((item) => item.id),
+      ...explicitReviewers.map((item) => item.id),
+      ...explicitQas.map((item) => item.id),
+    ]);
+    delegations = [...nonQuality, ...explicitReviewers, ...explicitQas].map((item) => ({
+      ...item,
+      dependsOnDelegationIds: (item.dependsOnDelegationIds || []).filter((depId) => retainedIds.has(depId)),
+    }));
+
     for (const builder of builders) {
-      const reviewerId = allocateGeneratedDelegationId(`review-${builder.id}`);
-      const qaId = allocateGeneratedDelegationId(`qa-${builder.id}`);
-      delegations.push({
-        id: reviewerId,
-        role: 'reviewer',
-        objective: `Review Builder lane "${builder.objective}" against the user request, repository rules, architecture and security constraints.`,
-        requiredCapabilities: ['code-review', 'security-review', 'architecture-review'],
-        dependsOnDelegationIds: [builder.id],
-        routePreference: decision.workerRoutes?.reviewer,
-      });
-      delegations.push({
-        id: qaId,
-        role: 'qa',
-        objective: `Validate the reviewed Builder lane "${builder.objective}" with the safest relevant build, tests, lint and static checks.`,
-        requiredCapabilities: ['testing', 'build', 'lint', 'validation'],
-        dependsOnDelegationIds: [reviewerId],
-        routePreference: decision.workerRoutes?.qa,
-      });
+      let reviewerIdsForQa = explicitReviewerIdsByBuilder.get(builder.id) || [];
+      if (!coveredByReviewer.has(builder.id)) {
+        const reviewerId = allocateGeneratedDelegationId(`review-${builder.id}`);
+        delegations.push({
+          id: reviewerId,
+          role: 'reviewer',
+          objective: `Review Builder lane "${builder.objective}" against the user request, repository rules, architecture and security constraints.`,
+          requiredCapabilities: ['code-review', 'security-review', 'architecture-review'],
+          dependsOnDelegationIds: [builder.id],
+          routePreference: decision.workerRoutes?.reviewer
+            || resolveTierRouteDefault('reviewer', 'verify', options?.routingDefaults, options?.planningResources),
+        });
+        reviewerIdsForQa = [reviewerId];
+      }
+      if (!coveredByQa.has(builder.id)) {
+        const qaId = allocateGeneratedDelegationId(`qa-${builder.id}`);
+        delegations.push({
+          id: qaId,
+          role: 'qa',
+          objective: `Validate the reviewed Builder lane "${builder.objective}" with the safest relevant build, tests, lint and static checks.`,
+          requiredCapabilities: ['testing', 'build', 'lint', 'validation'],
+          dependsOnDelegationIds: reviewerIdsForQa.length ? reviewerIdsForQa : [builder.id],
+          routePreference: decision.workerRoutes?.qa
+            || resolveTierRouteDefault('qa', 'verify', options?.routingDefaults, options?.planningResources),
+        });
+      }
     }
   }
 
-  return toStructuredTaskPlan(delegations, decision.workerRoutes);
+  return toStructuredTaskPlan(delegations, decision.workerRoutes, options);
 }

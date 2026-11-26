@@ -5,7 +5,7 @@ export interface SQLiteMigrationDatabase {
   transaction<T extends (...args: any[]) => any>(fn: T): T;
 }
 
-export const DATABASE_SCHEMA_VERSION = 23;
+export const DATABASE_SCHEMA_VERSION = 25;
 
 function hasColumn(sqlite: SQLiteMigrationDatabase, table: string, column: string): boolean {
   return sqlite.prepare(`PRAGMA table_info(${table})`).all()
@@ -16,7 +16,268 @@ function hasTable(sqlite: SQLiteMigrationDatabase, table: string): boolean {
   return sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").all(table).length > 0;
 }
 
+/**
+ * Single schema authority: ensures all base tables exist before incremental
+ * versioned migrations run. Safe and idempotent on both fresh and legacy DBs.
+ */
+function ensureBaseSchema(sqlite: SQLiteMigrationDatabase): void {
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      path TEXT NOT NULL DEFAULT '',
+      git_initialized INTEGER NOT NULL DEFAULT 0,
+      last_opened_at TEXT,
+      last_team_template_id TEXT,
+      created_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS missions (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      title TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'draft',
+      team_template_id TEXT NOT NULL DEFAULT '',
+      plan_id TEXT,
+      execution_mode TEXT NOT NULL DEFAULT 'balanced',
+      created_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      plan_id TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'planned',
+      priority TEXT NOT NULL DEFAULT 'medium',
+      assigned_agent_id TEXT,
+      assigned_role TEXT,
+      required_capabilities TEXT NOT NULL DEFAULT '[]',
+      depends_on TEXT NOT NULL DEFAULT '[]',
+      worktree_id TEXT,
+      created_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS account_profiles (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      runtime_type TEXT NOT NULL,
+      profile_name TEXT NOT NULL,
+      auth_status TEXT NOT NULL DEFAULT 'not_installed',
+      config_dir TEXT NOT NULL DEFAULT '',
+      supported_models TEXT NOT NULL DEFAULT '[]',
+      usage_scope TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS team_templates (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      max_parallel_agents INTEGER,
+      worker_pools TEXT,
+      is_default INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS team_roles (
+      id TEXT PRIMARY KEY,
+      template_id TEXT NOT NULL REFERENCES team_templates(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      model_profile_id TEXT DEFAULT '',
+      account_profile_id TEXT DEFAULT '',
+      default_capabilities TEXT NOT NULL DEFAULT '[]',
+      access_level TEXT NOT NULL DEFAULT 'read'
+    );
+
+    CREATE TABLE IF NOT EXISTS execution_policies (
+      id TEXT PRIMARY KEY,
+      scope_type TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      model_catalog_id TEXT,
+      account_profile_id TEXT,
+      reasoning_level TEXT,
+      fallback_catalog_ids TEXT NOT NULL DEFAULT '[]',
+      selection_mode TEXT NOT NULL DEFAULT 'auto',
+      source TEXT NOT NULL DEFAULT 'team_template',
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_policies_scope_role
+      ON execution_policies(scope_type, scope_id, role);
+
+    CREATE TABLE IF NOT EXISTS approvals (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      task_id TEXT,
+      run_id TEXT,
+      type TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      status TEXT DEFAULT 'pending',
+      decided_by TEXT,
+      requested_decision TEXT,
+      claimed_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      execution_error TEXT,
+      created_at TEXT NOT NULL,
+      decided_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS approval_operations (
+      approval_id TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
+      decision TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS mission_completions (
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      plan_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      summary TEXT,
+      tasks_completed INTEGER NOT NULL,
+      total_tasks INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      PRIMARY KEY (mission_id, plan_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS mission_events (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      task_id TEXT,
+      agent_instance_id TEXT,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_mission_events_mission_created ON mission_events(mission_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS task_dependencies (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS task_attempts (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      agent_instance_id TEXT NOT NULL,
+      attempt_number INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'running',
+      worktree_path TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      error TEXT,
+      result_summary TEXT,
+      review_pack TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS model_profiles (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      runtime_type TEXT NOT NULL,
+      account_profile_id TEXT,
+      suitable_roles TEXT NOT NULL DEFAULT '[]',
+      available INTEGER DEFAULT 1,
+      supports_reasoning INTEGER DEFAULT 0,
+      reasoning_levels TEXT NOT NULL DEFAULT '[]',
+      context_class TEXT DEFAULT 'medium',
+      speed_class TEXT DEFAULT 'standard',
+      is_subscription INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_instances (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      model_profile_id TEXT DEFAULT '',
+      account_profile_id TEXT DEFAULT '',
+      runtime_adapter_id TEXT DEFAULT '',
+      session_id TEXT,
+      status TEXT DEFAULT 'idle',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS resource_leases (
+      id TEXT PRIMARY KEY,
+      resource_type TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      held_by_agent_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      heartbeat_at TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      metadata TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS artifacts (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      task_id TEXT,
+      run_id TEXT,
+      type TEXT NOT NULL,
+      name TEXT NOT NULL,
+      path TEXT,
+      content TEXT,
+      size_bytes INTEGER,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS usage_snapshots (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      agent_instance_id TEXT,
+      account_profile_id TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cost INTEGER,
+      currency TEXT DEFAULT 'USD',
+      recorded_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS worktrees (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL,
+      branch_name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      id TEXT PRIMARY KEY,
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      workspace_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      git_ref TEXT,
+      snapshot_path TEXT,
+      created_at TEXT NOT NULL,
+      is_rollback_target INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS orchestrator_settings (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+}
+
 export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
+  ensureBaseSchema(sqlite);
   let current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
   if (current < 1) sqlite.transaction(() => {
     sqlite.exec(`
@@ -593,5 +854,38 @@ export function migrateDatabase(sqlite: SQLiteMigrationDatabase): void {
       }
     }
     sqlite.exec('PRAGMA user_version = 23');
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 24) sqlite.transaction(() => {
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS turn_directives (
+        id TEXT PRIMARY KEY,
+        mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        turn_id TEXT REFERENCES conversation_turns(id) ON DELETE SET NULL,
+        target_agent_id TEXT,
+        delivery TEXT NOT NULL DEFAULT 'steer',
+        content TEXT NOT NULL,
+        attachment_ids_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        applied_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_turn_directives_mission_status
+        ON turn_directives(mission_id, status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_turn_directives_agent_status
+        ON turn_directives(mission_id, target_agent_id, status, created_at);
+      PRAGMA user_version = 24;
+    `);
+  })();
+  current = Number(sqlite.pragma('user_version', { simple: true }) || 0);
+  if (current < 25) sqlite.transaction(() => {
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS orchestrator_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      PRAGMA user_version = 25;
+    `);
   })();
 }
