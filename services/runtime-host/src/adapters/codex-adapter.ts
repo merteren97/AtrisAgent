@@ -635,6 +635,7 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       throw Object.assign(error instanceof Error ? error : new Error(String(error)), { appServerStartupFailed: true });
     }
 
+    let controlPlaneRevoked = false;
     const state: AppServerSessionState = {
       sessionId,
       child,
@@ -647,7 +648,11 @@ export class CodexAdapter extends BaseRuntimeAdapter {
       closed: false,
       pendingRpc: new Map(),
       pendingApprovals: new Map(),
-      cleanupControlPlane: () => revokeControlPlaneAgent(sessionId),
+      cleanupControlPlane: () => {
+        if (controlPlaneRevoked) return;
+        controlPlaneRevoked = true;
+        revokeControlPlaneAgent(sessionId);
+      },
     };
 
     const stdoutDecoder = new StringDecoder('utf8');
