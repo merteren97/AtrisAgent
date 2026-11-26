@@ -1,4 +1,5 @@
 import type { Express, Request, Response } from 'express';
+import rateLimit from 'express-rate-limit';
 import type Database from 'better-sqlite3';
 import {
   isAgentRole,
@@ -116,7 +117,14 @@ export function installOrchestratorGraphRoutes(
     safeGetRuntimeCapabilities,
   } = deps;
 
-  app.post('/api/missions/:id/agents/:agentId/messages', async (req: Request, res: Response) => {
+  const graphRouteRateLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 2_000,
+    standardHeaders: false,
+    legacyHeaders: false,
+  });
+
+  app.post('/api/missions/:id/agents/:agentId/messages', graphRouteRateLimiter, async (req: Request, res: Response) => {
     try {
       const missionId = routeParam(req.params.id);
       const agentId = routeParam(req.params.agentId);
@@ -219,7 +227,7 @@ export function installOrchestratorGraphRoutes(
     }
   });
 
-  app.get('/api/missions/:id/graph', (req: Request, res: Response) => {
+  app.get('/api/missions/:id/graph', graphRouteRateLimiter, (req: Request, res: Response) => {
     try {
       const missionId = routeParam(req.params.id);
       const snapshot = sqlite.transaction(() => {
@@ -431,7 +439,7 @@ export function installOrchestratorGraphRoutes(
     }
   });
 
-  app.get('/api/orchestrator/routing-defaults', (_req: Request, res: Response) => {
+  app.get('/api/orchestrator/routing-defaults', graphRouteRateLimiter, (_req: Request, res: Response) => {
     try {
       res.json(getOrchestratorRoutingDefaults(sqlite));
     } catch (error: any) {
@@ -439,7 +447,7 @@ export function installOrchestratorGraphRoutes(
     }
   });
 
-  app.put('/api/orchestrator/routing-defaults', (req: Request, res: Response) => {
+  app.put('/api/orchestrator/routing-defaults', graphRouteRateLimiter, (req: Request, res: Response) => {
     try {
       const saved = saveOrchestratorRoutingDefaults(sqlite, req.body);
       res.json(saved);
@@ -448,7 +456,7 @@ export function installOrchestratorGraphRoutes(
     }
   });
 
-  app.patch('/api/missions/:id/tasks/:taskId/route', async (req: Request, res: Response) => {
+  app.patch('/api/missions/:id/tasks/:taskId/route', graphRouteRateLimiter, async (req: Request, res: Response) => {
     try {
       const missionId = routeParam(req.params.id);
       const taskId = routeParam(req.params.taskId);

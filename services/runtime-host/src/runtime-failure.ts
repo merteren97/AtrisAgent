@@ -38,12 +38,13 @@ function extractErrorText(error: unknown): string {
 }
 
 function parseRetryAfterMs(text: string): number | undefined {
-  const secMatch = text.match(/(?:retry[- ]after|try again in|wait|after)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b/i);
+  const sample = text.length > 4096 ? text.slice(0, 4096) : text;
+  const secMatch = sample.match(/(?:retry[- ]after|try again in|wait|after)(?:[:=]\s*|\s+)(\d+(?:\.\d+)?)\s?(?:s|sec|secs|second|seconds)\b/i);
   if (secMatch) {
     const ms = Math.ceil(Number(secMatch[1]) * 1000);
     if (Number.isFinite(ms) && ms > 0) return Math.min(ms, DEFAULT_MAX_RETRY_AFTER_MS);
   }
-  const minMatch = text.match(/(?:retry[- ]after|try again in|wait|after)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b/i);
+  const minMatch = sample.match(/(?:retry[- ]after|try again in|wait|after)(?:[:=]\s*|\s+)(\d+(?:\.\d+)?)\s?(?:m|min|mins|minute|minutes)\b/i);
   if (minMatch) {
     const ms = Math.ceil(Number(minMatch[1]) * 60_000);
     if (Number.isFinite(ms) && ms > 0) return Math.min(ms, DEFAULT_MAX_RETRY_AFTER_MS);

@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
+import rateLimit from 'express-rate-limit';
 import cors from 'cors';
 import { WebSocketServer, WebSocket } from 'ws';
 import Database from 'better-sqlite3';
@@ -357,6 +358,13 @@ app.use(cors({
 installManualCoordinationCallRoute(app, express.json({limit:'32kb'}));
 app.use(planningMedia.middleware);
 app.use(createRuntimeTokenMiddleware(RUNTIME_TOKEN));
+const localApiRateLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 2_000,
+  standardHeaders: false,
+  legacyHeaders: false,
+});
+app.use('/api', localApiRateLimiter);
 app.use('/api/attachments', express.json({ limit: '14mb' }));
 app.use('/api/workspaces/:workspaceId/plans', express.json({ limit: '6mb' }));
 app.use(express.json({ limit: '2mb' }));
@@ -3334,7 +3342,7 @@ app.post('/api/approvals/:id/decide', async (req, res) => {
   }
 });
 
-app.get('/api/events/stream', (req: Request, res: Response) => {
+app.get('/api/events/stream', localApiRateLimiter, (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');

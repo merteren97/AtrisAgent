@@ -320,6 +320,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error);
+  const message = error instanceof Error ? error.message : 'Phase A graph steering test failed';
+  console.error('Phase A graph steering test failed:', message.replace(/[\r\n]+/g, ' '));
   process.exit(1);
 });

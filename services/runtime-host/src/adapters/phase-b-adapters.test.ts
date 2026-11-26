@@ -478,6 +478,14 @@ try {
 
     const v2 = new RuntimeHostV2(undefined, { watchdogInterval: 0 });
     const v2Spawns: any[] = [];
+    (v2 as any).profileManager.getProfiles = async () => [{
+      id: 'default', provider: 'openai', runtimeType: 'codex', profileName: 'Primary', authStatus: 'connected',
+      configDir: '', supportedModels: ['gpt-5'], usageScope: null, createdAt: '', updatedAt: '', allowedRoles: [], schedulerAuto: true,
+    }];
+    (v2 as any).catalogService.getCachedCatalog = () => [{
+      catalogId: 'c1', runtimeId: 'codex', accountProfileId: 'default', providerId: 'openai', runtimeModelId: 'gpt-5',
+      displayName: 'GPT-5', supportedRoles: ['orchestrator', 'builder'], supportedReasoning: ['medium'], inputModalities: ['text'], availability: 'available', source: 'discovered',
+    }];
     (v2 as any).getSupervisorPlanningResources = async () => ({
       models: [{ catalogId: 'c1', accountProfileId: 'default', runtimeId: 'codex', runtimeModelId: 'gpt-5', displayName: 'GPT-5', supportedRoles: ['builder'], supportedReasoning: [] }],
       specialists: [],

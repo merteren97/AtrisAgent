@@ -21,13 +21,13 @@ export function clearNegatedQualitySignals(text: string): string {
     // Remove ordinary negated failure lists before scanning individual words;
     // e.g. "no test failures or errors" or "no pending issues" is a passing report, not a failure.
     .replace(/\b(?:0|no|without|zero|none)\s+(?:(?:any|all|the|pending|open|remaining|unresolved|test|tests|check|checks|build|builds|lint|validation|validations|blocking|major|critical)\s+)*(?:failures?|errors?|issues?|defects?|problems?|concerns?|blockers?|work|items?|tasks?)(?:\s+(?:and|or)\s+(?:failures?|errors?|issues?|defects?|problems?|concerns?|blockers?))*/gi, ' ')
-    .replace(/\b(?:no|without|zero)\s+(?:any\s+)?(?:blocking|major|critical)(?:\s*(?:[,/]\s*(?:and|or)?\s*|\b(?:and|or)\b\s*)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
+    .replace(/\b(?:no|without|zero)\s+(?:any\s+)?(?:blocking|major|critical)(?:(?:[,/]\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
     .replace(/\b(?:0|no|without|zero)\s+(?:failed|failing)\s+(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\b/gi, ' ')
     .replace(/\b(?:0|no|without|zero)\s+(?:checks?|tests?|builds?|lint(?:ing)?|validations?)\s+(?:failed|failing)\b/gi, ' ')
     .replace(/\b(?:no|without|zero)\s+(?:revision|revisions|change|changes)\s+(?:is\s+|are\s+|was\s+|were\s+)?(?:requested|required|needed)\b/gi, ' ')
     .replace(/\b(?:no|without|zero)\s+(?:(?:test|tests|check|checks|build|builds|command|commands|lint|validation|validations)\s+)?(?:failures?|errors?)(?:\s+(?:or|and|[/,])\s+(?:failures?|errors?))?\b/gi, ' ')
     .replace(/\b(?:no|without|zero)\s+(?:blocking|blocked|blockers?|major|critical|failure|failures|error|errors|pending)\b/gi, ' ')
-    .replace(/\b(?:0|none)\s+(?:blocking|major|critical)(?:\s*(?:[,/]\s*(?:and|or)?\s*|\b(?:and|or)\b\s*)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
+    .replace(/\b(?:0|none)\s+(?:blocking|major|critical)(?:(?:[,/]\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)(?:blocking|major|critical))*\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\b/gi, ' ')
     .replace(/\b(?:blocking|major|critical)\s+(?:findings?|issues?|defects?|problems?|concerns?|blockers?)\s*(?:[:=(]\s*)?(?:0|none)\b/gi, ' ')
     .replace(/\b(?:0|none)\s+(?:failed|failing|failure|failures|error|errors|issues?|pending)\b/gi, ' ')
     .replace(/\b(?:blocking|major|critical)\s*[:=-]\s*(?:none|no)\b/gi, ' ');
