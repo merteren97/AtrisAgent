@@ -23,6 +23,8 @@ import { planApi } from '@/stores/planning-store';
 import { loadLocalImagePreviewBlob, normalizeImagePath } from './chat-image-preview';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { MermaidBlock } from './mermaid-block';
+import { isMermaidLanguage } from './mermaid-renderer';
 
 export interface MarkdownContentProps {
   content: string;
@@ -45,6 +47,7 @@ interface Block {
   type: 'paragraph' | 'heading' | 'code' | 'quote' | 'alert' | 'list' | 'separator' | 'table' | 'image';
   level?: number;
   language?: string;
+  closed?: boolean;
   text?: string;
   alertType?: AlertKind;
   items?: ListItem[];
@@ -146,8 +149,14 @@ function parseBlocks(source: string): Block[] {
         code.push(lines[index]);
         index += 1;
       }
-      if (index < lines.length) index += 1;
-      blocks.push({ type: 'code', language: fence[2].trim() || 'text', text: code.join('\n') });
+      const hasClosingFence = index < lines.length;
+      if (hasClosingFence) index += 1;
+      blocks.push({
+        type: 'code',
+        language: fence[2].trim() || 'text',
+        closed: hasClosingFence,
+        text: code.join('\n'),
+      });
       continue;
     }
 
@@ -767,6 +776,9 @@ function renderBlocks(blocks: Block[], prefix: string, options: InlineOptions): 
     if (block.type === 'code') {
       if ((block.language || '').toLowerCase() === 'carousel') {
         return <CarouselBlock key={key} content={block.text || ''} options={options} />;
+      }
+      if (isMermaidLanguage(block.language)) {
+        return <MermaidBlock key={key} code={block.text || ''} isComplete={block.closed !== false} />;
       }
       return <CodeBlock key={key} language={block.language || 'text'} code={block.text || ''} />;
     }
