@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MarkdownContent, normalizeFileUri } from './markdown-content';
+import {
+  buildMermaidThemeVariables,
+  getMermaidDiagramLabel,
+  isMermaidLanguage,
+  normalizeMermaidSvgMarkup,
+  parseMermaidSvgDimensions,
+  scopeMermaidSvgIds,
+} from './mermaid-renderer';
 import { detectImageMime, loadLocalImagePreviewBlob, normalizeImagePath } from './chat-image-preview';
 import { configureApiRuntime } from '@/lib/api-client';
 import { browserUrl, useBrowserStore } from '@/stores/browser-store';
@@ -172,4 +180,70 @@ assert.equal(detectImageMime(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0,
   }
 }
 
-console.log('Markdown table, carousel, file link, alert, nested list, and image preview loader tests passed');
+// 6. Mermaid diagram blocks and renderer helpers
+assert.equal(isMermaidLanguage('mermaid'), true);
+assert.equal(isMermaidLanguage('MERMAID'), true);
+assert.equal(isMermaidLanguage('mermaid title="DSP"'), true);
+assert.equal(isMermaidLanguage('typescript'), false);
+assert.equal(isMermaidLanguage('carousel'), false);
+assert.equal(isMermaidLanguage(''), false);
+
+assert.equal(getMermaidDiagramLabel('flowchart LR\n  A --> B'), 'Flowchart');
+assert.equal(getMermaidDiagramLabel('%% comment\ngraph TD\n  A --> B'), 'Flowchart');
+assert.equal(getMermaidDiagramLabel('%%{init: {"theme": "dark"}}%%\nsequenceDiagram\n  A->>B: Hi'), 'Sequence');
+assert.equal(getMermaidDiagramLabel('stateDiagram-v2\n  [*] --> Idle'), 'State');
+assert.equal(getMermaidDiagramLabel('erDiagram\n  USER ||--o{ ORDER : places'), 'ER Diagram');
+
+const darkThemeVars = buildMermaidThemeVariables('dark', 'iris');
+const lightThemeVars = buildMermaidThemeVariables('light', 'ocean');
+assert.equal(darkThemeVars.darkMode, true);
+assert.equal(lightThemeVars.darkMode, false);
+assert.match(darkThemeVars.primaryColor, /^#[0-9a-f]{6}$/i);
+assert.match(lightThemeVars.primaryBorderColor, /^#[0-9a-f]{6}$/i);
+
+assert.deepEqual(
+  parseMermaidSvgDimensions('<svg id="m1" viewBox="0 0 1240.5 320" width="100%"><g/></svg>'),
+  { width: 1240.5, height: 320 },
+);
+assert.deepEqual(
+  parseMermaidSvgDimensions('<svg width="480px" height="240px"><g/></svg>'),
+  { width: 480, height: 240 },
+);
+assert.equal(parseMermaidSvgDimensions('<div>not svg</div>'), null);
+
+const scopedSvg = scopeMermaidSvgIds(
+  '<svg id="atris-mermaid-1"><style>#atris-mermaid-1 .node{}</style><path marker-end="url(#atris-mermaid-1_end)"/></svg>',
+  'atris-mermaid-1',
+  'modal',
+);
+assert.match(scopedSvg, /id="atris-mermaid-1-modal"/);
+assert.match(scopedSvg, /#atris-mermaid-1-modal \.node/);
+assert.match(scopedSvg, /url\(#atris-mermaid-1-modal_end\)/);
+
+const normalizedSvg = normalizeMermaidSvgMarkup('<svg id="m1" width="900" height="300" style="max-width: 900px;" viewBox="0 0 900 300"></svg>');
+assert.match(normalizedSvg, /width="100%" height="100%"/);
+assert.match(normalizedSvg, /max-width:none;/);
+
+const mermaidMd = [
+  '```mermaid',
+  'flowchart LR',
+  '  MIC["getUserMedia (AGC ON + AEC ON)"] --> RNN["RNNoise v0.1 non-SIMD"]',
+  '  RNN --> DEST["LiveKit"]',
+  '```',
+].join('\n');
+const mermaidHtml = render(mermaidMd);
+assert.match(mermaidHtml, /data-mermaid-block="true"/);
+assert.match(mermaidHtml, /aria-label="Mermaid Flowchart"/);
+assert.match(mermaidHtml, />Flowchart<\/span>/);
+assert.match(mermaidHtml, />Diagram<\/button>/);
+assert.match(mermaidHtml, />Code<\/button>/);
+
+const streamingMermaidHtml = render('```mermaid\nflowchart LR\n  A --> B');
+assert.match(streamingMermaidHtml, /data-mermaid-block="true"/);
+assert.match(streamingMermaidHtml, /Streaming diagram source/);
+
+const regularCodeHtml = render('```ts\nconst x = 1;\n```');
+assert.doesNotMatch(regularCodeHtml, /data-mermaid-block="true"/);
+assert.match(regularCodeHtml, />ts<\/span>/);
+
+console.log('Markdown table, carousel, file link, alert, nested list, image preview, and mermaid tests passed');
