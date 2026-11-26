@@ -1671,18 +1671,25 @@ mod tests {
     }
 
     #[cfg(windows)]
+    static REAL_PTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
     #[test]
     fn real_pty_resize_replay_retains_screen_geometry() {
+        let _serial = REAL_PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Cleanup(ManualTerminals);
+        impl Drop for Cleanup { fn drop(&mut self) { self.0.shutdown(); } }
         let manager = ManualTerminals::default();
+        let _cleanup = Cleanup(manager.clone());
         let id = "00000000-0000-4000-8000-000000000099";
         let executable = std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe").to_string_lossy().to_string();
-        // A disposable full-screen TUI. It exits on its own; no user process or session is touched.
-        let script = "$e=[char]27; $last=''; $end=(Get-Date).AddSeconds(5); [Console]::Write($e+'[?1049h'); while((Get-Date) -lt $end) { $w=[Console]::WindowWidth; $h=[Console]::WindowHeight; $key=$w.ToString()+'x'+$h; if($key -ne $last) { [Console]::Write($e+'[2J'+$e+'[1;1HHEADER-'+$key+$e+'[2;1H'+('TRANSCRIPT '*28)+$e+'['+$h+';1HFOOTER-'+$key); $last=$key }; Start-Sleep -Milliseconds 50 }";
+        // A disposable full-screen TUI. It exits on its own after emitting both initial and resized frames; no user process or session is touched.
+        let script = "$e=[char]27; $last=''; $draws=0; $end=(Get-Date).AddSeconds(15); [Console]::Write($e+'[?1049h'); while((Get-Date) -lt $end) { $w=[Console]::WindowWidth; $h=[Console]::WindowHeight; $key=$w.ToString()+'x'+$h; if($key -ne $last) { [Console]::Write($e+'[2J'+$e+'[1;1HHEADER-'+$key+$e+'[2;1H'+('TRANSCRIPT '*28)+$e+'['+$h+';1HFOOTER-'+$key); $last=$key; $draws+=1; if($draws -ge 2) { Start-Sleep -Milliseconds 300; break } }; Start-Sleep -Milliseconds 50 }";
         start(manager.clone(), Launch { id: id.into(), executable,
             args: vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(), script.into()],
             cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new(), runtime_type: String::new() }).unwrap();
         let wait_for = |after: u64, text: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             let mut replied = false;
             loop {
                 let result = snapshot(&manager, id.into(), after, false).unwrap();
@@ -1711,7 +1718,7 @@ mod tests {
         assert!(replay.resizes.iter().any(|size| size.columns == 57 && size.rows == 20));
         println!("TERMINAL_NATIVE_FIXTURE={}", serde_json::to_string(&serde_json::json!({ "initial": initial, "narrow": narrow, "replay": replay })).unwrap());
         // Keep the output reader alive until the fixture exits naturally.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while snapshot(&manager, id.into(), replay.sequence, true).unwrap().status == "open" {
             assert!(std::time::Instant::now() < deadline, "Native fixture failed to exit naturally");
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1748,6 +1755,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn real_pty_input_replay_and_independent_close() {
+        let _serial = REAL_PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct Cleanup(ManualTerminals);
         impl Drop for Cleanup { fn drop(&mut self) { self.0.shutdown(); } }
         let manager = ManualTerminals::default();
@@ -1763,7 +1771,7 @@ mod tests {
                 cwd: std::env::temp_dir().to_string_lossy().to_string(), env: HashMap::new(), runtime_type: if id == fourth { "antigravity".into() } else { String::new() } }).unwrap();
         }
         let wait_for = |id: &str, text: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             let mut replied_to_cursor = false;
             loop {
                 let result = snapshot(&manager, id.into(), 0, false).unwrap();
