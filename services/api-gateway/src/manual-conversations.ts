@@ -18,6 +18,8 @@ import { manualContentTitle, manualProviderName } from './manual-titles';
 import type { CodexPermissionMode } from '@atris-agent-code/domain';
 import { isCodexPermissionMode } from './manual-codex-permissions';
 import { ManualCodexSessions } from './manual-codex-session';
+import { isOpenCodeV2 } from '../../runtime-host/src/adapters/opencode-v2';
+import { ManualOpenCodeV2Sessions, type OpenCodeV2InboxItem } from './manual-opencode-v2-session';
 import { verifyManualCodexCompatibility } from './manual-codex-compatibility';
 import { manualCoordination } from './manual-coordination';
 import { prepareManualCoordination } from './manual-coordination-config';
@@ -93,6 +95,7 @@ export function parseManualTranscript(source: string, sessionId: string): Manual
 
 export class ManualConversationStore {
   readonly codexSessions = new ManualCodexSessions();
+  readonly openCodeSessions = new ManualOpenCodeV2Sessions();
   readonly changeReview: ManualChangeReview;
   readonly projectReview: DirectProjectReview;
   private preparations = new Map<string, { workspaceId: string; job: Promise<ManualConversation> }>();
@@ -154,6 +157,8 @@ export class ManualConversationStore {
     return rows.map((row) => ({ ...row, agents: agentsByConversation.get(row.id) || [] }));
   }
   agentActivitySummary(agent: ManualAgent): ManualAgentActivitySummary {
+    const liveOpenCode = this.openCodeSessions.get(agent.id)?.activity();
+    if (liveOpenCode) return liveOpenCode;
     const live = this.codexSessions.get(agent.id)?.activity();
     return new ManualProviderBridge(this.dataDir).agentActivitySummary(agent, live);
   }
@@ -302,7 +307,8 @@ export class ManualConversationStore {
         const hint = this.turnHints.get(agent.id);
         const hintAge = hint && hint.workspaceId === workspaceId ? now - hint.at : Infinity;
         const liveCodex = this.codexSessions.get(agent.id)?.activity();
-        const act = liveCodex || bridge.activity(agent);
+        const liveOpenCode = this.openCodeSessions.get(agent.id)?.activity();
+        const act = liveCodex || liveOpenCode || bridge.activity(agent);
         const actAt = act.at ? Date.parse(act.at) : NaN;
         const actAge = Number.isFinite(actAt) ? now - actAt : Infinity;
 
@@ -343,6 +349,7 @@ export class ManualConversationStore {
       this.sqlite.prepare('DELETE FROM manual_agent_sessions WHERE id = ?').run(id);
     })();
     void this.codexSessions.get(id)?.close().catch(() => {});
+    void this.openCodeSessions.get(id)?.close().catch(() => {});
     if (workspaceId) await this.pauseProjectReview(workspaceId);
     if (row && this.live) await this.live.pauseManualWhenEmpty(`manual:${row.conversation_id}`, () =>
       !this.sqlite.prepare('SELECT 1 FROM manual_agent_sessions WHERE conversation_id = ? LIMIT 1').get(row.conversation_id));
@@ -362,8 +369,9 @@ export class ManualConversationStore {
   markMemoryProcessed(agentId: string, sourceId: string): void {
     this.sqlite.prepare('INSERT OR IGNORE INTO manual_memory_receipts VALUES (?, ?)').run(agentId, sourceId);
   }
-  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; routeStatus?: {pending: boolean; error?: string}; truncated: boolean; bound: boolean; loading?: boolean; naming?: ManualNamingUpdate } {
+  readMessages(id: string): { supported: boolean; messages: ManualMessage[]; questions?: ManualQuestion[]; autoApprove?: {available: boolean; enabled: boolean; error?: string}; routeStatus?: {pending: boolean; error?: string}; inbox?: OpenCodeV2InboxItem[]; truncated: boolean; bound: boolean; loading?: boolean; naming?: ManualNamingUpdate } {
     const agent = this.agent(id);
+    const openCodeSession = this.openCodeSessions.get(agent.id);
     const antigravityResult = agent.runtimeType === 'antigravity'
       ? { supported: true, ...new ManualAntigravityBridge(this.dataDir).read(agent) }
       : undefined;
@@ -376,11 +384,22 @@ export class ManualConversationStore {
         if (rels.length) void this.projectReview.ensureBaseline(conv.workspaceId, rels);
       }
     }
-    const result = antigravityResult ?? readAgentMessages(agent, bridge);
-    const questions = antigravityResult
-      ? antigravityResult.questions
-      : bridge.pendingQuestions(agent);
-    return { ...result, questions, autoApprove: agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined, routeStatus:bridge.openCodeRouteStatus(agent), naming: this.syncTitles(id, result.bound ? result.messages : []) };
+    const result = openCodeSession
+      ? { supported: true, ...openCodeSession.messages() }
+      : (antigravityResult ?? readAgentMessages(agent, bridge));
+    const questions = openCodeSession
+      ? openCodeSession.pendingQuestions()
+      : antigravityResult
+        ? antigravityResult.questions
+        : bridge.pendingQuestions(agent);
+    return {
+      ...result,
+      questions,
+      autoApprove: openCodeSession ? openCodeSession.autoApprove() : (agent.runtimeType === 'opencode' ? bridge.autoApprove(agent) : undefined),
+      routeStatus: openCodeSession ? openCodeSession.routeStatus() : bridge.openCodeRouteStatus(agent),
+      ...(openCodeSession ? { inbox: openCodeSession.inbox() } : {}),
+      naming: this.syncTitles(id, result.bound ? result.messages : []),
+    };
   }
   needsTitle(id: string): boolean {
     const agent = this.agent(id);
@@ -735,6 +754,7 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       for (const agent of store.list(conversation.workspaceId).find(item => item.id === id)?.agents || []) {
         manualCoordination.revoke(agent.id);
         void store.codexSessions.get(agent.id)?.close().catch(() => {});
+        void store.openCodeSessions.get(agent.id)?.close().catch(() => {});
       }
     } catch (error: any) { if (error.status !== 404) throw error; }
     store.remove(id);
@@ -851,6 +871,37 @@ export function installManualConversations(app: Application, sqlite: Database.Da
       codexRuntimeId = endpoint.runtimeId;
     }
     if (agent.runtimeType === 'opencode') {
+      if (isOpenCodeV2(installation.version)) {
+        if (store.openCodeSessions.get(agent.id)) return fail('An OpenCode terminal is already open or starting for this agent.', 409);
+        const grant = manualCoordination.isConfigured() ? manualCoordination.issue(agent) : undefined;
+        let endpoint: Awaited<ReturnType<typeof store.openCodeSessions.create>>;
+        try {
+          endpoint = await store.openCodeSessions.create(agent.id, {
+            agentId: agent.id,
+            dataDir,
+            executable: installation.path,
+            cwd: agent.cwd,
+            env,
+            model: agent.model,
+            reasoning: agent.reasoning,
+            coordination: grant ? { endpoint: grant.endpoint, script: grant.script, token: grant.token } : undefined,
+            onClosed: () => { if (grant) manualCoordination.revokeToken(grant.token); },
+          });
+        } catch (error) {
+          if (grant) manualCoordination.revokeToken(grant.token);
+          throw error;
+        }
+        res.json({
+          id: agent.id,
+          runtimeType: agent.runtimeType,
+          executable: installation.path,
+          args: ['--server', endpoint.url, '--session', endpoint.sessionId],
+          cwd: launchCwd,
+          env: { ...env, OPENCODE_PASSWORD: endpoint.password },
+          openCodeRuntimeId: endpoint.runtimeId,
+        });
+        return;
+      }
       const prepared = bridge.prepareOpenCode(agent, installation.version); args = prepared.args; Object.assign(env, prepared.env);
     }
     const grant = agent.runtimeType !== 'codex' && manualCoordination.isConfigured() ? manualCoordination.issue(agent) : undefined;
@@ -875,15 +926,25 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     }
 
     const agent = store.agent(id);
-    const { messages, ...metadata } = store.readMessages(id);
+    const { messages, inbox, ...metadata } = store.readMessages(id);
     const swarm = agent.runtimeType === 'antigravity'
       ? new ManualAntigravityBridge(dataDir).readSwarmState(agent)
       : undefined;
-    return sendPaginatedChatSnapshot(res, { ...metadata, ...(swarm ? { swarm } : {}) }, messages, {
-      anchor: anchor as string | undefined,
-      older: older === '1',
-      known: known as string | undefined,
-    });
+    const steerCapabilities = agent.runtimeType === 'opencode' && store.openCodeSessions.get(id)
+      ? { mode: 'opencode_v2_inbox' as const }
+      : agent.runtimeType === 'antigravity'
+        ? { mode: 'antigravity_alt_m' as const, queuedMessagesSetting: readAntigravityQueuedMessagesSetting() }
+        : { mode: 'none' as const };
+    return sendPaginatedChatSnapshot(
+      res,
+      { ...metadata, ...(inbox ? { inbox } : {}), steerCapabilities, ...(swarm ? { swarm } : {}) },
+      messages,
+      {
+        anchor: anchor as string | undefined,
+        older: older === '1',
+        known: known as string | undefined,
+      },
+    );
   }));
   app.get('/api/manual/agents/:id/swarm/board', route((req, res) => {
     const agent = store.agent(idParam(req, 'id'));
@@ -941,19 +1002,64 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     if (session && session.runtimeId !== req.body?.runtimeId) return fail('The Codex runtime changed.', 409);
     await session?.close(); res.status(204).end();
   }));
+  app.delete('/api/manual/agents/:id/opencode-runtime', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const session = store.openCodeSessions.get(agent.id);
+    if (session && req.body?.runtimeId !== undefined && session.runtimeId !== req.body.runtimeId) return fail('The OpenCode runtime changed.', 409);
+    await session?.close();
+    res.status(204).end();
+  }));
   app.post('/api/manual/agents/:id/auto-approve', route((req, res) => {
-    bridge.setAutoApprove(store.agent(idParam(req, 'id')), req.body.enabled);
+    const agent = store.agent(idParam(req, 'id'));
+    const openCodeSession = store.openCodeSessions.get(agent.id);
+    if (openCodeSession) openCodeSession.setAutoApprove(req.body?.enabled);
+    else bridge.setAutoApprove(agent, req.body?.enabled);
     res.status(202).json({accepted:true});
   }));
-  app.post('/api/manual/agents/:id/questions/:questionId/reply', route((req, res) => {
-    bridge.replyQuestion(store.agent(idParam(req, 'id')), required(req.params.questionId, 'question ID'), req.body.answers);
+  app.post('/api/manual/agents/:id/questions/:questionId/reply', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const questionId = required(req.params.questionId, 'question ID');
+    const openCodeSession = store.openCodeSessions.get(agent.id);
+    if (openCodeSession) await openCodeSession.replyQuestion(questionId, req.body?.answers);
+    else bridge.replyQuestion(agent, questionId, req.body?.answers);
     res.status(202).json({accepted:true});
+  }));
+  app.post('/api/manual/agents/:id/prompt', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const text = required(req.body?.text, 'prompt text', 200_000);
+    const rawDelivery = req.body?.delivery;
+    if (rawDelivery !== undefined && rawDelivery !== 'queue' && rawDelivery !== 'steer') {
+      return fail('Invalid prompt delivery mode.');
+    }
+    const delivery = rawDelivery as 'queue' | 'steer' | undefined;
+    const openCodeSession = store.openCodeSessions.get(agent.id);
+    if (!openCodeSession) return fail('Open this OpenCode agent before sending prompts.', 409);
+    store.markTurnStarted(agent.id);
+    await openCodeSession.sendPrompt(text, delivery);
+    res.status(202).json({ accepted: true, delivery: delivery ?? 'queue' });
+  }));
+  app.post('/api/manual/agents/:id/inbox/:inboxId/steer', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const inboxId = idParam(req, 'inboxId');
+    const openCodeSession = store.openCodeSessions.get(agent.id);
+    if (!openCodeSession) return fail('Open this OpenCode agent before steering inbox messages.', 409);
+    store.markTurnStarted(agent.id);
+    await openCodeSession.steerInbox(inboxId);
+    res.json({ ok: true });
+  }));
+  app.delete('/api/manual/agents/:id/inbox/:inboxId', route(async (req, res) => {
+    const agent = store.agent(idParam(req, 'id'));
+    const inboxId = idParam(req, 'inboxId');
+    const openCodeSession = store.openCodeSessions.get(agent.id);
+    if (!openCodeSession) return fail('Open this OpenCode agent before cancelling inbox messages.', 409);
+    await openCodeSession.cancelInbox(inboxId);
+    res.status(204).end();
   }));
   app.get('/api/manual/agents/:id/activity', route((req, res) => {
     const id = idParam(req, 'id');
     // The shell polls every open terminal, including unselected Code panes.
     const naming = store.needsTitle(id) ? store.readMessages(id).naming : store.syncTitles(id, []);
-    res.json({ ...(store.codexSessions.get(id)?.activity() || bridge.activity(store.agent(id))), naming });
+    res.json({ ...(store.codexSessions.get(id)?.activity() || store.openCodeSessions.get(id)?.activity() || bridge.activity(store.agent(id))), naming });
   }));
   app.patch('/api/manual/agents/:id/model', route(async (req, res) => {
     const agent = store.agent(idParam(req, 'id'));
@@ -964,11 +1070,14 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     const profile = await runtime.getAccountProfileManager().getProfileById(descriptor.accountProfileId);
     if (!profile || profile.authStatus !== 'connected') return fail('Connect this model account first.');
     if (profile.runtimeType !== agent.runtimeType || descriptor.accountProfileId !== agent.accountProfileId) return fail('A different CLI or account requires a new independent agent.', 409);
-    if (agent.runtimeType === 'opencode' && req.body.live === true && !bridge.autoApprove(agent).available) return fail('Reopen this OpenCode agent once to enable live model and reasoning changes.', 409);
+    const openCodeSession = store.openCodeSessions.get(agent.id);
+    if (agent.runtimeType === 'opencode' && req.body.live === true && !openCodeSession && !bridge.autoApprove(agent).available) return fail('Reopen this OpenCode agent once to enable live model and reasoning changes.', 409);
     const updated = store.updateModel(agent.id, expected, descriptor.catalogId, descriptor.runtimeModelId, resolveReasoning(req.body.reasoning, descriptor));
     if (agent.runtimeType === 'opencode') {
-      try { bridge.updateOpenCodeRoute(updated); }
-      catch (error) {
+      try {
+        if (openCodeSession) await openCodeSession.switchModel(updated.model, updated.reasoning);
+        else bridge.updateOpenCodeRoute(updated);
+      } catch (error) {
         store.updateModel(agent.id, updated.catalogId, agent.catalogId, agent.model, agent.reasoning);
         throw error;
       }
@@ -976,4 +1085,17 @@ export function installManualConversations(app: Application, sqlite: Database.Da
     res.json(updated);
   }));
   return store;
+}
+
+function readAntigravityQueuedMessagesSetting(): 'queue' | 'send-immediately' {
+  try {
+    const configDir = process.env.AGY_CLI_CONFIG_DIR || path.join(os.homedir(), '.gemini', 'antigravity-cli');
+    const settingsPath = path.join(configDir, 'settings.json');
+    if (!fs.existsSync(settingsPath) || fs.lstatSync(settingsPath).isSymbolicLink()) return 'queue';
+    if (fs.statSync(settingsPath).size > 1024 * 1024) return 'queue';
+    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    return parsed?.queuedMessages === 'send-immediately' ? 'send-immediately' : 'queue';
+  } catch {
+    return 'queue';
+  }
 }

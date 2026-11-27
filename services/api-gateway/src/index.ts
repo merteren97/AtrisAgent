@@ -384,6 +384,7 @@ const shutdownCoordinator = createRuntimeShutdownCoordinator({
     orchestrator.dispose?.();
     await planningChat.close();
     await manualConversationStore.codexSessions.closeAll();
+    await manualConversationStore.openCodeSessions.closeAll();
     await runtimeHost.stopAll();
     await liveProjectChanges.close();
     await manualConversationStore.projectReview.close();

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react';
-import { Brain, FileText, ImagePlus, Loader2, Send, Shield, ShieldCheck, X } from 'lucide-react';
+import { Brain, FileText, ImagePlus, Loader2, Send, Shield, ShieldCheck, X, Zap } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ChatSessionControls, type ChatControlAgent } from './chat-session-controls';
 import type { DiscoveredModel } from '@/stores/account-store';
@@ -44,7 +44,7 @@ function FilePreview({ file, onOpen, onRemove }: { file: File; onOpen: () => voi
   </div>;
 }
 
-export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, routeStatus, permissionControl, setupPending, onOpenCode, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply, surface = 'manual', sendDisabled = false, statusText }: {
+export function ManualComposer({ agent, agents, live, native, pending, draft, files, autoApprove, routeStatus, permissionControl, setupPending, onOpenCode, onAutoApprove, onDraft, onAddFiles, onRemoveFile, onSend, onMemory, onApply, surface = 'manual', sendDisabled = false, statusText, busy = false, canUrgentSteer = false, onUrgentSteer }: {
   agent: ChatControlAgent & { name: string }; agents: readonly unknown[]; live: boolean; native: boolean; pending: boolean;
   autoApprove?: OpenCodeAutoApprove; onAutoApprove?: (enabled: boolean) => Promise<void>;
   routeStatus?: {pending: boolean; error?: string};
@@ -52,6 +52,7 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
   draft: string; files: File[]; onDraft: (value: string) => void; onAddFiles: (files: File[]) => void; onRemoveFile: (file: File) => void;
   onSend: () => void; onMemory?: () => void; onApply: (model: DiscoveredModel, independent: boolean, reasoning?: string) => Promise<boolean>;
   surface?: 'manual' | 'planning'; sendDisabled?: boolean; statusText?: string;
+  busy?: boolean; canUrgentSteer?: boolean; onUrgentSteer?: () => void;
 }) {
   const input = useRef<HTMLInputElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -87,7 +88,7 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
       {files.length > 0 && <div aria-label="Attached files" className="mb-2 flex gap-2 overflow-x-auto border-b border-border/60 pb-3">
         {files.map((file, index) => <FilePreview key={`${file.name}-${file.lastModified}-${index}`} file={file} onOpen={() => setPreview(file)} onRemove={() => { if (preview === file) setPreview(null); onRemoveFile(file); }} />)}
       </div>}
-      <MentionTextarea ref={textarea} aria-label={`Message ${agent.name}`} onPaste={event => { const pastedFiles = extractClipboardFiles(event.clipboardData); if (pastedFiles.length) { event.preventDefault(); onAddFiles(pastedFiles); } }} value={draft} onChange={event => { const value = event.target.value; onDraft(value); setMentionOpen(/(?:^|\s)@([\w-]*)$/.test(value)); if (!value) setIntegrationNotice(false); }} onKeyDown={event => { if (event.key === 'Escape' && mentionOpen) { event.preventDefault(); event.stopPropagation(); setMentionOpen(false); return; } if (event.nativeEvent.isComposing) return; if (event.key === 'Tab' && !event.shiftKey && mentionOpen) { const match = matchingIntegrationMentions(integrations.items, mentionQuery)[0]; if (match) { event.preventDefault(); chooseIntegration(match.mention); } return; } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (mentionOpen) { const match = matchingIntegrationMentions(integrations.items, mentionQuery)[0]; if (match) { chooseIntegration(match.mention); return; } setMentionOpen(false); } if (canSend) onSend(); } }} placeholder={live ? 'Message this agent…' : 'Open the agent to continue…'} maxLength={32000} style={{ height }} className="block w-full resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground" />
+      <MentionTextarea ref={textarea} aria-label={`Message ${agent.name}`} onPaste={event => { const pastedFiles = extractClipboardFiles(event.clipboardData); if (pastedFiles.length) { event.preventDefault(); onAddFiles(pastedFiles); } }} value={draft} onChange={event => { const value = event.target.value; onDraft(value); setMentionOpen(/(?:^|\s)@([\w-]*)$/.test(value)); if (!value) setIntegrationNotice(false); }} onKeyDown={event => { if (event.key === 'Escape' && mentionOpen) { event.preventDefault(); event.stopPropagation(); setMentionOpen(false); return; } if (event.nativeEvent.isComposing) return; if (event.key === 'Tab' && !event.shiftKey && mentionOpen) { const match = matchingIntegrationMentions(integrations.items, mentionQuery)[0]; if (match) { event.preventDefault(); chooseIntegration(match.mention); } return; } if (event.key === 'Enter' && event.altKey && !event.shiftKey) { if (surface === 'manual' && canSend && busy && canUrgentSteer && onUrgentSteer) { event.preventDefault(); onUrgentSteer(); } return; } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (mentionOpen) { const match = matchingIntegrationMentions(integrations.items, mentionQuery)[0]; if (match) { chooseIntegration(match.mention); return; } setMentionOpen(false); } if (canSend) onSend(); } }} placeholder={live ? 'Message this agent…' : 'Open the agent to continue…'} maxLength={32000} style={{ height }} className="block w-full resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground" />
       </div>
       <ComposerResizeHandle height={height} onHeightChange={setHeight} />
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-2"><ChatSessionControls key={agent.id} agent={agent} agents={agents} pending={pending || !native} onApply={onApply}/><div className="ml-auto flex items-center gap-1">
@@ -96,7 +97,13 @@ export function ManualComposer({ agent, agents, live, native, pending, draft, fi
         {agent.runtimeType === 'opencode' && <Button type="button" variant={autoApprove?.enabled ? 'secondary' : 'ghost'} size="icon" aria-label={autoApprove?.enabled ? 'Disable OpenCode auto-approve' : 'Enable OpenCode auto-approve'} aria-pressed={Boolean(autoApprove?.enabled)} title={autoApprove?.enabled ? 'Auto-approve on · click to turn off' : 'Auto-approve future permissions · explicit deny rules still apply'} disabled={!native || !live || pending || !autoApprove?.available || requestedMode !== null} onClick={toggleAutoApprove}>{requestedMode !== null ? <Loader2 className="h-4 w-4 animate-spin" /> : autoApprove?.enabled ? <ShieldCheck className="h-4 w-4 text-primary" /> : <Shield className="h-4 w-4" />}</Button>}
         {permissionControl}
          {onMemory && <Button type="button" variant="ghost" size="icon" aria-label="Open memory and references" onClick={onMemory}><Brain className="h-4 w-4" /></Button>}
-         <Button type="submit" size="sm" disabled={!canSend}>{pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">Send</span></Button>
+         {surface === 'manual' && busy && canUrgentSteer && onUrgentSteer && (
+           <Button type="button" size="sm" variant="secondary" disabled={!canSend} title="Send immediately into current turn (Alt+Enter)" onClick={onUrgentSteer}>
+             <Zap className="h-4 w-4" />
+             <span className="ml-1.5">Steer</span>
+           </Button>
+         )}
+         <Button type="submit" size="sm" disabled={!canSend} title={surface === 'manual' && busy ? 'Add to queue' : 'Send'}>{pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}<span className="ml-2">{surface === 'manual' && busy ? 'Queue' : 'Send'}</span></Button>
       </div></div>
     </div>
     {setupPending && <p role="status" className="mx-auto mt-2 max-w-3xl px-2 text-xs text-muted-foreground">Codex is starting. Your draft is kept until the CLI is ready. <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={onOpenCode}>View CLI setup</button></p>}

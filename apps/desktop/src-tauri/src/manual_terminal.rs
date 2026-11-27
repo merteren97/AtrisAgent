@@ -536,7 +536,7 @@ fn start(manager: ManualTerminals, request: Launch) -> Result<(), String> {
             opencode_mcp = Some(value);
             continue;
         }
-        if !["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "ATRIS_CODEX_REMOTE_TOKEN", "ATRIS_CONTROL_PLANE_URL", "ATRIS_CONTROL_PLANE_TOKEN", "ATRIS_MANUAL_COORDINATION"].contains(&key.as_str()) { return Err("Unsupported CLI environment override".into()); }
+        if !is_allowed_env_var(&key) { return Err("Unsupported CLI environment override".into()); }
         command.env(key, value);
     }
     let opencode = opencode_plugin.is_some() || opencode_mcp.is_some()
@@ -641,12 +641,59 @@ fn snapshot(manager: &ManualTerminals, id: String, after: u64, status_only: bool
     // output poll, so only an explicit close may release the terminal slot.
     Ok(snapshot)
 }
-#[tauri::command]
-pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String, data: String, paste: bool) -> Result<(), String> {
-    let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || write_input(&manager, &id, &data, paste)).await.map_err(|e| e.to_string())?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitMode {
+    Enter,
+    AltM,
 }
+
+impl SubmitMode {
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw {
+            None | Some("enter") => Ok(Self::Enter),
+            Some("alt_m") => Ok(Self::AltM),
+            Some(other) => Err(format!("Unsupported submitMode '{other}'; expected 'enter' or 'alt_m'.")),
+        }
+    }
+
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Enter => b"\r",
+            Self::AltM => b"\x1bm",
+        }
+    }
+}
+
+fn is_allowed_env_var(key: &str) -> bool {
+    [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "ATRIS_CODEX_REMOTE_TOKEN",
+        "ATRIS_CONTROL_PLANE_URL",
+        "ATRIS_CONTROL_PLANE_TOKEN",
+        "ATRIS_MANUAL_COORDINATION",
+        "OPENCODE_PASSWORD",
+    ]
+    .contains(&key)
+}
+
+#[tauri::command]
+pub async fn manual_terminal_write(state: State<'_, ManualTerminals>, id: String, data: String, paste: bool, submit_mode: Option<String>) -> Result<(), String> {
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || write_input_with_mode(&manager, &id, &data, paste, submit_mode.as_deref())).await.map_err(|e| e.to_string())?
+}
+#[cfg(test)]
 fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> Result<(), String> {
+    write_input_with_mode(manager, id, data, paste, None)
+}
+fn write_input_with_mode(manager: &ManualTerminals, id: &str, data: &str, paste: bool, submit_mode: Option<&str>) -> Result<(), String> {
+    let mode = SubmitMode::parse(submit_mode)?;
+    if mode == SubmitMode::AltM && !paste {
+        return Err("submitMode 'alt_m' is only supported for pasted Antigravity prompts.".into());
+    }
     let normalized: std::borrow::Cow<'_, str> = if paste && data.contains("\r\n") {
         std::borrow::Cow::Owned(data.replace("\r\n", "\n"))
     } else {
@@ -662,6 +709,9 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
     let terminal = terminal_slot.as_mut().ok_or("Open the agent first")?;
     if terminal.closed || !matches!(terminal.child.try_wait(), Ok(None)) { return Err("Agent is not connected".into()); }
     let antigravity = terminal.antigravity;
+    if mode == SubmitMode::AltM && !antigravity {
+        return Err("submitMode 'alt_m' is only supported for Antigravity terminals.".into());
+    }
     let writer = terminal.writer.clone();
     let replay = terminal.replay.clone();
     let opencode = terminal.opencode;
@@ -790,7 +840,7 @@ fn write_input(manager: &ManualTerminals, id: &str, data: &str, paste: bool) -> 
             if antigravity && state.input_ready != Some(true) { return Err("Antigravity is waiting for input in Code. Message not submitted.".into()); }
         }
         if paste_epoch.load(Ordering::SeqCst) != epoch { return Err("Automatic submit canceled by Code input. Check the terminal; the draft is kept.".into()); }
-        input.write_all(b"\r").map_err(|e| e.to_string())?;
+        input.write_all(mode.bytes()).map_err(|e| e.to_string())?;
         input.flush().map_err(|e| e.to_string())?;
         return Ok(());
     } else {
@@ -1791,6 +1841,7 @@ mod tests {
         };
         wait_for(first, "native-ready"); wait_for(second, "native-ready");
         wait_for(third, "native-ready"); wait_for(fourth, "native-ready");
+        assert!(write_input_with_mode(&manager, second, "must-not-submit", true, Some("alt_m")).unwrap_err().contains("only supported for Antigravity"));
         assert!(write_input(&manager, fourth, "must-not-reach-the-terminal", true).unwrap_err().contains("not ready"));
         write_input(&manager, fourth, "typed-explicitly\r", false).unwrap();
         assert!(!wait_for(fourth, "received:typed-explicitly").output.contains("must-not-reach-the-terminal"));
@@ -1822,5 +1873,25 @@ mod tests {
         assert_eq!(snapshot(&manager, second.into(), 0, true).unwrap().status, "disconnected");
         manager.shutdown();
         assert!(!manager.has_live_sessions());
+    }
+
+    #[test]
+    fn submit_mode_validation_and_bytes() {
+        assert_eq!(SubmitMode::parse(None).unwrap(), SubmitMode::Enter);
+        assert_eq!(SubmitMode::parse(Some("enter")).unwrap(), SubmitMode::Enter);
+        assert_eq!(SubmitMode::parse(Some("alt_m")).unwrap(), SubmitMode::AltM);
+        assert_eq!(SubmitMode::Enter.bytes(), b"\r");
+        assert_eq!(SubmitMode::AltM.bytes(), b"\x1bm");
+        let err = SubmitMode::parse(Some("ctrl_c")).unwrap_err();
+        assert!(err.contains("Unsupported submitMode"), "unexpected error: {err}");
+        let manager = ManualTerminals::default();
+        let non_paste_err = write_input_with_mode(&manager, "missing", "hello", false, Some("alt_m")).unwrap_err();
+        assert!(non_paste_err.contains("only supported for pasted Antigravity"), "unexpected error: {non_paste_err}");
+    }
+
+    #[test]
+    fn opencode_password_is_in_env_allowlist() {
+        assert!(is_allowed_env_var("OPENCODE_PASSWORD"));
+        assert!(!is_allowed_env_var("UNSUPPORTED"));
     }
 }

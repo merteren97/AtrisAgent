@@ -726,5 +726,96 @@ try {
     fs.rmSync(attachmentSubdir, { recursive: true, force: true });
   }
 
+  // OpenCode v2 runtime teardown & steerCapabilities route tests
+  {
+    const prevAgyConfig = process.env.AGY_CLI_CONFIG_DIR;
+    const agyConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-agy-settings-'));
+    try {
+      fs.writeFileSync(path.join(agyConfigDir, 'settings.json'), JSON.stringify({ queuedMessages: 'send-immediately' }));
+      process.env.AGY_CLI_CONFIG_DIR = agyConfigDir;
+      const agySnap = await (await fetch(`${base}/agents/${agyAgent.id}/messages?view=chat`)).json();
+      assert.deepEqual(agySnap.steerCapabilities, { mode: 'antigravity_alt_m', queuedMessagesSetting: 'send-immediately' });
+
+      fs.writeFileSync(path.join(agyConfigDir, 'settings.json'), '{broken json');
+      const agyFallback = await (await fetch(`${base}/agents/${agyAgent.id}/messages?view=chat`)).json();
+      assert.deepEqual(agyFallback.steerCapabilities, { mode: 'antigravity_alt_m', queuedMessagesSetting: 'queue' });
+    } finally {
+      if (prevAgyConfig === undefined) delete process.env.AGY_CLI_CONFIG_DIR; else process.env.AGY_CLI_CONFIG_DIR = prevAgyConfig;
+      fs.rmSync(agyConfigDir, { recursive: true, force: true });
+    }
+
+    assert.equal((await post(`/agents/${openAgent.id}/prompt`, { text: 'hello' })).status, 409, 'Prompt requires active v2 runtime');
+
+    const v2Root = fs.mkdtempSync(path.join(os.tmpdir(), 'atris-v2-route-'));
+    const v2Script = path.join(v2Root, 'mock-v2.cjs');
+    fs.writeFileSync(v2Script, `
+      const http = require('node:http');
+      const args = process.argv.slice(2);
+      const port = Number(args[args.indexOf('--port') + 1]);
+      const server = http.createServer((req, res) => {
+        if (req.url === '/api/info') return res.writeHead(200, {'Content-Type':'application/json'}).end(JSON.stringify({version:'2.4.2'}));
+        if (req.url === '/api/event') return res.writeHead(200, {'Content-Type':'text/event-stream'}).end(': ok\\n\\n');
+        if (req.method === 'POST' && req.url === '/api/session') return res.writeHead(200, {'Content-Type':'application/json'}).end(JSON.stringify({data:{id:'ses_route_1'}}));
+        if (req.method === 'GET' && req.url === '/api/session/ses_route_1') return res.writeHead(200, {'Content-Type':'application/json'}).end(JSON.stringify({data:{id:'ses_route_1'}}));
+        return res.writeHead(200, {'Content-Type':'application/json'}).end(JSON.stringify({data:[]}));
+      });
+      server.listen(port, '127.0.0.1');
+    `);
+    const v2Exe = process.platform === 'win32' ? path.join(v2Root, 'opencode.cmd') : path.join(v2Root, 'opencode');
+    if (process.platform === 'win32') fs.writeFileSync(v2Exe, `@echo off\r\n"${process.execPath}" "${v2Script}" %*\r\n`);
+    else fs.writeFileSync(v2Exe, `#!/usr/bin/env sh\nexec "${process.execPath}" "${v2Script}" "$@"\n`, { mode: 0o755 });
+
+    const origGetAdapter = runtime.getAdapter;
+    profile.runtimeType = 'opencode';
+    profile.authStatus = 'connected';
+    model.availability = 'available';
+    model.catalogId = 'opencode:v2'; model.runtimeModelId = 'openai/gpt-5'; model.supportedReasoning = ['medium'];
+    (runtime as any).getAdapter = () => ({
+      discoverInstallation: async () => ({ installed: true, path: v2Exe, version: '2.4.2' }),
+    });
+    try {
+      const v2AgentRes = await post(`/conversations/${conversationId}/agents`, { id: randomUUID(), catalogId: model.catalogId, reasoning: 'medium' });
+      const v2Agent = await v2AgentRes.json();
+      assert.equal(v2AgentRes.status, 200, JSON.stringify(v2Agent));
+
+      const launch1 = await post(`/agents/${v2Agent.id}/launch`, {});
+      assert.equal(launch1.status, 200);
+      const l1 = await launch1.json();
+      assert.ok(l1.openCodeRuntimeId);
+      assert.equal(l1.args[0], '--server');
+      assert.equal(l1.args[2], '--session');
+      assert.equal(l1.args[3], 'ses_route_1');
+      assert.ok(l1.env.OPENCODE_PASSWORD);
+      assert.equal(l1.env.ATRIS_MANUAL_OPENCODE_PLUGIN, undefined);
+
+      // Mismatched runtimeId -> 409
+      const mismatchDel = await fetch(`${base}/agents/${v2Agent.id}/opencode-runtime`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runtimeId: 'wrong-id' }),
+      });
+      assert.equal(mismatchDel.status, 409);
+
+      // No body (close/restart/passive exit) -> 204
+      const noBodyDel = await fetch(`${base}/agents/${v2Agent.id}/opencode-runtime`, { method: 'DELETE' });
+      assert.equal(noBodyDel.status, 204);
+
+      // Relaunch succeeds after no-body DELETE -> 200, then matching runtimeId DELETE -> 204
+      const launch2 = await post(`/agents/${v2Agent.id}/launch`, {});
+      assert.equal(launch2.status, 200);
+      const l2 = await launch2.json();
+      const matchDel = await fetch(`${base}/agents/${v2Agent.id}/opencode-runtime`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runtimeId: l2.openCodeRuntimeId }),
+      });
+      assert.equal(matchDel.status, 204);
+    } finally {
+      (runtime as any).getAdapter = origGetAdapter;
+      await installedStore.openCodeSessions.closeAll();
+      fs.rmSync(v2Root, { recursive: true, force: true });
+    }
+  }
+
   console.log('Manual conversation persistence, isolation, idempotency, transcript and route tests passed.');
 } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await liveChanges.close(); await installedStore.projectReview.close(); sqlite.close(); fs.rmSync(temporary, {recursive:true, force:true}); }

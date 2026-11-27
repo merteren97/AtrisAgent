@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Bot, Code2, MessageSquare, Plus, Square, X, Loader2, RotateCcw, ImagePlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { RuntimeBrandIcon, RUNTIME_BRANDS } from '@/components/runtime/runtime-brand-icon';
-import { useManualStore, type ManualAgent, type ManualMessage, type ManualQuestion } from '@/stores/manual-store';
+import { useManualStore, type ManualAgent, type ManualMessage, type ManualQuestion, type ManualQueuedPrompt } from '@/stores/manual-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useAccountStore, type DiscoveredModel } from '@/stores/account-store';
 import { useSettingsStore } from '@/stores/settings-store';
@@ -16,7 +16,8 @@ import { markManualLaunch, markManualClosed, forgetManualActivity, useManualActi
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Trash2 } from 'lucide-react';
 import { ManualComposer, addManualFiles } from './manual-composer';
-import { sendManualDraft } from './manual-attachment-send';
+import { ManualQueuePanel } from './manual-queue-panel';
+import { sendManualDraft, sendManualPayload } from './manual-attachment-send';
 import { ManualAgentSwitcher } from './manual-agent-switcher';
 import { ManualMemory } from './manual-memory';
 import { findMatchingArtifact, ManualChatContent } from './manual-chat-content';
@@ -32,6 +33,8 @@ import type { CodexPermissionMode } from '@atris-agent-code/domain';
 export { buildAntigravityQuestionKeystrokes };
 
 const EMPTY_FILES: File[] = [];
+const EMPTY_QUEUED: ManualQueuedPrompt[] = [];
+const OPTIMISTIC_BUSY_MS = 4500;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const supportsChat = (kind?: string) => ['claude_code', 'codex', 'opencode', 'antigravity'].includes(kind || '');
 const cliName = (kind: string) => ({ claude_code: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', antigravity: 'Antigravity' }[kind] || kind);
@@ -162,6 +165,14 @@ export function ManualWorkspace() {
   const [draggingFiles, setDraggingFiles] = useState(false);
   const dragDepth = useRef(0);
   const lifecycleEpoch = useRef(0);
+  const prevStatusesRef = useRef<Record<string, TerminalSnapshot['status']>>({});
+  const optimisticBusyUntil = useRef<Record<string, number>>({});
+  const lastDirectSendAt = useRef<Record<string, number>>({});
+  const deliveryChains = useRef<Record<string, Promise<void>>>({});
+  const busyTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const sendCheckInFlight = useRef<Set<string>>(new Set());
+  const [busyTick, setBusyTick] = useState(0);
+  const [queueActionId, setQueueActionId] = useState<string | null>(null);
   const visibleAgents = (conversation?.agents || []).filter(item => !hidden[item.id] && !['closed','exited','disconnected'].includes(statuses[item.id])).sort((a, b) => (order.includes(a.id) ? order.indexOf(a.id) : 999) - (order.includes(b.id) ? order.indexOf(b.id) : 999));
   const agent = (surface === 'code' ? visibleAgents : conversation?.agents.filter(a => !hidden[a.id]) || []).find(a => a.id === agentByConversation[conversation!.id]) || (surface === 'code' ? visibleAgents[0] : undefined) || conversation?.agents.find(a => !hidden[a.id]);
   const openCount = (conversation?.agents || []).filter(item => statuses[item.id] === 'open' && !hidden[item.id]).length;
@@ -170,6 +181,7 @@ export function ManualWorkspace() {
   const agentId = agent?.id;
   const draft = useManualStore(state => (agentId ? state.drafts[agentId] || '' : ''));
   const files = useManualStore(state => (agentId ? state.attachments[agentId] || EMPTY_FILES : EMPTY_FILES));
+  const queuedForAgent = useManualStore(state => (agentId ? state.queuedPrompts[agentId] || EMPTY_QUEUED : EMPTY_QUEUED));
   const agentIds = conversation?.agents.map(a => a.id).join(',') || '';
   const scroll = useChatHistoryScroll(`${agentId}:${surface}`);
   const { snapshot, messages, recentTools, questions, status, loadOlder, dismissConnectionError } = useManualChatHistory(
@@ -237,12 +249,33 @@ export function ManualWorkspace() {
     };
     void poll(); return () => { disposed = true; clearTimeout(timer); };
   }, [agentIds, native, generation]);
+  useEffect(() => {
+    const prev = prevStatusesRef.current;
+    for (const item of conversation?.agents || []) {
+      if (item.runtimeType === 'opencode' && prev[item.id] === 'open' && (statuses[item.id] === 'exited' || statuses[item.id] === 'disconnected')) {
+        void apiRequest(`/manual/agents/${item.id}/opencode-runtime`, { method: 'DELETE' }).catch(() => {});
+      }
+    }
+    prevStatusesRef.current = statuses;
+  }, [statuses, conversation?.agents]);
+  useEffect(() => {
+    if (!agentId) return;
+    const obs = observations[agentId];
+    if (obs?.state === 'completed' && obs.at) {
+      const atMs = Date.parse(obs.at);
+      if (Number.isFinite(atMs) && atMs >= (lastDirectSendAt.current[agentId] || 0)) {
+        delete optimisticBusyUntil.current[agentId];
+        setBusyTick(v => v + 1);
+      }
+    }
+  }, [agentId, observations]);
   const launch = async (target: ManualAgent, showCode = false) => {
     if (!native) return;
-    const request = await apiRequest<{codexRuntimeId?: string}>(`/manual/agents/${target.id}/launch`, { method: 'POST', timeoutMs: 60_000 });
+    const request = await apiRequest<{codexRuntimeId?: string; openCodeRuntimeId?: string}>(`/manual/agents/${target.id}/launch`, { method: 'POST', timeoutMs: 60_000 });
     try { await invoke('manual_terminal_start', { request }); }
     catch (error) {
       if (request.codexRuntimeId) await apiRequest(`/manual/agents/${target.id}/codex-runtime`, {method:'DELETE', body:JSON.stringify({runtimeId:request.codexRuntimeId})}).catch(() => {});
+      if (request.openCodeRuntimeId) await apiRequest(`/manual/agents/${target.id}/opencode-runtime`, {method:'DELETE', body:JSON.stringify({runtimeId:request.openCodeRuntimeId})}).catch(() => {});
       await apiRequest(`/manual/agents/${target.id}/coordination`, {method:'DELETE'}).catch(() => {});
       throw error;
     }
@@ -290,6 +323,9 @@ export function ManualWorkspace() {
         // Only abort deletion if a live process refused to close; already-closed/disconnected sessions can be removed.
         if (statuses[target.id] === 'open') throw err;
       }
+      if (target.runtimeType === 'opencode') {
+        await apiRequest(`/manual/agents/${target.id}/opencode-runtime`, { method: 'DELETE' }).catch(() => {});
+      }
     }
     lifecycleEpoch.current += 1;
     markManualClosed(target.id); setStatuses(previous => ({ ...previous, [target.id]: 'closed' }));
@@ -300,6 +336,9 @@ export function ManualWorkspace() {
   });
   const restart = (target: ManualAgent) => void action('restart', async () => {
     await invoke('manual_terminal_close', { id: target.id }); lifecycleEpoch.current += 1; markManualClosed(target.id);
+    if (target.runtimeType === 'opencode') {
+      await apiRequest(`/manual/agents/${target.id}/opencode-runtime`, { method: 'DELETE' }).catch(() => {});
+    }
     await apiRequest(`/manual/agents/${target.id}/coordination`, {method:'DELETE'});
     setStatuses(previous => ({ ...previous, [target.id]: 'closed' })); await launch(target);
   });
@@ -357,15 +396,257 @@ export function ManualWorkspace() {
       setError(null);
     } catch (e) { setError(errorText(e)); }
   };
-  const send = () => agent && action('send', async () => {
-    if (!live || !native) return;
-    if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) throw new Error('Codex is still starting. Your draft is kept; check CLI setup in Code.');
-    void apiRequest(`/manual/agents/${agent.id}/turn-started`, { method: 'POST' }).catch(() => {});
-    await sendManualDraft(agent, {
-      stage: async (id, file) => invoke<string>('manual_stage_attachment', { id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }),
-      write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
+  const steerMode = snapshot?.steerCapabilities?.mode ?? (agent?.runtimeType === 'antigravity' ? 'antigravity_alt_m' : 'none');
+  const canUrgentSteer = steerMode === 'opencode_v2_inbox' || steerMode === 'antigravity_alt_m';
+  const observation = agent ? observations[agent.id] : undefined;
+  const attention = Boolean(live && (observation?.state === 'attention' || questions.length > 0 || Boolean(unresolvedQuestion)));
+  const isBusy = Boolean(live && (observation?.state === 'working' || (agent ? (optimisticBusyUntil.current[agent.id] || 0) > Date.now() : false)));
+
+  const stageAttachment = useCallback(
+    async (id: string, file: File) => invoke<string>('manual_stage_attachment', { id, name: file.name, data: Array.from(new Uint8Array(await file.arrayBuffer())) }),
+    [],
+  );
+
+  const serializeDelivery = useCallback((id: string, task: () => Promise<void>): Promise<void> => {
+    const previous = deliveryChains.current[id] || Promise.resolve();
+    const next = previous.catch(() => {}).then(task);
+    deliveryChains.current[id] = next;
+    void next.finally(() => {
+      if (deliveryChains.current[id] === next) delete deliveryChains.current[id];
     });
-  });
+    return next;
+  }, []);
+
+  useEffect(() => () => {
+    Object.values(busyTimers.current).forEach(clearTimeout);
+    busyTimers.current = {};
+  }, []);
+
+  const markOptimisticBusy = useCallback((id: string) => {
+    const now = Date.now();
+    lastDirectSendAt.current[id] = now;
+    optimisticBusyUntil.current[id] = now + OPTIMISTIC_BUSY_MS;
+    if (busyTimers.current[id]) clearTimeout(busyTimers.current[id]);
+    busyTimers.current[id] = setTimeout(() => {
+      delete busyTimers.current[id];
+      setBusyTick(v => v + 1);
+    }, OPTIMISTIC_BUSY_MS + 50);
+    setBusyTick(v => v + 1);
+  }, []);
+
+  const send = () => {
+    if (!agent || !live || !native) return;
+    if (agent.runtimeType === 'codex' && inputReady[agent.id] === false) {
+      setError('Codex is still starting. Your draft is kept; check CLI setup in Code.');
+      return;
+    }
+    const currentState = useManualStore.getState();
+    const currentDraft = currentState.drafts[agent.id] || '';
+    const currentFiles = currentState.attachments[agent.id] || EMPTY_FILES;
+    if (!currentDraft.trim() && !currentFiles.length) return;
+    setError(null);
+
+    if (steerMode === 'opencode_v2_inbox') {
+      void serializeDelivery(agent.id, async () => {
+        try {
+          await sendManualDraft(agent, {
+            stage: stageAttachment,
+            write: async (id, prompt) => {
+              await apiRequest(`/manual/agents/${id}/prompt`, {
+                method: 'POST',
+                body: JSON.stringify({ text: prompt, delivery: 'queue' }),
+              });
+            },
+          });
+        } catch (e) { setError(errorText(e)); }
+      });
+      return;
+    }
+
+    if (sendCheckInFlight.current.has(agent.id)) return;
+    sendCheckInFlight.current.add(agent.id);
+    const targetAgent = agent;
+    void (async () => {
+      try {
+        let busy = observations[targetAgent.id]?.state === 'working' || (optimisticBusyUntil.current[targetAgent.id] || 0) > Date.now();
+        if (!busy) {
+          const fresh = await apiRequest<{ state?: string }>(`/manual/agents/${targetAgent.id}/activity`).catch(() => ({ state: undefined }));
+          if (fresh.state === 'working') busy = true;
+        }
+        const latest = useManualStore.getState();
+        const stillExists = Object.values(latest.conversations).some(items =>
+          items.some(c => c.id === targetAgent.conversationId && c.agents.some(item => item.id === targetAgent.id)),
+        );
+        if (!stillExists) return;
+        const latestDraft = latest.drafts[targetAgent.id] || '';
+        const latestFiles = latest.attachments[targetAgent.id] || EMPTY_FILES;
+        const sameDraft = latestDraft === currentDraft
+          && latestFiles.length === currentFiles.length
+          && latestFiles.every((file, index) => file === currentFiles[index]);
+        if (!sameDraft || (!latestDraft.trim() && !latestFiles.length)) return;
+
+        if (busy) {
+          latest.enqueuePrompt(targetAgent.id, {
+            id: crypto.randomUUID(),
+            text: currentDraft,
+            files: currentFiles,
+            createdAt: Date.now(),
+            status: 'queued',
+          });
+          latest.clearSentDraft(targetAgent.id, currentDraft, currentFiles);
+          return;
+        }
+        markOptimisticBusy(targetAgent.id);
+        void apiRequest(`/manual/agents/${targetAgent.id}/turn-started`, { method: 'POST' }).catch(() => {});
+        await serializeDelivery(targetAgent.id, async () => {
+          try {
+            await sendManualDraft(targetAgent, {
+              stage: stageAttachment,
+              write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
+            });
+          } catch (e) {
+            delete optimisticBusyUntil.current[targetAgent.id];
+            setBusyTick(v => v + 1);
+            setError(errorText(e));
+          }
+        });
+      } finally {
+        sendCheckInFlight.current.delete(targetAgent.id);
+      }
+    })();
+  };
+
+  const urgentSteer = () => {
+    if (!agent || !live || !native || !canUrgentSteer || attention) return;
+    setError(null);
+    void apiRequest(`/manual/agents/${agent.id}/turn-started`, { method: 'POST' }).catch(() => {});
+    if (steerMode === 'opencode_v2_inbox') {
+      void serializeDelivery(agent.id, async () => {
+        try {
+          await sendManualDraft(agent, {
+            stage: stageAttachment,
+            write: async (id, prompt) => {
+              await apiRequest(`/manual/agents/${id}/prompt`, {
+                method: 'POST',
+                body: JSON.stringify({ text: prompt, delivery: 'steer' }),
+              });
+            },
+          });
+        } catch (e) { setError(errorText(e)); }
+      });
+      return;
+    }
+    const submitMode = agent.runtimeType === 'antigravity' && isBusy && snapshot?.steerCapabilities?.queuedMessagesSetting !== 'send-immediately'
+      ? 'alt_m'
+      : 'enter';
+    markOptimisticBusy(agent.id);
+    void serializeDelivery(agent.id, async () => {
+      try {
+        await sendManualDraft(agent, {
+          stage: stageAttachment,
+          write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true, submitMode }),
+        });
+      } catch (e) {
+        delete optimisticBusyUntil.current[agent.id];
+        setBusyTick(v => v + 1);
+        setError(errorText(e));
+      }
+    });
+  };
+
+  const steerInboxItem = (inboxId: string) => {
+    if (!agent) return;
+    setQueueActionId(inboxId);
+    setError(null);
+    void apiRequest(`/manual/agents/${agent.id}/inbox/${encodeURIComponent(inboxId)}/steer`, { method: 'POST' })
+      .catch(e => setError(errorText(e)))
+      .finally(() => setQueueActionId(current => (current === inboxId ? null : current)));
+  };
+
+  const cancelInboxItem = (inboxId: string) => {
+    if (!agent) return;
+    setQueueActionId(inboxId);
+    setError(null);
+    void apiRequest(`/manual/agents/${agent.id}/inbox/${encodeURIComponent(inboxId)}`, { method: 'DELETE' })
+      .catch(e => setError(errorText(e)))
+      .finally(() => setQueueActionId(current => (current === inboxId ? null : current)));
+  };
+
+  const dispatchQueuedItem = (item: ManualQueuedPrompt, allowSteer: boolean) => {
+    if (!agent || !live || !native || attention || item.status === 'sending') return;
+    const targetAgent = agent;
+    setError(null);
+    void (async () => {
+      let busy = observations[targetAgent.id]?.state === 'working' || (optimisticBusyUntil.current[targetAgent.id] || 0) > Date.now();
+      if (!busy) {
+        const fresh = await apiRequest<{ state?: string }>(`/manual/agents/${targetAgent.id}/activity`).catch(() => ({ state: undefined }));
+        if (fresh.state === 'working') busy = true;
+      }
+      if (!allowSteer && busy) {
+        useManualStore.getState().updateQueuedPrompt(targetAgent.id, item.id, { status: 'queued', error: undefined });
+        return;
+      }
+      const submitMode = targetAgent.runtimeType === 'antigravity' && busy && snapshot?.steerCapabilities?.queuedMessagesSetting !== 'send-immediately'
+        ? 'alt_m'
+        : 'enter';
+      useManualStore.getState().updateQueuedPrompt(targetAgent.id, item.id, { status: 'sending', error: undefined });
+      markOptimisticBusy(targetAgent.id);
+      void apiRequest(`/manual/agents/${targetAgent.id}/turn-started`, { method: 'POST' }).catch(() => {});
+      await serializeDelivery(targetAgent.id, async () => {
+        try {
+          const sent = await sendManualPayload(targetAgent, { text: item.text, files: item.files }, {
+            stage: stageAttachment,
+            write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true, submitMode }),
+          });
+          if (sent) {
+            useManualStore.getState().removeQueuedPrompt(targetAgent.id, item.id);
+          } else {
+            delete optimisticBusyUntil.current[targetAgent.id];
+            setBusyTick(v => v + 1);
+            useManualStore.getState().removeQueuedPrompt(targetAgent.id, item.id);
+          }
+        } catch (e) {
+          delete optimisticBusyUntil.current[targetAgent.id];
+          setBusyTick(v => v + 1);
+          useManualStore.getState().updateQueuedPrompt(targetAgent.id, item.id, { status: 'error', error: errorText(e) });
+        }
+      });
+    })();
+  };
+
+  useEffect(() => {
+    if (!agent || !live || !native) return;
+    const head = queuedForAgent[0];
+    if (!head) return;
+    if (queuedForAgent.some(item => item.status === 'sending' || item.status === 'error')) return;
+    const state = observations[agent.id]?.state;
+    if (state !== 'completed' && state !== 'ready') return;
+    if (questions.length > 0 || unresolvedQuestion || inputReady[agent.id] === false) return;
+    if ((optimisticBusyUntil.current[agent.id] || 0) > Date.now()) return;
+
+    useManualStore.getState().updateQueuedPrompt(agent.id, head.id, { status: 'sending', error: undefined });
+    markOptimisticBusy(agent.id);
+    void apiRequest(`/manual/agents/${agent.id}/turn-started`, { method: 'POST' }).catch(() => {});
+    void serializeDelivery(agent.id, async () => {
+      try {
+        const sent = await sendManualPayload(agent, { text: head.text, files: head.files }, {
+          stage: stageAttachment,
+          write: (id, prompt) => invoke('manual_terminal_write', { id, data: prompt, paste: true }),
+        });
+        if (sent) {
+          useManualStore.getState().removeQueuedPrompt(agent.id, head.id);
+        } else {
+          delete optimisticBusyUntil.current[agent.id];
+          setBusyTick(v => v + 1);
+          useManualStore.getState().removeQueuedPrompt(agent.id, head.id);
+        }
+      } catch (e) {
+        delete optimisticBusyUntil.current[agent.id];
+        setBusyTick(v => v + 1);
+        useManualStore.getState().updateQueuedPrompt(agent.id, head.id, { status: 'error', error: errorText(e) });
+      }
+    });
+  }, [agent, live, native, queuedForAgent, observations, questions, unresolvedQuestion, inputReady, busyTick, stageAttachment, serializeDelivery, markOptimisticBusy]);
 
   if (creating || adding) return <ManualAgentSetup conversationId={adding ? conversation?.id : undefined} onClose={closeDialog} onCreated={created} />;
 
@@ -510,7 +791,21 @@ export function ManualWorkspace() {
             {scroll.detached && <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center"><div className="pointer-events-auto"><LatestMessagesButton onClick={scroll.jumpToLatest} /></div></div>}
             </div>
             <ChatChangeSummary endpoint={`/manual/conversations/${encodeURIComponent(conversation.id)}/changes?summary=1`} />
-             {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={() => void send()} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
+             {supportsChat(agent.runtimeType) && (
+               <ManualQueuePanel
+                 inbox={snapshot?.inbox}
+                 queued={queuedForAgent}
+                 canSteer={canUrgentSteer}
+                 attention={attention}
+                 pendingActionId={queueActionId}
+                 onSteerInbox={steerInboxItem}
+                 onCancelInbox={cancelInboxItem}
+                 onSteerQueued={item => dispatchQueuedItem(item, true)}
+                 onRetryQueued={item => dispatchQueuedItem(item, canUrgentSteer)}
+                 onCancelQueued={itemId => useManualStore.getState().removeQueuedPrompt(agent.id, itemId)}
+               />
+             )}
+             {supportsChat(agent.runtimeType) && <ManualComposer key={agent.id} agent={agent} agents={conversation.agents} live={Boolean(live)} native={native} pending={Boolean(pending)} draft={draft} files={files} autoApprove={autoApprove} routeStatus={routeStatus} setupPending={Boolean(live) && agent.runtimeType === 'codex' && inputReady[agent.id] === false} onOpenCode={() => setSurface(conversation.id, 'code')} permissionControl={agent.runtimeType === 'codex' ? <CodexPermissions key={agent.id} agent={agent} live={Boolean(live)} disabled={!native || Boolean(pending)} onApply={applyPermissions} /> : undefined} onAutoApprove={async enabled => { await apiRequest(`/manual/agents/${agent.id}/auto-approve`, {method:'POST',body:JSON.stringify({enabled})}); }} onDraft={value => setDraft(agent.id, value)} onAddFiles={addFiles} onSend={send} busy={isBusy} canUrgentSteer={canUrgentSteer && !attention} onUrgentSteer={urgentSteer} onMemory={() => setMemory({})} onApply={applyModel} onRemoveFile={file => updateAttachments(agent.id, current => current.filter(item => item !== file))} />}
              {Boolean(live) && agent.runtimeType === 'antigravity' && inputReady[agent.id] === false && !questions.length && !unresolvedQuestion && <p role="status" className="mx-auto mb-2 max-w-3xl px-6 text-xs text-muted-foreground">Antigravity is starting or waiting for input in Code. Your draft is kept until the CLI is ready. <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={() => setSurface(conversation.id, 'code')}>View CLI setup</button></p>}
           </div>
         </div>

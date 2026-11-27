@@ -228,6 +228,26 @@ try {
   await oldRefresh;
   assert.equal(store.getState().drafts.a,'Keep sibling','Superseded refresh cannot prune a surviving draft');
   assert.equal(store.getState().attachments.a[0],attachment,'Superseded refresh cannot prune surviving Files');
+
+  // Queued prompts lifecycle, persistence exclusion, and cleanup.
+  store.getState().enqueuePrompt('a', { id: 'q1', text: 'First queued', files: [attachment], createdAt: 100, status: 'queued' });
+  store.getState().enqueuePrompt('a', { id: 'q2', text: 'Second queued', files: [], createdAt: 101, status: 'queued' });
+  store.getState().enqueuePrompt('nonexistent', { id: 'q3', text: 'Ignored', files: [], createdAt: 102, status: 'queued' });
+  assert.equal(store.getState().queuedPrompts.nonexistent, undefined, 'Cannot enqueue for unknown agents');
+  assert.equal(store.getState().queuedPrompts.a.length, 2);
+  store.getState().updateQueuedPrompt('a', 'q1', { status: 'sending' });
+  assert.equal(store.getState().queuedPrompts.a[0].status, 'sending');
+  store.getState().removeQueuedPrompt('a', 'q1');
+  assert.deepEqual(store.getState().queuedPrompts.a.map(q => q.id), ['q2']);
+  const navAfterQueue = JSON.parse(persisted.get('atris-manual-navigation')!);
+  assert.equal('queuedPrompts' in navAfterQueue.state, false, 'queuedPrompts must not be persisted');
+  globalThis.fetch = (async () => new Response('[]',{status:200,headers:{'content-type':'application/json'}})) as typeof fetch;
+  await store.getState().refresh('project-a');
+  assert.equal(store.getState().queuedPrompts.a, undefined, 'Removed agents clean up queuedPrompts');
+  store.setState({ conversations: { 'project-a': [{ ...beforeRefresh, agents: [agents[0]] }] } });
+  store.getState().enqueuePrompt('a', { id: 'q4', text: 'Clear me', files: [], createdAt: 103, status: 'queued' });
+  store.getState().clearQueuedPrompts('a');
+  assert.equal(store.getState().queuedPrompts.a, undefined);
 } finally {
   globalThis.fetch = oldFetch;
   if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);

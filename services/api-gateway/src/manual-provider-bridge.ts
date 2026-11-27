@@ -566,7 +566,7 @@ export class ManualProviderBridge {
     if (!fs.existsSync(filename)) return {sessionId:null, messages:[]};
     if (fs.statSync(filename).size > 16 * 1024 * 1024) throw new Error('OpenCode history exceeded the supported size. Continue in Code.');
     const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
-    if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
+    if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9_-]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
     return {sessionId: record.sessionId, messages: Array.isArray(record.messages) ? record.messages.filter((m: any) => typeof m.id === 'string' && typeof m.text === 'string' && ['user','assistant','tool'].includes(m.role)) : []};
   }
   pendingQuestions(agent: ManualAgent): ManualQuestion[] {

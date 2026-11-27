@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
-import { addManualFiles, MAX_ATTACHMENT_SIZE, MAX_ATTACHMENTS } from './manual-composer';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { addManualFiles, ManualComposer, MAX_ATTACHMENT_SIZE, MAX_ATTACHMENTS } from './manual-composer';
 import { assistantProjectImages, displayManualPrompt } from './manual-chat-content';
-import { sendManualDraft } from './manual-attachment-send';
+import { sendManualDraft, sendManualPayload } from './manual-attachment-send';
 import { useManualStore, type ManualAgent, type ManualConversation } from '@/stores/manual-store';
 
 const file = (name: string, size: number) => new File([new Uint8Array(size)], name, { lastModified: 1 });
@@ -136,9 +138,66 @@ try {
   assert.equal(store.getState().attachments[agent.id],undefined,'Completion after conversation deletion cannot resurrect files');
   assert.equal(store.getState().drafts[agent.id],undefined,'Completion after conversation deletion cannot resurrect text');
   assert.deepEqual(store.getState().attachments[other.id],[second]);
+
+  // sendManualPayload stages files on flush without touching store drafts.
+  resetDraft();
+  let payloadPrompt = '';
+  const sentOk = await sendManualPayload(agent, { text: 'Queued follow-up', files: [first] }, {
+    stage: async () => 'C:\\Temp\\queued.png',
+    write: async (_id, prompt) => { payloadPrompt = prompt; },
+  });
+  assert.equal(sentOk, true);
+  assert.deepEqual(displayManualPrompt(payloadPrompt), { text: 'Queued follow-up', attachments: [{ name: first.name, path: 'C:\\Temp\\queued.png' }] });
+  assert.equal(store.getState().drafts[agent.id], ' Inspect this ', 'sendManualPayload leaves composer draft untouched');
 } finally {
   globalThis.fetch = oldFetch;
 }
+
+const composerAgent = { id: 'comp-1', name: 'Antigravity', runtimeType: 'antigravity' as const, catalogId: 'm', model: 'Gemini', accountProfileId: 'a' };
+const busyHtml = renderToStaticMarkup(
+  createElement(ManualComposer, {
+    agent: composerAgent,
+    agents: [composerAgent],
+    live: true,
+    native: true,
+    pending: false,
+    draft: 'Urgent correction',
+    files: [],
+    busy: true,
+    canUrgentSteer: true,
+    onUrgentSteer: () => {},
+    onDraft: () => {},
+    onAddFiles: () => {},
+    onRemoveFile: () => {},
+    onSend: () => {},
+    onApply: async () => true,
+  }),
+);
+assert.match(busyHtml, />Steer</);
+assert.match(busyHtml, />Queue</);
+
+const planningBusyHtml = renderToStaticMarkup(
+  createElement(ManualComposer, {
+    agent: composerAgent,
+    agents: [composerAgent],
+    live: true,
+    native: true,
+    pending: false,
+    draft: 'Plan',
+    files: [],
+    surface: 'planning',
+    busy: true,
+    canUrgentSteer: true,
+    onUrgentSteer: () => {},
+    onDraft: () => {},
+    onAddFiles: () => {},
+    onRemoveFile: () => {},
+    onSend: () => {},
+    onApply: async () => true,
+  }),
+);
+assert.doesNotMatch(planningBusyHtml, />Steer</);
+assert.match(planningBusyHtml, />Send</);
 
 console.log('Manual composer attachment validation passed.');
 console.log('Manual attachment send navigation, identity, failure and deletion regressions passed.');
