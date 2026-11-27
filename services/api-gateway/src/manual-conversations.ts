@@ -1011,9 +1011,11 @@ export function installManualConversations(app: Application, sqlite: Database.Da
   }));
   app.post('/api/manual/agents/:id/auto-approve', route((req, res) => {
     const agent = store.agent(idParam(req, 'id'));
+    if (typeof req.body?.enabled !== 'boolean') return fail('Invalid OpenCode permission mode.');
+    const enabled = req.body.enabled === true;
     const openCodeSession = store.openCodeSessions.get(agent.id);
-    if (openCodeSession) openCodeSession.setAutoApprove(req.body?.enabled);
-    else bridge.setAutoApprove(agent, req.body?.enabled);
+    if (openCodeSession) openCodeSession.setAutoApprove(enabled);
+    else bridge.setAutoApprove(agent, enabled);
     res.status(202).json({accepted:true});
   }));
   app.post('/api/manual/agents/:id/questions/:questionId/reply', route(async (req, res) => {
@@ -1088,14 +1090,20 @@ export function installManualConversations(app: Application, sqlite: Database.Da
 }
 
 function readAntigravityQueuedMessagesSetting(): 'queue' | 'send-immediately' {
+  let fd: number | undefined;
   try {
     const configDir = process.env.AGY_CLI_CONFIG_DIR || path.join(os.homedir(), '.gemini', 'antigravity-cli');
     const settingsPath = path.join(configDir, 'settings.json');
-    if (!fs.existsSync(settingsPath) || fs.lstatSync(settingsPath).isSymbolicLink()) return 'queue';
-    if (fs.statSync(settingsPath).size > 1024 * 1024) return 'queue';
-    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    fd = fs.openSync(settingsPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > 1024 * 1024) return 'queue';
+    const parsed = JSON.parse(fs.readFileSync(fd, 'utf8'));
     return parsed?.queuedMessages === 'send-immediately' ? 'send-immediately' : 'queue';
   } catch {
     return 'queue';
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
   }
 }

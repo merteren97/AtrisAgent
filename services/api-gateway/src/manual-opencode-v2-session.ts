@@ -119,18 +119,19 @@ export function buildOpenCodeV2ConfigContent(
   });
 }
 
-function assertNotSymlink(target: string): void {
-  if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) {
-    throw new Error(`Managed OpenCode path must not be a symbolic link: ${target}`);
-  }
-}
-
 function writeJsonAtomic(filename: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
-  const temp = `${filename}.tmp`;
-  assertNotSymlink(filename);
-  assertNotSymlink(temp);
-  fs.writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
+  const temp = `${filename}.${process.pid}.${randomUUID()}.tmp`;
+  const fd = fs.openSync(
+    temp,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    fs.writeFileSync(fd, JSON.stringify(value), 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(temp, filename);
 }
 
@@ -347,11 +348,12 @@ export class ManualOpenCodeV2Session {
   }
 
   private loadSavedHistory(): { sessionId: string | null; messages: ManualMessage[] } {
+    let fd: number | undefined;
     try {
-      if (!fs.existsSync(this.historyFile)) return { sessionId: null, messages: [] };
-      assertNotSymlink(this.historyFile);
-      if (fs.statSync(this.historyFile).size > MAX_HISTORY_BYTES) return { sessionId: null, messages: [] };
-      const record = JSON.parse(fs.readFileSync(this.historyFile, 'utf8'));
+      fd = fs.openSync(this.historyFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.size > MAX_HISTORY_BYTES) return { sessionId: null, messages: [] };
+      const record = JSON.parse(fs.readFileSync(fd, 'utf8'));
       if (!isValidSessionId(record?.sessionId)) return { sessionId: null, messages: [] };
       const messages = Array.isArray(record.messages)
         ? record.messages.filter(
@@ -362,6 +364,10 @@ export class ManualOpenCodeV2Session {
       return { sessionId: record.sessionId, messages };
     } catch {
       return { sessionId: null, messages: [] };
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch {}
+      }
     }
   }
 
@@ -394,17 +400,29 @@ export class ManualOpenCodeV2Session {
 
   private recordFileTouch(tool: string, rawPaths: string[]): void {
     if (!this.sessionId || !rawPaths.length) return;
+    let fd: number | undefined;
     try {
-      assertNotSymlink(this.fileEventsFile);
       const paths = [...new Set(rawPaths.filter((p) => typeof p === 'string' && p.trim() && p.length <= 2048).map((p) => p.trim()))];
       if (!paths.length) return;
-      fs.appendFileSync(
+      fs.mkdirSync(path.dirname(this.fileEventsFile), { recursive: true, mode: 0o700 });
+      fd = fs.openSync(
         this.fileEventsFile,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      if (!fs.fstatSync(fd).isFile()) return;
+      fs.writeSync(
+        fd,
         JSON.stringify({ sessionID: this.sessionId, tool: tool || 'tool', paths, at: new Date().toISOString() }) + '\n',
-        { mode: 0o600 },
+        undefined,
+        'utf8',
       );
     } catch {
       // Best effort attribution log.
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch {}
+      }
     }
   }
 
