@@ -557,16 +557,21 @@ export class ManualProviderBridge {
   setAutoApprove(agent: ManualAgent, enabled: unknown): void {
     if (agent.runtimeType !== 'opencode' || typeof enabled !== 'boolean') throw Object.assign(new Error('Invalid OpenCode permission mode.'), {status:400});
     if (!this.autoApprove(agent).available) throw Object.assign(new Error('Open this OpenCode agent before changing permissions.'), {status:409});
+    const nextEnabled = enabled === true;
     const filename = path.join(this.directory(agent), 'opencode-auto-request.json');
-    if (fs.existsSync(filename)) throw Object.assign(new Error('Permission mode is already changing.'), {status:409});
-    fs.writeFileSync(filename, JSON.stringify({id:randomUUID(),enabled,at:Date.now()}), {flag:'wx',mode:0o600});
+    try {
+      fs.writeFileSync(filename, JSON.stringify({id:randomUUID(),enabled:nextEnabled,at:Date.now()}), {flag:'wx',mode:0o600});
+    } catch (error: any) {
+      if (error?.code === 'EEXIST') throw Object.assign(new Error('Permission mode is already changing.'), {status:409});
+      throw error;
+    }
   }
   private openCodeHistory(agent: ManualAgent): {sessionId: string | null; messages: ManualMessage[]} {
     const filename = path.join(this.directory(agent), 'opencode-history.json');
     if (!fs.existsSync(filename)) return {sessionId:null, messages:[]};
     if (fs.statSync(filename).size > 16 * 1024 * 1024) throw new Error('OpenCode history exceeded the supported size. Continue in Code.');
     const record = JSON.parse(fs.readFileSync(filename, 'utf8'));
-    if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
+    if (typeof record.sessionId !== 'string' || !/^ses_[a-zA-Z0-9_-]+$/.test(record.sessionId)) return {sessionId:null,messages:[]};
     return {sessionId: record.sessionId, messages: Array.isArray(record.messages) ? record.messages.filter((m: any) => typeof m.id === 'string' && typeof m.text === 'string' && ['user','assistant','tool'].includes(m.role)) : []};
   }
   pendingQuestions(agent: ManualAgent): ManualQuestion[] {
@@ -597,9 +602,13 @@ export class ManualProviderBridge {
     if (!question) throw Object.assign(new Error('This question is no longer pending.'), {status:409});
     if (!Array.isArray(answers) || answers.length !== question.questions.length || answers.some((answer, index) => !Array.isArray(answer) || !answer.length || (!question.questions[index].multiple && answer.length !== 1) || answer.some(value => typeof value !== 'string' || !value.trim() || value.length > 2000 || (!question.questions[index].custom && !question.questions[index].options.some(option => option.label === value))))) throw Object.assign(new Error('Select an answer for each question.'), {status:400});
     const filename = path.join(this.directory(agent), 'opencode-question-reply.json');
-    if (fs.existsSync(filename)) throw Object.assign(new Error('An answer is already being delivered.'), {status:409});
+    try {
+      fs.writeFileSync(filename, JSON.stringify({id:question.id, sessionID:this.openCodeHistory(agent).sessionId, answers}), {flag:'wx', mode:0o600});
+    } catch (error: any) {
+      if (error?.code === 'EEXIST') throw Object.assign(new Error('An answer is already being delivered.'), {status:409});
+      throw error;
+    }
     fs.rmSync(path.join(this.directory(agent), 'opencode-question-error.json'), {force:true});
-    fs.writeFileSync(filename, JSON.stringify({id, sessionID:this.openCodeHistory(agent).sessionId, answers}), {flag:'wx', mode:0o600});
   }
   read(agent: ManualAgent): {messages: ManualMessage[]; truncated: boolean; bound: boolean; loading?: boolean} {
     if (agent.runtimeType === 'opencode') {

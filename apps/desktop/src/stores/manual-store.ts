@@ -106,13 +106,33 @@ export interface ManualSwarmBoardResponse {
   oldestSeq?: number;
   latestSeq?: number;
 }
+export interface ManualInboxItem {
+  id: string;
+  text: string;
+  delivery: 'queue' | 'steer';
+  createdAt?: number;
+}
+export interface ManualSteerCapabilities {
+  mode: 'opencode_v2_inbox' | 'antigravity_alt_m' | 'none';
+  queuedMessagesSetting?: 'queue' | 'send-immediately';
+}
+export interface ManualQueuedPrompt {
+  id: string;
+  text: string;
+  files: File[];
+  createdAt: number;
+  status: 'queued' | 'sending' | 'error';
+  error?: string;
+}
 export interface ManualChatSnapshot {
   revision: string;
   messages: ManualMessage[];
   recentTools: ManualMessage[];
   questions?: ManualQuestion[];
-  autoApprove?: { available: boolean; enabled: boolean; reason?: string };
+  autoApprove?: { available: boolean; enabled: boolean; error?: string; reason?: string };
   routeStatus?: { pending: boolean; error?: string };
+  inbox?: ManualInboxItem[];
+  steerCapabilities?: ManualSteerCapabilities;
   truncated: boolean;
   bound: boolean;
   loading?: boolean;
@@ -143,6 +163,7 @@ interface ManualState {
   drafts: Record<string, string>;
   // File objects survive workspace unmounts, but must never enter persisted navigation.
   attachments: Record<string, File[]>;
+  queuedPrompts: Record<string, ManualQueuedPrompt[]>;
   error: string | null;
   setMode: (mode: ManualMode) => void;
   select: (conversation: ManualConversation) => void;
@@ -151,6 +172,10 @@ interface ManualState {
   setDraft: (id: string, text: string) => void;
   updateAttachments: (id: string, update: (files: File[]) => File[]) => void;
   clearSentDraft: (id: string, draft: string, files: File[]) => void;
+  enqueuePrompt: (agentId: string, item: ManualQueuedPrompt) => void;
+  removeQueuedPrompt: (agentId: string, itemId: string) => void;
+  updateQueuedPrompt: (agentId: string, itemId: string, patch: Partial<ManualQueuedPrompt>) => void;
+  clearQueuedPrompts: (agentId: string) => void;
   forgetWorkspace: (workspaceId: string, knownConversations?: ManualConversation[]) => void;
   refresh: (workspaceId: string) => Promise<void>;
   create: (workspaceId: string, title: string | undefined, id: string, isolated?: boolean) => Promise<ManualConversation>;
@@ -168,6 +193,7 @@ function withoutAgentDrafts(state: ManualState, ids: Set<string>) {
   return {
     drafts: Object.fromEntries(Object.entries(state.drafts).filter(([id]) => !ids.has(id))),
     attachments: Object.fromEntries(Object.entries(state.attachments).filter(([id]) => !ids.has(id))),
+    queuedPrompts: Object.fromEntries(Object.entries(state.queuedPrompts).filter(([id]) => !ids.has(id))),
   };
 }
 export function migrateManualNavigation(persisted: unknown) {
@@ -177,7 +203,7 @@ export function migrateManualNavigation(persisted: unknown) {
 }
 export const useManualStore = create<ManualState>()(persist((set, get) => ({
   creating: false, setCreating: creating => set({ creating }),
-  mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, attachments: {}, error: null,
+  mode: 'choose', conversations: {}, activeByWorkspace: {}, agentByConversation: {}, surfaceByConversation: {}, drafts: {}, attachments: {}, queuedPrompts: {}, error: null,
   layoutByConversation: {},
   orderByConversation: {}, hiddenAgents: {}, acknowledgedActivity: {},
   acknowledgeActivity: (id, key) => set(state => state.acknowledgedActivity[id] === key ? {} : ({ acknowledgedActivity: { ...state.acknowledgedActivity, [id]: key } })),
@@ -215,6 +241,32 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       drafts: state.drafts[id] === draft ? { ...state.drafts, [id]: '' } : state.drafts,
       attachments: files.length ? { ...attachments, [id]: files } : attachments,
     };
+  }),
+  enqueuePrompt: (agentId, item) => set(state => {
+    if (!Object.values(state.conversations).some(items => items.some(c => c.agents.some(agent => agent.id === agentId)))) return {};
+    return { queuedPrompts: { ...state.queuedPrompts, [agentId]: [...(state.queuedPrompts[agentId] || []), item] } };
+  }),
+  removeQueuedPrompt: (agentId, itemId) => set(state => {
+    const existing = state.queuedPrompts[agentId];
+    if (!existing) return {};
+    const next = existing.filter(item => item.id !== itemId);
+    const { [agentId]: _previous, ...rest } = state.queuedPrompts;
+    return { queuedPrompts: next.length ? { ...rest, [agentId]: next } : rest };
+  }),
+  updateQueuedPrompt: (agentId, itemId, patch) => set(state => {
+    const existing = state.queuedPrompts[agentId];
+    if (!existing?.some(item => item.id === itemId)) return {};
+    return {
+      queuedPrompts: {
+        ...state.queuedPrompts,
+        [agentId]: existing.map(item => item.id === itemId ? { ...item, ...patch } : item),
+      },
+    };
+  }),
+  clearQueuedPrompts: agentId => set(state => {
+    if (!(agentId in state.queuedPrompts)) return {};
+    const { [agentId]: _previous, ...queuedPrompts } = state.queuedPrompts;
+    return { queuedPrompts };
   }),
   applyNaming: naming => {
     if (!naming) return;
@@ -306,11 +358,7 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       }
     }
     if (!workspaceId) {
-      set(state => {
-        const { [agent.id]: _draft, ...drafts } = state.drafts;
-        const { [agent.id]: _files, ...attachments } = state.attachments;
-        return { drafts, attachments };
-      });
+      set(state => withoutAgentDrafts(state, new Set([agent.id])));
       return;
     }
     fetchVersions.set(workspaceId, (fetchVersions.get(workspaceId) || 0) + 1);
@@ -321,11 +369,9 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       const index = ordered.findIndex(item => item.id === agent.id);
       const nextVisible = [...ordered.slice(index + 1), ...ordered.slice(0, index)].find(item => item.id !== agent.id && !state.hiddenAgents[item.id]);
       const conversations = state.conversations[workspaceId].map(c => c.id === agent.conversationId ? { ...c, agents: c.agents.filter(item => item.id !== agent.id) } : c);
-      const { [agent.id]: _draft, ...drafts } = state.drafts;
-      const { [agent.id]: _files, ...attachments } = state.attachments;
       const { [agent.id]: _hidden, ...hiddenAgents } = state.hiddenAgents;
       const { [agent.id]: _ack, ...acknowledgedActivity } = state.acknowledgedActivity;
-      return { conversations: { ...state.conversations, [workspaceId]: conversations }, drafts, attachments, hiddenAgents, acknowledgedActivity,
+      return { conversations: { ...state.conversations, [workspaceId]: conversations }, ...withoutAgentDrafts(state, new Set([agent.id])), hiddenAgents, acknowledgedActivity,
         terminalLayouts: { ...state.terminalLayouts, [agent.conversationId]: undefined },
         agentByConversation: { ...state.agentByConversation, [agent.conversationId]: state.agentByConversation[agent.conversationId] === agent.id ? nextVisible?.id || '' : state.agentByConversation[agent.conversationId] },
         orderByConversation: { ...state.orderByConversation, [agent.conversationId]: (state.orderByConversation[agent.conversationId] || []).filter(id => id !== agent.id) } };
@@ -346,10 +392,8 @@ export const useManualStore = create<ManualState>()(persist((set, get) => ({
       const { [conversation.workspaceId]: selected, ...others } = state.activeByWorkspace;
       // Include agents added while the delete request was in flight.
       const ids = new Set([...conversation.agents, ...(state.conversations[conversation.workspaceId]?.find(item => item.id === conversation.id)?.agents || [])].map(agent => agent.id));
-      const drafts = Object.fromEntries(Object.entries(state.drafts).filter(([id]) => !ids.has(id)));
-      const attachments = Object.fromEntries(Object.entries(state.attachments).filter(([id]) => !ids.has(id)));
       return { conversations: { ...state.conversations, [conversation.workspaceId]: (state.conversations[conversation.workspaceId] || []).filter(item => item.id !== conversation.id) },
-        drafts, attachments,
+        ...withoutAgentDrafts(state, ids),
         activeByWorkspace: selected === conversation.id ? others : state.activeByWorkspace, mode: selected === conversation.id ? 'choose' : state.mode };
     });
   },
