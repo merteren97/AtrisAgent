@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 35
     env:
       ANDROID_NDK_VERSION: 27.2.12479018
+      GRADLE_OPTS: -Dorg.gradle.workers.max=2 -Dorg.gradle.internal.http.connectionTimeout=60000 -Dorg.gradle.internal.http.socketTimeout=60000
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,7 +54,26 @@ jobs:
           export ANDROID_KEY_BASE64="$(base64 -w 0 "$RUNNER_TEMP/test.jks")"
           node .github/scripts/prepare-mobile-android-signing.mjs
           node .github/scripts/configure-mobile-android-signing.mjs
-      - run: npm run tauri -w @atris-agent-code/mobile -- android build --ci --apk --target aarch64
+      - name: Build Android release APK (retry transient Maven/Gradle HTTP failures)
+        run: |
+          set -euo pipefail
+          log_file="$RUNNER_TEMP/android-build.log"
+          for attempt in 1 2 3 4; do
+            set +e
+            npm run tauri -w @atris-agent-code/mobile -- android build --ci --apk --target aarch64 2>&1 | tee "$log_file"
+            status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 4 ] && grep -qiE 'status code (429|502|503|504)|Too Many Requests|Connection reset|Read timed out|Could not (GET|HEAD)' "$log_file"; then
+              delay=$((attempt * 20))
+              echo "Transient Gradle/Maven HTTP error on attempt $attempt/4; retrying in ${delay}s..."
+              sleep "$delay"
+              continue
+            fi
+            exit "$status"
+          done
       - name: Verify the built APK
         run: |
           set -euo pipefail
